@@ -1,0 +1,47 @@
+# 环境配置文件（包含 API Key）
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# 保留 .env.example 作为模板
+!.env.example
+
+# 输出目录（翻译结果和中间产物）
+outputs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 原文目录（大文件，不上传）
+原文/
+
+# 监控日志和临时文件
+*.log
+*.tmp
+*.temp
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# 虚拟环境
+venv/
+env/
+.venv/
