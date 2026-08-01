@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-将 translation.md 按自然段和文章标题重新整合为 Word 文档。
+历史脚本：将 translation.md 按自然段和文章标题重新整合为 Word 文档。
 去除页面标记和页码，保留文章标题层级结构。
 """
 import re

@@ -77,6 +77,7 @@ class ProviderProfile:
     reasoning_effort: str | None = None
     native_http: bool = False
     api_style: str = "chat"
+    base_url_env_aliases: tuple[str, ...] = ()
 
 
 PROVIDER_PROFILES: dict[str, ProviderProfile] = {
@@ -120,7 +121,7 @@ PROVIDER_PROFILES: dict[str, ProviderProfile] = {
     "deepseek": ProviderProfile(
         core="deepseek",
         api_key_env="DEEPSEEK_API_KEY",
-        base_url_env="DEEPSEEK_BASE_URL",
+        base_url_env="DEEPSEEK_API_BASE",
         model_env="DEEPSEEK_MODEL",
         default_base_url="https://api.deepseek.com",
         default_model="deepseek-v4-pro",
@@ -138,6 +139,7 @@ PROVIDER_PROFILES: dict[str, ProviderProfile] = {
         default_summary_chunk_chars=850000,
         thinking={"type": "enabled"},
         reasoning_effort="high",
+        base_url_env_aliases=("DEEPSEEK_BASE_URL",),
     ),
 }
 
@@ -803,7 +805,16 @@ def resolve_agent_connection(
     api_key = api_key_override or os.getenv(profile.api_key_env, "")
     if profile.core == "seed" and not api_key:
         api_key = os.getenv("OPENAI_API_KEY", "")
-    base_url = base_url_override or os.getenv(profile.base_url_env, profile.default_base_url)
+    base_url = base_url_override or os.getenv(profile.base_url_env, "")
+    if not base_url:
+        base_url = next(
+            (
+                value
+                for env_name in profile.base_url_env_aliases
+                if (value := os.getenv(env_name, ""))
+            ),
+            profile.default_base_url,
+        )
     model = model_override or os.getenv(profile.model_env, profile.default_model)
     vision_detail = vision_detail_override or os.getenv(
         f"{profile.core.upper()}_VISION_DETAIL",

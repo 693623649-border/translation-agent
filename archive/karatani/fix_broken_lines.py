@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-修复翻译文本中的换页截断问题。
+历史脚本：修复翻译文本中的换页截断问题。
 使用 DeepSeek V4 文字核心 LLM 对全文切片进行语义修复和段落整理。
 """
 import re
@@ -21,7 +21,7 @@ OUTPUT_FILE = Path("outputs/定本_完整处理/定本 柄谷行人文学论集 
 # DeepSeek API 配置
 API_KEY = ""
 BASE_URL = "https://api.deepseek.com"
-MODEL = "deepseek-chat"
+MODEL = "deepseek-v4-pro"
 
 # 段落合并阈值：连续行数少于此值的段落将被合并
 MIN_PARAGRAPH_LINES = 2

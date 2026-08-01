@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-严格按目录结构重新生成 LaTeX → PDF → Word 文档。
+历史脚本：严格按目录结构重新生成 LaTeX → PDF → Word 文档。
 """
 import re
 import sys

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PDF OCR + 翻译任务监控脚本
+历史版 PDF OCR + 翻译任务监控脚本
 持续监测 pdf_text_agent.py 的运行进度，显示处理速度与预计完成时间。
 """
 from __future__ import annotations

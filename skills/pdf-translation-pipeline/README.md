@@ -1,75 +1,15 @@
-# PDF 翻译全流程自动化管线
+# PDF Translation Pipeline Skill
 
-## 快速开始
+版本 2 的主线是影印版 PDF → 逐页 OCR → 结构化目录/页码偏移 → 非中文页可选 DeepSeek 翻译 → 按标题生成章节 Markdown → 无原始分页信息的 EPUB/Word / RAG JSONL / 带书签 PDF。
 
-```bash
-# 1. 安装依赖
-pip install -r requirements.txt
+输入必须是方向正确的 PDF。图片 ZIP 应先过滤系统元数据文件、按自然页序排序、应用 EXIF/OSD 或人工旋转，再按一图一页合成正向 PDF。OCR 可选 Coding Plan 视觉 MCP、标准 `glm-ocr` 或本地 Tesseract；日文竖排 Tesseract 推荐 `--tesseract-language jpn_vert+eng --tesseract-psm 3`，横排改为 `jpn+eng`。
 
-# 2. 配置 API
-cp .env.example .env
-# 编辑 .env 填入 API Key
+视觉 OCR 和目录结构化继续调用 GLM/Coding Plan，翻译使用独立的 DeepSeek API，不得混用 Key 或端点。推荐用 `pipeline.toml` 的 `ocr_profile`、`toc_profile`、`translation_profile` 选择端点和模型，凭据只以 `credential_env` 引用环境变量。检测到非中文 OCR 后，可在 `compile`/`all` 阶段传 `--translate-non-chinese --target-language 简体中文`。用 `--ocr-concurrency` 和 `--translation-concurrency` 分别控制两个逐页 worker 池；翻译 worker 默认 16，在 API 额度内并行，限流时只降低受影响阶段的 worker 数。默认模型为 `deepseek-v4-pro`；切换模型使用 `--translation-profile`，临时切换凭据使用 `--translation-api-key-env`，不得把原始 Key 放入 argv。
 
-# 3. 运行翻译
-python pdf_text_agent.py "原文\your_file.pdf" -o outputs --llm-core deepseek --ocr-llm-core mimo
+DeepSeek 官方已公告 `deepseek-chat` 和 `deepseek-reasoner` 已于北京时间 2026-07-24 23:59 停止使用；新任务默认使用 `deepseek-v4-pro`，也可显式改用仍受支持的 `deepseek-v4-flash`。
 
-# 4. 生成文档
-python build_docx_latex.py
-```
+DeepSeek V4 当前默认启用思考模式；翻译请求必须显式发送 `"thinking": {"type": "disabled"}`。翻译属于确定性文本转换，关闭思考可减少延迟和 token 消耗，并提高多 worker 吞吐。
 
-## 核心功能
+目录 JSON 是基于完整候选目录文本的单个全局请求，需在 OCR 完成后执行；不要为了增加 worker 而拆坏目录上下文。逐页 OCR 与逐页翻译则应尽可能并行并保留逐页检查点。
 
-### 1. OCR + 翻译
-- 支持 PDF/图片输入
-- 使用 mimo 进行视觉 OCR
-- 使用 deepseek 进行翻译
-- 自动生成总结
-
-### 2. 断点续传
-- 每页保存检查点
-- 中断后自动续传
-- 支持 OCR 恢复
-
-### 3. 排版输出
-- LaTeX → PDF（高质量排版）
-- Word（可编辑文档）
-- 严格按目录结构
-
-### 4. 语义修复
-- 修复 OCR 截断
-- 整理段落结构
-- 使用 DeepSeek V4
-
-## 文件说明
-
-| 文件 | 说明 |
-|------|------|
-| `pdf_text_agent.py` | 主程序（OCR + 翻译 + 总结） |
-| `build_docx_latex.py` | 排版脚本 |
-| `fix_broken_lines.py` | 语义修复脚本 |
-| `monitor.py` | 监控脚本 |
-
-## 使用场景
-
-1. **学术翻译**: 翻译学术论文、专著
-2. **文档数字化**: 将纸质文档转换为可编辑格式
-3. **批量处理**: 大规模文档翻译
-4. **断点续传**: 长时间任务中断恢复
-
-## 技术栈
-
-- **OCR**: mimo (小米视觉 LLM)
-- **翻译**: deepseek (深度求索)
-- **排版**: xelatex + python-docx
-- **监控**: 自定义 Python 脚本
-
-## 性能参考
-
-- 190 页 PDF: 约 3 小时完成全流程
-- OCR 速度: 约 1 页/分钟
-- 翻译速度: 约 1 页/分钟
-- 语义修复: 约 30 分钟
-
-## 许可证
-
-MIT License
+完整用法见仓库根目录 `README.md`，Agent 执行规则见 `skill.md`。
