@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
+
+
+ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,18 @@ class ModelProfile:
     concurrency: int = 1
     thinking: str = "disabled"
     command: tuple[str, ...] = ()
+    reading_direction: str = ""
+
+    def __post_init__(self) -> None:
+        if self.credential_env and not ENV_NAME_PATTERN.fullmatch(self.credential_env):
+            raise ValueError(
+                f"Profile {self.name!r} credential_env must be an environment "
+                "variable name, not a raw credential."
+            )
+        if self.reading_direction not in {"", "horizontal", "vertical"}:
+            raise ValueError(
+                f"Profile {self.name!r} reading_direction must be horizontal or vertical."
+            )
 
     def resolve_credential(
         self,
@@ -103,6 +119,7 @@ class PipelineProfiles:
     ocr_profile: str = ""
     toc_profile: str = ""
     translation_profile: str = ""
+    proofread_profile: str = ""
 
     def get(self, name: str) -> ModelProfile:
         try:
@@ -118,6 +135,10 @@ class PipelineProfiles:
             "ocr": self.ocr_profile,
             "toc": self.toc_profile,
             "translation": self.translation_profile,
+            # OCR proofreading is an optional text-model stage.  Reusing the
+            # translation profile keeps old profile files useful and avoids a
+            # second credential setting for the common DeepSeek setup.
+            "proofread": self.proofread_profile or self.translation_profile,
         }.get(stage, "")
         return self.get(selected) if selected else None
 
@@ -171,6 +192,7 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
             concurrency=concurrency,
             thinking=thinking,
             command=command,
+            reading_direction=str(raw.get("reading_direction") or "").strip().lower(),
         )
     pipeline = payload.get("pipeline", {})
     if not isinstance(pipeline, dict):
@@ -180,7 +202,8 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
         ocr_profile=str(pipeline.get("ocr_profile") or "").strip(),
         toc_profile=str(pipeline.get("toc_profile") or "").strip(),
         translation_profile=str(pipeline.get("translation_profile") or "").strip(),
+        proofread_profile=str(pipeline.get("proofread_profile") or "").strip(),
     )
-    for stage in ("ocr", "toc", "translation"):
+    for stage in ("ocr", "toc", "translation", "proofread"):
         result.for_stage(stage)
     return result

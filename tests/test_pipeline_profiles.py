@@ -16,6 +16,31 @@ from book_pipeline import (
 
 
 class PipelineProfileTests(unittest.TestCase):
+    def test_example_config_defaults_to_deepseek_flash(self) -> None:
+        config_path = Path(__file__).resolve().parents[1] / "pipeline.example.toml"
+        loaded = load_pipeline_profiles(config_path)
+
+        self.assertEqual(loaded.translation_profile, "deepseek_flash")
+        self.assertEqual(loaded.proofread_profile, "deepseek_flash")
+        self.assertEqual(
+            loaded.for_stage("proofread").name,
+            "deepseek_flash",
+        )
+        translation = loaded.for_stage("translation")
+        assert translation is not None
+        self.assertEqual(translation.model, "deepseek-v4-flash")
+        self.assertEqual(loaded.get("deepseek_pro").model, "deepseek-v4-pro")
+
+    def test_raw_secret_is_rejected_as_credential_environment_name(self) -> None:
+        with self.assertRaisesRegex(ValueError, "environment variable name"):
+            ModelProfile(
+                name="unsafe",
+                adapter="coding-plan-mcp",
+                provider="zhipu",
+                model="glm-4.6v",
+                credential_env="raw.secret-value",
+            )
+
     def test_profile_credential_does_not_fall_back_to_another_provider_key(self) -> None:
         profile = ModelProfile(
             name="custom",
@@ -91,6 +116,7 @@ credential_env = "GLM_TEST_API_KEY"
 timeout = 180
 concurrency = 4
 thinking = "omit"
+reading_direction = "vertical"
 
 [profiles.glm_toc]
 adapter = "openai-chat"
@@ -140,7 +166,12 @@ translation_profile = "deepseek_pro"
         self.assertEqual(translation.concurrency, 16)
         self.assertEqual(translation.thinking, "disabled")
         self.assertEqual(loaded.for_stage("ocr"), loaded.get("glm_vision"))
+        self.assertEqual(loaded.get("glm_vision").reading_direction, "vertical")
         self.assertEqual(loaded.for_stage("toc"), loaded.get("glm_toc"))
+        self.assertEqual(
+            loaded.for_stage("proofread"),
+            loaded.get("deepseek_pro"),
+        )
 
     def test_credential_is_resolved_from_environment_and_redacted(self) -> None:
         profile = ModelProfile(

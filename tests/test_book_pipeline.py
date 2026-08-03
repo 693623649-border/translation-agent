@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 import tempfile
@@ -14,11 +15,15 @@ import fitz
 from PIL import Image
 
 from book_pipeline import (
+    ChatTranslator,
     CodingPlanVisionOCR,
     DeepSeekClient,
     GlmClient,
+    McpStdioClient,
     PageRecord,
     TocEntry,
+    _exclusive_stage_lock,
+    annotate_printed_page_markers,
     apply_page_mapping,
     build_parser,
     build_bookmarked_pdf,
@@ -35,6 +40,7 @@ from book_pipeline import (
     markdown_inline_to_plain_text,
     normalize_target_script,
     ocr_pdf,
+    output_status,
     parse_page_spec,
     remove_duplicate_title,
     resolve_api_key,
@@ -42,12 +48,420 @@ from book_pipeline import (
     resolve_worker_counts,
     save_page_record,
     strip_publication_metadata,
+    trim_before_next_title,
     translate_non_chinese_pages,
     write_json,
 )
 
 
 class UtilityTests(unittest.TestCase):
+    def test_model_stage_lock_decorator_preserves_keyword_call_api(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            translate_non_chinese_pages(
+                records=[],
+                output_dir=output,
+                translator=object(),
+                target_language="简体中文",
+                force=False,
+            )
+            self.assertTrue((output / ".stage_locks" / "translate.lock").is_file())
+
+    def test_chapter_selector_is_rejected_outside_verify_phase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(SystemExit):
+                main(
+                    [
+                        "-o",
+                        directory,
+                        "--phase",
+                        "status",
+                        "--chapter-id",
+                        "1",
+                    ]
+                )
+
+    def test_english_translation_prompt_uses_source_language_grammar(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                self.prompts.append(prompt)
+                return f"译文{len(self.prompts)}。"
+
+        client = RecordingClient()
+        translator = ChatTranslator(client)
+
+        translated = translator.translate(
+            "# 审定标题\n\nEnglish body.\n\n## 御宅世界影像\n\nMore English body.",
+            source_language="en",
+            target_language="简体中文",
+        )
+
+        self.assertEqual(
+            translated,
+            "# 审定标题\n\n译文1。\n\n## 御宅世界影像\n\n译文2。",
+        )
+        self.assertEqual(len(client.prompts), 2)
+        for prompt in client.prompts:
+            self.assertIn("源语言标签：en", prompt)
+            self.assertIn("依据源语言的语法和上下文", prompt)
+            self.assertNotIn("日语语法", prompt)
+            self.assertIn("Markdown 标题已由程序保护", prompt)
+            self.assertNotIn("审定标题", prompt)
+            self.assertNotIn("御宅世界影像", prompt)
+
+    def test_translation_prompt_requires_every_numbered_footnote_definition(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                self.prompts.append(prompt)
+                source = prompt.split("\n原文：\n", 1)[1]
+                label = source.split(maxsplit=1)[0]
+                return f"{label} 第{label}条脚注全文。\n第{label}条续行。"
+
+        client = RecordingClient()
+        translated = ChatTranslator(client).translate(
+            "1 First footnote definition in full.\nFirst continuation.\n"
+            "2 Second footnote definition in full.\nSecond continuation.\n"
+            "3 Third footnote definition in full.\nThird continuation.\n"
+            "4 Fourth footnote definition in full.\nFourth continuation.",
+            source_language="en",
+            target_language="简体中文",
+        )
+
+        self.assertEqual(len(client.prompts), 4)
+        sources = [prompt.split("\n原文：\n", 1)[1] for prompt in client.prompts]
+        self.assertEqual(
+            sources,
+            [
+                "1 First footnote definition in full.\nFirst continuation.",
+                "2 Second footnote definition in full.\nSecond continuation.",
+                "3 Third footnote definition in full.\nThird continuation.",
+                "4 Fourth footnote definition in full.\nFourth continuation.",
+            ],
+        )
+        self.assertEqual(
+            translated,
+            "1 第1条脚注全文。\n第1条续行。\n\n"
+            "2 第2条脚注全文。\n第2条续行。\n\n"
+            "3 第3条脚注全文。\n第3条续行。\n\n"
+            "4 第4条脚注全文。\n第4条续行。",
+        )
+        for index, prompt in enumerate(client.prompts, start=1):
+            self.assertIn("每一个行首脚注编号及其对应定义全文", prompt)
+            self.assertIn("严禁合并、跳号、截断、只保留编号或省略出处", prompt)
+            self.assertIn(f"必须逐项原样保留）：{index}", prompt)
+
+    def test_dotted_numbers_are_not_footnotes_or_strict_labels(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                self.prompts.append(prompt)
+                return "这是包含年代和列表编号的译文。"
+
+        client = RecordingClient()
+        translated = ChatTranslator(client).translate(
+            "1853. A year in prose.\n240. A dotted list item.",
+            source_language="en",
+            target_language="简体中文",
+        )
+
+        self.assertEqual(translated, "这是包含年代和列表编号的译文。")
+        self.assertEqual(len(client.prompts), 1)
+        self.assertNotIn("本分块检测到的行首编号", client.prompts[0])
+
+    def test_parenthesized_number_is_strict_but_year_is_not(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                self.prompts.append(prompt)
+                return "(7) 保留的编号条目。\n年代出处已翻译。"
+
+        client = RecordingClient()
+        ChatTranslator(client).translate(
+            "(7) A parenthesized numbered item.\n(1853) A bibliographic year.",
+            source_language="en",
+            target_language="简体中文",
+        )
+
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("必须逐项原样保留）：7。", client.prompts[0])
+        self.assertNotIn("本分块检测到的行首编号", client.prompts[1])
+
+    def test_numbered_item_isolated_but_indented_volume_is_not_strict(self) -> None:
+        class RecordingClient:
+            def __init__(self) -> None:
+                self.prompts: list[str] = []
+
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                self.prompts.append(prompt)
+                source = prompt.split("\n原文：\n", 1)[1]
+                if source.startswith("(2) "):
+                    return "(2) 第二项。"
+                return "译文。"
+
+        client = RecordingClient()
+        ChatTranslator(client).translate(
+            "Introductory prose.\n"
+            "(2) Second enumerated body item.\n\n"
+            "2016. The International Encyclopedia (Volume\n"
+            "     2) (Malden: Wiley-Blackwell)",
+            source_language="en",
+            target_language="简体中文",
+        )
+
+        self.assertEqual(len(client.prompts), 2)
+        self.assertIn("必须逐项原样保留）：2", client.prompts[1])
+        self.assertNotIn("必须逐项原样保留）：2、2", client.prompts[1])
+
+    def test_translation_rejects_missing_numbered_definition(self) -> None:
+        class DroppingClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "1 只返回了第一条脚注。"
+
+        with self.assertRaisesRegex(RuntimeError, "leading labels: \\['2'\\]"):
+            ChatTranslator(DroppingClient()).translate(
+                "1 First footnote.\n2 Second footnote.",
+                source_language="en",
+                target_language="简体中文",
+            )
+
+    def test_translation_accepts_table_artifact_labels(self) -> None:
+        class DroppingClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "全部正文翻译完成。"
+
+        # Two-column chronology rows: the ``|`` artifact marks a table page,
+        # so stray leading numbers are OCR noise, not omitted footnotes.
+        translator = ChatTranslator(DroppingClient())
+        translator.translate(
+            "2 出狱被允许的陀思妥耶夫斯基的前途 | 〇 托尔斯泰诞生。\n"
+            "3 流刑第二年 | 〇 拿破仑政变。",
+            source_language="ja",
+            target_language="简体中文",
+        )
+
+    def test_translation_accepts_zero_and_header_labels(self) -> None:
+        class DroppingClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "正文译文。\n\n塞米巴拉金斯克。"
+
+        # "0" is a misread circle marker and "4" here is the chapter number
+        # in the running head; neither is a footnote definition.
+        translator = ChatTranslator(DroppingClient())
+        translator.translate(
+            "4 塞米巴拉金斯克\n\n正文文字。\n0 对自由的向往。",
+            source_language="ja",
+            target_language="简体中文",
+        )
+
+    def test_translation_rejects_japanese_only_output(self) -> None:
+        class EchoClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "文芸時評、大衆時評をはじめいろいろな時評が、元来輿論の代表者として責めるべきところを。"
+
+        with self.assertRaisesRegex(RuntimeError, "retained Japanese text"):
+            ChatTranslator(EchoClient()).translate(
+                "文芸時評、大衆時評をはじめいろいろな時評が、元来輿論の代表者として責めるべきところを。",
+                source_language="ja",
+                target_language="简体中文",
+            )
+
+    def test_translation_accepts_kana_name_glosses(self) -> None:
+        class GlossClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "在文学上给予基里尔（キイ）最强烈刺激的朋友，是父亲的朋友。"
+
+        translator = ChatTranslator(GlossClient())
+        result = translator.translate(
+            "文学上キリルに最も強い刺激を与へた友は父の友であつた。",
+            source_language="ja",
+            target_language="简体中文",
+        )
+        self.assertIn("基里尔（キイ）", result)
+
+    def test_status_accepts_multiple_ocr_model_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            save_page_record(
+                output,
+                PageRecord(
+                    pdf_page=1,
+                    text="竖排",
+                    ocr_model="coding-plan/glm-4.6v-vision-mcp/vertical-v2",
+                ),
+            )
+            save_page_record(
+                output,
+                PageRecord(
+                    pdf_page=2,
+                    text="横排",
+                    ocr_model="coding-plan/glm-4.6v-vision-mcp/horizontal-v2",
+                ),
+            )
+
+            status = output_status(
+                output,
+                expected_ocr_model_prefix=(
+                    "coding-plan/glm-4.6v-vision-mcp/vertical-v2,"
+                    "coding-plan/glm-4.6v-vision-mcp/horizontal-v2"
+                ),
+            )
+
+        self.assertEqual(status["ocr_pages_profile_fresh"], 2)
+
+    def test_status_only_accepts_fresh_full_publication_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            audit = output / "audit"
+            chapters = output / "chapters"
+            audit.mkdir()
+            chapters.mkdir()
+            report_path = audit / "release-report.json"
+            chapter_path = chapters / "001_test.md"
+            chapter_path.write_text("# 测试\n\n正文。\n", encoding="utf-8")
+            report_path.write_text(
+                json.dumps({"mode": "chapters", "status": "passed"}),
+                encoding="utf-8",
+            )
+
+            status = output_status(output)
+            self.assertFalse(status["verification_ready"])
+            self.assertIsNone(status["verification_status"])
+
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "full",
+                        "status": "passed",
+                        "summary": {"chapter_count": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(report_path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(chapter_path, ns=(2_000_000_000, 2_000_000_000))
+            stale = output_status(output)
+            self.assertTrue(stale["verification_ready"])
+            self.assertTrue(stale["verification_stale"])
+
+            os.utime(report_path, ns=(3_000_000_000, 3_000_000_000))
+            fresh = output_status(output)
+            self.assertEqual(fresh["verification_status"], "passed")
+            self.assertFalse(fresh["verification_stale"])
+
+    def test_stage_lock_rejects_duplicate_process_for_same_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with _exclusive_stage_lock(output, "ocr"):
+                with self.assertRaisesRegex(RuntimeError, "Another ocr process"):
+                    with _exclusive_stage_lock(output, "ocr"):
+                        self.fail("duplicate stage lock should not be acquired")
+
+    def test_closed_vision_backend_cannot_recreate_mcp_process(self) -> None:
+        backend = object.__new__(CodingPlanVisionOCR)
+        backend.closed = threading.Event()
+        backend.closed.set()
+        with self.assertRaisesRegex(RuntimeError, "backend is closed"):
+            backend._client()
+
+    def test_vertical_mcp_prompt_requires_right_to_left_column_order(self) -> None:
+        client = object.__new__(McpStdioClient)
+        client.reading_direction = "vertical"
+        client.tool = {
+            "inputSchema": {
+                "properties": {
+                    "image_source": {"type": "string"},
+                    "prompt": {"type": "string"},
+                },
+                "required": ["image_source", "prompt"],
+            }
+        }
+        arguments = client._tool_arguments(Path("page.jpg"))
+        self.assertIn("最右侧文字列", arguments["prompt"])
+        self.assertIn("逐列向左", arguments["prompt"])
+        self.assertIn("先完整读完上方版块", arguments["prompt"])
+
+    def test_shared_page_trim_removes_review_publication_header(self) -> None:
+        text = (
+            "本篇结尾。\n\n（参考文献）\n奈须蘑菇《DDD》\n"
+            "TYPE-MOON 相关近作评论\nCross Review\n"
+            "哈莫尼亚\n《Fate/Grand Order 终局特异点冠位时间神殿所罗门》\n（游戏）\n正文。"
+        )
+        trimmed = trim_before_next_title(
+            text,
+            "哈莫尼亚 《Fate/Grand Order 终局特异点冠位时间神殿所罗门》（游戏）",
+        )
+        self.assertEqual(trimmed, "本篇结尾。\n\n（参考文献）\n奈须蘑菇《DDD》")
+
     def test_write_json_is_safe_for_concurrent_writers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "page.json"
@@ -67,8 +481,8 @@ class UtilityTests(unittest.TestCase):
             "傳統藝術與歷史",
         )
         self.assertEqual(
-            normalize_target_script("作者望著天空，阅读名著，成就顯著。", "简体中文"),
-            "作者望着天空，阅读名著，成就显著。",
+            normalize_target_script("作者望著天空，阅读其所著名著，成就顯著。", "简体中文"),
+            "作者望着天空，阅读其所著名著，成就显著。",
         )
 
     def test_glm_chat_disables_thinking(self) -> None:
@@ -169,7 +583,7 @@ class UtilityTests(unittest.TestCase):
         self.assertIsInstance(client, DeepSeekClient)
         assert isinstance(client, DeepSeekClient)
         self.assertEqual(client.api_base, "https://api.deepseek.com")
-        self.assertEqual(client.text_model, "deepseek-v4-pro")
+        self.assertEqual(client.text_model, "deepseek-v4-flash")
         self.assertNotIn("deepseek-sentinel", repr(client.__dict__).replace(client.api_key, ""))
 
     def test_api_timeout_cli(self) -> None:
@@ -206,6 +620,8 @@ class UtilityTests(unittest.TestCase):
             "",
         )
         self.assertEqual(clean_ocr_text("```\n```\n\n正文"), "正文")
+        self.assertEqual(clean_ocr_text("```\n14\n\n正文"), "14\n\n正文")
+        self.assertEqual(clean_ocr_text("14\n\n正文\n```"), "14\n\n正文")
         self.assertEqual(
             clean_ocr_text(
                 "```\n```\n\n**Content Type** 空白书页\n\n**Quality Notes** 截图内容为空白。"
@@ -263,6 +679,21 @@ class UtilityTests(unittest.TestCase):
         result = strip_publication_metadata(source)
         self.assertEqual(result, "# 第一章\n\n第一页正文。\n\n第二页正文。\n")
 
+    def test_reader_output_removes_trailing_split_printed_page(self) -> None:
+        # Column-aware OCR split printed page 40 into two lines; both are a
+        # page footer and must be discarded, unlike mid-text numbers.
+        source = """# 章节
+
+正文。
+
+4
+0
+"""
+        self.assertEqual(
+            strip_publication_metadata(source),
+            "# 章节\n\n正文。\n",
+        )
+
     def test_reader_output_removes_source_page_but_keeps_sections_and_years(self) -> None:
         source = """# 章节
 
@@ -281,6 +712,35 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(
             strip_publication_metadata(source),
             "# 章节\n\n正文。\n\n119\n\n后文。\n\n2\n\n1921\n\n年表结束。\n",
+        )
+
+    def test_contents_chapter_removes_navigation_page_numbers_only(self) -> None:
+        source = """# 目录
+
+第一章
+
+6
+
+第二章
+
+42
+"""
+        self.assertEqual(
+            strip_publication_metadata(source, chapter_title="目录"),
+            "# 目录\n\n第一章\n\n第二章\n",
+        )
+        self.assertIn(
+            "\n\n6\n",
+            strip_publication_metadata(source, chapter_title="数据表"),
+        )
+
+    def test_known_two_page_spread_numbers_are_removed_from_publication(self) -> None:
+        source = "正文。\n\n6\n\n后文。\n\n7\n\n42\n\n数据。"
+        marked = annotate_printed_page_markers(source, [6, 7])
+        self.assertIn('id="printed-page-6"', marked)
+        self.assertEqual(
+            strip_publication_metadata(marked),
+            "正文。\n\n后文。\n\n42\n\n数据。\n",
         )
 
     def test_reader_removes_numeric_header_only_at_page_boundary(self) -> None:
@@ -508,6 +968,13 @@ class UtilityTests(unittest.TestCase):
         text = "小林秀雄全集第三卷\n\n**小说の问题 I**\n\n正文"
         self.assertEqual(remove_duplicate_title(text, "小说的问题 I"), "正文")
 
+    def test_remove_duplicate_title_handles_reordered_descriptor(self) -> None:
+        text = "84\n\n第八章\n\n批判细田守《无尽的斯嘉丽》\n\n正文"
+        self.assertEqual(
+            remove_duplicate_title(text, "细田守《无尽的斯嘉丽》批判"),
+            "正文",
+        )
+
     def test_parallel_translation_checkpoints(self) -> None:
         class FakeTranslator:
             def translate(self, text: str, *, source_language: str, target_language: str) -> str:
@@ -691,14 +1158,22 @@ for line in sys.stdin:
                 encoding="utf-8",
             )
             image = root / "page.jpg"
-            image.write_bytes(b"fake")
-            backend = CodingPlanVisionOCR(api_key="test-key", command=f"{sys.executable} -u {server}")
+            Image.new("RGB", (100, 160), "white").save(image)
+            backend = CodingPlanVisionOCR(
+                api_key="test-key",
+                command=f"{sys.executable} -u {server}",
+                reading_direction="vertical",
+            )
             try:
                 text, request_id = backend.ocr_image(image)
             finally:
                 backend.close()
             self.assertEqual(text, "# 识别标题\n\n识别正文")
             self.assertTrue(request_id.startswith("mcp-"))
+            self.assertEqual(
+                backend.ocr_model,
+                "coding-plan/glm-4.6v-vision-mcp/vertical-v2",
+            )
 
     def test_coding_plan_content_filter_uses_segmented_fallback(self) -> None:
         class FilterThenReadClient:
@@ -723,6 +1198,124 @@ for line in sys.stdin:
             self.assertTrue(request_id.startswith("mcp-segmented-"))
             self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
 
+    def test_coding_plan_timeout_splits_dense_page_instead_of_retrying_whole_page(self) -> None:
+        class TimeoutThenReadClient:
+            def __init__(self) -> None:
+                self.whole_page_calls = 0
+
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                if "_segment_" not in image_path.stem:
+                    self.whole_page_calls += 1
+                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
+                match = re.search(r"_segment_(\d+)_", image_path.stem)
+                assert match is not None
+                return {"1": "右页正文。", "2": "左页正文。"}[match.group(1)], "mcp-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "dense-spread.jpg"
+            Image.new("RGB", (400, 600), "white").save(image_path)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            client = TimeoutThenReadClient()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CODING_PLAN_SPREAD_SEGMENTS": "2",
+                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
+                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
+                    },
+                ),
+                patch.object(backend, "_client", return_value=client),
+            ):
+                text, request_id = backend.ocr_image(image_path)
+            self.assertEqual(client.whole_page_calls, 1)
+            self.assertEqual(text, "右页正文。\n\n左页正文。")
+            self.assertTrue(request_id.startswith("mcp-segmented-"))
+            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
+
+    def test_vertical_two_page_spread_is_split_before_first_model_call(self) -> None:
+        class ReadSegmentClient:
+            def __init__(self) -> None:
+                self.whole_page_calls = 0
+
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                if "_segment_" not in image_path.stem:
+                    self.whole_page_calls += 1
+                    raise AssertionError("the whole spread must not be submitted")
+                match = re.search(r"_segment_(\d+)_", image_path.stem)
+                assert match is not None
+                return {"1": "右页。", "2": "左页。"}[match.group(1)], "mcp-test"
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "spread.jpg"
+            Image.new("RGB", (800, 400), "white").save(image_path)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            client = ReadSegmentClient()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CODING_PLAN_SPREAD_SEGMENTS": "2",
+                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
+                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
+                    },
+                ),
+                patch.object(backend, "_client", return_value=client),
+            ):
+                text, request_id = backend.ocr_image(image_path)
+            self.assertEqual(client.whole_page_calls, 0)
+            self.assertEqual(text, "右页。\n\n左页。")
+            self.assertEqual(text.physical_page_texts, ("右页。", "左页。"))
+            self.assertTrue(request_id.startswith("mcp-segmented-"))
+
+    def test_segment_rate_limit_does_not_restart_completed_segments(self) -> None:
+        class RateLimitedSegmentClient:
+            def __init__(self) -> None:
+                self.calls = {"1": 0, "2": 0}
+
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                match = re.search(r"_segment_(\d+)_", image_path.stem)
+                assert match is not None
+                segment = match.group(1)
+                self.calls[segment] += 1
+                if segment == "2" and self.calls[segment] == 1:
+                    raise RuntimeError("HTTP 429: Rate limit reached for requests")
+                return {"1": "右页。", "2": "左页。"}[segment], "mcp-test"
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "rate-limited-spread.jpg"
+            Image.new("RGB", (800, 400), "white").save(image_path)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            client = RateLimitedSegmentClient()
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CODING_PLAN_SEGMENT_ATTEMPTS": "2",
+                        "CODING_PLAN_SEGMENT_RATE_LIMIT_DELAY": "0",
+                        "CODING_PLAN_SEGMENT_RATE_LIMIT_MAX_DELAY": "0",
+                        "CODING_PLAN_SEGMENT_RATE_LIMIT_JITTER": "0",
+                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
+                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
+                    },
+                ),
+                patch.object(backend, "_client", return_value=client),
+            ):
+                text, request_id = backend._ocr_segmented(
+                    image_path,
+                    client,
+                    segments=2,
+                )
+            self.assertEqual(text, "右页。\n\n左页。")
+            self.assertTrue(request_id.startswith("mcp-segmented-"))
+            self.assertEqual(client.calls, {"1": 1, "2": 2})
+
     def test_vertical_segment_fallback_reads_right_to_left(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image_path = Path(directory) / "vertical.jpg"
@@ -737,11 +1330,258 @@ for line in sys.stdin:
                     average = sum(band.get_flattened_data()) / (band.width * band.height)
                     return ("右。" if average > 127 else "左。"), "test"
 
-            with patch.object(backend, "_ocr_filtered_band", side_effect=read_band):
-                text, request_id = backend._ocr_segmented(image_path, object(), segments=2)
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
+                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
+                    },
+                ),
+                patch.object(backend, "_ocr_filtered_band", side_effect=read_band),
+            ):
+                text, request_id = backend._ocr_segmented(
+                    image_path,
+                    object(),
+                    segments=2,
+                )
             self.assertEqual(text, "右。\n\n左。")
             self.assertTrue(request_id.startswith("mcp-segmented-"))
             self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
+
+    def test_vertical_two_page_grid_reads_rows_then_columns_in_page_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "vertical-grid.jpg"
+            image = Image.new("RGB", (800, 400), "white")
+            colors = {
+                "左页上左。": (255, 0, 0),
+                "左页上右。": (0, 255, 0),
+                "左页下左。": (0, 0, 255),
+                "左页下右。": (255, 255, 0),
+                "右页上左。": (255, 0, 255),
+                "右页上右。": (0, 255, 255),
+                "右页下左。": (128, 0, 0),
+                "右页下右。": (0, 128, 0),
+            }
+            image.paste(colors["左页上左。"], (0, 0, 200, 200))
+            image.paste(colors["左页上右。"], (200, 0, 400, 200))
+            image.paste(colors["左页下左。"], (0, 200, 200, 400))
+            image.paste(colors["左页下右。"], (200, 200, 400, 400))
+            image.paste(colors["右页上左。"], (400, 0, 600, 200))
+            image.paste(colors["右页上右。"], (600, 0, 800, 200))
+            image.paste(colors["右页下左。"], (400, 200, 600, 400))
+            image.paste(colors["右页下右。"], (600, 200, 800, 400))
+            image.save(image_path, quality=100, subsampling=0)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+
+            def read_grid_cell(path: Path, *, depth: int) -> tuple[str, str]:
+                with Image.open(path).convert("RGB") as cell:
+                    self.assertEqual(cell.size, (200, 200))
+                    color = cell.getpixel((100, 100))
+                label = min(
+                    colors,
+                    key=lambda candidate: sum(
+                        abs(actual - expected)
+                        for actual, expected in zip(color, colors[candidate])
+                    ),
+                )
+                return label, "test"
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "2",
+                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "2",
+                    },
+                ),
+                patch.object(
+                    backend,
+                    "_blank_row_cuts",
+                    side_effect=lambda page, count: [page.height // 2],
+                ),
+                patch.object(
+                    backend,
+                    "_blank_column_cuts",
+                    side_effect=lambda page, count: [page.width // 2],
+                ),
+                patch.object(backend, "_ocr_filtered_band", side_effect=read_grid_cell),
+            ):
+                text, request_id = backend._ocr_segmented(
+                    image_path,
+                    object(),
+                    segments=2,
+                )
+
+            self.assertEqual(
+                text,
+                "\n\n".join(
+                    (
+                        "右页上右。",
+                        "右页上左。",
+                        "右页下右。",
+                        "右页下左。",
+                        "左页上右。",
+                        "左页上左。",
+                        "左页下右。",
+                        "左页下左。",
+                    )
+                ),
+            )
+            self.assertTrue(request_id.startswith("mcp-segmented-"))
+            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
+
+    def test_vertical_portrait_filtered_fallback_reads_top_then_bottom(self) -> None:
+        class TimeoutThenReadRegionClient:
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                if "_filtered_" not in image_path.stem:
+                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
+                with Image.open(image_path).convert("RGB") as region:
+                    self.test_case.assertEqual(region.size, (120, 100))
+                    red, _green, blue = region.getpixel((60, 50))
+                    return ("上段。" if red > blue else "下段。"), "mcp-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "portrait-page.jpg"
+            image = Image.new("RGB", (120, 200), "red")
+            image.paste("blue", (0, 100, 120, 200))
+            image.save(image_path, quality=100, subsampling=0)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            backend.local = threading.local()
+            client = TimeoutThenReadRegionClient()
+            client.test_case = self
+
+            with (
+                patch.object(backend, "_client", return_value=client),
+                patch.object(backend, "_blank_row_cuts", return_value=[100]) as row_cuts,
+                patch.object(
+                    backend,
+                    "_blank_column_cuts",
+                    side_effect=AssertionError("portrait page must not be split into columns"),
+                ),
+            ):
+                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
+
+            self.assertEqual(text, "上段。\n\n下段。")
+            self.assertTrue(request_id.startswith("mcp-filtered-"))
+            row_cuts.assert_called_once()
+            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
+
+    def test_short_physical_page_output_uses_ordered_fallback(self) -> None:
+        class ShortThenReadRegionClient:
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                if "_filtered_" not in image_path.stem:
+                    return "短。", "mcp-short"
+                with Image.open(image_path).convert("RGB") as region:
+                    red, _green, blue = region.getpixel((60, 50))
+                    return ("上段正文。" if red > blue else "下段正文。"), "mcp-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "short-portrait-page.jpg"
+            image = Image.new("RGB", (120, 200), "red")
+            image.paste("blue", (0, 100, 120, 200))
+            image.save(image_path, quality=100, subsampling=0)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            backend.local = threading.local()
+            client = ShortThenReadRegionClient()
+
+            with (
+                patch.dict(os.environ, {"CODING_PLAN_MIN_OCR_CHARS": "10"}),
+                patch.object(backend, "_client", return_value=client),
+                patch.object(backend, "_blank_row_cuts", return_value=[100]),
+            ):
+                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
+
+            self.assertEqual(text, "上段正文。\n\n下段正文。")
+            self.assertTrue(request_id.startswith("mcp-filtered-"))
+            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
+
+    def test_vertical_narrow_filtered_fallback_reads_right_then_left(self) -> None:
+        class TimeoutThenReadRegionClient:
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                if "_filtered_" not in image_path.stem:
+                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
+                with Image.open(image_path).convert("RGB") as region:
+                    self.test_case.assertEqual(region.size, (30, 240))
+                    red, _green, blue = region.getpixel((15, 120))
+                    return ("右列。" if red > blue else "左列。"), "mcp-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "narrow-column.jpg"
+            image = Image.new("RGB", (60, 240), "blue")
+            image.paste("red", (30, 0, 60, 240))
+            image.save(image_path, quality=100, subsampling=0)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            backend.local = threading.local()
+            client = TimeoutThenReadRegionClient()
+            client.test_case = self
+
+            with (
+                patch.object(backend, "_client", return_value=client),
+                patch.object(backend, "_blank_column_cuts", return_value=[30]) as column_cuts,
+                patch.object(
+                    backend,
+                    "_blank_row_cuts",
+                    side_effect=AssertionError("narrow vertical band must not be split into rows"),
+                ),
+            ):
+                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
+
+            self.assertEqual(text, "右列。\n\n左列。")
+            self.assertTrue(request_id.startswith("mcp-filtered-"))
+            column_cuts.assert_called_once()
+            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
+
+    def test_vertical_grid_cell_fallback_keeps_right_to_left_columns(self) -> None:
+        class TimeoutThenReadRegionClient:
+            def extract_text(self, image_path: Path) -> tuple[str, str]:
+                if "_filtered_" not in image_path.stem:
+                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
+                with Image.open(image_path).convert("RGB") as region:
+                    red, _green, blue = region.getpixel((30, 100))
+                    return ("右列。" if red > blue else "左列。"), "mcp-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page_segment_2_grid.jpg"
+            image = Image.new("RGB", (120, 200), "blue")
+            image.paste("red", (60, 0, 120, 200))
+            image.save(image_path, quality=100, subsampling=0)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "vertical"
+            backend.local = threading.local()
+            client = TimeoutThenReadRegionClient()
+
+            with (
+                patch.dict(os.environ, {"CODING_PLAN_VERTICAL_PAGE_ROWS": "2"}),
+                patch.object(backend, "_client", return_value=client),
+                patch.object(backend, "_blank_column_cuts", return_value=[60]),
+                patch.object(
+                    backend,
+                    "_blank_row_cuts",
+                    side_effect=AssertionError("grid row must retain vertical columns"),
+                ),
+            ):
+                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
+
+            self.assertEqual(text, "右列。\n\n左列。")
+            self.assertTrue(request_id.startswith("mcp-filtered-"))
+            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
 
 
 class MappingAndCompilationTests(unittest.TestCase):
@@ -808,6 +1648,113 @@ class MappingAndCompilationTests(unittest.TestCase):
         mapped = apply_page_mapping(payload, records, page_offset=None)
         self.assertEqual(mapped["page_offset"], 2)
         self.assertEqual([item["pdf_page"] for item in mapped["entries"]], [4, 8, 12])
+
+    def test_two_printed_pages_per_pdf_page_are_inferred(self) -> None:
+        entries = [
+            TocEntry("preface", "", "まえがき", 1, "frontmatter", None),
+            TocEntry("chapter-1", "第一章", "新海誠論", 1, "chapter", 6),
+            TocEntry("chapter-2", "第二章", "庵野秀明論", 1, "chapter", 17),
+            TocEntry("chapter-3", "第三章", "細田守論", 1, "chapter", 26),
+        ]
+        records = [PageRecord(page, f"普通正文 {page}") for page in range(1, 16)]
+        records[3] = PageRecord(4, "# 前書き\n本文")
+        records[4] = PageRecord(5, "# 第一章 新海誠論\n本文")
+        records[9] = PageRecord(10, "# 第二章 庵野秀明論\n本文")
+        records[14] = PageRecord(15, "# 第三章 細田守論\n本文")
+        payload = {"toc_pdf_pages": [3], "entries": [entry.__dict__ for entry in entries]}
+
+        mapped = apply_page_mapping(
+            payload,
+            records,
+            page_offset=None,
+            source_page_count=47,
+        )
+
+        self.assertEqual(mapped["printed_pages_per_pdf_page"], 2)
+        self.assertEqual(mapped["page_offset"], 2)
+        self.assertEqual(
+            [item["pdf_page"] for item in mapped["entries"]],
+            [4, 5, 10, 15],
+        )
+
+    def test_two_page_spread_chapter_ranges_overlap(self) -> None:
+        entries = [
+            TocEntry("chapter-1", "第一章", "起点", 1, "chapter", 6, pdf_page=5),
+            TocEntry("chapter-2", "第二章", "终点", 1, "chapter", 17, pdf_page=10),
+        ]
+        payload = {
+            "page_offset": 2,
+            "printed_pages_per_pdf_page": 2,
+            "entries": [entry.__dict__ for entry in entries],
+        }
+        manifest, _rows = compile_chapters(
+            self.pdf_path,
+            self.root / "spread-chapters",
+            self.sample_records(),
+            payload,
+            granularity="chapter",
+        )
+        self.assertEqual(
+            [(item["pdf_page"], item["end_pdf_page"]) for item in manifest],
+            [(5, 10), (10, 12)],
+        )
+        self.assertEqual(manifest[0]["boundary_mode"], "closed-overlap")
+
+    def test_two_page_spread_even_boundary_does_not_overlap(self) -> None:
+        entries = [
+            TocEntry("chapter-1", "第一章", "起点", 1, "chapter", 6, pdf_page=5),
+            TocEntry("chapter-2", "第二章", "终点", 1, "chapter", 16, pdf_page=10),
+        ]
+        payload = {
+            "page_offset": 2,
+            "printed_pages_per_pdf_page": 2,
+            "entries": [entry.__dict__ for entry in entries],
+        }
+        manifest, _rows = compile_chapters(
+            self.pdf_path,
+            self.root / "even-spread-chapters",
+            self.sample_records(),
+            payload,
+            granularity="chapter",
+        )
+        self.assertEqual(
+            [(item["pdf_page"], item["end_pdf_page"]) for item in manifest],
+            [(5, 9), (10, 12)],
+        )
+        self.assertEqual(manifest[0]["boundary_mode"], "non-overlap")
+
+    def test_shared_spread_boundary_is_trimmed_for_both_chapters(self) -> None:
+        entries = [
+            TocEntry("chapter-1", "第一章", "起点", 1, "chapter", 6, pdf_page=5),
+            TocEntry("chapter-2", "第二章", "终点", 1, "chapter", 17, pdf_page=10),
+        ]
+        payload = {
+            "page_offset": 2,
+            "printed_pages_per_pdf_page": 2,
+            "entries": [entry.__dict__ for entry in entries],
+        }
+        records = self.sample_records()
+        records[9] = PageRecord(
+            10,
+            "16\n上一章结尾\n\n17\n第二章\n终点\n下一章正文",
+        )
+        manifest, _rows = compile_chapters(
+            self.pdf_path,
+            self.root / "trimmed-spread-chapters",
+            records,
+            payload,
+            granularity="chapter",
+        )
+        first = (self.root / "trimmed-spread-chapters" / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        second = (self.root / "trimmed-spread-chapters" / "chapters" / manifest[1]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("上一章结尾", first)
+        self.assertNotIn("下一章正文", first)
+        self.assertIn("下一章正文", second)
+        self.assertNotIn("上一章结尾", second)
 
     def test_ocr_checkpoints_and_page_markdown(self) -> None:
         class FakeOCR:
@@ -900,10 +1847,14 @@ class MappingAndCompilationTests(unittest.TestCase):
             granularity="chapter",
         )
         self.assertEqual([(item["pdf_page"], item["end_pdf_page"]) for item in chapter_manifest], [(4, 8), (9, 12)])
+        self.assertTrue(all(item["reviewed_override"] is False for item in chapter_manifest))
         self.assertTrue(rows)
         first_markdown = (chapter_output / "chapters" / chapter_manifest[0]["filename"]).read_text(encoding="utf-8")
         self.assertTrue(first_markdown.startswith("# 第一章 起点\n"))
         self.assertEqual(first_markdown.count("# 第一章 起点"), 1)
+        self.assertNotIn("source-pdf", first_markdown)
+        self.assertNotIn("PDF_PAGE", first_markdown)
+        self.assertNotIn("pagebreak", first_markdown)
 
         section_output = self.root / "section-output"
         section_manifest, _ = compile_chapters(
@@ -985,7 +1936,427 @@ class MappingAndCompilationTests(unittest.TestCase):
             granularity="chapter",
             require_translation=True,
         )
-        self.assertEqual(rows[0]["printed_page"], None)
+        self.assertNotIn("printed_page", rows[0])
+        self.assertNotIn("source_pdf", rows[0])
+        self.assertNotIn("pdf_page_start", rows[0])
+
+        # The gate means "every page that needs translation", not every
+        # nonblank page. A Chinese source page must compile without a no-op
+        # Chinese-to-Chinese translation.
+        chinese_record = PageRecord(1, "这是中文正文，已经可以直接发布。", language="zh")
+        compile_chapters(
+            self.pdf_path,
+            self.root / "chinese-source-no-translation",
+            [chinese_record],
+            payload,
+            granularity="chapter",
+            require_translation=True,
+        )
+
+    def test_reviewed_chapter_override_replaces_output_and_knowledge_rows(self) -> None:
+        output = self.root / "reviewed-override"
+        reviewed_dir = output / "reviewed_chapters"
+        reviewed_dir.mkdir(parents=True)
+        reviewed_markdown = (
+            "# 第一章 正文\n\n"
+            "人工复核后的开篇。\n\n"
+            "## 分论\n\n"
+            "人工复核后的结论。\n"
+        )
+        (reviewed_dir / "chapter.md").write_text(
+            reviewed_markdown,
+            encoding="utf-8",
+        )
+        payload = {
+            "page_offset": 0,
+            "entries": [
+                TocEntry(
+                    "chapter",
+                    "第一章",
+                    "正文",
+                    1,
+                    "chapter",
+                    1,
+                    pdf_page=1,
+                ).__dict__
+            ],
+        }
+        manifest, rows = compile_chapters(
+            self.pdf_path,
+            output,
+            [PageRecord(1, "逐页 OCR 坏文本", language="ja")],
+            payload,
+            granularity="chapter",
+            require_translation=True,
+        )
+
+        rendered = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(rendered, reviewed_markdown)
+        self.assertTrue(manifest[0]["reviewed_override"])
+        self.assertNotIn("source-pdf", rendered)
+        self.assertNotIn("pdf-pages", rendered)
+        self.assertNotIn("PDF_PAGE", rendered)
+        self.assertNotIn("pagebreak", rendered)
+        knowledge_text = "\n".join(row["content"] for row in rows)
+        self.assertIn("人工复核后的开篇", knowledge_text)
+        self.assertIn("人工复核后的结论", knowledge_text)
+        self.assertNotIn("逐页 OCR 坏文本", knowledge_text)
+        self.assertNotIn("# 第一章 正文", knowledge_text)
+        for row in rows:
+            self.assertNotIn("source_pdf", row)
+            self.assertNotIn("pdf_page_start", row)
+            self.assertNotIn("pdf_page_end", row)
+            self.assertNotIn("printed_page", row)
+
+    def test_reviewed_docx_preserves_inline_emphasis_and_underline(self) -> None:
+        output = self.root / "reviewed-docx-inline"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章_正文.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章 正文\n\n"
+            "普通文字、<u>下划线</u>、**粗体**与*斜体*。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章 正文",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "inline.docx"
+        build_docx(
+            docx_path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        body = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text.startswith("普通文字")
+        )
+        runs = {run.text: run for run in body.runs if run.text}
+        self.assertTrue(runs["下划线"].underline)
+        self.assertTrue(runs["粗体"].bold)
+        self.assertTrue(runs["斜体"].italic)
+        self.assertFalse(bool(runs["普通文字、"].underline))
+
+    def test_reviewed_override_round_trips_middle_dot_title_and_body(self) -> None:
+        output = self.root / "reviewed-middle-dot"
+        reviewed_dir = output / "reviewed_chapters"
+        reviewed_dir.mkdir(parents=True)
+        title = "米哈伊尔·罗亚·巴尔达姆约恩研究"
+        reviewed_markdown = (
+            f"# {title}\n\n"
+            "## 罗亚的生平\n\n"
+            "罗亚仍是正文中必须反复出现的合法人物名。\n\n"
+            "## 樹木\n\n"
+            "> 合法引文。\n>\n> ——《月姬》\n"
+        )
+        (reviewed_dir / "chapter.md").write_text(
+            reviewed_markdown,
+            encoding="utf-8",
+        )
+        payload = {
+            "entries": [
+                TocEntry(
+                    "chapter",
+                    "",
+                    title,
+                    1,
+                    "chapter",
+                    1,
+                    pdf_page=1,
+                ).__dict__
+            ]
+        }
+
+        manifest, rows = compile_chapters(
+            self.pdf_path,
+            output,
+            [PageRecord(1, "不会进入成品的 OCR 文本")],
+            payload,
+            granularity="chapter",
+        )
+
+        rendered = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(rendered, reviewed_markdown)
+        self.assertIn("## 罗亚的生平", rendered)
+        self.assertIn("## 樹木", rendered)
+        self.assertIn("> ——《月姬》", rendered)
+        knowledge_text = "\n".join(row["content"] for row in rows)
+        self.assertIn("罗亚仍是正文", knowledge_text)
+        self.assertIn("——《月姬》", knowledge_text)
+
+        epub_path = output / "reviewed.epub"
+        build_epub(
+            epub_path,
+            output / "chapters",
+            manifest,
+            book_title="测试书",
+            language="zh-CN",
+        )
+        with zipfile.ZipFile(epub_path) as archive:
+            epub_text = "\n".join(
+                archive.read(name).decode("utf-8", errors="ignore")
+                for name in archive.namelist()
+                if name.endswith(".xhtml")
+            )
+        self.assertIn("罗亚仍是正文", epub_text)
+        self.assertIn("罗亚的生平", epub_text)
+        self.assertIn("——《月姬》", epub_text)
+
+        docx_path = output / "reviewed.docx"
+        build_docx(
+            docx_path,
+            output / "chapters",
+            manifest,
+            book_title="测试书",
+        )
+        from docx import Document
+
+        document = Document(docx_path)
+        docx_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        self.assertIn("罗亚仍是正文", docx_text)
+        self.assertIn("罗亚的生平", docx_text)
+        self.assertIn("——《月姬》", docx_text)
+
+    def test_reviewed_override_strips_only_explicit_source_page_markers(self) -> None:
+        output = self.root / "reviewed-explicit-markers"
+        reviewed_dir = output / "reviewed_chapters"
+        reviewed_dir.mkdir(parents=True)
+        reviewed_markdown = (
+            "# 第一章 正文\n\n"
+            "<!-- source-pdf: source.pdf -->\n"
+            "<!-- pdf-pages: 1-1 -->\n"
+            '<span epub:type="pagebreak" id="pdf-page-1" title="1"></span>\n'
+            "<!-- PDF_PAGE: 1 -->\n\n"
+            "1\n\n"
+            '<span id="pdf-page-2" title="2" epub:type="pagebreak"></span>\n'
+            "<!-- PDF_PAGE: 2 -->\n\n"
+            "2022\n\n"
+            "## 合法小标题\n\n"
+            "> 合法引文第一段。\n>\n> ——原著第二段。\n\n"
+            "Twitter ID：@Grand_Order_RTA\n\n"
+            "| 名称 | 值 |\n"
+            "| --- | --- |\n"
+            "| 罗亚 | 保留 |\n\n"
+            "1. 第一条脚注。\n"
+            "2. 第二条脚注。\n"
+        )
+        (reviewed_dir / "chapter.md").write_text(
+            reviewed_markdown,
+            encoding="utf-8",
+        )
+        payload = {
+            "entries": [
+                TocEntry(
+                    "chapter",
+                    "第一章",
+                    "正文",
+                    1,
+                    "chapter",
+                    1,
+                    pdf_page=1,
+                ).__dict__
+            ]
+        }
+
+        manifest, rows = compile_chapters(
+            self.pdf_path,
+            output,
+            [PageRecord(1, "OCR 正文")],
+            payload,
+            granularity="chapter",
+        )
+
+        rendered = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("source-pdf", rendered)
+        self.assertNotIn("pdf-pages", rendered)
+        self.assertNotIn("PDF_PAGE", rendered)
+        self.assertNotIn("pagebreak", rendered)
+        self.assertNotIn("\n1\n", rendered)
+        self.assertIn("\n2022\n", rendered)
+        self.assertIn("## 合法小标题", rendered)
+        self.assertIn("> ——原著第二段。", rendered)
+        self.assertIn("@Grand_Order_RTA", rendered)
+        self.assertIn("| 罗亚 | 保留 |", rendered)
+
+        knowledge_text = "\n".join(row["content"] for row in rows)
+        for marker in ("source-pdf", "pdf-pages", "PDF_PAGE", "pagebreak"):
+            self.assertNotIn(marker, knowledge_text)
+        self.assertIn("2022", knowledge_text)
+        self.assertIn("合法引文第一段", knowledge_text)
+        self.assertIn("@Grand_Order_RTA", knowledge_text)
+        self.assertIn("| 罗亚 | 保留 |", knowledge_text)
+
+        epub_path = output / "reviewed-explicit-markers.epub"
+        build_epub(
+            epub_path,
+            output / "chapters",
+            manifest,
+            book_title="测试书",
+            language="zh-CN",
+        )
+        with zipfile.ZipFile(epub_path) as archive:
+            epub_text = "\n".join(
+                archive.read(name).decode("utf-8", errors="ignore")
+                for name in archive.namelist()
+                if name.endswith(".xhtml") and name != "OEBPS/nav.xhtml"
+            )
+        for marker in ("source-pdf", "pdf-pages", "PDF_PAGE", "pagebreak"):
+            self.assertNotIn(marker, epub_text)
+        self.assertIn("2022", epub_text)
+        self.assertIn("<blockquote>", epub_text)
+        self.assertIn("@Grand_Order_RTA", epub_text)
+        self.assertIn("<table>", epub_text)
+
+        docx_path = output / "reviewed-explicit-markers.docx"
+        build_docx(
+            docx_path,
+            output / "chapters",
+            manifest,
+            book_title="测试书",
+        )
+        from docx import Document
+
+        document = Document(docx_path)
+        docx_paragraphs = [paragraph.text for paragraph in document.paragraphs]
+        docx_text = "\n".join(docx_paragraphs)
+        for marker in ("source-pdf", "pdf-pages", "PDF_PAGE", "pagebreak"):
+            self.assertNotIn(marker, docx_text)
+        self.assertIn("2022", docx_paragraphs)
+        self.assertIn("Twitter ID：@Grand_Order_RTA", docx_paragraphs)
+        self.assertIn("合法引文第一段。", docx_paragraphs)
+        self.assertIn("——原著第二段。", docx_paragraphs)
+        self.assertFalse(any(text.startswith(">") for text in docx_paragraphs))
+        numbered = [
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.style.name.startswith("List Number")
+        ]
+        self.assertEqual(
+            [paragraph.text for paragraph in numbered],
+            ["第一条脚注。", "第二条脚注。"],
+        )
+        self.assertEqual(len(document.tables), 1)
+        self.assertEqual(
+            [[cell.text for cell in row.cells] for row in document.tables[0].rows],
+            [["名称", "值"], ["罗亚", "保留"]],
+        )
+
+    def test_reviewed_override_still_requires_ocr_range(self) -> None:
+        output = self.root / "reviewed-missing-ocr"
+        reviewed_dir = output / "reviewed_chapters"
+        reviewed_dir.mkdir(parents=True)
+        (reviewed_dir / "chapter.md").write_text(
+            "# 第一章 正文\n\n人工复核正文。\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "entries": [
+                TocEntry(
+                    "chapter",
+                    "第一章",
+                    "正文",
+                    1,
+                    "chapter",
+                    1,
+                    pdf_page=1,
+                ).__dict__
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "Missing OCR pages"):
+            compile_chapters(
+                self.pdf_path,
+                output,
+                [PageRecord(2, "第二页")],
+                payload,
+                granularity="chapter",
+                require_translation=True,
+            )
+
+    def test_invalid_reviewed_override_preserves_previous_chapters(self) -> None:
+        output = self.root / "invalid-reviewed-override"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        previous = chapter_dir / "001_previous.md"
+        previous.write_text("# 上次成功产物\n", encoding="utf-8")
+        reviewed_dir = output / "reviewed_chapters"
+        reviewed_dir.mkdir(parents=True)
+        override_path = reviewed_dir / "chapter.md"
+        override_path.write_text("# 错误标题\n\n正文。\n", encoding="utf-8")
+        payload = {
+            "entries": [
+                TocEntry(
+                    "chapter",
+                    "第一章",
+                    "正文",
+                    1,
+                    "chapter",
+                    1,
+                    pdf_page=1,
+                ).__dict__
+            ]
+        }
+
+        with self.assertRaisesRegex(ValueError, "H1 must match"):
+            compile_chapters(
+                self.pdf_path,
+                output,
+                [PageRecord(1, "OCR 正文")],
+                payload,
+                granularity="chapter",
+            )
+        self.assertEqual(previous.read_text(encoding="utf-8"), "# 上次成功产物\n")
+
+        override_path.write_text("\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "override is empty"):
+            compile_chapters(
+                self.pdf_path,
+                output,
+                [PageRecord(1, "OCR 正文")],
+                payload,
+                granularity="chapter",
+            )
+        self.assertEqual(previous.read_text(encoding="utf-8"), "# 上次成功产物\n")
+
+        override_path.write_text(
+            "# 第一章 正文\n\n"
+            "<!-- source-pdf: source.pdf -->\n"
+            "<!-- pdf-pages: 1-1 -->\n"
+            '<span epub:type="pagebreak" id="pdf-page-1" title="1"></span>\n'
+            "<!-- PDF_PAGE: 1 -->\n\n"
+            "1\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "body is empty after publication metadata removal",
+        ):
+            compile_chapters(
+                self.pdf_path,
+                output,
+                [PageRecord(1, "OCR 正文")],
+                payload,
+                granularity="chapter",
+            )
+        self.assertEqual(previous.read_text(encoding="utf-8"), "# 上次成功产物\n")
 
     def test_compile_preflight_preserves_previous_chapters_on_failure(self) -> None:
         output = self.root / "preflight-preserves-output"
@@ -1108,6 +2479,8 @@ class MappingAndCompilationTests(unittest.TestCase):
     def test_cli_manual_toc_to_all_outputs(self) -> None:
         output = self.root / "cli-output"
         for record in self.sample_records():
+            record.ocr_model = "fixture-ocr"
+            record.language = "zh"
             save_page_record(output, record)
         manual_toc = self.root / "manual-toc.json"
         manual_toc.write_text(

@@ -27,6 +27,7 @@ class TranslationAgentApiTests(unittest.TestCase):
             output_dir="outputs/book",
             toc_pages="6-10",
             page_offset=12,
+            printed_pages_per_pdf_page=2,
             front_matter_pages=50,
             ocr_reading_direction="vertical",
             keep_page_images=True,
@@ -42,6 +43,8 @@ class TranslationAgentApiTests(unittest.TestCase):
             "6-10",
             "--page-offset",
             "12",
+            "--printed-pages-per-pdf-page",
+            "2",
             "--ocr-reading-direction",
             "vertical",
             "--keep-page-images",
@@ -52,6 +55,64 @@ class TranslationAgentApiTests(unittest.TestCase):
             "--no-bookmarked-pdf",
         ):
             self.assertIn(expected, argv)
+
+    def test_proofread_options_are_structured_without_credentials(self) -> None:
+        request = RunRequest(
+            output_dir="outputs/book",
+            phase="proofread",
+            config="pipeline.toml",
+            proofread_profile="deepseek_flash",
+            proofread_language="ja",
+            proofread_concurrency=8,
+            proofread_delay=0.5,
+            proofread_max_chars=9000,
+        )
+        argv = request.to_argv()
+        for expected in (
+            "--proofread-profile",
+            "deepseek_flash",
+            "--proofread-language",
+            "ja",
+            "--proofread-concurrency",
+            "8",
+            "--proofread-delay",
+            "0.5",
+            "--proofread-max-chars",
+            "9000",
+        ):
+            self.assertIn(expected, argv)
+        self.assertNotIn("--translation-api-key", argv)
+
+    def test_publication_verification_options_are_structured(self) -> None:
+        request = RunRequest(
+            output_dir="outputs/book",
+            phase="verify",
+            verification_report="outputs/book/audit/custom.json",
+            verification_chapter_ids=("chapter-5", "chapter-6"),
+            require_all_reviewed=True,
+        )
+        argv = request.to_argv()
+        self.assertIn("verify", argv)
+        self.assertEqual(argv.count("--chapter-id"), 2)
+        self.assertIn("chapter-5", argv)
+        self.assertIn("chapter-6", argv)
+        self.assertIn("--require-all-reviewed", argv)
+        self.assertIn("--report", argv)
+
+    def test_automatic_publication_verification_can_be_disabled(self) -> None:
+        argv = RunRequest(
+            output_dir="outputs/book",
+            verify_publication=False,
+        ).to_argv()
+        self.assertIn("--no-verify", argv)
+
+    def test_incremental_verification_ids_reject_non_verify_phase(self) -> None:
+        with self.assertRaises(ValueError):
+            RunRequest(
+                output_dir="outputs/book",
+                phase="compile",
+                verification_chapter_ids=("chapter-5",),
+            ).to_argv()
 
     def test_status_request_does_not_require_source_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -66,6 +127,12 @@ class TranslationAgentApiTests(unittest.TestCase):
 
     def test_run_result_status_uses_selected_translation_profile(self) -> None:
         config = """
+[profiles.glm_vision]
+adapter = "coding-plan-mcp"
+provider = "zhipu"
+model = "glm-4.6v"
+reading_direction = "vertical"
+
 [profiles.deepseek_pro]
 adapter = "openai-chat"
 provider = "deepseek"
@@ -74,6 +141,7 @@ model = "deepseek-v4-pro"
 credential_env = "DEEPSEEK_TEST_KEY"
 
 [pipeline]
+ocr_profile = "glm_vision"
 translation_profile = "deepseek_pro"
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -99,6 +167,10 @@ translation_profile = "deepseek_pro"
         identity = mocked_status.call_args.kwargs["expected_translation_identity"]
         self.assertEqual(identity.provider, "deepseek")
         self.assertEqual(identity.model, "deepseek-v4-pro")
+        self.assertEqual(
+            mocked_status.call_args.kwargs["expected_ocr_model_prefix"],
+            "coding-plan/glm-4.6v-vision-mcp/vertical-v2",
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF 翻译编译与验收"
+  short_description: "从影印 PDF 到可审计 Markdown、EPUB、Word 与知识库"
+  default_prompt: "使用 $pdf-translation-pipeline 编译并验证这本 PDF 的全部发布产物。"

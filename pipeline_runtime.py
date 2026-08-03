@@ -8,11 +8,20 @@ while sharing the same delay policy.
 from __future__ import annotations
 
 import math
+import json
+import os
 import random
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, TypeVar
+
+try:  # POSIX workers coordinate through flock; other platforms fall back locally.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows compatibility path.
+    fcntl = None
 
 
 ResultT = TypeVar("ResultT")
@@ -156,3 +165,191 @@ class StartRateLimiter:
                 self._sleep(wait_for)
             self._next_start_at = self._clock() + self.interval
             return wait_for
+
+
+class SharedAdaptiveRateLimiter:
+    """Coordinate request starts across threads and pipeline processes.
+
+    The state file is keyed by a one-way credential fingerprint, so concurrent
+    books using the same provider quota share one request-start schedule.  A
+    rate-limit response raises the interval; sustained successes reduce it in
+    small steps.  No credential or request content is persisted.
+    """
+
+    def __init__(
+        self,
+        interval: float,
+        *,
+        identity: str,
+        min_interval: float = 5.0,
+        max_interval: float = 60.0,
+        success_window: int = 8,
+        decrease_factor: float = 0.9,
+        increase_factor: float = 1.5,
+        state_dir: Path | str | None = None,
+        clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        for name, value in (
+            ("interval", interval),
+            ("min_interval", min_interval),
+            ("max_interval", max_interval),
+        ):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be a finite non-negative number")
+        if min_interval > max_interval:
+            raise ValueError("min_interval cannot exceed max_interval")
+        if success_window < 1:
+            raise ValueError("success_window must be at least 1")
+        if not 0 < decrease_factor <= 1:
+            raise ValueError("decrease_factor must be in (0, 1]")
+        if increase_factor < 1:
+            raise ValueError("increase_factor must be at least 1")
+        self.initial_interval = min(max(float(interval), min_interval), max_interval)
+        self.min_interval = float(min_interval)
+        self.max_interval = float(max_interval)
+        self.success_window = int(success_window)
+        self.decrease_factor = float(decrease_factor)
+        self.increase_factor = float(increase_factor)
+        self._clock = clock
+        self._sleep = sleep
+        self._local = StartRateLimiter(
+            self.initial_interval,
+            clock=clock,
+            sleep=sleep,
+        )
+        self._local_state = self._default_state(self._clock())
+        self._thread_lock = threading.Lock()
+        safe_identity = "".join(
+            character for character in identity.lower() if character.isalnum()
+        )[:64]
+        root = Path(
+            state_dir
+            or os.getenv("TRANSLATION_AGENT_RATE_LIMIT_DIR")
+            or Path(tempfile.gettempdir()) / "translation-agent-rate-limits"
+        )
+        self.state_path = (
+            root / f"{safe_identity or 'default'}.json"
+            if fcntl is not None
+            else None
+        )
+
+    def _default_state(self, now: float) -> dict[str, float | int]:
+        return {
+            "interval": self.initial_interval,
+            "next_start_at": 0.0,
+            "success_streak": 0,
+            "updated_at": now,
+        }
+
+    def _read_state(self, handle: object, now: float) -> dict[str, float | int]:
+        handle.seek(0)
+        raw = handle.read()
+        try:
+            value = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        try:
+            updated_at = float(value.get("updated_at", 0.0))
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        # Do not inherit an old throttled interval from a long-finished job.
+        if now - updated_at > 3600:
+            return self._default_state(now)
+        try:
+            interval = float(value.get("interval", self.initial_interval))
+            next_start_at = float(value.get("next_start_at", 0.0))
+            success_streak = int(value.get("success_streak", 0))
+        except (TypeError, ValueError):
+            return self._default_state(now)
+        return {
+            "interval": min(max(interval, self.min_interval), self.max_interval),
+            "next_start_at": max(0.0, next_start_at),
+            "success_streak": max(0, success_streak),
+            "updated_at": updated_at,
+        }
+
+    @staticmethod
+    def _write_state(handle: object, state: dict[str, float | int]) -> None:
+        handle.seek(0)
+        handle.truncate()
+        json.dump(state, handle, ensure_ascii=True, separators=(",", ":"))
+        handle.flush()
+
+    def _update(self, operation: Callable[[dict[str, float | int], float], float]) -> float:
+        if self.state_path is None:
+            with self._thread_lock:
+                now = self._clock()
+                result = operation(self._local_state, now)
+                self._local_state["updated_at"] = now
+                self._local.interval = float(self._local_state["interval"])
+                return result
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._thread_lock, self.state_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                now = self._clock()
+                state = self._read_state(handle, now)
+                result = operation(state, now)
+                state["updated_at"] = now
+                self._write_state(handle, state)
+                return result
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def wait(self) -> float:
+        if self.state_path is None:
+            return self._local.wait()
+        total_wait = 0.0
+        while True:
+            def reserve(state: dict[str, float | int], now: float) -> float:
+                wait_for = max(0.0, float(state["next_start_at"]) - now)
+                if wait_for == 0:
+                    state["next_start_at"] = now + float(state["interval"])
+                return wait_for
+
+            wait_for = self._update(reserve)
+            if wait_for <= 0:
+                return total_wait
+            self._sleep(wait_for)
+            total_wait += wait_for
+
+    def report_success(self) -> tuple[float, bool]:
+        def reward(state: dict[str, float | int], _now: float) -> float:
+            streak = int(state["success_streak"]) + 1
+            interval = float(state["interval"])
+            if streak >= self.success_window:
+                interval = max(self.min_interval, interval * self.decrease_factor)
+                streak = 0
+            state["success_streak"] = streak
+            state["interval"] = interval
+            return interval
+
+        before = self.current_interval()
+        after = self._update(reward)
+        return after, not math.isclose(before, after)
+
+    def report_rate_limit(self) -> tuple[float, bool]:
+        def penalize(state: dict[str, float | int], now: float) -> float:
+            interval = min(
+                self.max_interval,
+                max(self.initial_interval, float(state["interval"]) * self.increase_factor),
+            )
+            state["interval"] = interval
+            state["success_streak"] = 0
+            state["next_start_at"] = max(
+                float(state["next_start_at"]),
+                now + interval,
+            )
+            return interval
+
+        before = self.current_interval()
+        after = self._update(penalize)
+        return after, not math.isclose(before, after)
+
+    def current_interval(self) -> float:
+        return self._update(
+            lambda state, _now: float(state["interval"])
+        )

@@ -1,8 +1,15 @@
 import threading
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-from pipeline_runtime import RetryPolicy, StartRateLimiter, retry_with_backoff
+from pipeline_runtime import (
+    RetryPolicy,
+    SharedAdaptiveRateLimiter,
+    StartRateLimiter,
+    retry_with_backoff,
+)
 
 
 class RetryWithBackoffTests(unittest.TestCase):
@@ -87,6 +94,54 @@ class StartRateLimiterTests(unittest.TestCase):
         self.assertEqual(sorted(waits), [0.0] + [0.5] * (workers - 1))
         self.assertEqual(sleep_calls, [0.5] * (workers - 1))
         self.assertEqual(fake_time[0], 0.5 * (workers - 1))
+
+
+class SharedAdaptiveRateLimiterTests(unittest.TestCase):
+    def test_instances_with_same_identity_share_request_schedule(self) -> None:
+        now = [100.0]
+        sleeps: list[float] = []
+
+        def clock() -> float:
+            return now[0]
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            now[0] += seconds
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = SharedAdaptiveRateLimiter(
+                10,
+                identity="same-key",
+                state_dir=Path(directory),
+                clock=clock,
+                sleep=sleep,
+            )
+            second = SharedAdaptiveRateLimiter(
+                10,
+                identity="same-key",
+                state_dir=Path(directory),
+                clock=clock,
+                sleep=sleep,
+            )
+            self.assertEqual(first.wait(), 0)
+            self.assertEqual(second.wait(), 10)
+        self.assertEqual(sleeps, [10])
+
+    def test_successes_speed_up_and_429_slows_down(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            limiter = SharedAdaptiveRateLimiter(
+                10,
+                identity="adaptive-key",
+                min_interval=5,
+                max_interval=30,
+                success_window=2,
+                decrease_factor=0.5,
+                increase_factor=2,
+                state_dir=Path(directory),
+            )
+            self.assertEqual(limiter.report_success(), (10, False))
+            self.assertEqual(limiter.report_success(), (5, True))
+            self.assertEqual(limiter.report_rate_limit(), (10, True))
 
 
 if __name__ == "__main__":

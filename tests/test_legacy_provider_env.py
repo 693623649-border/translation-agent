@@ -6,6 +6,12 @@ from pdf_text_agent import PROVIDER_PROFILES, resolve_agent_connection
 
 
 class LegacyDeepSeekEnvironmentTests(unittest.TestCase):
+    def test_legacy_entry_defaults_to_deepseek_flash(self) -> None:
+        self.assertEqual(
+            PROVIDER_PROFILES["deepseek"].default_model,
+            "deepseek-v4-flash",
+        )
+
     def resolve_base_url(self, override: str | None = None) -> str:
         _, base_url, _, _ = resolve_agent_connection(
             profile=PROVIDER_PROFILES["deepseek"],

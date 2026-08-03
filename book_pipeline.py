@@ -4,19 +4,23 @@ import argparse
 import base64
 import contextlib
 import datetime as dt
+import functools
 import hashlib
 import html
 import http.client
+import inspect
 import json
 import os
 import re
 import select
 import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
 import threading
+import time
 import tomllib
 import unicodedata
 import urllib.error
@@ -24,9 +28,10 @@ import urllib.request
 import uuid
 import zipfile
 import ssl
-from collections import Counter
+import xml.etree.ElementTree as ET
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
@@ -40,7 +45,13 @@ from pipeline_profiles import (
     PipelineProfiles,
     load_pipeline_profiles,
 )
-from pipeline_runtime import RetryPolicy, StartRateLimiter, retry_with_backoff
+from pipeline_runtime import (
+    RetryPolicy,
+    SharedAdaptiveRateLimiter,
+    StartRateLimiter,
+    retry_with_backoff,
+)
+from publication_verifier import verify_publication
 
 try:
     import fcntl
@@ -56,12 +67,50 @@ except ImportError:  # pragma: no cover - POSIX compatibility path.
 DEFAULT_CODING_API_BASE = "https://open.bigmodel.cn/api/coding/paas/v4"
 DEFAULT_STANDARD_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-pro"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
-TRANSLATION_PROMPT_VERSION = "book-translation-v2"
+TRANSLATION_PROMPT_VERSION = "book-translation-v3"
+PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v1"
 TOC_KINDS = {"part", "chapter", "section", "subsection", "frontmatter", "other"}
 NON_CONTENT_MARKERS = {"[无法辨认]", "[空白页]"}
+
+
+def join_physical_page_texts(pages: Iterable[str]) -> str:
+    """Join ordered physical pages without serialising an internal marker."""
+
+    return "\n\n".join(str(page).strip() for page in pages).strip()
+
+
+def _validated_physical_page_texts(
+    text: str,
+    pages: Iterable[str],
+) -> tuple[str, ...] | None:
+    """Return trustworthy structured halves, or ``None`` for legacy/plain text."""
+
+    normalized = tuple(str(page).strip() for page in pages)
+    if len(normalized) < 2:
+        return None
+    if join_physical_page_texts(normalized) != text.strip():
+        return None
+    return normalized
+
+
+class PhysicalPageOCRText(str):
+    """A string-compatible OCR result carrying right-to-left physical pages.
+
+    OCR backends historically return ``tuple[str, request_id]``.  A ``str``
+    subclass keeps that public contract intact while allowing ``ocr_pdf`` to
+    persist the otherwise-lost boundary as structured checkpoint metadata.
+    """
+
+    physical_page_texts: tuple[str, ...]
+
+    def __new__(cls, pages: Iterable[str]) -> "PhysicalPageOCRText":
+        normalized = tuple(str(page).strip() for page in pages)
+        instance = super().__new__(cls, join_physical_page_texts(normalized))
+        instance.physical_page_texts = normalized
+        return instance
 
 
 @dataclass
@@ -78,21 +127,91 @@ class PageRecord:
     translation_fingerprint: str = ""
     notes: str = ""
     ocr_model: str = ""
+    # Appended after the legacy fields so positional PageRecord callers keep
+    # their historical argument order. The layer remains separate from
+    # ``text`` so the OCR checkpoint is always auditable and recoverable.
+    proofread_text: str = ""
+    proofread_source_sha256: str = ""
+    proofread_provider: str = ""
+    proofread_model: str = ""
+    proofread_language: str = ""
+    proofread_prompt_version: str = ""
+    proofread_fingerprint: str = ""
+    # Ordered physical pages inside one PDF scan. Japanese two-page spreads
+    # are stored as (right page, left page), matching ascending printed-page
+    # order. Separate arrays at every model layer make the boundary immune to
+    # proofreading/translation rewrites while old checkpoints remain valid.
+    physical_page_texts: list[str] = field(default_factory=list)
+    proofread_physical_page_texts: list[str] = field(default_factory=list)
+    translated_physical_page_texts: list[str] = field(default_factory=list)
 
     @property
     def compile_text(self) -> str:
-        return (self.translated_text if self.translation_is_fresh else self.text).strip()
+        return (
+            self.translated_text
+            if self.translation_is_fresh
+            else self.effective_text
+        ).strip()
 
     @property
     def text_sha256(self) -> str:
         return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
     @property
+    def proofread_is_fresh(self) -> bool:
+        return bool(
+            self.proofread_text.strip()
+            and self.proofread_source_sha256
+            and self.proofread_source_sha256 == self.text_sha256
+            and self.proofread_provider
+            and self.proofread_model
+            and self.proofread_language
+        )
+
+    def proofread_is_fresh_for(self, identity: ModelIdentity | None) -> bool:
+        if identity is None:
+            return self.proofread_is_fresh
+        return bool(
+            self.proofread_is_fresh
+            and self.proofread_provider == identity.provider
+            and self.proofread_model == identity.model
+            and self.proofread_language == identity.target_language
+            and self.proofread_prompt_version == identity.prompt_version
+            and self.proofread_fingerprint == identity.fingerprint
+        )
+
+    @property
+    def effective_text(self) -> str:
+        """Current source text: fresh proofreading overlay, otherwise raw OCR."""
+
+        return self.proofread_text if self.proofread_is_fresh else self.text
+
+    @property
+    def raw_physical_pages(self) -> tuple[str, ...]:
+        return _validated_physical_page_texts(
+            self.text,
+            self.physical_page_texts,
+        ) or (self.text.strip(),)
+
+    @property
+    def effective_physical_pages(self) -> tuple[str, ...]:
+        if self.proofread_is_fresh:
+            return _validated_physical_page_texts(
+                self.proofread_text,
+                self.proofread_physical_page_texts,
+            ) or (self.proofread_text.strip(),)
+        return self.raw_physical_pages
+
+    @property
+    def effective_text_sha256(self) -> str:
+        return hashlib.sha256(self.effective_text.encode("utf-8")).hexdigest()
+
+    @property
     def translation_is_fresh(self) -> bool:
         return bool(
             self.translated_text.strip()
             and self.translation_source_sha256
-            and self.translation_source_sha256 == self.text_sha256
+            and self.translation_source_sha256 == self.effective_text_sha256
             and self.translation_provider
             and self.translation_model
             and self.translation_target_language
@@ -127,8 +246,26 @@ class PageRecord:
         if identity is None:
             return self.compile_text
         return (
-            self.translated_text if self.translation_is_fresh_for(identity) else self.text
+            self.translated_text
+            if self.translation_is_fresh_for(identity)
+            else self.effective_text
         ).strip()
+
+    def compile_physical_pages_for(
+        self,
+        identity: ModelIdentity | None,
+    ) -> tuple[str, ...]:
+        translation_is_selected = (
+            self.translation_is_fresh
+            if identity is None
+            else self.translation_is_fresh_for(identity)
+        )
+        if translation_is_selected:
+            return _validated_physical_page_texts(
+                self.translated_text,
+                self.translated_physical_page_texts,
+            ) or (self.translated_text.strip(),)
+        return self.effective_physical_pages
 
 
 @dataclass
@@ -151,6 +288,12 @@ class Translator(Protocol):
     """Translation extension point for OCR text produced in non-Chinese languages."""
 
     def translate(self, text: str, *, source_language: str, target_language: str) -> str: ...
+
+
+class Proofreader(Protocol):
+    """Non-destructive correction extension point for raw OCR text."""
+
+    def proofread(self, text: str, *, language: str) -> str: ...
 
 
 class TextChatBackend(Protocol):
@@ -237,6 +380,16 @@ def parse_page_spec(value: str) -> list[int]:
     return sorted(pages)
 
 
+def parse_model_prefixes(value: str | None) -> tuple[str, ...]:
+    """Parse comma-separated cache/model prefixes consistently across stages."""
+
+    return tuple(
+        prefix.strip()
+        for prefix in (value or "").split(",")
+        if prefix.strip()
+    )
+
+
 def detect_language(text: str) -> str:
     han = len(re.findall(r"[\u3400-\u9fff]", text))
     kana = len(re.findall(r"[\u3040-\u30ff]", text))
@@ -257,6 +410,18 @@ def detect_language(text: str) -> str:
     if latin >= max(8, significant * 0.6):
         return "en"
     return "other"
+
+
+def page_record_needs_translation(record: PageRecord) -> bool:
+    """Return whether a nonblank effective OCR page requires Chinese translation."""
+
+    text = record.effective_text.strip()
+    if not text or text in NON_CONTENT_MARKERS:
+        return False
+    language = record.language
+    if language in {"", "unknown"}:
+        language = detect_language(text)
+    return language not in {"zh", "unknown"}
 
 
 def split_text(text: str, max_chars: int) -> list[str]:
@@ -319,6 +484,17 @@ def clean_ocr_text(text: str) -> str:
         lines = lines[2:]
         while lines and not lines[0].strip():
             lines.pop(0)
+    # Segmented OCR occasionally returns only the opening or closing wrapper
+    # fence. A lone edge fence cannot delimit a real Markdown block, so it is
+    # safe to drop without touching balanced fences inside book content.
+    if lines and fence.fullmatch(lines[0].strip()) and not any(
+        line.strip() == "```" for line in lines[1:]
+    ):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```" and not any(
+        fence.fullmatch(line.strip()) for line in lines[:-1]
+    ):
+        lines = lines[:-1]
     # Empty image bands sometimes arrive as a fenced unreadable marker after
     # otherwise valid page text.  Drop only that narrow trailing artifact.
     if lines and lines[-1].strip() == "```":
@@ -412,23 +588,40 @@ def normalize_target_script(text: str, target_language: str) -> str:
     if converter is None:
         converter = OpenCC("t2s")
         _target_script_state.simplified_converter = converter
-    normalized = str(converter.convert(text))
-    # OpenCC preserves 著 because it is valid in lexical words such as
-    # 著者/名著. DeepSeek can still emit the Taiwanese aspect marker 著 in
-    # otherwise simplified prose. Protect genuine lexical uses first.
+    # OpenCC may convert some lexical uses of 著 (for example 名著) to 着,
+    # while model output can also contain the Taiwanese aspect marker 著.
+    # Mark every 著 that participates in a known lexical term both before and
+    # after conversion. Computing positions before substitution also handles
+    # overlapping terms such as 所著名著 without losing either character.
     protected_terms = (
-        "著者", "著作", "著名", "显著", "卓著", "编著", "译著", "原著",
+        "著者", "著作", "著名", "显著", "卓著", "编著", "译著", "原著", "所著", "著有",
         "巨著", "名著", "专著", "论著", "土著", "著书", "著述", "著称", "著录", "著文",
     )
-    placeholders: dict[str, str] = {}
-    for index, term in enumerate(protected_terms):
-        placeholder = f"\ue000{index}\ue001"
-        if term in normalized:
-            normalized = normalized.replace(term, placeholder)
-            placeholders[placeholder] = term
+    lexical_sentinel = "\ue000"
+
+    def protect_lexical_zhu(value: str) -> str:
+        protected_positions: set[int] = set()
+        for term in protected_terms:
+            start = 0
+            while True:
+                position = value.find(term, start)
+                if position < 0:
+                    break
+                protected_positions.update(
+                    position + offset
+                    for offset, character in enumerate(term)
+                    if character == "著"
+                )
+                start = position + 1
+        return "".join(
+            lexical_sentinel if index in protected_positions else character
+            for index, character in enumerate(value)
+        )
+
+    normalized = str(converter.convert(protect_lexical_zhu(text)))
+    normalized = protect_lexical_zhu(normalized)
     normalized = normalized.replace("著", "着")
-    for placeholder, term in placeholders.items():
-        normalized = normalized.replace(placeholder, term)
+    normalized = normalized.replace(lexical_sentinel, "著")
     normalized = normalized.replace("著作家", "着作家")
     return normalized
 
@@ -643,7 +836,15 @@ class DeepSeekClient(GlmClient):
 class McpStdioClient:
     """Minimal newline-delimited JSON-RPC client for the official Coding Plan vision MCP."""
 
-    def __init__(self, command: list[str], *, api_key: str) -> None:
+    def __init__(
+        self,
+        command: list[str],
+        *,
+        api_key: str,
+        vision_model: str = "glm-4.6v",
+        request_timeout: int = 120,
+        reading_direction: str = "horizontal",
+    ) -> None:
         if not command or shutil.which(command[0]) is None:
             raise RuntimeError(
                 "Coding Plan vision OCR requires Node.js 18+ and npx. "
@@ -652,18 +853,35 @@ class McpStdioClient:
         environment = os.environ.copy()
         environment["Z_AI_API_KEY"] = api_key
         environment.setdefault("Z_AI_MODE", "ZHIPU")
+        environment["Z_AI_VISION_MODEL"] = vision_model
+        self.request_timeout = max(30, int(request_timeout))
+        # The upstream MCP package retries a failed tool call internally. Keep
+        # its first HTTP deadline just below our JSON-RPC deadline so a dense
+        # page can be split locally instead of multiplying two retry loops.
+        environment["Z_AI_TIMEOUT"] = str(
+            max(30, self.request_timeout - 5) * 1000
+        )
+        self.stderr_lines: deque[str] = deque(maxlen=40)
+        self._api_key = api_key
+        self.reading_direction = reading_direction
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             bufsize=1,
             env=environment,
+            start_new_session=(os.name == "posix"),
         )
+        self.stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name=f"vision-mcp-stderr-{self.process.pid}",
+            daemon=True,
+        )
+        self.stderr_thread.start()
         self.next_id = 1
-        self.request_timeout = max(30, int(os.getenv("CODING_PLAN_VISION_TIMEOUT", "300")))
         self._request(
             "initialize",
             {
@@ -682,6 +900,23 @@ class McpStdioClient:
         if self.tool is None:
             self.close()
             raise RuntimeError("Coding Plan vision MCP does not expose extract_text_from_screenshot.")
+
+    def _drain_stderr(self) -> None:
+        if self.process.stderr is None:
+            return
+        try:
+            for raw_line in self.process.stderr:
+                line = raw_line.strip().replace(self._api_key, "<redacted>")
+                if line:
+                    self.stderr_lines.append(line)
+        except (OSError, ValueError):
+            # close() may close the pipe while the daemon reader is blocked.
+            return
+
+    def _diagnostics(self) -> str:
+        if not self.stderr_lines:
+            return ""
+        return " MCP stderr: " + " | ".join(list(self.stderr_lines)[-8:])
 
     def _write(self, message: dict[str, Any]) -> None:
         if self.process.stdin is None:
@@ -703,11 +938,15 @@ class McpStdioClient:
             if not ready:
                 raise RuntimeError(
                     f"Vision MCP request timed out after {self.request_timeout} seconds."
+                    f"{self._diagnostics()}"
                 )
             line = self.process.stdout.readline()
             if not line:
                 code = self.process.poll()
-                raise RuntimeError(f"Vision MCP stopped before responding (exit={code}).")
+                raise RuntimeError(
+                    f"Vision MCP stopped before responding (exit={code})."
+                    f"{self._diagnostics()}"
+                )
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
@@ -715,7 +954,9 @@ class McpStdioClient:
             if message.get("id") != request_id:
                 continue
             if "error" in message:
-                raise RuntimeError(f"Vision MCP error: {message['error']}")
+                raise RuntimeError(
+                    f"Vision MCP error: {message['error']}{self._diagnostics()}"
+                )
             result = message.get("result", {})
             return result if isinstance(result, dict) else {"value": result}
 
@@ -729,9 +970,18 @@ class McpStdioClient:
             if any(token in lowered for token in ("image", "path", "file")):
                 arguments[name] = str(image_path.resolve())
             elif any(token in lowered for token in ("prompt", "query", "instruction")):
+                direction = (
+                    "这是日文竖排书页。每个单页必须从最右侧文字列开始，列内自上而下读取，再逐列向左；"
+                    "把各列连接成正常日文段落，绝不能按左列到右列倒序输出。"
+                    "如果单页分成上下两个或多个独立版块，必须先完整读完上方版块，再依次读下方版块，"
+                    "不得在上下版块之间来回跳读。页眉和页码单独成行，不要插入正文句中。"
+                    if self.reading_direction == "vertical"
+                    else "按从左到右、从上到下的自然阅读顺序输出。"
+                )
                 arguments[name] = (
-                    "逐字提取书页中的全部可见文字，不翻译、不总结。保持标题、段落、列表、表格和脚注结构，"
-                    "按自然阅读顺序输出 Markdown；无法辨认处标记 [无法辨认]。只输出识别文本。"
+                    "逐字提取书页中的全部可见文字，不翻译、不总结。"
+                    f"{direction}保持标题、段落、列表、表格和脚注结构，输出 Markdown；"
+                    "无法辨认处标记 [无法辨认]。只输出识别文本。"
                 )
             elif name in required and isinstance(definition, dict) and "default" in definition:
                 arguments[name] = definition["default"]
@@ -761,16 +1011,35 @@ class McpStdioClient:
 
     def close(self) -> None:
         if self.process.poll() is None:
-            self.process.terminate()
+            if os.name == "posix":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(self.process.pid, signal.SIGTERM)
+            else:  # pragma: no cover - Windows compatibility path.
+                self.process.terminate()
             try:
                 self.process.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                if os.name == "posix":
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                else:  # pragma: no cover - Windows compatibility path.
+                    self.process.kill()
                 self.process.wait(timeout=3)
         if self.process.stdin is not None and not self.process.stdin.closed:
             self.process.stdin.close()
         if self.process.stdout is not None and not self.process.stdout.closed:
             self.process.stdout.close()
+        if self.stderr_thread.is_alive():
+            self.stderr_thread.join(timeout=1)
+        # Do not close a TextIOWrapper while the drain thread owns its read
+        # lock. A terminated child closes the write end, so the daemon reader
+        # will observe EOF without cross-thread close().
+        if (
+            not self.stderr_thread.is_alive()
+            and self.process.stderr is not None
+            and not self.process.stderr.closed
+        ):
+            self.process.stderr.close()
 
 
 class CodingPlanVisionOCR:
@@ -784,20 +1053,90 @@ class CodingPlanVisionOCR:
         api_key: str,
         command: str,
         reading_direction: str = "horizontal",
+        vision_model: str = "glm-4.6v",
+        request_timeout: int = 120,
     ) -> None:
         self.api_key = api_key
         self.command = shlex.split(command)
+        self.vision_model = vision_model.strip() or "glm-4.6v"
+        self.request_timeout = max(30, int(request_timeout))
+        self.prompt_version = f"{reading_direction}-v2"
+        self.ocr_model = (
+            f"coding-plan/{self.vision_model}-vision-mcp/{self.prompt_version}"
+        )
         if reading_direction not in {"horizontal", "vertical"}:
             raise ValueError(f"Unsupported OCR reading direction: {reading_direction}")
         self.reading_direction = reading_direction
         self.local = threading.local()
         self.clients: list[McpStdioClient] = []
         self.clients_lock = threading.Lock()
+        self.closed = threading.Event()
+        request_delay = max(
+            0.0,
+            float(os.getenv("CODING_PLAN_VISION_REQUEST_DELAY", "0")),
+        )
+        credential_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        self.request_limiter = SharedAdaptiveRateLimiter(
+            request_delay,
+            identity=f"coding-plan-{credential_fingerprint}",
+            min_interval=float(
+                os.getenv(
+                    "CODING_PLAN_VISION_MIN_REQUEST_DELAY",
+                    "5" if request_delay > 0 else "0",
+                )
+            ),
+            max_interval=float(
+                os.getenv("CODING_PLAN_VISION_MAX_REQUEST_DELAY", "60")
+            ),
+            success_window=max(
+                1,
+                int(os.getenv("CODING_PLAN_VISION_SPEEDUP_WINDOW", "8")),
+            ),
+        )
+
+    def _wait_for_request_slot(self) -> None:
+        limiter = getattr(self, "request_limiter", None)
+        if limiter is not None:
+            limiter.wait()
+
+    def _report_request_success(self) -> None:
+        limiter = getattr(self, "request_limiter", None)
+        if limiter is None:
+            return
+        interval, changed = limiter.report_success()
+        if changed:
+            print(f"[ocr-rate] status=speed-up interval={interval:.1f}s", flush=True)
+
+    def _report_request_rate_limit(self) -> None:
+        limiter = getattr(self, "request_limiter", None)
+        if limiter is None:
+            return
+        interval, changed = limiter.report_rate_limit()
+        if changed:
+            print(f"[ocr-rate] status=throttled interval={interval:.1f}s", flush=True)
+
+    def _is_vertical_two_page_spread(self, image_path: Path) -> bool:
+        if getattr(self, "reading_direction", "horizontal") != "vertical":
+            return False
+        enabled = os.getenv("CODING_PLAN_SPLIT_SPREADS", "1").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            return False
+        with Image.open(image_path) as image:
+            return image.width >= image.height * 1.25
 
     def _client(self) -> McpStdioClient:
+        closed = getattr(self, "closed", None)
+        if closed is not None and closed.is_set():
+            raise RuntimeError("Vision MCP OCR backend is closed.")
         client = getattr(self.local, "client", None)
         if client is None:
-            client = McpStdioClient(self.command, api_key=self.api_key)
+            client = McpStdioClient(
+                self.command,
+                api_key=self.api_key,
+                vision_model=self.vision_model,
+                request_timeout=self.request_timeout,
+                reading_direction=self.reading_direction,
+            )
             self.local.client = client
             with self.clients_lock:
                 self.clients.append(client)
@@ -807,6 +1146,20 @@ class CodingPlanVisionOCR:
     def _is_content_filter_error(error: Exception) -> bool:
         message = str(error).lower()
         return any(token in message for token in ("contentfilter", '"code":"1301"', "potentially unsafe"))
+
+    @staticmethod
+    def _is_timeout_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "timed out" in message or "timeout" in message
+
+    @staticmethod
+    def _is_short_ocr_error(error: Exception) -> bool:
+        return "below configured minimum" in str(error).lower()
+
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "429" in message or "rate limit" in message or "rate-limit" in message
 
     @staticmethod
     def _blank_row_cuts(image: Image.Image, segments: int) -> list[int]:
@@ -864,42 +1217,177 @@ class CodingPlanVisionOCR:
         client: McpStdioClient,
         *,
         segments: int,
+        physical_spread: bool = False,
     ) -> tuple[str, str]:
         """OCR a filtered page as ordered horizontal bands using the same MCP."""
-        part_paths: list[Path] = []
+        part_paths: list[tuple[Path, int | None]] = []
         texts: list[str] = []
+        physical_page_texts: list[list[str]] = [[], []]
         try:
             with Image.open(image_path) as source:
                 image = source.convert("RGB")
                 width, height = image.size
                 if getattr(self, "reading_direction", "horizontal") == "vertical":
                     boundaries = [0, *self._blank_column_cuts(image, segments), width]
-                    regions = [
+                    physical_page_regions = [
                         (left, 0, right, height)
                         for left, right in reversed(list(zip(boundaries, boundaries[1:])))
                     ]
+                    page_rows = max(
+                        1,
+                        int(os.getenv("CODING_PLAN_VERTICAL_PAGE_ROWS", "1")),
+                    )
+                    page_columns = max(
+                        1,
+                        int(os.getenv("CODING_PLAN_VERTICAL_PAGE_COLUMNS", "1")),
+                    )
+                    # With the ordinary two-way spread split, each outer
+                    # region is one physical page (right page first).  Dense
+                    # vertical layouts can opt into a finer grid without
+                    # changing the ordering of the content-filter fallbacks,
+                    # which may deliberately request 4/8/16 outer bands.
+                    if segments == 2 and (page_rows > 1 or page_columns > 1):
+                        region_specs: list[
+                            tuple[tuple[int, int, int, int], int | None]
+                        ] = []
+                        for physical_page_index, (
+                            page_left,
+                            page_top,
+                            page_right,
+                            page_bottom,
+                        ) in enumerate(physical_page_regions):
+                            physical_page = image.crop(
+                                (page_left, page_top, page_right, page_bottom)
+                            )
+                            page_width, page_height = physical_page.size
+                            row_boundaries = [
+                                0,
+                                *self._blank_row_cuts(physical_page, page_rows),
+                                page_height,
+                            ]
+                            for row_top, row_bottom in zip(
+                                row_boundaries, row_boundaries[1:]
+                            ):
+                                row_image = physical_page.crop(
+                                    (0, row_top, page_width, row_bottom)
+                                )
+                                column_boundaries = [
+                                    0,
+                                    *self._blank_column_cuts(row_image, page_columns),
+                                    page_width,
+                                ]
+                                for column_left, column_right in reversed(
+                                    list(
+                                        zip(
+                                            column_boundaries,
+                                            column_boundaries[1:],
+                                        )
+                                    )
+                                ):
+                                    region_specs.append(
+                                        (
+                                            (
+                                                page_left + column_left,
+                                                page_top + row_top,
+                                                page_left + column_right,
+                                                page_top + row_bottom,
+                                            ),
+                                            (
+                                                physical_page_index
+                                                if physical_spread
+                                                else None
+                                            ),
+                                        )
+                                    )
+                    else:
+                        region_specs = []
+                        for region in physical_page_regions:
+                            left, _top, right, _bottom = region
+                            physical_page_index = (
+                                0 if (left + right) / 2 >= width / 2 else 1
+                            )
+                            region_specs.append(
+                                (
+                                    region,
+                                    physical_page_index if physical_spread else None,
+                                )
+                            )
                 else:
                     boundaries = [0, *self._blank_row_cuts(image, segments), height]
-                    regions = [
-                        (0, top, width, bottom)
+                    region_specs = [
+                        ((0, top, width, bottom), None)
                         for top, bottom in zip(boundaries, boundaries[1:])
                     ]
-                for index, region in enumerate(regions, start=1):
+                for index, (region, physical_page_index) in enumerate(
+                    region_specs,
+                    start=1,
+                ):
                     part_path = image_path.with_name(
                         f"{image_path.stem}_segment_{index}_{uuid.uuid4().hex[:8]}.jpg"
                     )
                     image.crop(region).save(part_path, "JPEG", quality=95, optimize=True)
-                    part_paths.append(part_path)
-            for part_path in part_paths:
-                text, _ = self._ocr_filtered_band(part_path, depth=0)
+                    part_paths.append((part_path, physical_page_index))
+            for part_index, (part_path, physical_page_index) in enumerate(
+                part_paths,
+                start=1,
+            ):
+                segment_started_at = time.monotonic()
+                print(
+                    f"[ocr-segment-start] page_image={image_path.stem} "
+                    f"segment={part_index}/{len(part_paths)}",
+                    flush=True,
+                )
+                # Preserve previously completed segments when only the current
+                # request is rate-limited. Retrying at page level would repeat
+                # every successful segment from the beginning.
+                text, _ = retry_with_backoff(
+                    lambda: self._ocr_filtered_band(part_path, depth=0),
+                    policy=RetryPolicy(
+                        attempts=max(
+                            1,
+                            int(os.getenv("CODING_PLAN_SEGMENT_ATTEMPTS", "4")),
+                        ),
+                        base_delay=2.0,
+                        max_delay=12.0,
+                        rate_limit_base_delay=float(
+                            os.getenv("CODING_PLAN_SEGMENT_RATE_LIMIT_DELAY", "15")
+                        ),
+                        rate_limit_max_delay=float(
+                            os.getenv("CODING_PLAN_SEGMENT_RATE_LIMIT_MAX_DELAY", "60")
+                        ),
+                        rate_limit_jitter=float(
+                            os.getenv("CODING_PLAN_SEGMENT_RATE_LIMIT_JITTER", "3")
+                        ),
+                    ),
+                    should_retry=self._is_rate_limit_error,
+                    is_rate_limited=lambda _exc: True,
+                )
+                print(
+                    f"[ocr-segment-response] page_image={image_path.stem} "
+                    f"segment={part_index}/{len(part_paths)} "
+                    f"elapsed={time.monotonic() - segment_started_at:.1f}s "
+                    f"chars={len(text)}",
+                    flush=True,
+                )
                 text = text.strip()
                 if text and not self._is_empty_band_text(text):
                     texts.append(text)
+                    if physical_page_index is not None:
+                        physical_page_texts[physical_page_index].append(text)
         finally:
-            for part_path in part_paths:
+            for part_path, _physical_page_index in part_paths:
                 part_path.unlink(missing_ok=True)
-        if not texts or any(not text for text in texts):
+        if not texts:
             raise RuntimeError("Segmented vision MCP OCR returned an empty band.")
+        if physical_spread:
+            pages = [
+                self._merge_band_texts(page_texts) if page_texts else ""
+                for page_texts in physical_page_texts
+            ]
+            return (
+                PhysicalPageOCRText(pages),
+                f"mcp-segmented-{uuid.uuid4().hex[:12]}",
+            )
         return self._merge_band_texts(texts), f"mcp-segmented-{uuid.uuid4().hex[:12]}"
 
     @staticmethod
@@ -939,13 +1427,47 @@ class CodingPlanVisionOCR:
         return merged
 
     def _ocr_filtered_band(self, image_path: Path, *, depth: int) -> tuple[str, str]:
-        """Recursively split only the band that still triggers error 1301."""
+        """Recursively split a band that is filtered or too dense to finish."""
         client = self._client()
         try:
-            return client.extract_text(image_path)
+            self._wait_for_request_slot()
+            result = client.extract_text(image_path)
+            minimum_chars = max(
+                0,
+                int(os.getenv("CODING_PLAN_MIN_OCR_CHARS", "0")),
+            )
+            compact_length = len(re.sub(r"\s+", "", result[0]))
+            # This opt-in guard is evaluated only for the complete physical
+            # page/band. Recursive children may legitimately contain a short
+            # heading or sparse lower block, so they must not inherit it.
+            if depth == 0 and minimum_chars and compact_length < minimum_chars:
+                raise RuntimeError(
+                    "Vision MCP OCR text is below configured minimum: "
+                    f"chars={compact_length} minimum={minimum_chars}."
+                )
+            self._report_request_success()
+            return result
         except Exception as exc:
-            if not self._is_content_filter_error(exc) or depth >= 6:
+            if self._is_rate_limit_error(exc):
+                self._report_request_rate_limit()
+            is_filter = self._is_content_filter_error(exc)
+            is_timeout = self._is_timeout_error(exc)
+            is_short = self._is_short_ocr_error(exc)
+            max_depth = 6 if is_filter else 3
+            if not (is_filter or is_timeout or is_short) or depth >= max_depth:
+                if is_filter or is_timeout or is_short:
+                    client.close()
+                    self.local.client = None
                 raise
+            fallback_reason = (
+                "content-filter" if is_filter else "short-output" if is_short else "timeout"
+            )
+            print(
+                f"[ocr-fallback] page_image={image_path.stem} "
+                f"reason={fallback_reason} "
+                f"depth={depth} next_depth={depth + 1}",
+                flush=True,
+            )
             # A filtered MCP process can stop answering. Recreate it before
             # sending the smaller child bands.
             client.close()
@@ -957,20 +1479,40 @@ class CodingPlanVisionOCR:
                     image = source.convert("RGB")
                     width, height = image.size
                     is_vertical = getattr(self, "reading_direction", "horizontal") == "vertical"
-                    split_dimension = width if is_vertical else height
+                    is_vertical_grid_cell = (
+                        is_vertical
+                        and "_segment_" in image_path.stem
+                        and int(os.getenv("CODING_PLAN_VERTICAL_PAGE_ROWS", "1")) > 1
+                    )
+                    # A normal portrait physical page in this magazine is laid
+                    # out as an upper block followed by a lower block.  When a
+                    # whole page reaches the recursive fallback, splitting it
+                    # into right/left halves interleaves those blocks.  Narrow
+                    # column bands created by _ocr_segmented still need the
+                    # ordinary vertical right-to-left split.  Re-evaluating the
+                    # geometry at every recursion also lets a horizontal child
+                    # band fall back to its constituent vertical columns.
+                    is_portrait_page = (
+                        is_vertical
+                        and not is_vertical_grid_cell
+                        and width < height
+                        and width * 2 >= height
+                    )
+                    split_horizontally = not is_vertical or is_portrait_page
+                    split_dimension = height if split_horizontally else width
                     if split_dimension < 40:
                         raise RuntimeError(
-                            "Vision MCP content filter persisted at the minimum safe band height."
+                            "Vision MCP fallback persisted at the minimum safe band size."
                         ) from exc
-                    if is_vertical:
-                        cut = self._blank_column_cuts(image, 2)[0]
-                        regions = ((cut, 0, width, height), (0, 0, cut, height))
-                    else:
+                    if split_horizontally:
                         cut = self._blank_row_cuts(image, 2)[0]
                         regions = ((0, 0, width, cut), (0, cut, width, height))
+                    else:
+                        cut = self._blank_column_cuts(image, 2)[0]
+                        regions = ((cut, 0, width, height), (0, 0, cut, height))
                     if cut <= 0 or cut >= split_dimension:
                         raise RuntimeError(
-                            "Vision MCP content filter could not be split into nonempty bands."
+                            "Vision MCP fallback could not be split into nonempty bands."
                         ) from exc
                     for index, region in enumerate(regions, start=1):
                         child = image_path.with_name(
@@ -992,15 +1534,38 @@ class CodingPlanVisionOCR:
             return self._merge_band_texts(texts), f"mcp-filtered-{uuid.uuid4().hex[:12]}"
 
     def ocr_image(self, image_path: Path) -> tuple[str, str]:
-        attempts = max(1, int(os.getenv("CODING_PLAN_OCR_ATTEMPTS", "4")))
+        attempts = max(1, int(os.getenv("CODING_PLAN_OCR_ATTEMPTS", "2")))
 
         def recognize_once() -> tuple[str, str]:
             client = self._client()
+            used_segmented_path = False
             try:
-                return client.extract_text(image_path)
+                if self._is_vertical_two_page_spread(image_path):
+                    used_segmented_path = True
+                    spread_segments = max(
+                        2,
+                        int(os.getenv("CODING_PLAN_SPREAD_SEGMENTS", "2")),
+                    )
+                    return self._ocr_segmented(
+                        image_path,
+                        client,
+                        segments=spread_segments,
+                        physical_spread=True,
+                    )
+                self._wait_for_request_slot()
+                result = client.extract_text(image_path)
+                self._report_request_success()
+                return result
             except Exception as exc:  # noqa: BLE001 - MCP/network failures are retried per page.
+                # Segmented requests report each 429 at the exact failing
+                # segment. Avoid penalising the shared interval twice when the
+                # final segment retry bubbles up to this page-level boundary.
+                if self._is_rate_limit_error(exc) and not used_segmented_path:
+                    self._report_request_rate_limit()
                 retry_error: Exception = exc
-                if self._is_content_filter_error(exc):
+                is_filter = self._is_content_filter_error(exc)
+                is_timeout = self._is_timeout_error(exc)
+                if is_filter or is_timeout:
                     # A whole scholarly page can trip input filtering because
                     # of an isolated historical phrase.  Retrying the identical
                     # image cannot help, so use the same OCR service on ordered
@@ -1008,20 +1573,34 @@ class CodingPlanVisionOCR:
                     # still contain the triggering context.
                     # Recreate the stdio client first: some MCP server builds
                     # stop answering subsequent tool calls after error 1301.
-                    close_client = getattr(client, "close", None)
+                    # Recursive band handling may already have replaced the
+                    # client captured above. Close the currently active MCP
+                    # process, not a stale wrapper, before starting a retry.
+                    local_state = getattr(self, "local", None)
+                    active_client = (
+                        getattr(local_state, "client", None)
+                        if local_state is not None
+                        else None
+                    ) or client
+                    close_client = getattr(active_client, "close", None)
                     if callable(close_client):
                         close_client()
                     if hasattr(self, "local"):
                         self.local.client = None
                     client = self._client()
-                    for segments in (4, 8, 16, 32):
+                    segment_counts = (4, 8, 16, 32) if is_filter else (2,)
+                    for segments in segment_counts:
                         try:
                             return self._ocr_segmented(image_path, client, segments=segments)
                         except Exception as segmented_error:  # noqa: BLE001
                             retry_error = segmented_error
                             if not self._is_content_filter_error(segmented_error):
                                 break
-                if client.process.poll() is not None or "timed out" in str(exc).lower():
+                process = getattr(client, "process", None)
+                if (
+                    (process is not None and process.poll() is not None)
+                    or self._is_timeout_error(exc)
+                ):
                     client.close()
                     self.local.client = None
                 raise retry_error
@@ -1037,6 +1616,12 @@ class CodingPlanVisionOCR:
                     rate_limit_max_delay=45.0,
                     rate_limit_jitter=3.0,
                 ),
+                should_retry=lambda exc: not (
+                    (getattr(self, "closed", None) is not None and self.closed.is_set())
+                    or self._is_content_filter_error(exc)
+                    or self._is_timeout_error(exc)
+                    or self._is_rate_limit_error(exc)
+                ),
             )
         except Exception as exc:
             raise RuntimeError(
@@ -1044,6 +1629,9 @@ class CodingPlanVisionOCR:
             ) from exc
 
     def close(self) -> None:
+        closed = getattr(self, "closed", None)
+        if closed is not None:
+            closed.set()
         with self.clients_lock:
             clients = list(self.clients)
             self.clients.clear()
@@ -1087,41 +1675,254 @@ class TesseractOCR:
         return
 
 
+_NUMBERED_TRANSLATION_UNIT = re.compile(
+    r"(?m)^(?:[ \t]*\d{1,3}|[ \t]?(?:\[\d{1,4}\]|\(\d{1,4}\)|\d{1,3}[)）]))"
+    r"[ \t]+(?=\S)"
+)
+_LEADING_NUMBERED_LINE = re.compile(
+    r"(?m)^(?:[ \t]*(\d{1,3})|[ \t]?(?:\[(\d{1,4})\]|\((\d{1,4})\)|(\d{1,3})[)）]))"
+    r"[ \t]+(?=\S)"
+)
+
+
+def _leading_numbered_line_labels(text: str) -> list[str]:
+    """Return normalized labels for footnotes/lists that start a source line."""
+
+    labels = [
+        next(value for value in match.groups() if value is not None)
+        for match in _LEADING_NUMBERED_LINE.finditer(text)
+    ]
+    # Four-digit years in bibliographic prose are not footnote identifiers.
+    return [label for label in labels if not 1800 <= int(label) <= 2099]
+
+
+_LINE_PUNCTUATION = frozenset(
+    "。．、，,.．！？!?…：:；;·\"'「」『』()（）〈〉《》〔〕"
+)
+_SENTENCE_TERMINAL = frozenset("。．.!?！？…")
+
+
+def _kana_ratio(text: str) -> float:
+    """Fraction of non-whitespace characters that are Japanese kana."""
+
+    if not text:
+        return 0.0
+    meaningful = [ch for ch in text if not ch.isspace()]
+    if not meaningful:
+        return 0.0
+    return len(KANA_CHARS.findall(text)) / len(meaningful)
+
+
+KANA_CHARS = re.compile(r"[぀-ヿ]")
+
+
+def _enforceable_numbered_labels(text: str) -> list[str]:
+    """Labels the footnote-preservation gate must require in the translation.
+
+    Scanned-book pages frequently carry OCR artifacts that the model is
+    right to drop and that must not be mistaken for omitted footnotes:
+
+    * ``|``-separated or ``〇``-marked lines are two-column chronology or
+      table rows, not footnote definitions;
+    * ``0`` can never be a footnote number (it is a misread circle marker);
+    * a bare label whose remainder carries no punctuation is a chapter
+      number, running head or layout fragment, not a definition;
+    * a label that starts a line continuing an unfinished sentence is a
+      footnote reference merged by column-aware OCR onto prose, not the
+      beginning of a footnote definition.
+    """
+
+    if "|" in text or "〇" in text:
+        return []
+    labels: list[str] = []
+    for match in _LEADING_NUMBERED_LINE.finditer(text):
+        label = next(value for value in match.groups() if value is not None)
+        if label == "0":
+            continue
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.start())
+        if line_end == -1:
+            line_end = len(text)
+        remainder = text[match.end():line_end]
+        if not any(ch in _LINE_PUNCTUATION for ch in remainder):
+            continue
+        if line_start > 0:
+            previous_end = line_start - 1
+            previous_start = text.rfind("\n", 0, previous_end) + 1
+            previous_line = text[previous_start:previous_end].strip()
+            if previous_line and not previous_line.endswith(
+                tuple(_SENTENCE_TERMINAL)
+            ):
+                continue
+        if not 1800 <= int(label) <= 2099:
+            labels.append(label)
+    return labels
+
+
+def _split_translation_body(text: str, max_chars: int) -> list[str]:
+    """Split body prose so numbered footnotes/list items are separate units.
+
+    A bare one-to-three digit label followed by whitespace is the convention
+    used by the imported thesis.  Dotted numbers such as ``1853.`` and
+    ``240.`` are prose/list data, not footnote boundaries.  A bracketed or
+    parenthesized marker is accepted only with at most one leading space, so
+    an indented wrapped bibliography line such as ``     2)`` is not mistaken
+    for a new item. Continuation lines stay with their preceding unit until
+    the next label; only then is an overlong unit passed through the ordinary
+    size splitter.
+    """
+
+    starts = [match.start() for match in _NUMBERED_TRANSLATION_UNIT.finditer(text)]
+    if not starts:
+        return split_text(text, max_chars)
+
+    boundaries = ([0] if starts[0] else []) + starts + [len(text)]
+    chunks: list[str] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        unit = text[start:end].strip()
+        if unit:
+            chunks.extend(split_text(unit, max_chars))
+    return chunks
+
+
 class ChatTranslator:
     def __init__(self, client: TextChatBackend, *, max_chars: int = 12000) -> None:
         self.client = client
         self.max_chars = max_chars
 
     def translate(self, text: str, *, source_language: str, target_language: str) -> str:
+        # Reviewed/imported Markdown headings are structural metadata, not
+        # translatable prose. Keep them entirely outside the model request so
+        # a model cannot silently change an approved Chinese title or term.
+        plan: list[tuple[str, str]] = []
+        body_lines: list[str] = []
+
+        def flush_body() -> None:
+            body = "".join(body_lines).strip()
+            body_lines.clear()
+            if body:
+                plan.extend(
+                    ("body", chunk)
+                    for chunk in _split_translation_body(body, self.max_chars)
+                )
+
+        for line in text.splitlines(keepends=True):
+            without_ending = line.rstrip("\r\n")
+            if re.fullmatch(r"#{1,6}[ \t]+\S.*", without_ending):
+                flush_body()
+                plan.append(("heading", without_ending))
+            else:
+                body_lines.append(line)
+        flush_body()
+
+        body_total = sum(kind == "body" for kind, _value in plan)
+        body_index = 0
+        enforceable_page_labels = _enforceable_numbered_labels(text)
         translated: list[str] = []
-        chunks = split_text(text, self.max_chars)
-        for index, chunk in enumerate(chunks, start=1):
+        for kind, value in plan:
+            if kind == "heading":
+                translated.append(value)
+                continue
+            body_index += 1
+            chunk = value
+            source_leading_numbers = _leading_numbered_line_labels(chunk)
+            numbered_requirement = (
+                "\n本分块检测到的行首编号（必须逐项原样保留）："
+                + "、".join(source_leading_numbers)
+                + "。"
+                if source_leading_numbers
+                else ""
+            )
             output_budget = min(32768, max(4096, len(chunk) * 4))
             prompt = f"""
 请把下面的 OCR 原文完整翻译成{target_language}。
 源语言标签：{source_language}
-分块：{index}/{len(chunks)}
+分块：{body_index}/{body_total}
 
 要求：
 1. 不总结、不删减、不扩写。
-2. 保留 Markdown 标题、列表、表格、脚注和段落结构。
-3. 人名、书名、术语前后一致；无法确认的内容保留原文并标注 [存疑]。
-4. 输入来自 OCR。先根据日语语法和上下文修正明显的字符、断行和空格错误；无法可靠还原时标注 [原文存疑]，不要编造。
-5. 正文中出现的日语、英语及其他外语段落或引文也必须译成目标语言，不得整段保留未译；仅专名、必要术语和文献标识可按惯例保留原文。
-6. 如果目标是简体中文，必须使用中国大陆通行简体字与标点，不得输出繁体字。
-7. 只输出译文，不附加说明或质量报告。
+2. 保留列表、表格、脚注和段落结构；Markdown 标题已由程序保护，不会出现在本分块中。
+3. 源文中每一个行首脚注编号及其对应定义全文都必须逐条保留并完整翻译；严禁合并、跳号、截断、只保留编号或省略出处。{numbered_requirement}
+4. 人名、书名、术语前后一致；无法确认的内容保留原文并标注 [存疑]。
+5. 输入来自 OCR。先依据源语言的语法和上下文修正明显的字符、断行和空格错误；无法可靠还原时标注 [原文存疑]，不要编造。
+6. 正文中出现的日语、英语及其他外语段落或引文也必须译成目标语言，不得整段保留未译；仅专名、必要术语和文献标识可按惯例保留原文。
+7. 如果目标是简体中文，必须使用中国大陆通行简体字与标点，不得输出繁体字。
+8. 只输出译文，不附加说明或质量报告。
+9. 这是翻译任务，不是校勘任务：必须把整页内容译成{target_language}，不得只修正错字后原样输出日文原文；除人名、作品名、文献标识的必要注音外，不得保留日文假名。
 
 原文：
 {chunk}
 """.strip()
-            translated.append(
-                clean_translation_text(self.client.chat_text(
+            output = clean_translation_text(
+                self.client.chat_text(
                     prompt,
                     system="你是严谨的书籍翻译器，优先保证完整性、准确性和结构可追溯。",
                     max_tokens=output_budget,
-                ))
+                )
             )
-        return normalize_target_script("\n\n".join(translated).strip(), target_language)
+            translated.append(normalize_target_script(output, target_language))
+        output_labels: Counter[str] = Counter()
+        for part in translated:
+            output_labels.update(_leading_numbered_line_labels(part))
+        missing_numbers = list(
+            (Counter(enforceable_page_labels) - output_labels).elements()
+        )
+        if missing_numbers:
+            raise RuntimeError(
+                "Translation omitted numbered footnote/list definitions with "
+                f"leading labels: {missing_numbers}."
+            )
+        joined = "\n\n".join(part.strip() for part in translated if part.strip()).strip()
+        if target_language == "简体中文":
+            kana_ratio = _kana_ratio(joined)
+            if kana_ratio > 0.20:
+                raise RuntimeError(
+                    "Translation retained Japanese text "
+                    f"(kana_ratio={kana_ratio:.2f})."
+                )
+        return joined
+
+
+class ChatOCRProofreader:
+    """Correct Japanese OCR without translating or replacing the raw checkpoint."""
+
+    def __init__(self, client: TextChatBackend, *, max_chars: int = 12000) -> None:
+        self.client = client
+        self.max_chars = max_chars
+
+    def proofread(self, text: str, *, language: str) -> str:
+        corrected: list[str] = []
+        chunks = split_text(text, self.max_chars)
+        for index, chunk in enumerate(chunks, start=1):
+            output_budget = min(32768, max(4096, len(chunk) * 4))
+            prompt = f"""
+请校勘下面的日文 OCR 原文。语言标签：{language}
+分块：{index}/{len(chunks)}
+
+要求：
+1. 只修正能够从日语语法和上下文可靠判断的 OCR 错字、漏字、重复行、错误空格、断行和明显的阅读顺序错误。
+2. 严禁翻译成中文或任何其他语言；输出必须仍是原文日语。
+3. 不总结、不删减、不扩写，不改写作者表达，不凭常识补造原文没有的内容。
+4. 保留 Markdown 标题、列表、表格、脚注、引文和段落结构。
+5. 无法可靠还原的文字保留原 OCR，并紧邻标注 [原文存疑]。
+6. 只输出校勘后的原文，不附加说明、修改清单或质量报告。
+
+OCR 原文：
+{chunk}
+""".strip()
+            corrected.append(
+                clean_ocr_text(
+                    self.client.chat_text(
+                        prompt,
+                        system=(
+                            "你是严谨的日文书籍 OCR 校勘员。你只校正日文原文，"
+                            "绝不翻译、概述或创作。"
+                        ),
+                        max_tokens=output_budget,
+                    )
+                )
+            )
+        return "\n\n".join(corrected).strip()
 
 
 # Compatibility alias for existing integrations that imported the old name.
@@ -1174,6 +1975,54 @@ def _exclusive_page_lock(path: Path) -> Iterator[None]:
         lock = _FALLBACK_LOCKS.setdefault(key, threading.Lock())
     with lock:
         yield
+
+
+@contextlib.contextmanager
+def _exclusive_stage_lock(output_dir: Path, stage: str) -> Iterator[None]:
+    """Reject duplicate model-stage processes for one output directory."""
+
+    lock_path = output_dir / ".stage_locks" / f"{stage}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is not None:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                handle.seek(0)
+                holder = handle.read().strip() or "unknown"
+                raise RuntimeError(
+                    f"Another {stage} process already owns {lock_path} "
+                    f"(holder={holder}). Wait for it or stop it before resuming."
+                ) from exc
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"pid={os.getpid()} started={dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+            handle.flush()
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    # Windows and platforms without a cross-process flock still benefit from
+    # the existing portable exclusive lock implementation.
+    with _exclusive_page_lock(lock_path):  # pragma: no cover - POSIX uses flock above.
+        yield
+
+
+def _stage_process_locked(stage: str):
+    def decorate(operation):
+        signature = inspect.signature(operation)
+
+        @functools.wraps(operation)
+        def wrapped(*args: Any, **kwargs: Any):
+            bound = signature.bind(*args, **kwargs)
+            output_dir = bound.arguments["output_dir"]
+            with _exclusive_stage_lock(Path(output_dir), stage):
+                return operation(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
 
 
 def _page_record_from_mapping(data: dict[str, Any]) -> PageRecord:
@@ -1240,13 +2089,21 @@ class PageStore:
         expected_text_sha256: str,
         translated_text: str,
         identity: ModelIdentity,
+        translated_physical_page_texts: Iterable[str] | None = None,
     ) -> PageRecord:
         with _exclusive_page_lock(self._lock_path(pdf_page)):
             latest = self.load(pdf_page)
-            if latest.text_sha256 != expected_text_sha256:
+            if latest.effective_text_sha256 != expected_text_sha256:
                 raise StalePageSourceError(
-                    f"Page {pdf_page} OCR changed while translation was running; "
+                    f"Page {pdf_page} effective OCR text changed while translation was running; "
                     "the stale translation was discarded."
+                )
+            if (
+                len(latest.effective_physical_pages) > 1
+                and translated_physical_page_texts is None
+            ):
+                raise ValueError(
+                    "A structured spread translation must preserve its physical pages."
                 )
             latest.translated_text = translated_text
             latest.translation_source_sha256 = expected_text_sha256
@@ -1255,6 +2112,14 @@ class PageStore:
             latest.translation_target_language = identity.target_language
             latest.translation_prompt_version = identity.prompt_version
             latest.translation_fingerprint = identity.fingerprint
+            physical_pages = list(translated_physical_page_texts or [])
+            if physical_pages and (
+                join_physical_page_texts(physical_pages) != translated_text.strip()
+            ):
+                raise ValueError(
+                    "Translated physical-page text does not reconstruct the page text."
+                )
+            latest.translated_physical_page_texts = physical_pages
             self._write_unlocked(latest, write_markdown=False)
             return latest
 
@@ -1266,13 +2131,15 @@ class PageStore:
         expected_translation_sha256: str,
         expected_translation_fingerprint: str,
         translated_text: str,
+        translated_physical_page_texts: Iterable[str] | None = None,
     ) -> PageRecord:
         """Normalize a cached translation without replacing newer OCR/model output."""
         with _exclusive_page_lock(self._lock_path(pdf_page)):
             latest = self.load(pdf_page)
-            if latest.text_sha256 != expected_text_sha256:
+            if latest.effective_text_sha256 != expected_text_sha256:
                 raise StalePageSourceError(
-                    f"Page {pdf_page} OCR changed while cached translation was normalized."
+                    f"Page {pdf_page} effective OCR text changed while cached "
+                    "translation was normalized."
                 )
             latest_translation_sha256 = hashlib.sha256(
                 latest.translated_text.encode("utf-8")
@@ -1286,7 +2153,71 @@ class PageStore:
                     f"Page {pdf_page} translation changed while its cached text "
                     "was normalized."
                 )
+            if (
+                _validated_physical_page_texts(
+                    latest.translated_text,
+                    latest.translated_physical_page_texts,
+                )
+                is not None
+                and translated_physical_page_texts is None
+            ):
+                raise ValueError(
+                    "A structured spread translation update must preserve its physical pages."
+                )
+            physical_pages = list(translated_physical_page_texts or [])
+            if physical_pages and (
+                join_physical_page_texts(physical_pages) != translated_text.strip()
+            ):
+                raise ValueError(
+                    "Translated physical-page text does not reconstruct the page text."
+                )
             latest.translated_text = translated_text
+            latest.translated_physical_page_texts = physical_pages
+            self._write_unlocked(latest, write_markdown=False)
+            return latest
+
+    def commit_proofread(
+        self,
+        pdf_page: int,
+        *,
+        expected_text_sha256: str,
+        proofread_text: str,
+        identity: ModelIdentity,
+        proofread_physical_page_texts: Iterable[str] | None = None,
+    ) -> PageRecord:
+        """Publish an OCR correction overlay only if its raw OCR source is current."""
+
+        with _exclusive_page_lock(self._lock_path(pdf_page)):
+            latest = self.load(pdf_page)
+            if latest.text_sha256 != expected_text_sha256:
+                raise StalePageSourceError(
+                    f"Page {pdf_page} OCR changed while proofreading was running; "
+                    "the stale proofreading result was discarded."
+                )
+            if (
+                len(latest.raw_physical_pages) > 1
+                and proofread_physical_page_texts is None
+            ):
+                raise ValueError(
+                    "A structured spread proofreading result must preserve its physical pages."
+                )
+            latest.proofread_text = proofread_text
+            latest.proofread_source_sha256 = expected_text_sha256
+            latest.proofread_provider = identity.provider
+            latest.proofread_model = identity.model
+            latest.proofread_language = identity.target_language
+            latest.proofread_prompt_version = identity.prompt_version
+            latest.proofread_fingerprint = identity.fingerprint
+            physical_pages = list(proofread_physical_page_texts or [])
+            if physical_pages and (
+                join_physical_page_texts(physical_pages) != proofread_text.strip()
+            ):
+                raise ValueError(
+                    "Proofread physical-page text does not reconstruct the page text."
+                )
+            latest.proofread_physical_page_texts = physical_pages
+            # The page Markdown intentionally remains the immutable raw OCR
+            # view. Consumers select effective_text from the JSON checkpoint.
             self._write_unlocked(latest, write_markdown=False)
             return latest
 
@@ -1304,8 +2235,23 @@ class PageStore:
                 raise StalePageSourceError(
                     f"Page {pdf_page} OCR changed while deterministic cleanup was running."
                 )
+            original_physical_pages = _validated_physical_page_texts(
+                latest.text,
+                latest.physical_page_texts,
+            )
             latest.text = cleaned_text
             latest.language = language
+            if original_physical_pages is not None:
+                cleaned_physical_pages = [
+                    clean_ocr_text(page_text)
+                    for page_text in original_physical_pages
+                ]
+                if join_physical_page_texts(cleaned_physical_pages) == cleaned_text:
+                    latest.physical_page_texts = cleaned_physical_pages
+                else:
+                    latest.physical_page_texts = []
+            else:
+                latest.physical_page_texts = []
             self._write_unlocked(latest, write_markdown=True)
             return latest
 
@@ -1391,6 +2337,31 @@ def import_existing_ocr(source_dir: Path, output_dir: Path) -> int:
             translation_target_language=str(item.get("translation_target_language") or ""),
             translation_prompt_version=str(item.get("translation_prompt_version") or ""),
             translation_fingerprint=str(item.get("translation_fingerprint") or ""),
+            proofread_text=str(item.get("proofread_text") or ""),
+            proofread_source_sha256=str(item.get("proofread_source_sha256") or ""),
+            proofread_provider=str(item.get("proofread_provider") or ""),
+            proofread_model=str(item.get("proofread_model") or ""),
+            proofread_language=str(item.get("proofread_language") or ""),
+            proofread_prompt_version=str(item.get("proofread_prompt_version") or ""),
+            proofread_fingerprint=str(item.get("proofread_fingerprint") or ""),
+            physical_page_texts=[
+                str(value)
+                for value in item.get("physical_page_texts", [])
+            ]
+            if isinstance(item.get("physical_page_texts"), list)
+            else [],
+            proofread_physical_page_texts=[
+                str(value)
+                for value in item.get("proofread_physical_page_texts", [])
+            ]
+            if isinstance(item.get("proofread_physical_page_texts"), list)
+            else [],
+            translated_physical_page_texts=[
+                str(value)
+                for value in item.get("translated_physical_page_texts", [])
+            ]
+            if isinstance(item.get("translated_physical_page_texts"), list)
+            else [],
             notes=str(item.get("notes") or ""),
             ocr_model=str(item.get("ocr_model") or "imported"),
         )
@@ -1411,6 +2382,7 @@ def render_pdf_page(pdf_path: Path, pdf_page: int, image_path: Path, *, dpi: int
     image.save(image_path, "JPEG", quality=quality, optimize=True)
 
 
+@_stage_process_locked("ocr")
 def ocr_pdf(
     pdf_path: Path,
     output_dir: Path,
@@ -1428,11 +2400,7 @@ def ocr_pdf(
     request_delay: float = 0.0,
 ) -> list[PageRecord]:
     existing = {record.pdf_page: record for record in load_page_records(output_dir)}
-    cache_model_prefixes = tuple(
-        prefix.strip()
-        for prefix in (cache_model_prefix or "").split(",")
-        if prefix.strip()
-    )
+    cache_model_prefixes = parse_model_prefixes(cache_model_prefix)
     pages = list(range(start_page, end_page + 1))
     pending = [
         page
@@ -1457,6 +2425,8 @@ def ocr_pdf(
     rate_limiter = StartRateLimiter(max(0.0, request_delay))
 
     def process(pdf_page: int) -> PageRecord:
+        started_at = time.monotonic()
+        print(f"[ocr-start] page={pdf_page}", flush=True)
         image_path = image_dir / f"page_{pdf_page:04d}.jpg"
         render_pdf_page(
             pdf_path,
@@ -1469,12 +2439,32 @@ def ocr_pdf(
         try:
             rate_limiter.wait()
             text, request_id = client.ocr_image(image_path)
+            physical_page_texts = list(
+                getattr(text, "physical_page_texts", ())
+            )
+            text = str(text).strip()
+            if physical_page_texts and (
+                join_physical_page_texts(physical_page_texts) != text
+            ):
+                raise RuntimeError(
+                    f"OCR physical-page structure is inconsistent on page {pdf_page}."
+                )
+            elapsed = time.monotonic() - started_at
+            print(
+                f"[ocr-response] page={pdf_page} elapsed={elapsed:.1f}s chars={len(text)}",
+                flush=True,
+            )
             record = PageRecord(
                 pdf_page=pdf_page,
                 text=text,
                 language=detect_language(text),
-                notes=f"request_id={request_id}" if request_id else "",
+                notes=(
+                    f"request_id={request_id}; elapsed_seconds={elapsed:.1f}"
+                    if request_id
+                    else f"elapsed_seconds={elapsed:.1f}"
+                ),
                 ocr_model=client.ocr_model,
+                physical_page_texts=physical_page_texts,
             )
             save_page_record(output_dir, record)
             return record
@@ -1484,7 +2474,10 @@ def ocr_pdf(
 
     if pending:
         failures: list[tuple[int, str]] = []
-        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        executor = ThreadPoolExecutor(max_workers=max(1, concurrency))
+        interrupted = False
+        futures: dict[Any, int] = {}
+        try:
             futures = {executor.submit(process, page): page for page in pending}
             completed = 0
             for future in as_completed(futures):
@@ -1497,6 +2490,26 @@ def ocr_pdf(
                     continue
                 completed += 1
                 print(f"[ocr] page={page} completed={completed}/{len(pending)}")
+        except KeyboardInterrupt:
+            interrupted = True
+            # A normal ThreadPoolExecutor context waits for every queued job,
+            # which made a user-requested pause start pages that had not begun.
+            # Cancel queued work immediately; only already-running model calls
+            # are allowed to unwind.
+            for future in futures:
+                future.cancel()
+            close_backend = getattr(client, "close", None)
+            if callable(close_backend):
+                close_backend()
+            # Closing the backend terminates in-flight MCP process groups, so
+            # running workers unwind promptly. Wait for them here to guarantee
+            # that a paused CLI cannot survive as an orphan and duplicate the
+            # next resume run.
+            executor.shutdown(wait=True, cancel_futures=True)
+            raise
+        finally:
+            if not interrupted:
+                executor.shutdown(wait=True)
         if not keep_page_images and image_dir.exists() and not any(image_dir.iterdir()):
             image_dir.rmdir()
         if failures:
@@ -1510,6 +2523,7 @@ def ocr_pdf(
     return [existing[page] for page in pages if page in existing]
 
 
+@_stage_process_locked("translate")
 def translate_non_chinese_pages(
     records: list[PageRecord],
     output_dir: Path,
@@ -1538,20 +2552,36 @@ def translate_non_chinese_pages(
         for record in records:
             if not record.translated_text:
                 continue
-            normalized = normalize_target_script(
-                clean_translation_text(record.translated_text),
-                target_language,
+            cached_physical_pages = _validated_physical_page_texts(
+                record.translated_text,
+                record.translated_physical_page_texts,
             )
+            if cached_physical_pages is not None:
+                normalized_physical_pages = [
+                    normalize_target_script(
+                        clean_translation_text(page_text),
+                        target_language,
+                    )
+                    for page_text in cached_physical_pages
+                ]
+                normalized = join_physical_page_texts(normalized_physical_pages)
+            else:
+                normalized_physical_pages = []
+                normalized = normalize_target_script(
+                    clean_translation_text(record.translated_text),
+                    target_language,
+                )
             if normalized != record.translated_text:
                 try:
                     committed = store.update_translation_text(
                         record.pdf_page,
-                        expected_text_sha256=record.text_sha256,
+                        expected_text_sha256=record.effective_text_sha256,
                         expected_translation_sha256=hashlib.sha256(
                             record.translated_text.encode("utf-8")
                         ).hexdigest(),
                         expected_translation_fingerprint=record.translation_fingerprint,
                         translated_text=normalized,
+                        translated_physical_page_texts=normalized_physical_pages,
                     )
                 except (
                     FileNotFoundError,
@@ -1566,8 +2596,8 @@ def translate_non_chinese_pages(
     candidates = [
         record
         for record in records
-        if record.text.strip()
-        and record.text.strip() not in NON_CONTENT_MARKERS
+        if record.effective_text.strip()
+        and record.effective_text.strip() not in NON_CONTENT_MARKERS
         and (source_language is not None or record.language not in {"zh", "unknown"})
         and (
             force
@@ -1583,19 +2613,41 @@ def translate_non_chinese_pages(
     def process(record: PageRecord) -> int:
         if not store.path(record.pdf_page).exists():
             store.save(record)
-        rate_limiter.wait()
         print(f"[translate] page={record.pdf_page} language={record.language} started")
-        source_sha256 = record.text_sha256
-        translated_text = translator.translate(
-            record.text,
-            source_language=source_language or record.language,
-            target_language=target_language,
-        )
+        source_sha256 = record.effective_text_sha256
+        source_physical_pages = record.effective_physical_pages
+        translated_physical_pages: list[str] = []
+        for physical_page_index, source_text in enumerate(
+            source_physical_pages,
+            start=1,
+        ):
+            if not source_text.strip():
+                translated_physical_pages.append("")
+                continue
+            rate_limiter.wait()
+            if len(source_physical_pages) > 1:
+                print(
+                    f"[translate] page={record.pdf_page} "
+                    f"physical_page={physical_page_index}/{len(source_physical_pages)} started"
+                )
+            translated_physical_pages.append(
+                translator.translate(
+                    source_text,
+                    source_language=source_language or record.language,
+                    target_language=target_language,
+                )
+            )
+        translated_text = join_physical_page_texts(translated_physical_pages)
         committed = store.commit_translation(
             record.pdf_page,
             expected_text_sha256=source_sha256,
             translated_text=translated_text,
             identity=identity,
+            translated_physical_page_texts=(
+                translated_physical_pages
+                if len(source_physical_pages) > 1
+                else None
+            ),
         )
         for field_name in PageRecord.__dataclass_fields__:
             setattr(record, field_name, getattr(committed, field_name))
@@ -1620,6 +2672,104 @@ def translate_non_chinese_pages(
         raise RuntimeError(
             f"Translation completed with {len(failures)} failed page(s): {failed_pages}. "
             "Rerun the same command to resume only missing translations."
+        )
+
+
+@_stage_process_locked("proofread")
+def proofread_ocr_pages(
+    records: list[PageRecord],
+    output_dir: Path,
+    proofreader: Proofreader,
+    *,
+    language: str,
+    identity: ModelIdentity,
+    force: bool,
+    concurrency: int = 3,
+    request_delay: float = 0.0,
+) -> None:
+    """Create model-attributed OCR correction overlays with page-level CAS."""
+
+    store = PageStore(output_dir)
+    candidates = [
+        record
+        for record in records
+        if record.text.strip()
+        and record.text.strip() not in NON_CONTENT_MARKERS
+        and (
+            record.language in {language, "unknown", "other"}
+            or (
+                language.lower() == "ja"
+                and re.search(r"[\u3040-\u30ff]", record.text) is not None
+            )
+        )
+        and (force or not record.proofread_is_fresh_for(identity))
+    ]
+    print(
+        f"[proofread] total={len(candidates)} concurrency={max(1, concurrency)} "
+        f"request_delay={max(0.0, request_delay):g}s language={language}"
+    )
+    rate_limiter = StartRateLimiter(max(0.0, request_delay))
+
+    def process(record: PageRecord) -> int:
+        if not store.path(record.pdf_page).exists():
+            store.save(record)
+        print(f"[proofread] page={record.pdf_page} started")
+        source_sha256 = record.text_sha256
+        source_physical_pages = record.raw_physical_pages
+        proofread_physical_pages: list[str] = []
+        for physical_page_index, source_text in enumerate(
+            source_physical_pages,
+            start=1,
+        ):
+            if not source_text.strip():
+                proofread_physical_pages.append("")
+                continue
+            rate_limiter.wait()
+            if len(source_physical_pages) > 1:
+                print(
+                    f"[proofread] page={record.pdf_page} "
+                    f"physical_page={physical_page_index}/{len(source_physical_pages)} started"
+                )
+            proofread_physical_pages.append(
+                proofreader.proofread(source_text, language=language)
+            )
+        proofread_text = join_physical_page_texts(proofread_physical_pages)
+        if not proofread_text.strip():
+            raise RuntimeError("Proofreading model returned no text.")
+        committed = store.commit_proofread(
+            record.pdf_page,
+            expected_text_sha256=source_sha256,
+            proofread_text=proofread_text,
+            identity=identity,
+            proofread_physical_page_texts=(
+                proofread_physical_pages
+                if len(source_physical_pages) > 1
+                else None
+            ),
+        )
+        for field_name in PageRecord.__dataclass_fields__:
+            setattr(record, field_name, getattr(committed, field_name))
+        return record.pdf_page
+
+    failures: list[tuple[int, str]] = []
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        futures = {executor.submit(process, record): record.pdf_page for record in candidates}
+        completed = 0
+        for future in as_completed(futures):
+            page = futures[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 - per-page work is resumable.
+                failures.append((page, str(exc)))
+                print(f"[proofread-error] page={page}: {exc}", file=sys.stderr)
+                continue
+            completed += 1
+            print(f"[proofread] page={page} completed={completed}/{len(candidates)}")
+    if failures:
+        failed_pages = [page for page, _ in failures]
+        raise RuntimeError(
+            f"Proofreading completed with {len(failures)} failed page(s): "
+            f"{failed_pages}. Rerun the same command to resume only missing overlays."
         )
 
 
@@ -1709,10 +2859,23 @@ def normalize_toc_payload(payload: dict[str, Any], *, fallback_pages: list[int] 
     mapped_pages = [entry.pdf_page for entry in entries if entry.pdf_page is not None]
     if mapped_pages != sorted(mapped_pages):
         raise ValueError("TOC PDF page mappings must be monotonic.")
+    raw_divisor = payload.get("printed_pages_per_pdf_page")
+    try:
+        printed_pages_per_pdf_page = (
+            int(raw_divisor) if raw_divisor is not None else None
+        )
+    except (TypeError, ValueError):
+        printed_pages_per_pdf_page = None
+    if (
+        printed_pages_per_pdf_page is not None
+        and printed_pages_per_pdf_page < 1
+    ):
+        raise ValueError("printed_pages_per_pdf_page must be a positive integer.")
     return {
         "schema_version": 1,
         "toc_pdf_pages": toc_pages,
         "page_offset": payload.get("page_offset"),
+        "printed_pages_per_pdf_page": printed_pages_per_pdf_page,
         "offset_evidence": payload.get("offset_evidence", []),
         "entries": [asdict(entry) for entry in entries],
     }
@@ -1745,6 +2908,16 @@ def extract_toc(
 
 def normalize_match_text(value: str) -> str:
     value = unicodedata.normalize("NFKC", value).lower()
+    # Common Japanese TOC labels are often written in kana while the opening
+    # page uses kanji.  Normalising these pairs lets an unnumbered preface be
+    # mapped from its heading without inventing a printed page number.
+    for kana, kanji in (
+        ("まえがき", "前書き"),
+        ("あとがき", "後書き"),
+        ("はじめに", "初めに"),
+        ("おわりに", "終わりに"),
+    ):
+        value = value.replace(kana, kanji)
     # Critical-edition margin numbers can precede a chapter heading on its
     # opening page (for example ``37 第一章 ...``).  They are pagination aids,
     # not part of the title used for duplicate-heading detection.
@@ -1788,7 +2961,7 @@ def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_
     searchable = [record for record in records if record.pdf_page > toc_end and record.compile_text]
     evidence: list[dict[str, Any]] = []
     for entry in entries:
-        if entry.printed_page is None or entry.kind not in {
+        if entry.kind not in {
             "chapter",
             "section",
             "subsection",
@@ -1811,7 +2984,11 @@ def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_
                     "title": entry.display_title,
                     "printed_page": entry.printed_page,
                     "pdf_page": best_page,
-                    "offset": best_page - entry.printed_page,
+                    "offset": (
+                        best_page - entry.printed_page
+                        if entry.printed_page is not None
+                        else None
+                    ),
                     "score": round(best_score, 3),
                 }
             )
@@ -1819,21 +2996,82 @@ def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_
 
 
 def infer_page_offset(entries: list[TocEntry], records: list[PageRecord], toc_end: int) -> tuple[int, list[dict[str, Any]]]:
-    evidence = find_title_evidence(entries, records, toc_end)
-    if not evidence:
-        raise ValueError("Cannot infer page offset from OCR text. Pass --page-offset after checking one chapter page.")
-    offsets = [int(item["offset"]) for item in evidence]
+    offset, _divisor, evidence = infer_page_mapping(
+        entries,
+        records,
+        toc_end,
+        divisor_candidates=(1,),
+    )
+    return offset, evidence
+
+
+def _dominant_page_offset(offsets: list[int]) -> int:
+    if not offsets:
+        raise ValueError("Cannot infer page offset without title evidence.")
     counts = Counter(offsets)
     best_count = max(counts.values())
     if best_count >= 2:
         candidates = [offset for offset, count in counts.items() if count == best_count]
-        offset = min(candidates, key=lambda item: (abs(item), item))
-    else:
-        offset = int(round(statistics.median(offsets)))
-    matching = [item for item in evidence if abs(int(item["offset"]) - offset) <= 1]
-    if len(evidence) >= 3 and not matching:
-        raise ValueError("TOC/page-title matches disagree; pass --page-offset manually.")
-    return offset, evidence
+        return min(candidates, key=lambda item: (abs(item), item))
+    return int(round(statistics.median(offsets)))
+
+
+def _mapping_evidence(
+    evidence: list[dict[str, Any]],
+    divisor: int,
+) -> tuple[int, list[dict[str, Any]], tuple[int, int, int]]:
+    annotated: list[dict[str, Any]] = []
+    offsets: list[int] = []
+    for item in evidence:
+        if item.get("printed_page") is None:
+            annotated.append(
+                {
+                    **item,
+                    "offset": None,
+                    "printed_pages_per_pdf_page": divisor,
+                }
+            )
+            continue
+        printed_page = int(item["printed_page"])
+        pdf_page = int(item["pdf_page"])
+        offset = pdf_page - printed_page // divisor
+        offsets.append(offset)
+        annotated.append(
+            {
+                **item,
+                "offset": offset,
+                "printed_pages_per_pdf_page": divisor,
+            }
+        )
+    offset = _dominant_page_offset(offsets)
+    exact_support = sum(value == offset for value in offsets)
+    dispersion = sum(abs(value - offset) for value in offsets)
+    # Prefer the simplest one-page mapping when evidence is otherwise tied.
+    rank = (exact_support, -dispersion, -divisor)
+    return offset, annotated, rank
+
+
+def infer_page_mapping(
+    entries: list[TocEntry],
+    records: list[PageRecord],
+    toc_end: int,
+    *,
+    divisor_candidates: tuple[int, ...] = (1, 2),
+) -> tuple[int, int, list[dict[str, Any]]]:
+    evidence = find_title_evidence(entries, records, toc_end)
+    if not any(item.get("printed_page") is not None for item in evidence):
+        raise ValueError("Cannot infer page offset from OCR text. Pass --page-offset after checking one chapter page.")
+    valid_candidates = tuple(
+        sorted({int(value) for value in divisor_candidates if int(value) >= 1})
+    )
+    if not valid_candidates:
+        raise ValueError("At least one positive printed-page divisor is required.")
+    ranked = [
+        (*_mapping_evidence(evidence, divisor), divisor)
+        for divisor in valid_candidates
+    ]
+    offset, annotated, _rank, divisor = max(ranked, key=lambda item: item[2])
+    return offset, divisor, annotated
 
 
 def apply_page_mapping(
@@ -1842,18 +3080,36 @@ def apply_page_mapping(
     *,
     page_offset: int | None,
     source_page_count: int | None = None,
+    printed_pages_per_pdf_page: int | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_toc_payload(toc_payload)
     entries = [TocEntry(**item) for item in normalized["entries"]]
     toc_end = max(normalized.get("toc_pdf_pages") or [0])
     evidence = find_title_evidence(entries, records, toc_end)
     manual_override = page_offset is not None
+    stored_divisor = normalized.get("printed_pages_per_pdf_page")
+    divisor = printed_pages_per_pdf_page or (
+        int(stored_divisor) if isinstance(stored_divisor, int) else None
+    )
+    if divisor is not None and divisor < 1:
+        raise ValueError("printed_pages_per_pdf_page must be a positive integer.")
     if page_offset is None:
         existing_offset = normalized.get("page_offset")
         if isinstance(existing_offset, int):
             page_offset = existing_offset
+            divisor = divisor or 1
         else:
-            page_offset, evidence = infer_page_offset(entries, records, toc_end)
+            page_offset, divisor, evidence = infer_page_mapping(
+                entries,
+                records,
+                toc_end,
+                divisor_candidates=(divisor,) if divisor is not None else (1, 2),
+            )
+    else:
+        divisor = divisor or 1
+        if any(item.get("printed_page") is not None for item in evidence):
+            _unused, evidence, _rank = _mapping_evidence(evidence, divisor)
+    assert divisor is not None
     direct_pages = {
         item["entry_id"]: int(item["pdf_page"])
         for item in evidence
@@ -1864,9 +3120,35 @@ def apply_page_mapping(
         if entry.id in direct_pages and (not manual_override or entry.printed_page is None):
             entry.pdf_page = direct_pages[entry.id]
         elif entry.printed_page is not None:
-            mapped = entry.printed_page + page_offset
+            mapped = entry.printed_page // divisor + page_offset
             entry.pdf_page = mapped if 1 <= mapped <= max_page else None
+
+    # A leading preface commonly has no printed page in the TOC.  When its
+    # heading was too damaged to match, place it in the only available front-
+    # matter slot(s) between the TOC and the first numbered entry.  This keeps
+    # the fallback deterministic and never shifts numbered chapter mappings.
+    first_numbered_index = next(
+        (
+            index
+            for index, entry in enumerate(entries)
+            if entry.printed_page is not None and entry.pdf_page is not None
+        ),
+        None,
+    )
+    if first_numbered_index is not None:
+        first_numbered_page = int(entries[first_numbered_index].pdf_page or 0)
+        fallback_page = toc_end + 1
+        for entry in entries[:first_numbered_index]:
+            if (
+                entry.pdf_page is None
+                and entry.printed_page is None
+                and entry.kind in {"frontmatter", "other"}
+                and fallback_page < first_numbered_page
+            ):
+                entry.pdf_page = fallback_page
+                fallback_page += 1
     normalized["page_offset"] = page_offset
+    normalized["printed_pages_per_pdf_page"] = divisor
     normalized["offset_evidence"] = evidence
     normalized["entries"] = [asdict(entry) for entry in entries]
     return normalized
@@ -1910,11 +3192,54 @@ def select_entries(entries: list[TocEntry], granularity: str) -> list[TocEntry]:
     return leaves or with_pages
 
 
-def remove_duplicate_title(text: str, title: str) -> str:
+def resolve_compile_granularity(
+    output_dir: Path,
+    toc_payload: dict[str, Any],
+    requested: str | None,
+) -> str:
+    """Preserve an existing chapter selection unless explicitly overridden."""
+
+    if requested:
+        return requested
+    manifest_path = output_dir / "chapters.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, list) and manifest:
+            tagged = {
+                str(item.get("granularity") or "")
+                for item in manifest
+                if isinstance(item, dict)
+            }
+            if len(tagged) == 1:
+                saved = next(iter(tagged))
+                if saved in {"chapter", "section", "subsection", "all"}:
+                    return saved
+            existing_ids = [
+                str(item.get("id") or "")
+                for item in manifest
+                if isinstance(item, dict)
+            ]
+            try:
+                entries = [
+                    TocEntry(**item)
+                    for item in toc_payload.get("entries", [])
+                    if isinstance(item, dict)
+                ]
+            except TypeError:
+                entries = []
+            for candidate in ("chapter", "section", "subsection", "all"):
+                if [entry.id for entry in select_entries(entries, candidate)] == existing_ids:
+                    return candidate
+    return "chapter"
+
+
+def _title_heading_span(text: str, title: str) -> tuple[int, int] | None:
     lines = text.splitlines()
     normalized_title = normalize_match_text(title)
     loose_title = re.sub(r"(?:的|之|の)", "", normalized_title)
-    last_title_line: int | None = None
 
     def matches(candidate: str) -> bool:
         if not candidate:
@@ -1923,6 +3248,11 @@ def remove_duplicate_title(text: str, title: str) -> str:
             return True
         loose_candidate = re.sub(r"(?:的|之|の)", "", candidate)
         if loose_candidate and loose_candidate == loose_title:
+            return True
+        # OCR/translation can move a leading descriptor such as “批判” to the
+        # end of a title. An identical multiset of title characters is a safe
+        # match within the opening heading search window.
+        if len(normalized_title) >= 5 and Counter(candidate) == Counter(normalized_title):
             return True
         if len(normalized_title) >= 4 and (
             normalized_title in candidate or candidate in normalized_title
@@ -1939,24 +3269,131 @@ def remove_duplicate_title(text: str, title: str) -> str:
 
     # Search each possible heading start instead of assuming that the first
     # OCR line is the chapter title. A running book header can precede it.
-    for start in range(min(10, len(lines))):
+    # A shared two-page scan can contain the previous chapter's entire final
+    # printed page before the next heading, so inspect more than ten lines.
+    for start in range(min(40, len(lines))):
         if not lines[start].strip():
             continue
         combined = ""
-        for index in range(start, min(start + 4, len(lines), 10)):
+        for index in range(start, min(start + 4, len(lines), 40)):
             if not lines[index].strip():
                 continue
             combined += normalize_match_text(lines[index])
             if matches(combined):
-                last_title_line = index
-                break
-        if last_title_line is not None:
-            break
-    if last_title_line is not None:
+                return start, index
+    return None
+
+
+def remove_duplicate_title(text: str, title: str) -> str:
+    lines = text.splitlines()
+    span = _title_heading_span(text, title)
+    if span is not None:
+        _first_title_line, last_title_line = span
         del lines[: last_title_line + 1]
         while lines and not lines[0].strip():
             del lines[0]
     return "\n".join(lines).strip()
+
+
+def trim_before_next_title(text: str, title: str) -> str:
+    """Keep only the previous printed page from a shared chapter boundary."""
+
+    lines = text.splitlines()
+    span = _title_heading_span(text, title)
+    if span is None:
+        return text.strip()
+    first_title_line, _last_title_line = span
+    cut = first_title_line
+    # Drop the next printed page number and blank separators immediately
+    # preceding the detected chapter heading. Some scans omit that number but
+    # retain a short running header; remove at most two compact publication
+    # headers. Once an
+    # explicit page number was seen, never consume a short line behind it,
+    # because that line belongs to the previous printed page.
+    removed_page_number = bool(
+        re.fullmatch(r"(?:```)?\s*\d{1,4}", lines[first_title_line].strip())
+    )
+    removed_running_headers = 0
+    while cut > 0:
+        previous = lines[cut - 1].strip()
+        if not previous:
+            cut -= 1
+            continue
+        if re.fullmatch(r"(?:```)?\s*\d{1,4}", previous):
+            removed_page_number = True
+            cut -= 1
+            continue
+        normalized = normalize_match_text(previous)
+        review_header = bool(
+            re.search(
+                r"(?:cross\s*review|関連近作レビュー|相关近作(?:评论|短评|评述)|"
+                r"近作(?:评论|短评|评述))",
+                previous,
+                flags=re.I,
+            )
+        )
+        if (
+            not removed_page_number
+            and removed_running_headers < 2
+            and normalized
+            and (len(normalized) <= 10 or review_header)
+        ):
+            removed_running_headers += 1
+            cut -= 1
+            continue
+        break
+    return "\n".join(lines[:cut]).strip()
+
+
+def annotate_printed_page_markers(text: str, printed_pages: Iterable[int]) -> str:
+    """Turn known standalone book-page numbers into audit-only page markers."""
+
+    expected = {int(page) for page in printed_pages if int(page) >= 0}
+    if not expected:
+        return text
+    output: list[str] = []
+    for line in text.splitlines():
+        match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
+        if match and int(match.group(1)) in expected:
+            printed_page = int(match.group(1))
+            output.append(
+                f'<span epub:type="pagebreak" id="printed-page-{printed_page}" '
+                f'title="{printed_page}"></span>'
+            )
+        else:
+            output.append(line)
+    return "\n".join(output)
+
+
+def _load_reviewed_chapter_override(
+    output_dir: Path,
+    entry: TocEntry,
+) -> str | None:
+    """Load and validate an optional human-reviewed chapter replacement."""
+
+    override_path = output_dir / "reviewed_chapters" / f"{entry.id}.md"
+    if not override_path.is_file():
+        return None
+    markdown = override_path.read_text(encoding="utf-8").lstrip("\ufeff").strip()
+    if not markdown:
+        raise ValueError(f"Reviewed chapter override is empty: {override_path}")
+    first_line = markdown.splitlines()[0].strip()
+    heading = re.fullmatch(r"#\s+(.+?)\s*", first_line)
+    if heading is None or heading.group(1).strip() != entry.display_title:
+        raise ValueError(
+            "Reviewed chapter override H1 must match the TOC title "
+            f"{entry.display_title!r}: {override_path}"
+        )
+    if not "\n".join(markdown.splitlines()[1:]).strip():
+        raise ValueError(f"Reviewed chapter override body is empty: {override_path}")
+    return markdown.rstrip() + "\n"
+
+
+def _reviewed_chapter_body(markdown: str) -> str:
+    """Return reviewed chapter content without its validated document H1."""
+
+    lines = markdown.splitlines()
+    return "\n".join(lines[1:]).strip()
 
 
 def compile_chapters(
@@ -1977,30 +3414,67 @@ def compile_chapters(
     selected.sort(key=lambda entry: entry_positions.get(entry.id, 10**9))
     last_pdf_page = max((record.pdf_page for record in records), default=0)
     record_map = {record.pdf_page: record for record in records}
-    overlap_boundary = granularity in {"section", "subsection"}
-    chapter_ranges: dict[str, tuple[int, int, int | None, bool]] = {}
+    printed_pages_per_pdf_page = int(
+        toc_payload.get("printed_pages_per_pdf_page") or 1
+    )
+    page_offset = int(toc_payload.get("page_offset") or 0)
+    chapter_ranges: dict[
+        str,
+        tuple[int, int, int | None, bool, TocEntry | None],
+    ] = {}
+    reviewed_overrides: dict[str, str] = {}
 
     # Validate every selected range before touching a previous successful
     # chapter build. A late missing page or stale translation must not leave a
     # half-replaced chapters directory.
     for sequence, entry in enumerate(selected, start=1):
+        reviewed_override = _load_reviewed_chapter_override(output_dir, entry)
+        if reviewed_override is not None:
+            reviewed_override = strip_reviewed_publication_metadata(
+                reviewed_override
+            )
+            if not _reviewed_chapter_body(reviewed_override).strip():
+                override_path = (
+                    output_dir / "reviewed_chapters" / f"{entry.id}.md"
+                )
+                raise ValueError(
+                    "Reviewed chapter override body is empty after publication "
+                    f"metadata removal: {override_path}"
+                )
+            reviewed_overrides[entry.id] = reviewed_override
         start = int(entry.pdf_page or 0)
         next_start: int | None = None
         next_level: int | None = None
+        next_entry: TocEntry | None = None
         if granularity == "all":
             if sequence < len(selected) and selected[sequence].pdf_page:
-                next_start = int(selected[sequence].pdf_page)
-                next_level = selected[sequence].level
+                next_entry = selected[sequence]
+                next_start = int(next_entry.pdf_page)
+                next_level = next_entry.level
         else:
             position = entry_positions.get(entry.id, -1)
             for candidate in entries[position + 1 :]:
                 if candidate.pdf_page is None or candidate.level > entry.level:
                     continue
                 if int(candidate.pdf_page) >= start:
+                    next_entry = candidate
                     next_start = int(candidate.pdf_page)
                     next_level = candidate.level
                     break
-        overlaps_next = overlap_boundary and next_level == entry.level
+        overlaps_next = bool(
+            next_entry is not None
+            and next_level == entry.level
+            and (
+                granularity in {"section", "subsection"}
+                or (
+                    printed_pages_per_pdf_page > 1
+                    and next_entry.printed_page is not None
+                    and int(next_entry.printed_page)
+                    % printed_pages_per_pdf_page
+                    != 0
+                )
+            )
+        )
         if next_start is None:
             end = last_pdf_page
         elif overlaps_next:
@@ -2013,12 +3487,13 @@ def compile_chapters(
             preview = missing[:12]
             suffix = "..." if len(missing) > len(preview) else ""
             raise ValueError(f"Missing OCR pages for {entry.display_title}: {preview}{suffix}")
-        if require_translation:
+        if require_translation and reviewed_override is None:
             stale_or_missing_translation = [
                 page
                 for page in range(start, end + 1)
-                if record_map[page].text.strip()
-                and record_map[page].text.strip() not in NON_CONTENT_MARKERS
+                if record_map[page].effective_text.strip()
+                and record_map[page].effective_text.strip() not in NON_CONTENT_MARKERS
+                and page_record_needs_translation(record_map[page])
                 and not (
                     record_map[page].translation_is_fresh_for(
                         expected_translation_identity
@@ -2034,7 +3509,13 @@ def compile_chapters(
                     f"Missing or stale translation for {entry.display_title}: "
                     f"{preview}{suffix}. Run the translation phase again."
                 )
-        chapter_ranges[entry.id] = (start, end, next_start, overlaps_next)
+        chapter_ranges[entry.id] = (
+            start,
+            end,
+            next_start,
+            overlaps_next,
+            next_entry,
+        )
 
     chapter_dir = output_dir / "chapters"
     if chapter_dir.exists():
@@ -2045,53 +3526,115 @@ def compile_chapters(
     knowledge_rows: list[dict[str, Any]] = []
 
     for sequence, entry in enumerate(selected, start=1):
-        start, end, next_start, overlaps_next = chapter_ranges[entry.id]
+        start, end, next_start, overlaps_next, next_entry = chapter_ranges[entry.id]
         filename = f"{sequence:03d}_{slugify(entry.display_title)}.md"
-        parts = [
-            f"# {entry.display_title}",
-            "",
-            f"<!-- source-pdf: {pdf_path.name} -->",
-            f"<!-- pdf-pages: {start}-{end} -->",
-            "",
-        ]
-        for page in range(start, end + 1):
-            record = record_map[page]
-            content = record.compile_text_for(expected_translation_identity)
-            if page == start:
-                content = remove_duplicate_title(content, entry.title)
-            parts.extend(
-                [
-                    f'<span epub:type="pagebreak" id="pdf-page-{page}" title="{page}"></span>',
-                    f"<!-- PDF_PAGE: {page} -->",
-                    "",
-                    content,
-                    "",
-                ]
-            )
-            for chunk_index, chunk in enumerate(split_text(content, 4000), start=1):
-                row_id = hashlib.sha1(
-                    f"{pdf_path.name}:{entry.id}:{page}:{chunk_index}".encode("utf-8")
-                ).hexdigest()
-                knowledge_rows.append(
-                    {
-                        "id": row_id,
-                        "title": entry.display_title,
-                        "chapter_id": entry.id,
-                        "chapter_order": sequence,
-                        "content": chunk,
-                        "source_pdf": pdf_path.name,
-                        "pdf_page_start": page,
-                        "pdf_page_end": page,
-                        "printed_page": (
-                            None
-                            if entry.printed_page is None
-                            else int(entry.printed_page) + page - start
-                        ),
-                        "boundary_overlap": overlaps_next and next_start == page,
-                    }
+        reviewed_override = reviewed_overrides.get(entry.id)
+        if reviewed_override is not None:
+            markdown = reviewed_override
+        else:
+            parts = [
+                f"# {entry.display_title}",
+                "",
+                f"<!-- source-pdf: {pdf_path.name} -->",
+                f"<!-- pdf-pages: {start}-{end} -->",
+                "",
+            ]
+            for page in range(start, end + 1):
+                record = record_map[page]
+                physical_pages = record.compile_physical_pages_for(
+                    expected_translation_identity
                 )
-        markdown = "\n".join(parts).rstrip() + "\n"
+                has_exact_physical_pages = (
+                    printed_pages_per_pdf_page > 1
+                    and len(physical_pages) == printed_pages_per_pdf_page
+                )
+                physical_start = 0
+                physical_end = len(physical_pages)
+                if (
+                    has_exact_physical_pages
+                    and page == start
+                    and entry.printed_page is not None
+                ):
+                    physical_start = (
+                        int(entry.printed_page) % printed_pages_per_pdf_page
+                    )
+                if (
+                    has_exact_physical_pages
+                    and next_entry is not None
+                    and next_start == page
+                    and next_entry.printed_page is not None
+                ):
+                    physical_end = (
+                        int(next_entry.printed_page)
+                        % printed_pages_per_pdf_page
+                    )
+                content = join_physical_page_texts(
+                    physical_pages[physical_start:physical_end]
+                )
+                if (
+                    not has_exact_physical_pages
+                    and page == end
+                    and overlaps_next
+                    and next_start == page
+                    and next_entry is not None
+                ):
+                    content = trim_before_next_title(content, next_entry.title)
+                if page == start:
+                    content = remove_duplicate_title(content, entry.title)
+                first_printed_page = (page - page_offset) * printed_pages_per_pdf_page
+                expected_printed_pages = range(
+                    first_printed_page + physical_start,
+                    first_printed_page + (
+                        physical_end
+                        if has_exact_physical_pages
+                        else printed_pages_per_pdf_page
+                    ),
+                )
+                marked_content = annotate_printed_page_markers(
+                    content,
+                    expected_printed_pages,
+                )
+                parts.extend(
+                    [
+                        f'<span epub:type="pagebreak" id="pdf-page-{page}" title="{page}"></span>',
+                        f"<!-- PDF_PAGE: {page} -->",
+                        "",
+                        marked_content,
+                        "",
+                    ]
+                )
+            # Chapter Markdown is a reader-facing output just like EPUB,
+            # Word, and the knowledge base. Keep PDF/page coordinates only in
+            # checkpoints and chapters.json; never expose them in book text.
+            markdown = strip_publication_metadata(
+                "\n".join(parts).rstrip() + "\n",
+                chapter_title=entry.display_title,
+            )
         (chapter_dir / filename).write_text(markdown, encoding="utf-8")
+        # Derive RAG chunks from the final reader-facing Markdown, not from
+        # individual source pages. This makes every chapter exactly
+        # reconstructable and prevents page-boundary cleanup from diverging
+        # between Markdown and the knowledge base.
+        reader_content = _reviewed_chapter_body(markdown)
+        row_source = "reviewed" if reviewed_override is not None else "compiled"
+        for chunk_index, chunk in enumerate(
+            split_text(reader_content, 4000),
+            start=1,
+        ):
+            row_id = hashlib.sha1(
+                f"{pdf_path.name}:{entry.id}:{row_source}:{chunk_index}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            knowledge_rows.append(
+                {
+                    "id": row_id,
+                    "title": entry.display_title,
+                    "chapter_id": entry.id,
+                    "chapter_order": sequence,
+                    "content": chunk,
+                }
+            )
         manifest.append(
             {
                 **asdict(entry),
@@ -2101,6 +3644,8 @@ def compile_chapters(
                 "pdf_page": start,
                 "end_pdf_page": end,
                 "boundary_mode": "closed-overlap" if overlaps_next else "non-overlap",
+                "reviewed_override": reviewed_override is not None,
+                "granularity": granularity,
             }
         )
     write_json(output_dir / "chapters.json", manifest)
@@ -2122,6 +3667,13 @@ def strip_publication_metadata(
 ) -> str:
     """Remove audit-only source/page markers from reader-facing documents."""
     output: list[str] = []
+    normalized_chapter_title = normalize_match_text(chapter_title or "")
+    is_contents_chapter = normalized_chapter_title in {
+        "目录",
+        "目次",
+        "contents",
+        "tableofcontents",
+    }
     normalized_titles: list[str] = []
     for title in (publication_title, chapter_title):
         if not title:
@@ -2169,13 +3721,16 @@ def strip_publication_metadata(
         return False
 
     def discard_trailing_printed_page() -> None:
+        # Column-aware OCR can split a printed page number across two lines
+        # (for example ``4`` / ``0`` for page 40), so every consecutive
+        # trailing standalone digit line is a page footer, not body text.
         while output and not output[-1].strip():
             output.pop()
-        if output:
-            candidate = output[-1].strip()
-            digits = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", candidate)
-            if digits:
-                output.pop()
+        while output and re.fullmatch(
+            r"[-—–\s]*(\d{1,3})[-—–\s]*",
+            output[-1].strip(),
+        ):
+            output.pop()
         while output and not output[-1].strip():
             output.pop()
 
@@ -2212,11 +3767,25 @@ def strip_publication_metadata(
     for line in markdown_text.splitlines():
         stripped = line.strip()
         if stripped.startswith('<span epub:type="pagebreak"'):
-            discard_trailing_printed_page()
+            is_known_printed_marker = 'id="printed-page-' in stripped
+            if not is_known_printed_marker:
+                discard_trailing_printed_page()
             pending_page_boundary = True
-            skipped_leading_page_number = False
+            # The known printed-page number was replaced by this marker, so a
+            # following standalone number can be real content and must remain.
+            skipped_leading_page_number = is_known_printed_marker
             continue
         if stripped.startswith("<!--") and stripped.endswith("-->"):
+            continue
+        # A body copy of the scanned contents page can contain page numbers
+        # throughout the page rather than only at the physical-page boundary.
+        # Keep standalone numbers in normal chapters as real content, but omit
+        # them from reader-facing contents chapters where they are navigation
+        # coordinates tied to the source edition.
+        if is_contents_chapter and re.fullmatch(
+            r"[-—–\s]*\d{1,4}[-—–\s]*",
+            stripped,
+        ):
             continue
         if is_running_title(line):
             continue
@@ -2264,6 +3833,107 @@ def strip_publication_metadata(
             continue
         compact.append(line)
     return "\n".join(compact).strip() + "\n"
+
+
+def strip_reviewed_publication_metadata(markdown_text: str) -> str:
+    """Remove only explicit source/page markers from a reviewed override.
+
+    Human-reviewed Markdown has already had running headers and source page
+    numbers resolved by an editor.  It must not pass through the fuzzy
+    running-title heuristics used for raw OCR, because a short title fragment
+    (for example a name separated by ``·``) can also occur throughout the
+    legitimate body text.
+    """
+
+    def pagebreak_numbers(line: str) -> set[int] | None:
+        anchor = re.fullmatch(
+            r"<span\b(?P<attrs>[^>]*)>\s*</span>",
+            line,
+            flags=re.I,
+        ) or re.fullmatch(
+            r"<span\b(?P<attrs>[^>]*)/\s*>",
+            line,
+            flags=re.I,
+        )
+        if anchor is None:
+            return None
+        attributes = anchor.group("attrs")
+        if not re.search(
+            r"\bepub:type\s*=\s*(['\"])pagebreak\1",
+            attributes,
+            flags=re.I,
+        ):
+            return None
+        numbers = {
+            int(value)
+            for value in re.findall(
+                r"\b(?:pdf|printed)[-_]page[-_](\d{1,6})\b",
+                attributes,
+                flags=re.I,
+            )
+        }
+        title = re.search(
+            r"\btitle\s*=\s*(['\"])(\d{1,6})\1",
+            attributes,
+            flags=re.I,
+        )
+        if title is not None:
+            numbers.add(int(title.group(2)))
+        return numbers
+
+    output: list[str] = []
+    removed_marker = False
+    pending_page_numbers: set[int] | None = None
+    for line in markdown_text.splitlines():
+        stripped = line.strip()
+        anchor_numbers = pagebreak_numbers(stripped)
+        if anchor_numbers is not None:
+            removed_marker = True
+            pending_page_numbers = anchor_numbers
+            continue
+        metadata = re.fullmatch(
+            r"<!--\s*(?P<key>source[-_ ]pdf|pdf[-_ ]pages|pdf[-_ ]page)"
+            r"\s*:\s*(?P<value>.*?)\s*-->",
+            stripped,
+            flags=re.I,
+        )
+        if metadata is not None:
+            removed_marker = True
+            key = re.sub(r"[- ]", "_", metadata.group("key").lower())
+            if key == "pdf_page":
+                page_number = re.fullmatch(
+                    r"[-—–\s]*(\d{1,6})[-—–\s]*",
+                    metadata.group("value"),
+                )
+                if page_number is not None:
+                    if pending_page_numbers is None:
+                        pending_page_numbers = set()
+                    pending_page_numbers.add(int(page_number.group(1)))
+            continue
+        if pending_page_numbers is not None:
+            if not stripped:
+                output.append(line)
+                continue
+            adjacent_number = re.fullmatch(
+                r"[-—–\s]*(\d{1,6})[-—–\s]*",
+                stripped,
+            )
+            if (
+                adjacent_number is not None
+                and int(adjacent_number.group(1)) in pending_page_numbers
+            ):
+                removed_marker = True
+                pending_page_numbers = None
+                continue
+            pending_page_numbers = None
+        output.append(line)
+
+    if not removed_marker:
+        return markdown_text
+    cleaned = "\n".join(output)
+    if markdown_text.endswith(("\n", "\r")):
+        cleaned += "\n"
+    return cleaned
 
 
 def markdown_to_html(markdown_text: str) -> str:
@@ -2315,6 +3985,224 @@ def markdown_inline_to_plain_text(value: str) -> str:
     return re.sub(r"[`*_]{1,3}", "", cleaned).strip()
 
 
+def _html_local_name(element: ET.Element) -> str:
+    tag = element.tag
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def _html_element_text(
+    element: ET.Element,
+    *,
+    skip_tags: frozenset[str] = frozenset(),
+) -> str:
+    """Extract visible XHTML text while retaining authored hard line breaks."""
+
+    parts: list[str] = []
+
+    def visit(node: ET.Element) -> None:
+        if node.text:
+            parts.append(node.text)
+        for child in node:
+            tag = _html_local_name(child)
+            if tag == "br":
+                parts.append("\n")
+            elif tag not in skip_tags:
+                visit(child)
+            if child.tail:
+                parts.append(child.tail)
+
+    visit(element)
+    return "".join(parts).strip()
+
+
+def _docx_style_name(
+    document: Any,
+    preferred: str,
+    fallback: str | None = None,
+) -> str | None:
+    try:
+        document.styles[preferred]
+    except KeyError:
+        return fallback
+    return preferred
+
+
+def _append_markdown_to_docx(document: Any, markdown_text: str) -> None:
+    """Render reader-facing Markdown without flattening its structure."""
+
+    fragment = markdown_to_html(markdown_text)
+    root = ET.fromstring(f"<document>{fragment}</document>")
+
+    def append_inline(
+        paragraph: Any,
+        element: ET.Element,
+        *,
+        bold: bool = False,
+        italic: bool = False,
+        underline: bool = False,
+        skip_tags: frozenset[str] = frozenset(),
+    ) -> None:
+        """Append the supported inline XHTML subset without losing run styles."""
+
+        def add_run(text: str | None, *, run_bold: bool, run_italic: bool, run_underline: bool) -> None:
+            if not text:
+                return
+            run = paragraph.add_run(text)
+            if run_bold:
+                run.bold = True
+            if run_italic:
+                run.italic = True
+            if run_underline:
+                run.underline = True
+
+        add_run(
+            element.text,
+            run_bold=bold,
+            run_italic=italic,
+            run_underline=underline,
+        )
+        for child in element:
+            tag = _html_local_name(child)
+            if tag in skip_tags:
+                pass
+            elif tag == "br":
+                add_run(
+                    "\n",
+                    run_bold=bold,
+                    run_italic=italic,
+                    run_underline=underline,
+                )
+            else:
+                append_inline(
+                    paragraph,
+                    child,
+                    bold=bold or tag in {"b", "strong", "th"},
+                    italic=italic or tag in {"em", "i"},
+                    underline=underline or tag in {"u", "ins"},
+                    skip_tags=skip_tags,
+                )
+            add_run(
+                child.tail,
+                run_bold=bold,
+                run_italic=italic,
+                run_underline=underline,
+            )
+
+    def add_paragraph(
+        element: ET.Element,
+        *,
+        style: str | None = None,
+        bold: bool = False,
+        skip_tags: frozenset[str] = frozenset(),
+    ) -> Any | None:
+        if not _html_element_text(element, skip_tags=skip_tags):
+            return None
+        paragraph = document.add_paragraph(style=style)
+        append_inline(
+            paragraph,
+            element,
+            bold=bold,
+            skip_tags=skip_tags,
+        )
+        return paragraph
+
+    def render_list(element: ET.Element, level: int = 0) -> None:
+        ordered = _html_local_name(element) == "ol"
+        base_style = "List Number" if ordered else "List Bullet"
+        preferred_style = (
+            base_style
+            if level == 0
+            else f"{base_style} {min(level + 1, 3)}"
+        )
+        style = _docx_style_name(
+            document,
+            preferred_style,
+            _docx_style_name(document, base_style),
+        )
+        for item in element:
+            if _html_local_name(item) != "li":
+                continue
+            add_paragraph(
+                item,
+                style=style,
+                skip_tags=frozenset({"ol", "ul"}),
+            )
+            for nested in item:
+                if _html_local_name(nested) in {"ol", "ul"}:
+                    render_list(nested, level + 1)
+
+    def render_table(element: ET.Element) -> None:
+        rows = [node for node in element.iter() if _html_local_name(node) == "tr"]
+        cells_by_row = [
+            [
+                cell
+                for cell in row
+                if _html_local_name(cell) in {"td", "th"}
+            ]
+            for row in rows
+        ]
+        column_count = max((len(cells) for cells in cells_by_row), default=0)
+        if not rows or not column_count:
+            return
+        table = document.add_table(rows=len(rows), cols=column_count)
+        table_style = _docx_style_name(document, "Table Grid")
+        if table_style is not None:
+            table.style = table_style
+        for row_index, cells in enumerate(cells_by_row):
+            for column_index, source_cell in enumerate(cells):
+                target_cell = table.cell(row_index, column_index)
+                target_cell.text = ""
+                paragraph = target_cell.paragraphs[0]
+                append_inline(
+                    paragraph,
+                    source_cell,
+                    bold=_html_local_name(source_cell) == "th",
+                )
+
+    def render(element: ET.Element, *, quote: bool = False) -> None:
+        tag = _html_local_name(element)
+        if re.fullmatch(r"h[1-6]", tag):
+            level = min(3, int(tag[1]))
+            heading = document.add_heading("", level=level)
+            append_inline(heading, element)
+            return
+        if tag == "p":
+            style = (
+                _docx_style_name(document, "Quote")
+                if quote
+                else None
+            )
+            add_paragraph(element, style=style)
+            return
+        if tag == "blockquote":
+            for child in element:
+                render(child, quote=True)
+            return
+        if tag in {"ol", "ul"}:
+            render_list(element)
+            return
+        if tag == "table":
+            render_table(element)
+            return
+        if tag == "pre":
+            add_paragraph(element, style=_docx_style_name(document, "No Spacing"))
+            return
+        if tag == "hr":
+            return
+        if tag in {"div", "section", "article", "document"}:
+            for child in element:
+                render(child, quote=quote)
+            return
+        add_paragraph(
+            element,
+            style=_docx_style_name(document, "Quote") if quote else None,
+        )
+
+    render(root)
+
+
 def build_docx(
     output_path: Path,
     chapter_dir: Path,
@@ -2359,23 +4247,16 @@ def build_docx(
     title.add_run(book_title)
     for item in manifest:
         source = (chapter_dir / item["filename"]).read_text(encoding="utf-8")
-        publication = strip_publication_metadata(
-            source,
-            publication_title=book_title,
-            chapter_title=str(item.get("display_title") or ""),
+        publication = (
+            strip_reviewed_publication_metadata(source)
+            if item.get("reviewed_override")
+            else strip_publication_metadata(
+                source,
+                publication_title=book_title,
+                chapter_title=str(item.get("display_title") or ""),
+            )
         )
-        for block in _markdown_blocks(publication):
-            heading = re.fullmatch(r"(#{1,4})\s+(.+)", block)
-            if heading:
-                document.add_heading(heading.group(2).strip(), level=min(3, len(heading.group(1))))
-                continue
-            cleaned = markdown_inline_to_plain_text(block)
-            if re.fullmatch(r"[一二三四五六七八九十]+", cleaned):
-                document.add_heading(cleaned, level=2)
-            elif re.match(r"^\d+[.、．]\s*\S", cleaned) and len(cleaned) <= 80:
-                document.add_heading(cleaned, level=2)
-            elif cleaned:
-                document.add_paragraph(cleaned)
+        _append_markdown_to_docx(document, publication)
     document.core_properties.title = book_title
     document.core_properties.subject = "由章节 Markdown 合并生成的文字版 Word 文档"
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2401,7 +4282,9 @@ def build_epub(
         xhtml_name = md_path.with_suffix(".xhtml").name
         source_markdown = md_path.read_text(encoding="utf-8")
         body = markdown_to_html(
-            strip_publication_metadata(
+            strip_reviewed_publication_metadata(source_markdown)
+            if item.get("reviewed_override")
+            else strip_publication_metadata(
                 source_markdown,
                 publication_title=book_title,
                 chapter_title=str(item.get("display_title") or ""),
@@ -2495,12 +4378,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "input",
         nargs="?",
-        help="Scanned PDF input. Optional for translate, epub, docx, and status.",
+        help=(
+            "Scanned PDF input. Optional for translate, epub, docx, status, "
+            "incremental verify, or verify with --no-bookmarked-pdf."
+        ),
     )
     parser.add_argument("-o", "--output-dir", default="outputs/book", help="Stable work/output directory; reruns resume automatically.")
     parser.add_argument(
         "--phase",
-        choices=["all", "ocr", "translate", "toc", "compile", "epub", "docx", "status"],
+        choices=["all", "ocr", "proofread", "translate", "toc", "compile", "epub", "docx", "verify", "status"],
         default="all",
     )
     parser.add_argument(
@@ -2510,6 +4396,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ocr-profile", default=None)
     parser.add_argument("--toc-profile", default=None)
+    parser.add_argument(
+        "--proofread-profile",
+        default=None,
+        help="Text-model Profile for the optional OCR proofreading stage.",
+    )
     parser.add_argument("--translation-profile", default=None)
     parser.add_argument("--api-mode", choices=["coding-plan", "standard"], default=os.getenv("GLM_API_MODE", "coding-plan"))
     parser.add_argument(
@@ -2544,10 +4435,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--ocr-reading-direction",
         choices=["horizontal", "vertical"],
-        default="horizontal",
+        default=None,
         help=(
             "Page reading direction used by the content-filter band fallback. "
-            "Use vertical for traditional Japanese right-to-left columns."
+            "Use vertical for traditional Japanese right-to-left columns. "
+            "Defaults to the OCR profile setting, then horizontal."
         ),
     )
     parser.add_argument("--tesseract-language", default="jpn_vert+eng")
@@ -2602,8 +4494,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--front-matter-pages", type=int, default=40)
     parser.add_argument("--toc-pages", default=None, help="Confirmed PDF TOC pages, e.g. 6-10,12.")
     parser.add_argument("--toc-json", default=None, help="Use a manually prepared TOC JSON instead of calling the LLM.")
-    parser.add_argument("--page-offset", type=int, default=None, help="PDF page minus printed page; auto-detected when omitted.")
-    parser.add_argument("--granularity", choices=["chapter", "section", "subsection", "all"], default="chapter")
+    parser.add_argument(
+        "--page-offset",
+        type=int,
+        default=None,
+        help=(
+            "PDF page minus floor(printed page / printed-pages-per-PDF-page); "
+            "auto-detected when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--printed-pages-per-pdf-page",
+        type=int,
+        default=None,
+        help=(
+            "Printed pages contained in one PDF page; auto-detects 1 or 2 from "
+            "chapter-title evidence when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--granularity",
+        choices=["chapter", "section", "subsection", "all"],
+        default=None,
+        help=(
+            "Chapter merge level. When omitted, preserve the existing output's "
+            "selection; a first compile defaults to chapter."
+        ),
+    )
+    parser.add_argument(
+        "--proofread-language",
+        default="ja",
+        help="Language tag to proofread without translation (default: ja).",
+    )
+    parser.add_argument(
+        "--proofread-concurrency",
+        type=int,
+        default=None,
+        help="Parallel OCR-proofreading workers; defaults to the selected Profile.",
+    )
+    parser.add_argument(
+        "--proofread-delay",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between proofreading request starts across workers.",
+    )
+    parser.add_argument("--proofread-max-chars", type=int, default=12000)
     parser.add_argument("--translate-non-chinese", action="store_true")
     parser.add_argument(
         "--translation-provider",
@@ -2659,6 +4594,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-docx", action="store_true")
     parser.add_argument("--no-kb", action="store_true")
     parser.add_argument("--no-bookmarked-pdf", action="store_true")
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Skip the automatic publication quality gate after compile/all.",
+    )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help=(
+            "Verification report path (default: OUTPUT/audit/release-report.json, "
+            "or chapter-report.json with --chapter-id)."
+        ),
+    )
+    parser.add_argument(
+        "--chapter-id",
+        action="append",
+        default=[],
+        help=(
+            "Limit --phase verify to one manifest chapter id or sequence; repeat the "
+            "option for multiple repaired chapters."
+        ),
+    )
+    parser.add_argument(
+        "--require-all-reviewed",
+        action="store_true",
+        help="Fail verification unless every compiled chapter has a reviewed override.",
+    )
     parser.add_argument(
         "--require-complete-ocr",
         action="store_true",
@@ -2856,6 +4818,17 @@ def build_translation_client(
     return client
 
 
+def build_proofread_client(
+    args: argparse.Namespace,
+    *,
+    glm_api_base: str,
+    profile: ModelProfile | None = None,
+) -> TextChatBackend | None:
+    """Build the proofreading text backend using the selected model Profile."""
+
+    return build_translation_client(args, glm_api_base=glm_api_base, profile=profile)
+
+
 def resolve_translation_identity(
     args: argparse.Namespace,
     *,
@@ -2940,24 +4913,148 @@ def resolve_expected_translation_identity(
     )
 
 
+def resolve_proofread_identity(
+    args: argparse.Namespace,
+    *,
+    glm_api_base: str,
+    profile: ModelProfile | None = None,
+) -> ModelIdentity:
+    """Resolve proofreading cache identity without requiring a credential."""
+
+    if profile is not None:
+        return profile.identity(
+            target_language=args.proofread_language,
+            prompt_version=PROOFREAD_PROMPT_VERSION,
+        )
+    fallback = resolve_translation_identity(
+        args,
+        glm_api_base=glm_api_base,
+        profile=None,
+    )
+    return ModelIdentity(
+        provider=fallback.provider,
+        adapter=fallback.adapter,
+        base_url=fallback.base_url,
+        model=fallback.model,
+        target_language=args.proofread_language,
+        prompt_version=PROOFREAD_PROMPT_VERSION,
+    )
+
+
+def resolve_ocr_reading_direction(
+    args: argparse.Namespace,
+    ocr_profile: ModelProfile | None = None,
+) -> str:
+    """Resolve OCR layout consistently for execution, cache identity, and status."""
+
+    return (
+        args.ocr_reading_direction
+        or (ocr_profile.reading_direction if ocr_profile is not None else "")
+        or "horizontal"
+    )
+
+
+def resolve_expected_ocr_model_prefix(
+    args: argparse.Namespace,
+    ocr_profile: ModelProfile | None = None,
+) -> str | None:
+    """Resolve the selected OCR cache identity without duplicating status logic."""
+
+    if args.required_ocr_model_prefix:
+        return args.required_ocr_model_prefix
+    if ocr_profile is not None and ocr_profile.adapter == "coding-plan-mcp":
+        direction = resolve_ocr_reading_direction(args, ocr_profile)
+        return f"coding-plan/{ocr_profile.model}-vision-mcp/{direction}-v2"
+    return None
+
+
 def output_status(
     output_dir: Path,
     *,
     expected_translation_identity: ModelIdentity | None = None,
+    expected_proofread_identity: ModelIdentity | None = None,
+    expected_ocr_model_prefix: str | None = None,
 ) -> dict[str, Any]:
     records = load_page_records(output_dir)
     toc_path = output_dir / "toc.json"
     chapters_path = output_dir / "chapters.json"
+    verification_path = output_dir / "audit" / "release-report.json"
+    verification: dict[str, Any] | None = None
+    verification_stale = False
+    if verification_path.exists():
+        try:
+            payload = json.loads(verification_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                verification = payload
+                report_mtime = verification_path.stat().st_mtime_ns
+                watched_paths = [
+                    output_dir / "toc.json",
+                    output_dir / "chapters.json",
+                    output_dir / "knowledge_base.jsonl",
+                    *output_dir.glob("*.epub"),
+                    *output_dir.glob("*.docx"),
+                    *output_dir.glob("*_带目录.pdf"),
+                    *(output_dir / "chapters").glob("*.md"),
+                    *(output_dir / "reviewed_chapters").glob("*.md"),
+                    *(output_dir / "pages").glob("page_*.json"),
+                ]
+                verification_stale = any(
+                    path.is_file() and path.stat().st_mtime_ns > report_mtime
+                    for path in watched_paths
+                )
+        except (OSError, ValueError):
+            verification = None
+    full_verification = (
+        verification
+        if verification is not None and verification.get("mode") == "full"
+        else None
+    )
     artifacts = sorted(
         path.name
         for path in output_dir.iterdir()
         if path.is_file()
         and path.suffix.lower() in {".epub", ".docx", ".pdf", ".jsonl"}
     ) if output_dir.exists() else []
+    expected_ocr_model_prefixes = parse_model_prefixes(
+        expected_ocr_model_prefix
+    )
     return {
         "output_dir": str(output_dir),
         "pages": len(records),
+        "ocr_pages_profile_fresh": (
+            sum(
+                1
+                for record in records
+                if record.ocr_model.startswith(expected_ocr_model_prefixes)
+            )
+            if expected_ocr_model_prefixes
+            else None
+        ),
         "ocr_models": dict(sorted(Counter(record.ocr_model for record in records).items())),
+        "proofread_pages_source_fresh": sum(
+            1 for record in records if record.proofread_is_fresh
+        ),
+        "proofread_pages_profile_fresh": (
+            sum(
+                1
+                for record in records
+                if record.proofread_is_fresh_for(expected_proofread_identity)
+            )
+            if expected_proofread_identity is not None
+            else None
+        ),
+        "proofread_models": dict(
+            sorted(
+                Counter(
+                    record.proofread_model
+                    for record in records
+                    if record.proofread_model
+                ).items()
+            )
+        ),
+        "effective_text_pages": sum(
+            1 for record in records if record.proofread_is_fresh
+        ),
         "translations_source_fresh": sum(
             1 for record in records if record.translation_is_fresh
         ),
@@ -2972,6 +5069,28 @@ def output_status(
         ),
         "toc_ready": toc_path.exists(),
         "chapters_ready": chapters_path.exists(),
+        "verification_ready": full_verification is not None,
+        "verification_status": (
+            full_verification.get("status")
+            if full_verification is not None
+            else None
+        ),
+        "verification_release_ready": (
+            bool(full_verification.get("release_ready"))
+            if full_verification is not None
+            else False
+        ),
+        "verification_stale": (
+            verification_stale if full_verification is not None else False
+        ),
+        "verification_summary": (
+            full_verification.get("summary")
+            if full_verification is not None
+            else None
+        ),
+        "verification_report": (
+            str(verification_path) if full_verification is not None else None
+        ),
         "artifacts": artifacts,
     }
 
@@ -2980,6 +5099,8 @@ def main(argv: list[str] | None = None) -> int:
     load_env_file(Path(__file__).with_name(".env"))
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.chapter_id and args.phase != "verify":
+        parser.error("--chapter-id is only valid with --phase verify.")
     output_dir = Path(args.output_dir).expanduser().resolve()
     if args.phase == "status" and not output_dir.exists():
         parser.error(f"Output directory does not exist: {output_dir}")
@@ -2991,8 +5112,18 @@ def main(argv: list[str] | None = None) -> int:
             profile_config = load_pipeline_profiles(args.config)
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
             parser.error(f"Invalid profile configuration: {exc}")
-    elif args.ocr_profile or args.toc_profile or args.translation_profile:
-        parser.error("--ocr-profile/--toc-profile/--translation-profile require --config.")
+    elif any(
+        (
+            args.ocr_profile,
+            args.toc_profile,
+            args.proofread_profile,
+            args.translation_profile,
+        )
+    ):
+        parser.error(
+            "--ocr-profile/--toc-profile/--proofread-profile/"
+            "--translation-profile require --config."
+        )
     try:
         ocr_profile = (
             profile_config.for_stage("ocr", args.ocr_profile)
@@ -3004,6 +5135,11 @@ def main(argv: list[str] | None = None) -> int:
             if profile_config is not None
             else None
         )
+        proofread_profile = (
+            profile_config.for_stage("proofread", args.proofread_profile)
+            if profile_config is not None
+            else None
+        )
         translation_profile = (
             profile_config.for_stage("translation", args.translation_profile)
             if profile_config is not None
@@ -3011,12 +5147,21 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
+    args.ocr_reading_direction = resolve_ocr_reading_direction(args, ocr_profile)
     if (
         toc_profile is not None
         and toc_profile.adapter not in {"openai-chat", "glm-chat"}
     ):
         parser.error(
             f"TOC profile {toc_profile.name!r} requires an OpenAI-compatible chat adapter."
+        )
+    if (
+        proofread_profile is not None
+        and proofread_profile.adapter not in {"openai-chat", "glm-chat"}
+    ):
+        parser.error(
+            f"Proofread profile {proofread_profile.name!r} requires an "
+            "OpenAI-compatible chat adapter."
         )
     if (
         translation_profile is not None
@@ -3033,7 +5178,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    pdf_required = args.phase in {"all", "ocr", "toc", "compile"}
+    pdf_required = args.phase in {"all", "ocr", "toc", "compile"} or (
+        args.phase == "verify"
+        and not args.chapter_id
+        and not args.no_bookmarked_pdf
+    )
     pdf_path: Path | None = None
     pdf_page_count = 0
     if args.input:
@@ -3059,13 +5208,21 @@ def main(argv: list[str] | None = None) -> int:
         glm_api_base=toc_api_base,
         profile=translation_profile,
     )
+    expected_proofread_identity = resolve_proofread_identity(
+        args,
+        glm_api_base=toc_api_base,
+        profile=proofread_profile,
+    )
 
     if args.phase == "status":
+        expected_ocr_prefix = resolve_expected_ocr_model_prefix(args, ocr_profile)
         print(
             json.dumps(
                 output_status(
                     output_dir,
                     expected_translation_identity=expected_translation_identity,
+                    expected_proofread_identity=expected_proofread_identity,
+                    expected_ocr_model_prefix=expected_ocr_prefix,
                 ),
                 ensure_ascii=False,
                 indent=2,
@@ -3076,6 +5233,40 @@ def main(argv: list[str] | None = None) -> int:
     book_title = args.title or (
         pdf_path.stem if pdf_path is not None else output_dir.name
     )
+    default_report_name = (
+        "chapter-report.json" if args.chapter_id else "release-report.json"
+    )
+    verification_report_path = (
+        Path(args.report).expanduser().resolve()
+        if args.report
+        else output_dir / "audit" / default_report_name
+    )
+    if args.phase == "verify":
+        report = verify_publication(
+            output_dir,
+            source_pdf=pdf_path,
+            book_title=args.title,
+            expected_language=(
+                "zh-CN"
+                if args.target_language == "简体中文"
+                else args.target_language
+            ),
+            expected_translation_fingerprint=(
+                expected_translation_identity.fingerprint
+                if args.require_translation
+                else None
+            ),
+            require_translation=args.require_translation,
+            require_epub=not args.no_epub,
+            require_docx=not args.no_docx,
+            require_knowledge_base=not args.no_kb,
+            require_bookmarked_pdf=not args.no_bookmarked_pdf,
+            require_all_reviewed=args.require_all_reviewed,
+            chapter_ids=args.chapter_id or None,
+            report_path=verification_report_path,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0 if bool(report.get("ok")) else 1
     if args.phase in {"epub", "docx"}:
         manifest_path = output_dir / "chapters.json"
         if not manifest_path.exists():
@@ -3134,10 +5325,25 @@ def main(argv: list[str] | None = None) -> int:
         and args.concurrency is None
     ):
         translation_workers = translation_profile.concurrency
-    if ocr_workers < 1 or translation_workers < 1:
-        parser.error("OCR and translation worker counts must both be positive.")
-    if args.translation_max_chars < 1:
-        parser.error("--translation-max-chars must be positive.")
+    proofread_workers = (
+        args.proofread_concurrency
+        if args.proofread_concurrency is not None
+        else (
+            args.concurrency
+            if args.concurrency is not None
+            else (
+                proofread_profile.concurrency
+                if proofread_profile is not None
+                else translation_workers
+            )
+        )
+    )
+    if ocr_workers < 1 or translation_workers < 1 or proofread_workers < 1:
+        parser.error("OCR, proofreading, and translation worker counts must be positive.")
+    if args.translation_max_chars < 1 or args.proofread_max_chars < 1:
+        parser.error("Translation and proofreading max-chars values must be positive.")
+    if args.proofread_delay < 0:
+        parser.error("--proofread-delay cannot be negative.")
     if args.api_timeout < 1 or (
         args.translation_api_timeout is not None and args.translation_api_timeout < 1
     ):
@@ -3188,6 +5394,16 @@ def main(argv: list[str] | None = None) -> int:
                         api_key=ocr_key,
                         command=ocr_command,
                         reading_direction=args.ocr_reading_direction,
+                        vision_model=(
+                            ocr_profile.model
+                            if ocr_profile is not None
+                            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
+                        ),
+                        request_timeout=(
+                            ocr_profile.timeout
+                            if ocr_profile is not None
+                            else int(os.getenv("CODING_PLAN_VISION_TIMEOUT", "120"))
+                        ),
                     )
                 elif ocr_backend_name == "glm-ocr":
                     standard_ocr_key = resolve_ocr_api_key(args, ocr_profile)
@@ -3239,6 +5455,12 @@ def main(argv: list[str] | None = None) -> int:
                     cache_model_prefix=args.ocr_cache_model_prefix,
                     request_delay=args.ocr_delay,
                 )
+            # Release the model subprocess as soon as its stage finishes so
+            # translation/compilation and the publication gate never run
+            # while an idle OCR MCP service is still alive.
+            if ocr_backend is not None:
+                ocr_backend.close()
+                ocr_backend = None
             records = normalize_cached_page_records(output_dir, records)
             records = load_page_records(output_dir)
             if args.phase == "ocr":
@@ -3246,8 +5468,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         records = load_page_records(output_dir)
         normalization_records = records
-        if args.phase == "translate":
-            # A targeted translation run must not rewrite unrelated pages.
+        if args.phase in {"proofread", "translate"}:
+            # A targeted text-model run must not rewrite unrelated pages.
             # Besides avoiding needless I/O, this prevents a translation
             # process from publishing a stale copy of a page that a concurrent
             # OCR worker has just refreshed.
@@ -3260,6 +5482,42 @@ def main(argv: list[str] | None = None) -> int:
         records = load_page_records(output_dir)
         if not records:
             raise ValueError("No page OCR records found. Run --phase ocr or import existing OCR first.")
+
+        if args.phase == "proofread":
+            proofread_client = build_proofread_client(
+                args,
+                glm_api_base=toc_api_base,
+                profile=proofread_profile,
+            )
+            if proofread_client is None:
+                raise ValueError(
+                    f"{expected_proofread_identity.provider} proofreading requires "
+                    "the credential environment variable selected by its profile."
+                )
+            proofread_identity = proofread_client.model_identity(
+                target_language=args.proofread_language,
+                prompt_version=PROOFREAD_PROMPT_VERSION,
+            )
+            proofread_records = [
+                record
+                for record in records
+                if args.start_page <= record.pdf_page <= end_page
+            ]
+            proofread_ocr_pages(
+                proofread_records,
+                output_dir,
+                ChatOCRProofreader(
+                    proofread_client,
+                    max_chars=args.proofread_max_chars,
+                ),
+                language=args.proofread_language,
+                identity=proofread_identity,
+                force=args.force,
+                concurrency=proofread_workers,
+                request_delay=args.proofread_delay,
+            )
+            print(f"[done] OCR proofreading overlays: {output_dir / 'pages'}")
+            return 0
 
         if args.translate_non_chinese and args.phase in {"all", "translate", "compile"}:
             translation_client = build_translation_client(
@@ -3327,9 +5585,15 @@ def main(argv: list[str] | None = None) -> int:
                 records,
                 page_offset=args.page_offset,
                 source_page_count=pdf_page_count,
+                printed_pages_per_pdf_page=args.printed_pages_per_pdf_page,
             )
             write_json(toc_path, toc_payload)
-            print(f"[toc] entries={len(toc_payload['entries'])} offset={toc_payload['page_offset']} path={toc_path}")
+            print(
+                f"[toc] entries={len(toc_payload['entries'])} "
+                f"offset={toc_payload['page_offset']} "
+                f"printed_pages_per_pdf_page={toc_payload['printed_pages_per_pdf_page']} "
+                f"path={toc_path}"
+            )
             if args.phase == "toc":
                 return 0
 
@@ -3351,11 +5615,15 @@ def main(argv: list[str] | None = None) -> int:
                         f"match the source PDF: missing={preview}{suffix}, "
                         f"extra={extra_pages[:20]}"
                     )
-            if args.required_ocr_model_prefix:
-                required_prefixes = tuple(
-                    prefix.strip()
-                    for prefix in args.required_ocr_model_prefix.split(",")
-                    if prefix.strip()
+            required_ocr_model_prefix = args.required_ocr_model_prefix
+            if not required_ocr_model_prefix and args.require_complete_ocr:
+                required_ocr_model_prefix = resolve_expected_ocr_model_prefix(
+                    args,
+                    ocr_profile,
+                )
+            if required_ocr_model_prefix:
+                required_prefixes = parse_model_prefixes(
+                    required_ocr_model_prefix
                 )
                 wrong_models = [
                     (record.pdf_page, record.ocr_model)
@@ -3367,24 +5635,35 @@ def main(argv: list[str] | None = None) -> int:
                     preview = wrong_models[:12]
                     suffix = "..." if len(wrong_models) > len(preview) else ""
                     raise ValueError(
-                        f"OCR model prefix {args.required_ocr_model_prefix!r} is required, "
+                        f"OCR model prefix {required_ocr_model_prefix!r} is required, "
                         f"but cached pages do not match: {preview}{suffix}"
                     )
             toc_payload = load_toc(toc_path)
-            if not isinstance(toc_payload.get("page_offset"), int) or args.page_offset is not None:
+            if (
+                not isinstance(toc_payload.get("page_offset"), int)
+                or args.page_offset is not None
+                or args.printed_pages_per_pdf_page is not None
+            ):
                 toc_payload = apply_page_mapping(
                     toc_payload,
                     records,
                     page_offset=args.page_offset,
                     source_page_count=pdf_page_count,
+                    printed_pages_per_pdf_page=args.printed_pages_per_pdf_page,
                 )
                 write_json(toc_path, toc_payload)
+            compile_granularity = resolve_compile_granularity(
+                output_dir,
+                toc_payload,
+                args.granularity,
+            )
+            print(f"[compile] granularity={compile_granularity}")
             manifest, knowledge_rows = compile_chapters(
                 pdf_path,
                 output_dir,
                 records,
                 toc_payload,
-                granularity=args.granularity,
+                granularity=compile_granularity,
                 require_translation=args.require_translation,
                 expected_translation_identity=expected_translation_identity,
             )
@@ -3411,6 +5690,42 @@ def main(argv: list[str] | None = None) -> int:
                     output_dir / f"{slugify(book_title)}_带目录.pdf",
                     toc_payload,
                 )
+            if not args.no_verify:
+                report = verify_publication(
+                    output_dir,
+                    source_pdf=pdf_path,
+                    book_title=book_title,
+                    expected_language=(
+                        "zh-CN"
+                        if args.target_language == "简体中文"
+                        else args.target_language
+                    ),
+                    expected_translation_fingerprint=(
+                        expected_translation_identity.fingerprint
+                        if args.require_translation
+                        else None
+                    ),
+                    require_translation=args.require_translation,
+                    require_epub=not args.no_epub,
+                    require_docx=not args.no_docx,
+                    require_knowledge_base=not args.no_kb,
+                    require_bookmarked_pdf=not args.no_bookmarked_pdf,
+                    require_all_reviewed=args.require_all_reviewed,
+                    report_path=verification_report_path,
+                )
+                summary = report.get("summary", {})
+                print(
+                    "[verify] "
+                    f"status={report.get('status')} "
+                    f"passed={summary.get('passed', 0)} "
+                    f"failed={summary.get('failed', 0)} "
+                    f"report={verification_report_path}"
+                )
+                if not bool(report.get("ok")):
+                    raise ValueError(
+                        "Publication quality gate failed; inspect "
+                        f"{verification_report_path}."
+                    )
             print(f"[done] chapters={len(manifest)} output={output_dir}")
         return 0
     except Exception as exc:

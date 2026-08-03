@@ -21,11 +21,13 @@ from translation_agent_api import RunRequest, status_for_request
 PHASES = {
     "一键全流程": "all",
     "① OCR 逐页识别": "ocr",
-    "② 识别目录": "toc",
-    "③ 翻译非中文页面": "translate",
-    "④ 编译章节 Markdown": "compile",
+    "② 校勘日文 OCR": "proofread",
+    "③ 识别目录": "toc",
+    "④ 翻译非中文页面": "translate",
+    "⑤ 编译章节 Markdown": "compile",
     "生成 EPUB": "epub",
     "生成 Word": "docx",
+    "发布质量验收": "verify",
     "只查看状态": "status",
 }
 PDF_REQUIRED_PHASES = {"all", "ocr", "toc", "compile"}
@@ -64,18 +66,47 @@ def render_status(status: dict) -> None:
     if not status:
         st.info("还没有可读取的检查点。")
         return
-    columns = st.columns(4)
-    columns[0].metric("OCR 页面", status.get("pages", 0))
+    columns = st.columns(6)
+    fresh_ocr = status.get("ocr_pages_profile_fresh")
+    columns[0].metric(
+        "当前模型 OCR",
+        (
+            f"{fresh_ocr}/{status.get('pages', 0)}"
+            if fresh_ocr is not None
+            else status.get("pages", 0)
+        ),
+    )
     columns[1].metric(
+        "当前模型校勘",
+        status.get("proofread_pages_profile_fresh")
+        if status.get("proofread_pages_profile_fresh") is not None
+        else "—",
+    )
+    columns[2].metric(
         "当前模型译文",
         status.get("translations_profile_fresh")
         if status.get("translations_profile_fresh") is not None
         else "—",
     )
-    columns[2].metric("目录", "已完成" if status.get("toc_ready") else "待处理")
-    columns[3].metric(
+    columns[3].metric("目录", "已完成" if status.get("toc_ready") else "待处理")
+    columns[4].metric(
         "章节 Markdown",
         "已完成" if status.get("chapters_ready") else "待处理",
+    )
+    verification_status = status.get("verification_status")
+    columns[5].metric(
+        "发布验收",
+        (
+            "需重新验收"
+            if status.get("verification_stale")
+            else "已通过"
+            if verification_status == "passed"
+            else (
+                "部分验收"
+                if verification_status == "partial"
+                else ("未通过" if verification_status == "failed" else "待处理")
+            )
+        ),
     )
     with st.expander("查看详细状态"):
         st.json(status)
@@ -88,7 +119,7 @@ def main() -> None:
         layout="wide",
     )
     st.title("📚 影印书转换台")
-    st.caption("影印 PDF → 逐页 OCR → 目录 → 章节 Markdown → EPUB / Word / 知识库")
+    st.caption("影印 PDF → 逐页 OCR → 可选校勘 → 目录 → 章节 Markdown → EPUB / Word / 知识库")
 
     default_config = (
         PROJECT_ROOT / "pipeline.toml"
@@ -109,6 +140,7 @@ def main() -> None:
 
         ocr_options = stage_profiles(profiles, "ocr")
         toc_options = stage_profiles(profiles, "toc")
+        proofread_options = stage_profiles(profiles, "proofread")
         translation_options = stage_profiles(profiles, "translation")
         if not ocr_options or not toc_options or not translation_options:
             st.error("配置中至少需要一个 OCR Profile 和一个文本模型 Profile。")
@@ -124,6 +156,15 @@ def main() -> None:
             "目录模型",
             toc_options,
             index=selected_index(toc_options, profiles.toc_profile),
+            format_func=profile_label,
+        )
+        proofread_profile = st.selectbox(
+            "OCR 校勘模型",
+            proofread_options,
+            index=selected_index(
+                proofread_options,
+                profiles.proofread_profile or profiles.translation_profile,
+            ),
             format_func=profile_label,
         )
         translation_profile = st.selectbox(
@@ -180,8 +221,11 @@ def main() -> None:
         )
         granularity = granularity_col.selectbox(
             "Markdown 粒度",
-            ["chapter", "section", "subsection", "all"],
+            [None, "chapter", "section", "subsection", "all"],
             index=0,
+            format_func=lambda value: (
+                "自动（保持已有设置）" if value is None else value
+            ),
         )
 
     with right:
@@ -192,6 +236,8 @@ def main() -> None:
             active_profiles.append(("OCR", ocr_profile))
         if phase in {"all", "toc"}:
             active_profiles.append(("目录", toc_profile))
+        if phase == "proofread":
+            active_profiles.append(("OCR 校勘", proofread_profile))
         if translate_enabled or phase == "translate":
             active_profiles.append(("翻译", translation_profile))
 
@@ -221,14 +267,25 @@ def main() -> None:
         generate_docx = artifact_cols[1].checkbox("Word", value=True)
         generate_kb = artifact_cols[0].checkbox("AI 知识库 JSONL", value=True)
         generate_pdf = artifact_cols[1].checkbox("带书签 PDF", value=True)
+        verify_publication = st.checkbox(
+            "编译后自动执行发布质量验收",
+            value=True,
+            help="无模型调用；验证全页检查点、目录覆盖、章节/引注、全部文字容器及 PDF 外观与文字层。",
+        )
 
     with st.expander("高级设置"):
-        worker_col, translation_worker_col, range_col = st.columns(3)
+        worker_col, proofread_worker_col, translation_worker_col, range_col = st.columns(4)
         ocr_workers = worker_col.number_input(
             "OCR workers",
             min_value=1,
             max_value=128,
             value=ocr_profile.concurrency,
+        )
+        proofread_workers = proofread_worker_col.number_input(
+            "校勘 workers",
+            min_value=1,
+            max_value=128,
+            value=proofread_profile.concurrency,
         )
         translation_workers = translation_worker_col.number_input(
             "翻译 workers",
@@ -249,6 +306,11 @@ def main() -> None:
             max_value=200,
             value=40,
         )
+        printed_pages_per_pdf_page = st.selectbox(
+            "每个 PDF 页包含的书内页数",
+            [None, 1, 2],
+            format_func=lambda value: "自动检测" if value is None else str(value),
+        )
         direction = st.selectbox(
             "OCR 阅读方向",
             ["horizontal", "vertical"],
@@ -256,6 +318,22 @@ def main() -> None:
         )
         force = st.checkbox("强制重跑已有检查点", value=False)
         keep_images = st.checkbox("保留逐页渲染图片", value=False)
+        require_all_reviewed = st.checkbox(
+            "要求全部章节均为人工审定稿",
+            value=False,
+            help="仅用于整本已完成审定时的严格验收。",
+        )
+        completeness_col, translation_gate_col = st.columns(2)
+        require_complete_ocr = completeness_col.checkbox(
+            "发布前要求全页 OCR 检查点",
+            value=True,
+            help="阻止局部页范围或缺页检查点被误编译为完整书籍。",
+        )
+        require_translation = translation_gate_col.checkbox(
+            "发布前要求应译页译文新鲜",
+            value=bool(translate_enabled),
+            help="翻译任务建议开启；人工审定覆盖章不会重复要求逐页译文。",
+        )
 
     start_page = None
     end_page = None
@@ -277,6 +355,7 @@ def main() -> None:
             config=config_path,
             ocr_profile=ocr_profile.name,
             toc_profile=toc_profile.name,
+            proofread_profile=proofread_profile.name,
             translation_profile=translation_profile.name,
             title=title.strip() or None,
             start_page=start_page,
@@ -285,18 +364,27 @@ def main() -> None:
             source_language=source_language,
             target_language="简体中文",
             ocr_concurrency=int(ocr_workers),
+            proofread_language=(
+                source_language if source_language != "auto" else "ja"
+            ),
+            proofread_concurrency=int(proofread_workers),
             translation_concurrency=int(translation_workers),
             granularity=granularity,
             toc_pages=toc_pages.strip() or None,
             page_offset=int(page_offset_value) if page_offset_value.strip() else None,
+            printed_pages_per_pdf_page=printed_pages_per_pdf_page,
             front_matter_pages=int(front_matter_pages),
             ocr_reading_direction=direction,
             keep_page_images=keep_images,
             force=force,
+            require_complete_ocr=require_complete_ocr,
+            require_translation=require_translation,
             generate_epub=generate_epub,
             generate_docx=generate_docx,
             generate_knowledge_base=generate_kb,
             generate_bookmarked_pdf=generate_pdf,
+            verify_publication=verify_publication,
+            require_all_reviewed=require_all_reviewed,
         )
 
     st.subheader("3. 运行")
@@ -326,7 +414,10 @@ def main() -> None:
         elif pdf_path_value.strip():
             input_pdf = Path(pdf_path_value).expanduser().resolve()
 
-        if phase in PDF_REQUIRED_PHASES and input_pdf is None:
+        if (
+            phase in PDF_REQUIRED_PHASES
+            or (phase == "verify" and generate_pdf)
+        ) and input_pdf is None:
             validation_error = f"“{phase_label}”需要选择 PDF。"
         elif input_pdf is not None and (
             not input_pdf.exists() or input_pdf.suffix.lower() != ".pdf"

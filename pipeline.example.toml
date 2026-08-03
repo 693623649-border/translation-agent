@@ -2,19 +2,20 @@
 adapter = "coding-plan-mcp"
 provider = "zhipu"
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-model = "glm-4.6v-vision-mcp"
+model = "glm-4.6v"
 credential_env = "GLM_CODING_API_KEY"
 command = ["npx", "-y", "@z_ai/mcp-server@latest"]
-timeout = 300
+timeout = 180
 concurrency = 4
 thinking = "omit"
+reading_direction = "vertical"
 
 [profiles.glm_toc]
 adapter = "openai-chat"
 provider = "zhipu"
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 model = "glm-5.2"
-credential_env = "GLM_CODING_API_KEY"
+credential_env = "GLM_TOC_API_KEY"
 timeout = 120
 concurrency = 1
 thinking = "disabled"
@@ -42,4 +43,6 @@ thinking = "disabled"
 [pipeline]
 ocr_profile = "glm_vision"
 toc_profile = "glm_toc"
-translation_profile = "deepseek_pro"
+translation_profile = "deepseek_flash"
+# Optional. When omitted, proofreading safely reuses translation_profile.
+proofread_profile = "deepseek_flash"
