@@ -13,6 +13,50 @@
 
 主入口是 `book_pipeline.py`。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的 `patch_translations.py` 和 `extract_textbook_layer.py` 是新格式检查点的人工辅助工具；一次性书籍脚本和旧监控器已移到 `archive/`，详情见 `archive/README.md`。
 
+## 本版本改动（2026-08）
+
+### 发布清洗层（book_pipeline.py + publication_verifier.py）
+
+针对输出侧三类常见问题：
+
+1. **分段混乱（跨页断词/断句）**：`should_join_page_boundary` 按字元边界
+   拼接页末"作为对"+下一页"象"为"作为对象"；译者/编者/原注结尾行拒绝
+   与下页正文拼接，页末脚注不再粘到下一页。
+2. **注释位置混乱**：脚注编号保留门改为整页级判定——表格/年表行
+   （`|`、`〇`）、编号 `0`、无标点标题行、跨行续行标记等 OCR 噪声不再
+   误报"漏译脚注"；翻译提示词显式禁止输出日文原文，并新增 kana 占比门禁
+   （译文假名 >20% 判失败），DeepSeek 只校勘不翻译的页面会被阻断。
+3. **原图页数错误出现在译文**：独立 2–3 位边页码、跨行拆分的印刷页码
+   （竖排 OCR 把"40"拆成 `4`/`0` 两行）循环清除、运行页眉+页码
+   （"导论 17"）按标题子片段匹配剥离；验证器期望文本镜像同一规则，
+   保证 EPUB/Word 与章节 Markdown 精确一致。
+
+### 章节注释重组工具（work/note_reflow.py）
+
+针对从 Word/LaTeX 导出的论文型 PDF（正文段与页脚注定义段交错导入，
+注释定义插在正文段落之间），提供上游重组：
+
+- 注释定义统一移入章末 `## 注释`（编号全书连续）；
+- 正文行内裸数字引用（"。3 "、"，4 "、"迪士尼15，"）标记化为 `〔n〕`；
+- 缺失引用按定义行前最近正文段回填，保证引用 ↔ 定义双向闭环；
+- 错位 URL 续行按内容关键词归位，定义行内混入的正文引述
+  （"第xvii页。拉马尔写道：…"）切回正文流，正文残句段与承接段拼接。
+
+### 两级验收门
+
+- **增量门**（`--phase verify --chapter-id`）：审定稿单次清洗后精确往返、
+  正文引注↔尾注定义双向闭环、唯一 H1、无乱码/占位符/模型前言/分页痕迹；
+- **全书门**（compile 自动执行）：11 项无模型检查，覆盖检查点、manifest、
+  EPUB/Word 结构、知识库稳定 ID、PDF 书签与页面外观、运行卫生。
+
+### 测试
+
+186 项单元测试覆盖发布清洗、页码处理、注释门禁、验收门与重组工具：
+
+```bash
+python -m unittest discover tests
+```
+
 ## 仓库结构
 
 ```text
@@ -29,6 +73,7 @@ translation-agent/
 ├── pdf_text_agent.py             # 兼容旧检查点的旧入口
 ├── patch_translations.py         # 新格式译文人工修补工具
 ├── extract_textbook_layer.py     # 新格式文本层提取工具
+├── work/note_reflow.py           # 章节注释重组工具（见下文）
 ├── archive/
 │   ├── karatani/                 # 硬编码单本书的一次性脚本
 │   └── legacy/monitor.py         # 仅适用旧 Windows 流程
@@ -452,6 +497,31 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 阻止发布。全书门还会逐章比对 EPUB/Word/知识库可见全文及标题签名，精确核对
 Word 表格、引文归属、粗体/斜体/下划线，并将带书签 PDF 的页面几何、文字层
 和低分辨率 RGB 外观逐页与源 PDF 比对，而不只检查数量。
+
+### 章节注释重组（work/note_reflow.py）
+
+当章节出现"注释定义散布在正文段落之间、正文被逐条打断"时（常见于从
+Word/LaTeX 导出的论文 PDF），先在审定稿层面重排，再走常规增量门+全书门：
+
+```bash
+# 1. 将问题章节放入 reviewed_chapters/（人工审定稿）
+# 2. 预览统计：定义/引用数量、闭环缺口（不写盘）
+python work/note_reflow.py --dry
+# 3. 写回审定稿：定义归入章末 ## 注释，正文引用标记化为 〔n〕
+python work/note_reflow.py
+# 4. 轻量编译更新发布章
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase compile \
+  --no-verify --no-epub --no-docx --no-kb --no-bookmarked-pdf
+# 5. 增量门验收改动章
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase verify \
+  --chapter-id intro --chapter-id ch-1 \
+  --report "outputs/my_book/audit/chapter-report.json"
+# 6. 全部通过后正常编译一次，自动跑全书门
+```
+
+工具要求 `--dry` 输出中每章"定义数 == 引用唯一数"（双向闭环）后才写盘；
+多章之间注释编号全书连续时（如 1–162 → 163–306 …），各章定义可直接沿用
+原编号，正文引用与章末定义一一对应。
 
 ## 非中文 OCR 的 DeepSeek 翻译接口
 
