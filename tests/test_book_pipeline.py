@@ -378,6 +378,51 @@ class UtilityTests(unittest.TestCase):
 
         self.assertEqual(status["ocr_pages_profile_fresh"], 2)
 
+    def test_status_distinguishes_exact_ocr_identity_from_explicit_prefix(self) -> None:
+        models = (
+            "tesseract/chi_sim/psm-3",
+            "tesseract/chi_sim/psm-30",
+            "coding-plan/glm-4.6v-vision-mcp/horizontal-v2",
+            "coding-plan/glm-4.6v-vision-mcp/horizontal-v20",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            for pdf_page, model in enumerate(models, start=1):
+                save_page_record(
+                    output,
+                    PageRecord(
+                        pdf_page=pdf_page,
+                        text="正文",
+                        ocr_model=model,
+                    ),
+                )
+
+            tesseract_exact = output_status(
+                output,
+                expected_ocr_model_exact="tesseract/chi_sim/psm-3",
+            )
+            tesseract_prefix = output_status(
+                output,
+                expected_ocr_model_prefix="tesseract/chi_sim/psm-3",
+            )
+            glm_exact = output_status(
+                output,
+                expected_ocr_model_exact=(
+                    "coding-plan/glm-4.6v-vision-mcp/horizontal-v2"
+                ),
+            )
+            glm_prefix = output_status(
+                output,
+                expected_ocr_model_prefix=(
+                    "coding-plan/glm-4.6v-vision-mcp/horizontal-v2"
+                ),
+            )
+
+        self.assertEqual(tesseract_exact["ocr_pages_profile_fresh"], 1)
+        self.assertEqual(tesseract_prefix["ocr_pages_profile_fresh"], 2)
+        self.assertEqual(glm_exact["ocr_pages_profile_fresh"], 1)
+        self.assertEqual(glm_prefix["ocr_pages_profile_fresh"], 2)
+
     def test_status_only_accepts_fresh_full_publication_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -417,6 +462,39 @@ class UtilityTests(unittest.TestCase):
             fresh = output_status(output)
             self.assertEqual(fresh["verification_status"], "passed")
             self.assertFalse(fresh["verification_stale"])
+
+    def test_status_accepts_fresh_word_publication_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            audit = output / "audit"
+            chapters = output / "chapters"
+            audit.mkdir()
+            chapters.mkdir()
+            report_path = audit / "word-release-report.json"
+            chapter_path = chapters / "001_test.md"
+            chapter_path.write_text("# 测试\n\n正文。\n", encoding="utf-8")
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "mode": "full",
+                        "publication_profile": "word",
+                        "status": "passed",
+                        "release_ready": True,
+                        "summary": {"chapter_count": 1},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.utime(chapter_path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(report_path, ns=(2_000_000_000, 2_000_000_000))
+
+            status = output_status(output)
+
+            self.assertTrue(status["verification_ready"])
+            self.assertEqual(status["verification_profile"], "word")
+            self.assertEqual(status["verification_status"], "passed")
+            self.assertTrue(status["verification_release_ready"])
+            self.assertEqual(status["verification_report"], str(report_path))
 
     def test_stage_lock_rejects_duplicate_process_for_same_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -743,6 +821,35 @@ class UtilityTests(unittest.TestCase):
             "正文。\n\n后文。\n\n42\n\n数据。\n",
         )
 
+    def test_decorated_printed_page_numbers_are_removed_without_losing_body(self) -> None:
+        source = "上一页未完\n\n27 ●\n\n●30出血的代价。\n\n© 330肃。\n\n⊙ 458闹。\n\n1968年正文。"
+        marked = annotate_printed_page_markers(source, [27, 30, 330, 458])
+        self.assertEqual(marked.count('epub:type="pagebreak"'), 4)
+        self.assertNotIn("27 ●", marked)
+        self.assertNotIn("●30", marked)
+        self.assertNotIn("© 330", marked)
+        self.assertNotIn("⊙ 458", marked)
+        self.assertIn("出血的代价。", marked)
+        self.assertIn("肃。", marked)
+        self.assertIn("闹。", marked)
+        self.assertIn("1968年正文。", marked)
+
+    def test_decorated_page_marker_allows_cross_page_sentence_join(self) -> None:
+        marked = annotate_printed_page_markers("付\n●30", [30])
+        source = f"""# 章节
+
+{marked}
+
+<span epub:type="pagebreak" id="pdf-page-42" title="42"></span>
+<!-- PDF_PAGE: 42 -->
+
+出血的代价。
+"""
+        self.assertEqual(
+            strip_publication_metadata(source),
+            "# 章节\n\n付出血的代价。\n",
+        )
+
     def test_reader_removes_numeric_header_only_at_page_boundary(self) -> None:
         source = """# 章节
 
@@ -821,6 +928,47 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(
             strip_publication_metadata(noisy, publication_title="消费／消灭之理——《魔法使之夜》与〈普遍经济〉"),
             "# 消费／消灭之理——《魔法使之夜》与〈普遍经济〉\n\n正文。\n",
+        )
+
+    def test_publication_title_inside_body_sentence_is_preserved(self) -> None:
+        source = """# 第一章 历史想象力
+
+中产阶级的孩子们
+
+老左派衰落后，中产阶级的孩子们重新拿出了革命旗帜，这句话属于正文。
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="中产阶级的孩子们：60年代与文化领导权",
+            ),
+            "# 第一章 历史想象力\n\n老左派衰落后，中产阶级的孩子们重新拿出了革命旗帜，这句话属于正文。\n",
+        )
+
+    def test_vertical_publication_running_title_is_removed(self) -> None:
+        source = """# 主要参考书目
+
+上一条书目。
+
+<span epub:type="pagebreak" id="pdf-page-487" title="487"></span>
+<!-- PDF_PAGE: 487 -->
+
+中
+产
+阶
+级
+的
+孩
+子
+们
+M.E.Sharpe, Inc., 1983.
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="中产阶级的孩子们：60年代与文化领导权",
+            ),
+            "# 主要参考书目\n\n上一条书目。\n\nM.E.Sharpe, Inc., 1983.\n",
         )
 
     def test_chapter_running_title_and_page_number_are_removed(self) -> None:
@@ -1617,6 +1765,35 @@ class MappingAndCompilationTests(unittest.TestCase):
         records[8] = PageRecord(9, "# 第二章 终点\n第二章正文")
         return records
 
+    def test_chapter_compile_removes_publication_running_title(self) -> None:
+        entries = [
+            TocEntry("chapter-1", "第一章", "历史想象力", 1, "chapter", 1, pdf_page=1),
+        ]
+        records = [
+            PageRecord(1, "中产阶级的孩子们\n\n正文第一页。"),
+            PageRecord(
+                2,
+                "中产阶级的孩子们\n\n正文提到中产阶级的孩子们参与了运动。",
+            ),
+        ]
+        output = self.root / "publication-title-chapters"
+        manifest, rows = compile_chapters(
+            self.pdf_path,
+            output,
+            records,
+            {"page_offset": 0, "entries": [entry.__dict__ for entry in entries]},
+            granularity="chapter",
+            publication_title="中产阶级的孩子们：60年代与文化领导权",
+        )
+        markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("\n中产阶级的孩子们\n", markdown)
+        self.assertIn("正文提到中产阶级的孩子们参与了运动。", markdown)
+        self.assertTrue(rows)
+        self.assertNotIn("\n中产阶级的孩子们\n", rows[0]["content"])
+        self.assertIn("正文提到中产阶级的孩子们参与了运动。", rows[0]["content"])
+
     def test_infer_page_offset(self) -> None:
         offset, evidence = infer_page_offset(self.sample_entries(), self.sample_records(), toc_end=2)
         self.assertEqual(offset, 3)
@@ -1830,6 +2007,53 @@ class MappingAndCompilationTests(unittest.TestCase):
             cache_model_prefix="coding-plan/",
         )
         self.assertEqual(records[0].ocr_model, "coding-plan/test")
+
+    def test_ocr_exact_cache_identity_rejects_similar_prefix(self) -> None:
+        class FakeOCR:
+            def __init__(self, model: str) -> None:
+                self.ocr_model = model
+                self.calls = 0
+
+            def ocr_image(self, _image_path: Path) -> tuple[str, str]:
+                self.calls += 1
+                return f"由 {self.ocr_model} 识别", "request"
+
+            def close(self) -> None:
+                return
+
+        output = self.root / "model-exact-output"
+        first = FakeOCR("tesseract/chi_sim/psm-30")
+        ocr_pdf(
+            self.pdf_path,
+            output,
+            first,
+            start_page=1,
+            end_page=1,
+            concurrency=1,
+            dpi=72,
+            max_image_side=800,
+            jpeg_quality=80,
+            keep_page_images=False,
+            force=False,
+        )
+        second = FakeOCR("tesseract/chi_sim/psm-3")
+        records = ocr_pdf(
+            self.pdf_path,
+            output,
+            second,
+            start_page=1,
+            end_page=1,
+            concurrency=1,
+            dpi=72,
+            max_image_side=800,
+            jpeg_quality=80,
+            keep_page_images=False,
+            force=False,
+            cache_model_exact="tesseract/chi_sim/psm-3",
+        )
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 1)
+        self.assertEqual(records[0].ocr_model, "tesseract/chi_sim/psm-3")
 
     def test_chapter_and_section_boundaries(self) -> None:
         payload = {
@@ -2050,6 +2274,132 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertTrue(runs["粗体"].bold)
         self.assertTrue(runs["斜体"].italic)
         self.assertFalse(bool(runs["普通文字、"].underline))
+
+    def test_docx_book_layout_has_controlled_front_matter_and_footer(self) -> None:
+        output = self.root / "docx-book-layout"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        chapters = (
+            ("001_第一章.md", "# 第一章\n\n正文。\n"),
+            ("002_第二章.md", "# 第二章\n\n后文。\n"),
+        )
+        for filename, markdown in chapters:
+            (chapter_dir / filename).write_text(markdown, encoding="utf-8")
+        manifest = [
+            {
+                "sequence": index,
+                "id": f"chapter-{index}",
+                "display_title": f"第{'一' if index == 1 else '二'}章",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+            for index, (filename, _markdown) in enumerate(chapters, start=1)
+        ]
+        path = output / "book.docx"
+        build_docx(
+            path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+            author="测试作者",
+        )
+
+        from docx import Document
+
+        document = Document(path)
+        self.assertEqual(document.paragraphs[0].style.name, "Codex Book Title")
+        self.assertEqual(document.paragraphs[0].text, "测试书")
+        self.assertEqual(document.paragraphs[1].text, "测试作者")
+        self.assertEqual(document.core_properties.author, "测试作者")
+        self.assertEqual(
+            [
+                paragraph.text
+                for paragraph in document.paragraphs
+                if paragraph.style.name == "Heading 1"
+            ],
+            ["第一章", "第二章"],
+        )
+
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        with zipfile.ZipFile(path) as archive:
+            body = ET.fromstring(archive.read("word/document.xml"))
+            styles = ET.fromstring(archive.read("word/styles.xml"))
+            footer = ET.fromstring(archive.read("word/footer1.xml"))
+        self.assertEqual(len(body.findall(".//w:br[@w:type='page']", namespace)), 1)
+        heading_style = styles.find(
+            ".//w:style[@w:styleId='Heading1']", namespace
+        )
+        self.assertIsNotNone(heading_style)
+        self.assertIsNotNone(heading_style.find(".//w:pageBreakBefore", namespace))
+        self.assertEqual(
+            [field.get(f"{{{namespace['w']}}}instr") for field in footer.findall(".//w:fldSimple", namespace)],
+            ["PAGE"],
+        )
+
+    def test_docx_book_layout_styles_backmatter_and_table_geometry(self) -> None:
+        output = self.root / "docx-book-backmatter"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        chapters = (
+            ("001_主要参考书目.md", "# 主要参考书目\n\nSmith, A., A Book, 2001.\n"),
+            ("002_索引.md", "# 索引\n\n阿伦特 12, 18\n"),
+            (
+                "003_表格.md",
+                "# 表格\n\n| 项目 | 很长的说明列 |\n| --- | --- |\n| A | 说明文字 |\n",
+            ),
+        )
+        manifest = [
+            {
+                "sequence": index,
+                "id": identity,
+                "display_title": title,
+                "filename": filename,
+                "reviewed_override": True,
+            }
+            for index, (identity, title, (filename, _markdown)) in enumerate(
+                zip(
+                    ("bibliography", "index", "chapter"),
+                    ("主要参考书目", "索引", "表格"),
+                    chapters,
+                ),
+                start=1,
+            )
+        ]
+        for filename, markdown in chapters:
+            (chapter_dir / filename).write_text(markdown, encoding="utf-8")
+        path = output / "book.docx"
+        build_docx(path, chapter_dir, manifest, book_title="测试书")
+
+        from docx import Document
+
+        document = Document(path)
+        paragraphs = {paragraph.text: paragraph.style.name for paragraph in document.paragraphs}
+        self.assertEqual(paragraphs["Smith, A., A Book, 2001."], "Bibliography Entry")
+        self.assertEqual(paragraphs["阿伦特 12, 18"], "Index Entry")
+
+        namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        attr = lambda name: f"{{{namespace['w']}}}{name}"
+        with zipfile.ZipFile(path) as archive:
+            body = ET.fromstring(archive.read("word/document.xml"))
+        table = body.find(".//w:tbl", namespace)
+        self.assertIsNotNone(table)
+        table_width = table.find("w:tblPr/w:tblW", namespace)
+        table_indent = table.find("w:tblPr/w:tblInd", namespace)
+        grid = [
+            int(column.get(attr("w")))
+            for column in table.findall("w:tblGrid/w:gridCol", namespace)
+        ]
+        self.assertEqual(table_width.get(attr("type")), "dxa")
+        self.assertEqual(table_indent.get(attr("w")), "120")
+        self.assertEqual(sum(grid), int(table_width.get(attr("w"))))
+        for row in table.findall("w:tr", namespace):
+            self.assertEqual(
+                [
+                    int(cell.find("w:tcPr/w:tcW", namespace).get(attr("w")))
+                    for cell in row.findall("w:tc", namespace)
+                ],
+                grid,
+            )
 
     def test_reviewed_override_round_trips_middle_dot_title_and_body(self) -> None:
         output = self.root / "reviewed-middle-dot"
@@ -2444,7 +2794,7 @@ class MappingAndCompilationTests(unittest.TestCase):
             self.assertNotIn(b"source-pdf", document_xml)
             self.assertNotIn(b"PDF_PAGE", document_xml)
             self.assertNotIn(b"pdf-page-", document_xml)
-            self.assertNotIn(b'w:type="page"', document_xml)
+            self.assertEqual(document_xml.count(b'<w:br w:type="page"'), 1)
 
         toc_payload = {
             "entries": [

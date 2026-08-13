@@ -1,0 +1,6 @@
+schema_version = 1
+id = "text-pdf-full-publication"
+targets = ["publication.report"]
+enable = ["core.pages.text_extract"]
+disable = ["core.pages.ocr"]
+required_plugins = []

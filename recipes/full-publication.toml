@@ -1,0 +1,6 @@
+schema_version = 1
+id = "full-publication"
+targets = ["publication.report"]
+enable = []
+disable = []
+required_plugins = []

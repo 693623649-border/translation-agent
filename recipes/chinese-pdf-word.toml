@@ -1,0 +1,10 @@
+schema_version = 1
+id = "chinese-pdf-word"
+targets = ["publication.word_report"]
+enable = []
+disable = [
+  "core.publish.knowledge_base",
+  "core.publish.epub",
+  "core.publish.reference_pdf",
+]
+required_plugins = []

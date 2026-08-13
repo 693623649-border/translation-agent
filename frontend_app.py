@@ -68,23 +68,33 @@ def render_status(status: dict) -> None:
         return
     columns = st.columns(6)
     fresh_ocr = status.get("ocr_pages_profile_fresh")
+    ocr_semantic_stale = status.get("ocr_semantic_stale") is True
     columns[0].metric(
         "当前模型 OCR",
         (
+            "设置已变更"
+            if ocr_semantic_stale
+            else
             f"{fresh_ocr}/{status.get('pages', 0)}"
             if fresh_ocr is not None
             else status.get("pages", 0)
         ),
     )
+    proofread_semantic_stale = status.get("proofread_semantic_stale") is True
     columns[1].metric(
         "当前模型校勘",
-        status.get("proofread_pages_profile_fresh")
+        "设置已变更"
+        if proofread_semantic_stale
+        else status.get("proofread_pages_profile_fresh")
         if status.get("proofread_pages_profile_fresh") is not None
         else "—",
     )
+    translation_semantic_stale = status.get("translation_semantic_stale") is True
     columns[2].metric(
         "当前模型译文",
-        status.get("translations_profile_fresh")
+        "设置已变更"
+        if translation_semantic_stale
+        else status.get("translations_profile_fresh")
         if status.get("translations_profile_fresh") is not None
         else "—",
     )
@@ -108,6 +118,20 @@ def render_status(status: dict) -> None:
             )
         ),
     )
+    stale_stages = [
+        label
+        for label, stale in (
+            ("OCR", ocr_semantic_stale),
+            ("校勘", proofread_semantic_stale),
+            ("翻译", translation_semantic_stale),
+        )
+        if stale
+    ]
+    if stale_stages:
+        st.warning(
+            "以下阶段的内容设置已变化，继续相应阶段时会按页重做："
+            + "、".join(stale_stages)
+        )
     with st.expander("查看详细状态"):
         st.json(status)
 
@@ -207,6 +231,7 @@ def main() -> None:
             help="同一目录重复运行会自动续传。",
         )
         title = st.text_input("书名（可选）", placeholder="默认使用 PDF 文件名")
+        author = st.text_input("作者（可选）", placeholder="用于 Word 扉页与文档属性")
 
         translate_enabled = st.toggle(
             "将非中文 OCR 翻译为中文",
@@ -358,6 +383,7 @@ def main() -> None:
             proofread_profile=proofread_profile.name,
             translation_profile=translation_profile.name,
             title=title.strip() or None,
+            author=author.strip() or None,
             start_page=start_page,
             end_page=end_page,
             translate_non_chinese=translate_enabled or phase == "translate",

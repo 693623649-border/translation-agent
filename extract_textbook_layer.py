@@ -230,14 +230,14 @@ def extract_page_texts(
     sort: bool = False,
     strip_leading_page_number_offset: int | None = None,
 ) -> list[str]:
-    """Pre-scan every page and reject PDFs without a complete text layer."""
+    """Pre-scan every page and reject mixed image/text or internal text gaps."""
 
     if strip_leading_page_number_offset is not None and (
         strip_leading_page_number_offset < 0
     ):
         raise ValueError("Leading page-number offset cannot be negative.")
     page_texts: list[str] = []
-    failures: list[str] = []
+    missing: list[tuple[int, str]] = []
     with fitz.open(pdf_path) as document:
         if document.page_count < 1:
             raise ValueError("Input PDF contains no pages.")
@@ -245,7 +245,8 @@ def extract_page_texts(
             text = page.get_text("text", sort=sort).strip()
             if not text:
                 content = "image-only" if page.get_images(full=True) else "empty-text"
-                failures.append(f"PDF {page_index + 1} ({content})")
+                missing.append((page_index + 1, content))
+                page_texts.append("")
                 continue
             page_texts.append(
                 _strip_expected_leading_page_number(
@@ -254,13 +255,38 @@ def extract_page_texts(
                     offset=strip_leading_page_number_offset,
                 )
             )
+    missing_pages = {page for page, _kind in missing}
+    boundary_blank_pages: set[int] = set()
+    for page in range(1, len(page_texts) + 1):
+        if (page, "empty-text") in missing:
+            boundary_blank_pages.add(page)
+        else:
+            break
+    for page in range(len(page_texts), 0, -1):
+        if (page, "empty-text") in missing:
+            boundary_blank_pages.add(page)
+        else:
+            break
+    failures = [
+        (page, kind)
+        for page, kind in missing
+        if kind == "image-only" or page not in boundary_blank_pages
+    ]
+    if missing_pages and len(missing_pages) == len(page_texts):
+        failures = list(missing)
     if failures:
-        preview = ", ".join(failures[:20])
+        preview = ", ".join(
+            f"PDF {page} ({kind})" for page, kind in failures[:20]
+        )
         suffix = "..." if len(failures) > 20 else ""
         raise ValueError(
             "The PDF does not have a complete embedded text layer; no checkpoints "
             f"were written. Missing pages: {preview}{suffix}. Use vision OCR instead."
         )
+    if missing_pages and missing_pages != boundary_blank_pages:
+        raise AssertionError("text-layer blank-page classification is inconsistent")
+    for page in boundary_blank_pages:
+        page_texts[page - 1] = "[空白页]"
     return page_texts
 
 
@@ -350,8 +376,16 @@ def extract_text_layer(
                 pdf_page=pdf_page,
                 text=text,
                 language=detect_language(text),
-                notes=notes,
-                ocr_model=TEXT_LAYER_MODEL,
+                notes=(
+                    f"{notes}; visually-confirmed-boundary-blank"
+                    if text == "[空白页]"
+                    else notes
+                ),
+                ocr_model=(
+                    f"{TEXT_LAYER_MODEL}/boundary-blank"
+                    if text == "[空白页]"
+                    else TEXT_LAYER_MODEL
+                ),
             ),
         )
         written += 1

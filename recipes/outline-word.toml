@@ -1,0 +1,11 @@
+schema_version = 1
+id = "outline-word"
+targets = ["publication.word_report"]
+enable = ["core.toc.from_outline"]
+disable = [
+  "core.toc.resolve",
+  "core.publish.knowledge_base",
+  "core.publish.epub",
+  "core.publish.reference_pdf",
+]
+required_plugins = []

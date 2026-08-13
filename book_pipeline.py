@@ -19,6 +19,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -52,6 +53,15 @@ from pipeline_runtime import (
     retry_with_backoff,
 )
 from publication_verifier import verify_publication
+from docx_footnotes import patch_docx_footnotes
+from publication_semantics import (
+    append_markdown_footnotes,
+    markdown_footnote_contract_sha256,
+    markdown_footnotes_to_docx_markers,
+    parse_markdown_footnotes,
+    reconstruct_page_footnotes,
+    semantic_audit_summary,
+)
 
 try:
     import fcntl
@@ -848,7 +858,7 @@ class McpStdioClient:
         if not command or shutil.which(command[0]) is None:
             raise RuntimeError(
                 "Coding Plan vision OCR requires Node.js 18+ and npx. "
-                "Install Node.js, then verify: npx -y @z_ai/mcp-server@latest"
+                "Install Node.js, then verify: npx -y @z_ai/mcp-server@0.1.4"
             )
         environment = os.environ.copy()
         environment["Z_AI_API_KEY"] = api_key
@@ -2397,6 +2407,7 @@ def ocr_pdf(
     keep_page_images: bool,
     force: bool,
     cache_model_prefix: str | None = None,
+    cache_model_exact: str | None = None,
     request_delay: float = 0.0,
 ) -> list[PageRecord]:
     existing = {record.pdf_page: record for record in load_page_records(output_dir)}
@@ -2408,6 +2419,10 @@ def ocr_pdf(
         if force
         or page not in existing
         or not existing[page].text.strip()
+        or (
+            cache_model_exact
+            and existing[page].ocr_model != cache_model_exact
+        )
         or (
             cache_model_prefixes
             and not existing[page].ocr_model.startswith(cache_model_prefixes)
@@ -3346,22 +3361,59 @@ def trim_before_next_title(text: str, title: str) -> str:
 
 
 def annotate_printed_page_markers(text: str, printed_pages: Iterable[int]) -> str:
-    """Turn known standalone book-page numbers into audit-only page markers."""
+    """Turn known book-page furniture into audit-only page markers.
+
+    OCR frequently retains a small ornament next to a printed page number and
+    may attach both to the first/last body fragment (``●30出血`` or
+    ``© 330肃。``).  The caller supplies the exact page numbers possible on
+    this physical PDF page, so these decorated edge forms can be removed
+    without treating years, citations, index coordinates, or numbered lists as
+    publication metadata.
+    """
 
     expected = {int(page) for page in printed_pages if int(page) >= 0}
     if not expected:
         return text
     output: list[str] = []
+    ornaments = r"●©◎○◉◯⊙•·◆◇"
+
+    def marker(printed_page: int) -> str:
+        return (
+            f'<span epub:type="pagebreak" id="printed-page-{printed_page}" '
+            f'title="{printed_page}"></span>'
+        )
+
     for line in text.splitlines():
         match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
         if match and int(match.group(1)) in expected:
-            printed_page = int(match.group(1))
-            output.append(
-                f'<span epub:type="pagebreak" id="printed-page-{printed_page}" '
-                f'title="{printed_page}"></span>'
+            output.append(marker(int(match.group(1))))
+            continue
+        decorated = re.fullmatch(
+            rf"[{ornaments}\s]*(\d{{1,3}})[{ornaments}\s]*",
+            line.strip(),
+        )
+        if decorated and int(decorated.group(1)) in expected:
+            output.append(marker(int(decorated.group(1))))
+            continue
+        prefixed = re.match(
+            rf"^\s*[{ornaments}]\s*(\d{{1,3}})\s*(.+)$",
+            line,
+        )
+        if prefixed and int(prefixed.group(1)) in expected:
+            output.extend(
+                [marker(int(prefixed.group(1))), prefixed.group(2).lstrip()]
             )
-        else:
-            output.append(line)
+            continue
+        suffixed = re.match(
+            rf"^\s*(\d{{1,3}})\s*[{ornaments}]\s*(.+)$",
+            line,
+        )
+        if suffixed and int(suffixed.group(1)) in expected:
+            output.extend(
+                [marker(int(suffixed.group(1))), suffixed.group(2).lstrip()]
+            )
+            continue
+        output.append(line)
     return "\n".join(output)
 
 
@@ -3396,6 +3448,48 @@ def _reviewed_chapter_body(markdown: str) -> str:
     return "\n".join(lines[1:]).strip()
 
 
+def build_knowledge_rows_from_manifest(
+    pdf_path: Path,
+    chapter_dir: Path,
+    manifest: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build stable reader-facing knowledge chunks from chapter Markdown.
+
+    Keeping this derivation separate from chapter assembly lets the graph
+    expose the knowledge-base publisher as an independently replaceable node.
+    The legacy compiler calls the same helper, so both execution engines keep
+    byte-for-byte compatible row IDs and content.
+    """
+
+    rows: list[dict[str, Any]] = []
+    for item in manifest:
+        markdown = (chapter_dir / str(item["filename"])).read_text(
+            encoding="utf-8"
+        )
+        reader_content = _reviewed_chapter_body(markdown)
+        row_source = "reviewed" if item.get("reviewed_override") else "compiled"
+        for chunk_index, chunk in enumerate(
+            split_text(reader_content, 4000),
+            start=1,
+        ):
+            row_id = hashlib.sha1(
+                (
+                    f"{pdf_path.name}:{item['id']}:{row_source}:"
+                    f"{chunk_index}"
+                ).encode("utf-8")
+            ).hexdigest()
+            rows.append(
+                {
+                    "id": row_id,
+                    "title": str(item["display_title"]),
+                    "chapter_id": str(item["id"]),
+                    "chapter_order": int(item["sequence"]),
+                    "content": chunk,
+                }
+            )
+    return rows
+
+
 def compile_chapters(
     pdf_path: Path,
     output_dir: Path,
@@ -3403,6 +3497,7 @@ def compile_chapters(
     toc_payload: dict[str, Any],
     *,
     granularity: str,
+    publication_title: str | None = None,
     require_translation: bool = False,
     expected_translation_identity: ModelIdentity | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -3523,14 +3618,35 @@ def compile_chapters(
             old_path.unlink()
     chapter_dir.mkdir(parents=True, exist_ok=True)
     manifest: list[dict[str, Any]] = []
-    knowledge_rows: list[dict[str, Any]] = []
+    semantic_chapters: list[dict[str, Any]] = []
 
     for sequence, entry in enumerate(selected, start=1):
         start, end, next_start, overlaps_next, next_entry = chapter_ranges[entry.id]
         filename = f"{sequence:03d}_{slugify(entry.display_title)}.md"
         reviewed_override = reviewed_overrides.get(entry.id)
+        chapter_semantic_pages: list[dict[str, Any]] = []
+        chapter_footnotes: list[Any] = []
+        chapter_semantic_issues: list[dict[str, Any]] = []
         if reviewed_override is not None:
             markdown = reviewed_override
+            reviewed_inventory = parse_markdown_footnotes(markdown)
+            for code, values in (
+                ("semantic_markdown_duplicate_definitions", reviewed_inventory.duplicate_definitions),
+                ("semantic_markdown_missing_definitions", reviewed_inventory.missing_definitions),
+                ("semantic_markdown_unused_definitions", reviewed_inventory.unused_definitions),
+                ("semantic_markdown_duplicate_references", reviewed_inventory.duplicate_references),
+            ):
+                if values:
+                    chapter_semantic_issues.append(
+                        {
+                            "code": code,
+                            "message": "人工审定章的 Markdown 脚注未形成一对一闭环。",
+                            "source_page": f"reviewed:{entry.id}",
+                            "note_label": None,
+                            "blocking": True,
+                            "evidence": {"values": list(values)},
+                        }
+                    )
         else:
             parts = [
                 f"# {entry.display_title}",
@@ -3568,7 +3684,7 @@ def compile_chapters(
                         int(next_entry.printed_page)
                         % printed_pages_per_pdf_page
                     )
-                content = join_physical_page_texts(
+                selected_physical_pages = list(
                     physical_pages[physical_start:physical_end]
                 )
                 if (
@@ -3578,7 +3694,33 @@ def compile_chapters(
                     and next_start == page
                     and next_entry is not None
                 ):
-                    content = trim_before_next_title(content, next_entry.title)
+                    selected_physical_pages = [
+                        trim_before_next_title(
+                            join_physical_page_texts(selected_physical_pages),
+                            next_entry.title,
+                        )
+                    ]
+                semantic_page_bodies: list[str] = []
+                for physical_index, physical_text in enumerate(
+                    selected_physical_pages,
+                    start=physical_start + 1,
+                ):
+                    source_page = (
+                        f"pdf-{page:04d}-physical-{physical_index:02d}"
+                    )
+                    semantic_page = reconstruct_page_footnotes(
+                        physical_text,
+                        source_page=source_page,
+                    )
+                    semantic_page_bodies.append(semantic_page.body)
+                    chapter_footnotes.extend(semantic_page.footnotes)
+                    page_audit = {
+                        "source_page": source_page,
+                        **semantic_page.to_audit_dict(),
+                    }
+                    chapter_semantic_pages.append(page_audit)
+                    chapter_semantic_issues.extend(page_audit["issues"])
+                content = join_physical_page_texts(semantic_page_bodies)
                 if page == start:
                     content = remove_duplicate_title(content, entry.title)
                 first_printed_page = (page - page_offset) * printed_pages_per_pdf_page
@@ -3606,35 +3748,16 @@ def compile_chapters(
             # Chapter Markdown is a reader-facing output just like EPUB,
             # Word, and the knowledge base. Keep PDF/page coordinates only in
             # checkpoints and chapters.json; never expose them in book text.
-            markdown = strip_publication_metadata(
+            semantic_markdown = append_markdown_footnotes(
                 "\n".join(parts).rstrip() + "\n",
+                chapter_footnotes,
+            )
+            markdown = strip_publication_metadata(
+                semantic_markdown,
+                publication_title=publication_title,
                 chapter_title=entry.display_title,
             )
         (chapter_dir / filename).write_text(markdown, encoding="utf-8")
-        # Derive RAG chunks from the final reader-facing Markdown, not from
-        # individual source pages. This makes every chapter exactly
-        # reconstructable and prevents page-boundary cleanup from diverging
-        # between Markdown and the knowledge base.
-        reader_content = _reviewed_chapter_body(markdown)
-        row_source = "reviewed" if reviewed_override is not None else "compiled"
-        for chunk_index, chunk in enumerate(
-            split_text(reader_content, 4000),
-            start=1,
-        ):
-            row_id = hashlib.sha1(
-                f"{pdf_path.name}:{entry.id}:{row_source}:{chunk_index}".encode(
-                    "utf-8"
-                )
-            ).hexdigest()
-            knowledge_rows.append(
-                {
-                    "id": row_id,
-                    "title": entry.display_title,
-                    "chapter_id": entry.id,
-                    "chapter_order": sequence,
-                    "content": chunk,
-                }
-            )
         manifest.append(
             {
                 **asdict(entry),
@@ -3646,9 +3769,58 @@ def compile_chapters(
                 "boundary_mode": "closed-overlap" if overlaps_next else "non-overlap",
                 "reviewed_override": reviewed_override is not None,
                 "granularity": granularity,
+                "semantic_footnote_count": (
+                    len(chapter_footnotes)
+                    if reviewed_override is None
+                    else len(parse_markdown_footnotes(markdown).definitions)
+                ),
+                "semantic_issue_count": len(chapter_semantic_issues),
+            }
+        )
+        semantic_chapters.append(
+            {
+                "chapter_id": entry.id,
+                "filename": filename,
+                "reviewed_override": reviewed_override is not None,
+                "footnote_count": (
+                    len(chapter_footnotes)
+                    if reviewed_override is None
+                    else len(parse_markdown_footnotes(markdown).definitions)
+                ),
+                "pages": chapter_semantic_pages,
+                "issues": chapter_semantic_issues,
+                "release_blocked": any(
+                    bool(issue.get("blocking", True))
+                    for issue in chapter_semantic_issues
+                ),
+                "markdown_sha256": hashlib.sha256(
+                    markdown.encode("utf-8")
+                ).hexdigest(),
+                "footnote_contract_sha256": markdown_footnote_contract_sha256(
+                    markdown
+                ),
             }
         )
     write_json(output_dir / "chapters.json", manifest)
+    semantic_summary = semantic_audit_summary(semantic_chapters)
+    write_json(
+        output_dir / "audit" / "semantic-reconstruction.json",
+        {
+            "schema_version": 1,
+            "status": "blocked" if semantic_summary["release_blocked"] else "passed",
+            "summary": semantic_summary,
+            "chapters": semantic_chapters,
+        },
+    )
+    # Derive RAG chunks from the final reader-facing Markdown, not from
+    # individual source pages. This makes every chapter exactly
+    # reconstructable and prevents page-boundary cleanup from diverging
+    # between Markdown and the knowledge base.
+    knowledge_rows = build_knowledge_rows_from_manifest(
+        pdf_path,
+        chapter_dir,
+        manifest,
+    )
     return manifest, knowledge_rows
 
 
@@ -3700,7 +3872,7 @@ def strip_publication_metadata(
         if not candidate:
             return False
         for normalized_title in normalized_titles:
-            if normalized_title in candidate or (
+            if candidate == normalized_title or (
                 len(candidate) >= 2
                 and candidate in normalized_title
                 and len(without_page) <= len(normalized_title) + 4
@@ -3734,6 +3906,45 @@ def strip_publication_metadata(
         while output and not output[-1].strip():
             output.pop()
 
+    def discard_vertical_running_titles(lines: list[str]) -> list[str]:
+        """Remove a running title OCR emitted as one glyph per line.
+
+        Sideways margin titles in otherwise horizontal books are sometimes
+        returned as ``中`` / ``产`` / ... rather than one title line.  Match
+        only a contiguous run of single CJK/kana glyphs against a configured
+        publication/chapter title so ordinary prose containing the same words
+        remains untouched.
+        """
+        cleaned: list[str] = []
+        index = 0
+        while index < len(lines):
+            if not re.fullmatch(r"[\u3400-\u9fff\u3040-\u30ff]", lines[index].strip()):
+                cleaned.append(lines[index])
+                index += 1
+                continue
+            end = index
+            glyphs: list[str] = []
+            while end < len(lines) and re.fullmatch(
+                r"[\u3400-\u9fff\u3040-\u30ff]",
+                lines[end].strip(),
+            ):
+                glyphs.append(lines[end].strip())
+                end += 1
+            candidate = normalize_match_text("".join(glyphs))
+            matched = any(
+                candidate == normalized_title
+                or (
+                    len(normalized_title) >= 4
+                    and normalized_title in candidate
+                    and len(candidate) <= len(normalized_title) + 2
+                )
+                for normalized_title in normalized_titles
+            )
+            if not matched:
+                cleaned.extend(lines[index:end])
+            index = end
+        return cleaned
+
     def should_join_page_boundary(previous: str, following: str) -> bool:
         """Join a sentence or word split only because the scanned page changed."""
         previous = previous.rstrip()
@@ -3764,7 +3975,12 @@ def strip_publication_metadata(
 
     pending_page_boundary = False
     skipped_leading_page_number = False
-    for line in markdown_text.splitlines():
+    # Remove a vertically emitted running title before page-boundary joining.
+    # Otherwise its first glyph can be mistaken for the continuation of the
+    # previous page (for example ``凯`` + ``中``), leaving a corrupt fragment
+    # even if the remaining title glyphs are removed later.
+    source_lines = discard_vertical_running_titles(markdown_text.splitlines())
+    for line in source_lines:
         stripped = line.strip()
         if stripped.startswith('<span epub:type="pagebreak"'):
             is_known_printed_marker = 'id="printed-page-' in stripped
@@ -3826,6 +4042,7 @@ def strip_publication_metadata(
             continue
         output.append(line.rstrip())
     discard_trailing_printed_page()
+    output = discard_vertical_running_titles(output)
 
     compact: list[str] = []
     for line in output:
@@ -3941,7 +4158,11 @@ def markdown_to_html(markdown_text: str) -> str:
         import markdown  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError("EPUB compilation requires Markdown>=3.6; install requirements.txt.") from exc
-    return markdown.markdown(markdown_text, extensions=["extra", "sane_lists"], output_format="xhtml")
+    return markdown.markdown(
+        markdown_text,
+        extensions=["extra", "sane_lists", "footnotes"],
+        output_format="xhtml",
+    )
 
 
 def _join_wrapped_lines(lines: list[str]) -> str:
@@ -4029,7 +4250,12 @@ def _docx_style_name(
     return preferred
 
 
-def _append_markdown_to_docx(document: Any, markdown_text: str) -> None:
+def _append_markdown_to_docx(
+    document: Any,
+    markdown_text: str,
+    *,
+    body_style: str | None = None,
+) -> None:
     """Render reader-facing Markdown without flattening its structure."""
 
     fragment = markdown_to_html(markdown_text)
@@ -4172,7 +4398,7 @@ def _append_markdown_to_docx(document: Any, markdown_text: str) -> None:
             style = (
                 _docx_style_name(document, "Quote")
                 if quote
-                else None
+                else body_style
             )
             add_paragraph(element, style=style)
             return
@@ -4203,49 +4429,351 @@ def _append_markdown_to_docx(document: Any, markdown_text: str) -> None:
     render(root)
 
 
+def _docx_manifest_body_style(item: dict[str, Any]) -> str | None:
+    """Return a semantic body style for back-matter prose when applicable."""
+
+    identity = " ".join(
+        str(item.get(name) or "")
+        for name in ("id", "kind", "index", "title", "display_title")
+    ).casefold()
+    if re.search(r"(?:bibliograph|references?|参考书目|参考文献|书目)", identity):
+        return "Bibliography Entry"
+    if re.search(r"(?:^|\s)index(?:\s|$)|索引", identity):
+        return "Index Entry"
+    return None
+
+
+def _set_docx_style_font(
+    style: Any,
+    *,
+    east_asia: str,
+    latin: str,
+    size: float,
+) -> None:
+    """Set all Word font slots instead of depending on theme fallbacks."""
+
+    from docx.oxml.ns import qn  # type: ignore[import-not-found]
+    from docx.shared import Pt  # type: ignore[import-not-found]
+
+    style.font.name = latin
+    style.font.size = Pt(size)
+    rpr = style._element.get_or_add_rPr()
+    fonts = rpr.get_or_add_rFonts()
+    fonts.set(qn("w:ascii"), latin)
+    fonts.set(qn("w:hAnsi"), latin)
+    fonts.set(qn("w:eastAsia"), east_asia)
+    fonts.set(qn("w:cs"), latin)
+
+
+def _configure_book_docx_styles(document: Any) -> str:
+    """Install the deterministic, monochrome style sheet used by book DOCX."""
+
+    from docx.enum.style import WD_STYLE_TYPE  # type: ignore[import-not-found]
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+    from docx.shared import Pt, RGBColor  # type: ignore[import-not-found]
+
+    normal = document.styles["Normal"]
+    _set_docx_style_font(
+        normal,
+        east_asia="Songti SC",
+        latin="Times New Roman",
+        size=11,
+    )
+    normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    normal.paragraph_format.first_line_indent = Pt(22)
+    normal.paragraph_format.line_spacing = 1.5
+    normal.paragraph_format.space_before = Pt(0)
+    normal.paragraph_format.space_after = Pt(0)
+    normal.paragraph_format.widow_control = True
+
+    title_style_name = "Codex Book Title"
+    try:
+        title = document.styles[title_style_name]
+    except KeyError:
+        title = document.styles.add_style(title_style_name, WD_STYLE_TYPE.PARAGRAPH)
+    _set_docx_style_font(
+        title,
+        east_asia="Hiragino Sans GB",
+        latin="Arial",
+        size=24,
+    )
+    title.font.bold = True
+    title.font.color.rgb = RGBColor(0, 0, 0)
+    title.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.paragraph_format.first_line_indent = Pt(0)
+    title.paragraph_format.space_before = Pt(120)
+    title.paragraph_format.space_after = Pt(24)
+
+    for name, size in (
+        ("Heading 1", 18),
+        ("Heading 2", 14),
+        ("Heading 3", 12),
+    ):
+        style = document.styles[name]
+        _set_docx_style_font(
+            style,
+            east_asia="Hiragino Sans GB",
+            latin="Arial",
+            size=size,
+        )
+        style.font.bold = True
+        style.font.color.rgb = RGBColor(0, 0, 0)
+        style.paragraph_format.first_line_indent = Pt(0)
+        style.paragraph_format.keep_with_next = True
+        style.paragraph_format.widow_control = True
+        style.paragraph_format.page_break_before = name == "Heading 1"
+        style.paragraph_format.line_spacing = 1.15
+        style.paragraph_format.space_before = Pt(0 if name == "Heading 1" else 14)
+        style.paragraph_format.space_after = Pt(8)
+
+    quote = document.styles["Quote"]
+    _set_docx_style_font(
+        quote,
+        east_asia="Songti SC",
+        latin="Times New Roman",
+        size=10.5,
+    )
+    quote.paragraph_format.left_indent = Pt(22)
+    quote.paragraph_format.right_indent = Pt(22)
+    quote.paragraph_format.first_line_indent = Pt(0)
+    quote.paragraph_format.line_spacing = 1.35
+    quote.paragraph_format.space_before = Pt(4)
+    quote.paragraph_format.space_after = Pt(4)
+
+    semantic_styles = (
+        ("Bibliography Entry", 10, 20, -20, 1.2, 2),
+        ("Index Entry", 9.5, 0, 0, 1.15, 1),
+        ("Table Text", 9.5, 0, 0, 1.1, 0),
+    )
+    for name, size, left, first, spacing, after in semantic_styles:
+        try:
+            style = document.styles[name]
+        except KeyError:
+            style = document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
+        _set_docx_style_font(
+            style,
+            east_asia="Songti SC",
+            latin="Times New Roman",
+            size=size,
+        )
+        style.paragraph_format.left_indent = Pt(left)
+        style.paragraph_format.first_line_indent = Pt(first)
+        style.paragraph_format.line_spacing = spacing
+        style.paragraph_format.space_before = Pt(0)
+        style.paragraph_format.space_after = Pt(after)
+        style.paragraph_format.widow_control = True
+
+    try:
+        footnote_text = document.styles["Footnote Text"]
+    except KeyError:
+        footnote_text = document.styles.add_style(
+            "Footnote Text", WD_STYLE_TYPE.PARAGRAPH
+        )
+    _set_docx_style_font(
+        footnote_text,
+        east_asia="Songti SC",
+        latin="Times New Roman",
+        size=9,
+    )
+    footnote_text.paragraph_format.first_line_indent = Pt(0)
+    footnote_text.paragraph_format.line_spacing = 1.0
+    footnote_text.paragraph_format.space_before = Pt(0)
+    footnote_text.paragraph_format.space_after = Pt(0)
+    footnote_text.paragraph_format.widow_control = False
+    return title_style_name
+
+
+def _configure_docx_footnote_numbering(section: Any) -> None:
+    from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+    from docx.oxml.ns import qn  # type: ignore[import-not-found]
+
+    section_properties = section._sectPr
+    footnote_properties = section_properties.find(qn("w:footnotePr"))
+    if footnote_properties is None:
+        footnote_properties = OxmlElement("w:footnotePr")
+        section_properties.insert(0, footnote_properties)
+    for child in list(footnote_properties):
+        if child.tag in {qn("w:numFmt"), qn("w:numRestart")}:
+            footnote_properties.remove(child)
+    number_format = OxmlElement("w:numFmt")
+    number_format.set(qn("w:val"), "decimal")
+    footnote_properties.append(number_format)
+    restart = OxmlElement("w:numRestart")
+    restart.set(qn("w:val"), "eachPage")
+    footnote_properties.append(restart)
+
+
+def _add_docx_page_number_footer(document: Any) -> None:
+    """Add only a centered PAGE field; the title page intentionally stays blank."""
+
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+    from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+    from docx.oxml.ns import qn  # type: ignore[import-not-found]
+    from docx.shared import Pt, RGBColor  # type: ignore[import-not-found]
+
+    section = document.sections[0]
+    section.different_first_page_header_footer = True
+    paragraph = section.footer.paragraphs[0]
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    paragraph.paragraph_format.first_line_indent = Pt(0)
+    run = paragraph.add_run()
+    run.font.name = "Times New Roman"
+    run.font.size = Pt(9)
+    run.font.color.rgb = RGBColor(96, 96, 96)
+    field = OxmlElement("w:fldSimple")
+    field.set(qn("w:instr"), "PAGE")
+    cached_run = OxmlElement("w:r")
+    cached_text = OxmlElement("w:t")
+    cached_text.text = "1"
+    cached_run.append(cached_text)
+    field.append(cached_run)
+    paragraph._p.append(field)
+
+
+def _style_docx_tables(document: Any) -> None:
+    """Apply fixed, internally consistent DXA geometry to every book table."""
+
+    import math
+
+    from docx.enum.table import (  # type: ignore[import-not-found]
+        WD_CELL_VERTICAL_ALIGNMENT,
+        WD_TABLE_ALIGNMENT,
+    )
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+    from docx.oxml import OxmlElement  # type: ignore[import-not-found]
+    from docx.oxml.ns import qn  # type: ignore[import-not-found]
+    from docx.shared import Twips  # type: ignore[import-not-found]
+
+    section = document.sections[0]
+    total_width = int(
+        section.page_width.twips
+        - section.left_margin.twips
+        - section.right_margin.twips
+    )
+
+    def ensure(parent: Any, tag: str) -> Any:
+        node = parent.find(qn(tag))
+        if node is None:
+            node = OxmlElement(tag)
+            parent.append(node)
+        return node
+
+    for table in document.tables:
+        if not table.columns:
+            continue
+        max_lengths = [
+            max(
+                (max(1, len(row.cells[index].text.strip())) for row in table.rows),
+                default=1,
+            )
+            for index in range(len(table.columns))
+        ]
+        weights = [max(1.2, math.sqrt(value)) for value in max_lengths]
+        total_weight = sum(weights)
+        widths = [int(round(total_width * weight / total_weight)) for weight in weights]
+        widths[-1] += total_width - sum(widths)
+
+        table.style = "Table Grid"
+        table.autofit = False
+        table.alignment = WD_TABLE_ALIGNMENT.LEFT
+        table_properties = table._tbl.tblPr
+        for tag, width in (("w:tblW", total_width), ("w:tblInd", 120)):
+            node = ensure(table_properties, tag)
+            node.set(qn("w:type"), "dxa")
+            node.set(qn("w:w"), str(width))
+        layout = ensure(table_properties, "w:tblLayout")
+        layout.set(qn("w:type"), "fixed")
+
+        grid = table._tbl.tblGrid
+        for child in list(grid):
+            grid.remove(child)
+        for width in widths:
+            grid_column = OxmlElement("w:gridCol")
+            grid_column.set(qn("w:w"), str(width))
+            grid.append(grid_column)
+
+        if table.rows:
+            row_properties = table.rows[0]._tr.get_or_add_trPr()
+            header = row_properties.find(qn("w:tblHeader"))
+            if header is None:
+                header = OxmlElement("w:tblHeader")
+                row_properties.append(header)
+            header.set(qn("w:val"), "true")
+
+        for index, width in enumerate(widths):
+            table.columns[index].width = Twips(width)
+        for row_index, row in enumerate(table.rows):
+            row.height = None
+            for column_index, cell in enumerate(row.cells):
+                width = widths[column_index]
+                cell.width = Twips(width)
+                cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                cell_properties = cell._tc.get_or_add_tcPr()
+                cell_width = ensure(cell_properties, "w:tcW")
+                cell_width.set(qn("w:type"), "dxa")
+                cell_width.set(qn("w:w"), str(width))
+                margins = ensure(cell_properties, "w:tcMar")
+                for side, margin_width in (
+                    ("top", 80),
+                    ("bottom", 80),
+                    ("start", 120),
+                    ("end", 120),
+                ):
+                    margin = ensure(margins, f"w:{side}")
+                    margin.set(qn("w:type"), "dxa")
+                    margin.set(qn("w:w"), str(margin_width))
+                for paragraph in cell.paragraphs:
+                    paragraph.style = document.styles["Table Text"]
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in paragraph.runs:
+                        run.bold = row_index == 0
+
+
 def build_docx(
     output_path: Path,
     chapter_dir: Path,
     manifest: list[dict[str, Any]],
     *,
     book_title: str,
+    author: str | None = None,
 ) -> None:
     try:
         from docx import Document  # type: ignore[import-not-found]
         from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
-        from docx.oxml.ns import qn  # type: ignore[import-not-found]
+        from docx.enum.text import WD_BREAK  # type: ignore[import-not-found]
         from docx.shared import Cm, Pt  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError("Word compilation requires python-docx>=1.1; install requirements.txt.") from exc
 
     document = Document()
     section = document.sections[0]
-    section.top_margin = Cm(2.4)
-    section.bottom_margin = Cm(2.4)
-    section.left_margin = Cm(2.7)
-    section.right_margin = Cm(2.7)
+    section.page_width = Cm(21)
+    section.page_height = Cm(29.7)
+    section.top_margin = Cm(2.35)
+    section.bottom_margin = Cm(2.25)
+    section.left_margin = Cm(2.55)
+    section.right_margin = Cm(2.55)
+    section.header_distance = Cm(1.2)
+    section.footer_distance = Cm(1.25)
+    title_style_name = _configure_book_docx_styles(document)
+    _configure_docx_footnote_numbering(section)
+    _add_docx_page_number_footer(document)
 
-    normal = document.styles["Normal"]
-    normal.font.name = "宋体"
-    normal._element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    normal.font.size = Pt(11)
-    normal.paragraph_format.line_spacing = 1.5
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.first_line_indent = Pt(22)
-    for name, size in (("Title", 24), ("Heading 1", 18), ("Heading 2", 15), ("Heading 3", 13)):
-        style = document.styles[name]
-        style.font.name = "黑体"
-        style._element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-        style.font.size = Pt(size)
-        style.font.bold = True
-        style.paragraph_format.first_line_indent = Pt(0)
-        style.paragraph_format.space_before = Pt(14)
-        style.paragraph_format.space_after = Pt(8)
-
-    title = document.add_paragraph(style="Title")
+    title = document.add_paragraph(style=title_style_name)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.add_run(book_title)
-    for item in manifest:
+    if author:
+        author_paragraph = document.add_paragraph(style="Normal")
+        author_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        author_paragraph.paragraph_format.first_line_indent = Pt(0)
+        author_paragraph.paragraph_format.space_before = Pt(0)
+        author_paragraph.paragraph_format.space_after = Pt(0)
+        author_paragraph.add_run(author)
+    title_break = document.add_paragraph()
+    title_break.paragraph_format.first_line_indent = Pt(0)
+    title_break.add_run().add_break(WD_BREAK.PAGE)
+    ordered_notes: list[tuple[str, str]] = []
+    for sequence, item in enumerate(manifest, start=1):
         source = (chapter_dir / item["filename"]).read_text(encoding="utf-8")
         publication = (
             strip_reviewed_publication_metadata(source)
@@ -4256,11 +4784,44 @@ def build_docx(
                 chapter_title=str(item.get("display_title") or ""),
             )
         )
-        _append_markdown_to_docx(document, publication)
+        rendered_markdown, chapter_notes = markdown_footnotes_to_docx_markers(
+            publication,
+            namespace=str(item.get("id") or f"chapter-{sequence}"),
+        )
+        ordered_notes.extend(
+            (stable_id, markdown_inline_to_plain_text(note_text))
+            for stable_id, note_text in chapter_notes
+        )
+        _append_markdown_to_docx(
+            document,
+            rendered_markdown,
+            body_style=_docx_manifest_body_style(item),
+        )
+    _style_docx_tables(document)
     document.core_properties.title = book_title
+    if author:
+        document.core_properties.author = author
     document.core_properties.subject = "由章节 Markdown 合并生成的文字版 Word 文档"
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    document.save(output_path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_path.name}.",
+        suffix=".docx",
+        dir=output_path.parent,
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        document.save(temporary_path)
+        if ordered_notes:
+            patch_docx_footnotes(
+                temporary_path,
+                output_path,
+                ordered_notes,
+            )
+        else:
+            os.replace(temporary_path, output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def build_epub(
@@ -4453,7 +5014,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ocr-api-base", default=os.getenv("GLM_OCR_API_BASE", DEFAULT_STANDARD_API_BASE))
     parser.add_argument(
         "--ocr-command",
-        default=os.getenv("CODING_PLAN_VISION_MCP_COMMAND", "npx -y @z_ai/mcp-server@latest"),
+        default=os.getenv("CODING_PLAN_VISION_MCP_COMMAND", "npx -y @z_ai/mcp-server@0.1.4"),
         help="Official Coding Plan vision MCP stdio command.",
     )
     parser.add_argument("--start-page", type=int, default=1)
@@ -4486,6 +5047,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Reuse a cached OCR page only when its ocr_model starts with one of these "
             "comma-separated prefixes; for example coding-plan/,manual/visually-confirmed-blank."
+        ),
+    )
+    parser.add_argument(
+        "--ocr-cache-model",
+        default=None,
+        help=(
+            "Reuse cached OCR only when ocr_model exactly equals this identity. "
+            "The Graph adapter sets this automatically; prefix matching remains "
+            "available for compatibility."
         ),
     )
     parser.add_argument("--force", action="store_true", help="Re-run cached OCR/translation for the requested pages.")
@@ -4590,6 +5160,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--target-language", default="简体中文")
     parser.add_argument("--title", default=None, help="EPUB/Word title; defaults to the PDF filename.")
+    parser.add_argument(
+        "--author",
+        default=None,
+        help="Optional author shown on the Word title page and stored in DOCX properties.",
+    )
     parser.add_argument("--no-epub", action="store_true")
     parser.add_argument("--no-docx", action="store_true")
     parser.add_argument("--no-kb", action="store_true")
@@ -4600,11 +5175,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the automatic publication quality gate after compile/all.",
     )
     parser.add_argument(
+        "--no-docx-render",
+        action="store_true",
+        help=(
+            "Skip LibreOffice rendering of Word only for an unvalidated "
+            "intermediate build; a full report will not be release-ready."
+        ),
+    )
+    parser.add_argument(
+        "--verification-profile",
+        choices=("full", "word"),
+        default="full",
+        help=(
+            "Verification contract: full requires every selected publication "
+            "container; word requires DOCX structure and LibreOffice rendering "
+            "while allowing EPUB, knowledge base, and reference PDF to remain "
+            "outside the release scope."
+        ),
+    )
+    parser.add_argument(
         "--report",
         default=None,
         help=(
             "Verification report path (default: OUTPUT/audit/release-report.json, "
-            "or chapter-report.json with --chapter-id)."
+            "word-release-report.json for the word profile, or "
+            "chapter-report.json with --chapter-id)."
         ),
     )
     parser.add_argument(
@@ -4921,15 +5516,10 @@ def resolve_proofread_identity(
 ) -> ModelIdentity:
     """Resolve proofreading cache identity without requiring a credential."""
 
-    if profile is not None:
-        return profile.identity(
-            target_language=args.proofread_language,
-            prompt_version=PROOFREAD_PROMPT_VERSION,
-        )
     fallback = resolve_translation_identity(
         args,
         glm_api_base=glm_api_base,
-        profile=None,
+        profile=profile,
     )
     return ModelIdentity(
         provider=fallback.provider,
@@ -4962,9 +5552,41 @@ def resolve_expected_ocr_model_prefix(
 
     if args.required_ocr_model_prefix:
         return args.required_ocr_model_prefix
+    if args.ocr_cache_model_prefix:
+        return str(args.ocr_cache_model_prefix)
     if ocr_profile is not None and ocr_profile.adapter == "coding-plan-mcp":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
         return f"coding-plan/{ocr_profile.model}-vision-mcp/{direction}-v2"
+    return None
+
+
+def resolve_expected_ocr_model_exact(
+    args: argparse.Namespace,
+    ocr_profile: ModelProfile | None = None,
+) -> str | None:
+    """Resolve the exact OCR checkpoint identity selected for execution.
+
+    Explicit prefix matching remains a compatibility escape hatch.  In that
+    mode status deliberately falls back to the prefix resolver above.
+    """
+
+    if args.ocr_cache_model:
+        return str(args.ocr_cache_model)
+    if args.ocr_cache_model_prefix:
+        return None
+    backend = ocr_profile.adapter if ocr_profile is not None else args.ocr_backend
+    if backend == "coding-plan-mcp":
+        direction = resolve_ocr_reading_direction(args, ocr_profile)
+        model = (
+            ocr_profile.model
+            if ocr_profile is not None
+            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
+        )
+        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
+    if backend == "glm-ocr":
+        return ocr_profile.model if ocr_profile is not None else args.ocr_model
+    if backend == "tesseract":
+        return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
     return None
 
 
@@ -4974,41 +5596,51 @@ def output_status(
     expected_translation_identity: ModelIdentity | None = None,
     expected_proofread_identity: ModelIdentity | None = None,
     expected_ocr_model_prefix: str | None = None,
+    expected_ocr_model_exact: str | None = None,
 ) -> dict[str, Any]:
     records = load_page_records(output_dir)
     toc_path = output_dir / "toc.json"
     chapters_path = output_dir / "chapters.json"
-    verification_path = output_dir / "audit" / "release-report.json"
+    verification_paths = (
+        output_dir / "audit" / "release-report.json",
+        output_dir / "audit" / "word-release-report.json",
+    )
+    verification_path: Path | None = None
     verification: dict[str, Any] | None = None
     verification_stale = False
-    if verification_path.exists():
+    verification_candidates: list[tuple[int, Path, dict[str, Any]]] = []
+    for candidate_path in verification_paths:
+        if not candidate_path.exists():
+            continue
         try:
-            payload = json.loads(verification_path.read_text(encoding="utf-8"))
-            if isinstance(payload, dict):
-                verification = payload
-                report_mtime = verification_path.stat().st_mtime_ns
-                watched_paths = [
-                    output_dir / "toc.json",
-                    output_dir / "chapters.json",
-                    output_dir / "knowledge_base.jsonl",
-                    *output_dir.glob("*.epub"),
-                    *output_dir.glob("*.docx"),
-                    *output_dir.glob("*_带目录.pdf"),
-                    *(output_dir / "chapters").glob("*.md"),
-                    *(output_dir / "reviewed_chapters").glob("*.md"),
-                    *(output_dir / "pages").glob("page_*.json"),
-                ]
-                verification_stale = any(
-                    path.is_file() and path.stat().st_mtime_ns > report_mtime
-                    for path in watched_paths
+            payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("mode") == "full":
+                verification_candidates.append(
+                    (candidate_path.stat().st_mtime_ns, candidate_path, payload)
                 )
         except (OSError, ValueError):
-            verification = None
-    full_verification = (
-        verification
-        if verification is not None and verification.get("mode") == "full"
-        else None
-    )
+            continue
+    if verification_candidates:
+        report_mtime, verification_path, verification = max(
+            verification_candidates,
+            key=lambda item: item[0],
+        )
+        watched_paths = [
+            output_dir / "toc.json",
+            output_dir / "chapters.json",
+            output_dir / "knowledge_base.jsonl",
+            *output_dir.glob("*.epub"),
+            *output_dir.glob("*.docx"),
+            *output_dir.glob("*_带目录.pdf"),
+            *(output_dir / "chapters").glob("*.md"),
+            *(output_dir / "reviewed_chapters").glob("*.md"),
+            *(output_dir / "pages").glob("page_*.json"),
+        ]
+        verification_stale = any(
+            path.is_file() and path.stat().st_mtime_ns > report_mtime
+            for path in watched_paths
+        )
+    full_verification = verification
     artifacts = sorted(
         path.name
         for path in output_dir.iterdir()
@@ -5025,9 +5657,13 @@ def output_status(
             sum(
                 1
                 for record in records
-                if record.ocr_model.startswith(expected_ocr_model_prefixes)
+                if (
+                    record.ocr_model == expected_ocr_model_exact
+                    if expected_ocr_model_exact is not None
+                    else record.ocr_model.startswith(expected_ocr_model_prefixes)
+                )
             )
-            if expected_ocr_model_prefixes
+            if expected_ocr_model_exact is not None or expected_ocr_model_prefixes
             else None
         ),
         "ocr_models": dict(sorted(Counter(record.ocr_model for record in records).items())),
@@ -5075,6 +5711,11 @@ def output_status(
             if full_verification is not None
             else None
         ),
+        "verification_profile": (
+            full_verification.get("publication_profile", "full")
+            if full_verification is not None
+            else None
+        ),
         "verification_release_ready": (
             bool(full_verification.get("release_ready"))
             if full_verification is not None
@@ -5089,16 +5730,51 @@ def output_status(
             else None
         ),
         "verification_report": (
-            str(verification_path) if full_verification is not None else None
+            str(verification_path)
+            if full_verification is not None and verification_path is not None
+            else None
         ),
         "artifacts": artifacts,
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def _shared_output_directory_locked(operation: Any) -> Any:
+    """Serialize legacy and Graph entry points on the same output directory."""
+
+    @functools.wraps(operation)
+    def wrapped(argv: list[str] | None = None) -> int:
+        effective_argv = list(sys.argv[1:] if argv is None else argv)
+        load_env_file(Path(__file__).with_name(".env"))
+        lock_args = build_parser().parse_args(effective_argv)
+        output_dir = Path(lock_args.output_dir).expanduser().resolve()
+        # Preserve the established read-only failure semantics for a missing
+        # status directory instead of creating it merely to acquire a lock.
+        if lock_args.phase == "status" and not output_dir.exists():
+            return operation(effective_argv)
+        from pipeline_graph.core import OutputDirectoryLock
+
+        with OutputDirectoryLock(
+            output_dir / ".pipeline_graph" / "output.lock"
+        ):
+            return operation(effective_argv)
+
+    return wrapped
+
+
+def _main_unlocked(argv: list[str] | None = None) -> int:
+    """Run the pipeline without taking the shared output lock.
+
+    This is an internal integration seam for ``pipeline_graph``.  Public
+    callers must use :func:`main`, which owns the output-directory lock.
+    """
+
     load_env_file(Path(__file__).with_name(".env"))
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.ocr_cache_model and args.ocr_cache_model_prefix:
+        parser.error(
+            "--ocr-cache-model and --ocr-cache-model-prefix are mutually exclusive."
+        )
     if args.chapter_id and args.phase != "verify":
         parser.error("--chapter-id is only valid with --phase verify.")
     output_dir = Path(args.output_dir).expanduser().resolve()
@@ -5216,6 +5892,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.phase == "status":
         expected_ocr_prefix = resolve_expected_ocr_model_prefix(args, ocr_profile)
+        expected_ocr_exact = resolve_expected_ocr_model_exact(args, ocr_profile)
         print(
             json.dumps(
                 output_status(
@@ -5223,6 +5900,7 @@ def main(argv: list[str] | None = None) -> int:
                     expected_translation_identity=expected_translation_identity,
                     expected_proofread_identity=expected_proofread_identity,
                     expected_ocr_model_prefix=expected_ocr_prefix,
+                    expected_ocr_model_exact=expected_ocr_exact,
                 ),
                 ensure_ascii=False,
                 indent=2,
@@ -5234,7 +5912,13 @@ def main(argv: list[str] | None = None) -> int:
         pdf_path.stem if pdf_path is not None else output_dir.name
     )
     default_report_name = (
-        "chapter-report.json" if args.chapter_id else "release-report.json"
+        "chapter-report.json"
+        if args.chapter_id
+        else (
+            "word-release-report.json"
+            if args.verification_profile == "word"
+            else "release-report.json"
+        )
     )
     verification_report_path = (
         Path(args.report).expanduser().resolve()
@@ -5259,9 +5943,13 @@ def main(argv: list[str] | None = None) -> int:
             require_translation=args.require_translation,
             require_epub=not args.no_epub,
             require_docx=not args.no_docx,
+            require_docx_render=(
+                not args.no_docx and not args.no_docx_render
+            ),
             require_knowledge_base=not args.no_kb,
             require_bookmarked_pdf=not args.no_bookmarked_pdf,
             require_all_reviewed=args.require_all_reviewed,
+            publication_profile=args.verification_profile,
             chapter_ids=args.chapter_id or None,
             report_path=verification_report_path,
         )
@@ -5290,6 +5978,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir / "chapters",
                 manifest,
                 book_title=book_title,
+                author=args.author,
             )
         return 0
 
@@ -5453,6 +6142,7 @@ def main(argv: list[str] | None = None) -> int:
                     keep_page_images=args.keep_page_images,
                     force=args.force,
                     cache_model_prefix=args.ocr_cache_model_prefix,
+                    cache_model_exact=args.ocr_cache_model,
                     request_delay=args.ocr_delay,
                 )
             # Release the model subprocess as soon as its stage finishes so
@@ -5664,6 +6354,7 @@ def main(argv: list[str] | None = None) -> int:
                 records,
                 toc_payload,
                 granularity=compile_granularity,
+                publication_title=book_title,
                 require_translation=args.require_translation,
                 expected_translation_identity=expected_translation_identity,
             )
@@ -5683,6 +6374,7 @@ def main(argv: list[str] | None = None) -> int:
                     output_dir / "chapters",
                     manifest,
                     book_title=book_title,
+                    author=args.author,
                 )
             if not args.no_bookmarked_pdf:
                 build_bookmarked_pdf(
@@ -5708,9 +6400,13 @@ def main(argv: list[str] | None = None) -> int:
                     require_translation=args.require_translation,
                     require_epub=not args.no_epub,
                     require_docx=not args.no_docx,
+                    require_docx_render=(
+                        not args.no_docx and not args.no_docx_render
+                    ),
                     require_knowledge_base=not args.no_kb,
                     require_bookmarked_pdf=not args.no_bookmarked_pdf,
                     require_all_reviewed=args.require_all_reviewed,
+                    publication_profile=args.verification_profile,
                     report_path=verification_report_path,
                 )
                 summary = report.get("summary", {})
@@ -5734,6 +6430,13 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if ocr_backend is not None:
             ocr_backend.close()
+
+
+@_shared_output_directory_locked
+def main(argv: list[str] | None = None) -> int:
+    """Run the legacy-compatible CLI under the shared output lock."""
+
+    return _main_unlocked(argv)
 
 
 if __name__ == "__main__":

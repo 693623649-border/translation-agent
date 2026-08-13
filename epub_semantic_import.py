@@ -1,0 +1,914 @@
+"""Import born-digital EPUB books into the publication semantic layer.
+
+The PDF pipeline reconstructs continuous chapters from page checkpoints.  An
+EPUB already has a reading order, so this importer uses the package spine as
+the source boundary and emits the same ``chapters.json`` + chapter Markdown
+contract consumed by the existing EPUB/DOCX publishers.
+
+No model is called here.  Translation is exchanged as hash-bound JSONL units:
+``import`` writes ``semantic/translation-units.jsonl`` and
+``apply-translations`` accepts the same records with ``translated_markdown``.
+This keeps source extraction deterministic and lets any translation provider
+operate outside the structural reconstruction step.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import html
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import tempfile
+from typing import Any, Iterable, Iterator, Mapping
+from urllib.parse import unquote, urljoin, urlsplit
+import zipfile
+
+from lxml import etree
+
+from publication_semantics import (
+    markdown_footnote_contract_sha256,
+    parse_markdown_footnotes,
+    semantic_audit_summary,
+)
+
+
+EPUB_NS = "http://www.idpf.org/2007/ops"
+CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
+OPF_NS = "http://www.idpf.org/2007/opf"
+DC_NS = "http://purl.org/dc/elements/1.1/"
+SCHEMA_VERSION = 1
+IMPORTER_VERSION = "epub-semantic-v1"
+
+
+class EpubSemanticError(ValueError):
+    """Raised when an EPUB cannot prove a safe semantic reconstruction."""
+
+
+@dataclass(frozen=True)
+class EpubMetadata:
+    title: str
+    author: str
+    language: str
+    identifier: str
+
+
+@dataclass(frozen=True)
+class _SpineDocument:
+    item_id: str
+    href: str
+    media_type: str
+    properties: frozenset[str]
+    root: etree._Element
+    raw_sha256: str
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _atomic_write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, value: Any) -> None:
+    _atomic_write_text(
+        path,
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
+    )
+
+
+def _safe_member(value: str) -> str:
+    decoded = unquote(value).replace("\\", "/")
+    path = PurePosixPath(decoded)
+    if path.is_absolute() or not decoded or any(part in {"", ".", ".."} for part in path.parts):
+        raise EpubSemanticError(f"unsafe EPUB member path: {value!r}")
+    return path.as_posix()
+
+
+def _resolve_member(base_member: str, href: str) -> str:
+    parsed = urlsplit(href)
+    if parsed.scheme or parsed.netloc:
+        raise EpubSemanticError(f"external EPUB package href is unsupported: {href!r}")
+    joined = urljoin(PurePosixPath(base_member).parent.as_posix() + "/", parsed.path)
+    return _safe_member(joined)
+
+
+def _read_member(archive: zipfile.ZipFile, member: str) -> bytes:
+    safe = _safe_member(member)
+    try:
+        info = archive.getinfo(safe)
+    except KeyError as exc:
+        raise EpubSemanticError(f"EPUB member is missing: {safe}") from exc
+    if info.file_size > 64 * 1024 * 1024:
+        raise EpubSemanticError(f"EPUB member is unexpectedly large: {safe}")
+    return archive.read(info)
+
+
+def _parse_xml(raw: bytes, *, member: str) -> etree._Element:
+    parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=True)
+    try:
+        root = etree.fromstring(raw, parser=parser)
+    except etree.XMLSyntaxError as exc:
+        raise EpubSemanticError(f"invalid XML/XHTML in {member}: {exc}") from exc
+    if root is None:
+        raise EpubSemanticError(f"empty XML/XHTML document: {member}")
+    return root
+
+
+def _local_name(element: etree._Element) -> str:
+    if not isinstance(element.tag, str):
+        return ""
+    return etree.QName(element).localname.lower()
+
+
+def _text_value(element: etree._Element | None) -> str:
+    if element is None:
+        return ""
+    return " ".join("".join(element.itertext()).split())
+
+
+def _epub_type(element: etree._Element) -> set[str]:
+    value = (
+        element.get(f"{{{EPUB_NS}}}type")
+        or element.get("epub:type")
+        or element.get("role")
+        or ""
+    )
+    return {item.strip().lower() for item in value.split() if item.strip()}
+
+
+def _package_documents(
+    source: Path,
+) -> tuple[
+    EpubMetadata,
+    list[_SpineDocument],
+    dict[str, etree._Element],
+    dict[str, str],
+    str,
+]:
+    if not source.is_file() or source.suffix.lower() != ".epub":
+        raise EpubSemanticError(f"input must be an existing EPUB: {source}")
+    if not zipfile.is_zipfile(source):
+        raise EpubSemanticError(f"input is not a valid EPUB ZIP: {source}")
+    with zipfile.ZipFile(source) as archive:
+        encrypted = "META-INF/encryption.xml" in archive.namelist()
+        if encrypted:
+            encryption = _read_member(archive, "META-INF/encryption.xml")
+            if b"EncryptedData" in encryption:
+                raise EpubSemanticError("encrypted/DRM EPUB content is unsupported")
+        container = _parse_xml(
+            _read_member(archive, "META-INF/container.xml"),
+            member="META-INF/container.xml",
+        )
+        rootfiles = container.xpath(
+            "//*[local-name()='rootfile']/@full-path",
+            namespaces={"c": CONTAINER_NS},
+        )
+        if len(rootfiles) != 1:
+            raise EpubSemanticError("EPUB must declare exactly one package rootfile")
+        opf_member = _safe_member(str(rootfiles[0]))
+        package = _parse_xml(_read_member(archive, opf_member), member=opf_member)
+
+        def metadata_value(local: str) -> str:
+            values = package.xpath(
+                f"//*[local-name()='metadata']/*[local-name()='{local}']"
+            )
+            return _text_value(values[0]) if values else ""
+
+        metadata = EpubMetadata(
+            title=metadata_value("title") or source.stem,
+            author=metadata_value("creator"),
+            language=metadata_value("language") or "und",
+            identifier=metadata_value("identifier"),
+        )
+        manifest: dict[str, dict[str, str]] = {}
+        for item in package.xpath("//*[local-name()='manifest']/*[local-name()='item']"):
+            item_id = str(item.get("id") or "").strip()
+            href = str(item.get("href") or "").strip()
+            if not item_id or not href or item_id in manifest:
+                raise EpubSemanticError("EPUB manifest contains missing or duplicate ids/hrefs")
+            manifest[item_id] = {
+                "href": _resolve_member(opf_member, href),
+                "media_type": str(item.get("media-type") or ""),
+                "properties": str(item.get("properties") or ""),
+            }
+        spine_refs = [
+            str(item.get("idref") or "").strip()
+            for item in package.xpath("//*[local-name()='spine']/*[local-name()='itemref']")
+            if str(item.get("linear") or "yes").lower() != "no"
+        ]
+        if not spine_refs:
+            raise EpubSemanticError("EPUB spine is empty")
+
+        documents: list[_SpineDocument] = []
+        all_roots: dict[str, etree._Element] = {}
+        for item_id, item in manifest.items():
+            if item["media_type"] not in {"application/xhtml+xml", "text/html"}:
+                continue
+            raw = _read_member(archive, item["href"])
+            all_roots[item["href"]] = _parse_xml(raw, member=item["href"])
+        title_hints: dict[str, str] = {}
+        spine_nodes = package.xpath("//*[local-name()='spine']")
+        ncx_id = str(spine_nodes[0].get("toc") or "") if spine_nodes else ""
+        if ncx_id and ncx_id in manifest:
+            ncx_item = manifest[ncx_id]
+            ncx_root = _parse_xml(
+                _read_member(archive, ncx_item["href"]),
+                member=ncx_item["href"],
+            )
+            for point in ncx_root.xpath("//*[local-name()='navPoint']"):
+                content = point.xpath("./*[local-name()='content']/@src")
+                labels = point.xpath(
+                    "./*[local-name()='navLabel']/*[local-name()='text']"
+                )
+                if content and labels:
+                    href = _resolve_member(ncx_item["href"], str(content[0]))
+                    label = _text_value(labels[0])
+                    if label:
+                        title_hints.setdefault(href, label)
+        for item_id, item in manifest.items():
+            if "nav" not in item["properties"].split() or item["href"] not in all_roots:
+                continue
+            for anchor in all_roots[item["href"]].xpath(
+                "//*[local-name()='nav']//*[local-name()='a'][@href]"
+            ):
+                href = _resolve_member(item["href"], str(anchor.get("href")))
+                label = _text_value(anchor)
+                if label:
+                    title_hints.setdefault(href, label)
+        for item_id in spine_refs:
+            if item_id not in manifest:
+                raise EpubSemanticError(f"spine references missing manifest id: {item_id}")
+            item = manifest[item_id]
+            if item["href"] not in all_roots:
+                raise EpubSemanticError(
+                    f"spine item is not XHTML/HTML: {item['href']} ({item['media_type']})"
+                )
+            raw = _read_member(archive, item["href"])
+            documents.append(
+                _SpineDocument(
+                    item_id=item_id,
+                    href=item["href"],
+                    media_type=item["media_type"],
+                    properties=frozenset(item["properties"].split()),
+                    root=all_roots[item["href"]],
+                    raw_sha256=_sha256_bytes(raw),
+                )
+            )
+    return metadata, documents, all_roots, title_hints, opf_member
+
+
+def _element_id(element: etree._Element) -> str:
+    return str(element.get("id") or element.get("{http://www.w3.org/XML/1998/namespace}id") or "")
+
+
+def _is_note(element: etree._Element) -> bool:
+    kinds = _epub_type(element)
+    return bool({"footnote", "endnote", "doc-footnote", "doc-endnote"} & kinds)
+
+
+def _is_noteref(element: etree._Element) -> bool:
+    kinds = _epub_type(element)
+    return bool({"noteref", "doc-noteref"} & kinds)
+
+
+def _escape_markdown(value: str) -> str:
+    return re.sub(r"([\\`*_[\]])", r"\\\1", value)
+
+
+class _XhtmlRenderer:
+    def __init__(self, documents: Mapping[str, etree._Element]):
+        self.documents = documents
+        self.note_roots: set[etree._Element] = set()
+        self.targets: dict[tuple[str, str], etree._Element] = {}
+        for href, root in documents.items():
+            for element in root.iter():
+                fragment = _element_id(element)
+                if fragment:
+                    self.targets[(href, fragment)] = element
+                if _is_note(element):
+                    self.note_roots.add(element)
+        self.reference_counts: dict[tuple[str, str], int] = {}
+        self.definitions: list[tuple[str, str]] = []
+        self.issues: list[dict[str, Any]] = []
+        self.pending_issues: dict[str, list[dict[str, Any]]] = {}
+        self.note_continuations: dict[etree._Element, list[etree._Element]] = {}
+        self.element_hrefs: dict[etree._Element, str] = {}
+        self.render_metrics: dict[str, dict[str, int]] = {}
+        for href, root in documents.items():
+            for parent in root.iter():
+                last_identified_note: etree._Element | None = None
+                for child in parent:
+                    if not _is_note(child):
+                        last_identified_note = None
+                        continue
+                    if _element_id(child):
+                        last_identified_note = child
+                    elif last_identified_note is not None:
+                        self.note_continuations.setdefault(last_identified_note, []).append(child)
+                    else:
+                        self.pending_issues.setdefault(href, []).append(
+                            {
+                                "code": "epub_orphan_note_continuation",
+                                "message": "匿名 EPUB 脚注续段之前没有带 ID 的脚注定义。",
+                                "source_page": href,
+                                "note_label": None,
+                                "blocking": True,
+                                "evidence": {
+                                    "preview": _text_value(child)[:200],
+                                },
+                            }
+                        )
+            for element in root.iter():
+                self.element_hrefs[element] = href
+
+    def _note_reference(self, element: etree._Element, current_href: str) -> str:
+        href = str(element.get("href") or "")
+        parsed = urlsplit(href)
+        fragment = unquote(parsed.fragment)
+        try:
+            target_href = _resolve_member(current_href, parsed.path) if parsed.path else current_href
+        except EpubSemanticError:
+            target_href = ""
+        target = self.targets.get((target_href, fragment)) if fragment else None
+        if target is None:
+            self.issues.append(
+                {
+                    "code": "epub_footnote_target_missing",
+                    "message": "EPUB 脚注引用无法解析到定义。",
+                    "source_page": current_href,
+                    "note_label": fragment or None,
+                    "blocking": True,
+                    "evidence": {"href": href},
+                }
+            )
+            return self._inline_children(element, current_href)
+        key = (target_href, fragment)
+        occurrence = self.reference_counts.get(key, 0) + 1
+        self.reference_counts[key] = occurrence
+        digest = hashlib.sha256(f"{target_href}#{fragment}".encode("utf-8")).hexdigest()[:12]
+        note_id = f"epub-{digest}-r{occurrence}"
+        note_text = self._note_text(target, target_href)
+        continuation_texts = [
+            self._note_text(continuation, target_href)
+            for continuation in self.note_continuations.get(target, [])
+        ]
+        note_text = "\n\n".join(
+            value for value in [note_text, *continuation_texts] if value
+        )
+        if not note_text:
+            self.issues.append(
+                {
+                    "code": "epub_footnote_definition_empty",
+                    "message": "EPUB 脚注定义为空。",
+                    "source_page": target_href,
+                    "note_label": fragment,
+                    "blocking": True,
+                    "evidence": {"href": href},
+                }
+            )
+            return self._inline_children(element, current_href)
+        self.definitions.append((note_id, note_text))
+        return f"[^{note_id}]"
+
+    def _note_text(self, element: etree._Element, current_href: str) -> str:
+        pieces: list[str] = []
+        if element.text:
+            pieces.append(element.text)
+        for child in element:
+            if _local_name(child) == "a" and (
+                "backlink" in _epub_type(child)
+                or str(child.get("href") or "").startswith("#")
+                and _text_value(child) in {"↩", "↑", "back", "Back"}
+            ):
+                if child.tail:
+                    pieces.append(child.tail)
+                continue
+            pieces.append(self._inline(child, current_href))
+            if child.tail:
+                pieces.append(child.tail)
+        return " ".join("".join(pieces).split()).strip()
+
+    def _inline_children(self, element: etree._Element, current_href: str) -> str:
+        pieces = [element.text or ""]
+        for child in element:
+            pieces.append(self._inline(child, current_href))
+            pieces.append(child.tail or "")
+        return "".join(pieces)
+
+    def _inline(self, element: etree._Element, current_href: str) -> str:
+        tag = _local_name(element)
+        if tag in {"script", "style"}:
+            return ""
+        if tag == "a" and _is_noteref(element):
+            return self._note_reference(element, current_href)
+        inner = self._inline_children(element, current_href)
+        if tag in {"em", "i"} and inner.strip():
+            return f"*{inner.strip()}*"
+        if tag in {"strong", "b"} and inner.strip():
+            return f"**{inner.strip()}**"
+        if tag == "code" and inner.strip():
+            return f"`{inner.strip()}`"
+        if tag == "br":
+            return "  \n"
+        if tag == "img":
+            alt = _escape_markdown(str(element.get("alt") or ""))
+            src = str(element.get("src") or "")
+            return f"![{alt}]({src})" if src else ""
+        if tag == "a":
+            href = str(element.get("href") or "")
+            label = inner.strip()
+            parsed = urlsplit(href)
+            # Printed-page/index locators are reader labels, not semantic
+            # cross-document links.  Keeping their href would leak source EPUB
+            # coordinates into a newly published book.
+            if (
+                parsed.fragment.lower().startswith("page_")
+                or re.fullmatch(r"[ivxlcdm]+|\d+(?:[-–]\d+)?", label, re.I)
+                and parsed.path
+            ):
+                return label
+            return f"[{label}]({href})" if href and label else label
+        if tag == "sup" and inner.strip():
+            return f"<sup>{html.escape(inner.strip())}</sup>"
+        if tag == "sub" and inner.strip():
+            return f"<sub>{html.escape(inner.strip())}</sub>"
+        return inner
+
+    def _blocks(self, element: etree._Element, current_href: str) -> Iterator[str]:
+        if element in self.note_roots:
+            return
+        tag = _local_name(element)
+        if tag in {"script", "style", "head"}:
+            return
+        if tag in {f"h{level}" for level in range(1, 7)}:
+            level = int(tag[1])
+            value = " ".join(self._inline_children(element, current_href).split())
+            if value:
+                yield f"{'#' * level} {value}"
+            return
+        if tag in {"p", "dt", "dd", "figcaption"}:
+            value = self._inline_children(element, current_href).strip()
+            if value:
+                yield value
+            return
+        if tag == "blockquote":
+            nested = list(self._child_blocks(element, current_href))
+            if nested:
+                yield "\n> \n".join("> " + line.replace("\n", "\n> ") for line in nested)
+            return
+        if tag in {"ul", "ol"}:
+            ordered = tag == "ol"
+            items = [child for child in element if _local_name(child) == "li"]
+            for index, item in enumerate(items, start=1):
+                if item in self.note_roots:
+                    continue
+                value = " ".join(self._inline_children(item, current_href).split())
+                if value:
+                    yield f"{index}. {value}" if ordered else f"- {value}"
+            return
+        if tag == "table":
+            rows: list[list[str]] = []
+            for row in element.xpath(".//*[local-name()='tr']"):
+                cells = [
+                    " ".join(self._inline_children(cell, current_href).split())
+                    for cell in row
+                    if _local_name(cell) in {"th", "td"}
+                ]
+                if cells:
+                    rows.append(cells)
+            if rows:
+                width = max(len(row) for row in rows)
+                padded = [row + [""] * (width - len(row)) for row in rows]
+                yield "| " + " | ".join(padded[0]) + " |"
+                yield "| " + " | ".join(["---"] * width) + " |"
+                for row in padded[1:]:
+                    yield "| " + " | ".join(row) + " |"
+            return
+        if tag == "img":
+            value = self._inline(element, current_href)
+            if value:
+                yield value
+            return
+        if tag == "pre":
+            value = "".join(element.itertext()).rstrip()
+            if value:
+                yield f"```\n{value}\n```"
+            return
+        if tag == "hr":
+            yield "---"
+            return
+        yield from self._child_blocks(element, current_href)
+
+    def _child_blocks(self, element: etree._Element, current_href: str) -> Iterator[str]:
+        if element.text and element.text.strip() and _local_name(element) in {"body", "div", "section", "article", "main"}:
+            yield " ".join(element.text.split())
+        for child in element:
+            yield from self._blocks(child, current_href)
+            if child.tail and child.tail.strip():
+                yield " ".join(child.tail.split())
+
+    def render(self, document: _SpineDocument) -> tuple[str, list[tuple[str, str]], list[dict[str, Any]]]:
+        before_definitions = len(self.definitions)
+        before_issues = len(self.issues)
+        self.issues.extend(self.pending_issues.get(document.href, []))
+        body_nodes = document.root.xpath("//*[local-name()='body']")
+        root = body_nodes[0] if body_nodes else document.root
+        blocks = [block.strip() for block in self._blocks(root, document.href) if block.strip()]
+        definitions = self.definitions[before_definitions:]
+        issues = self.issues[before_issues:]
+        self.render_metrics[document.href] = {
+            "continuation_merged_count": sum(
+                len(continuations)
+                for note, continuations in self.note_continuations.items()
+                if self.element_hrefs.get(note) == document.href
+            )
+        }
+        return "\n\n".join(blocks).strip(), definitions, issues
+
+
+def _heading_title(markdown: str, fallback: str) -> str:
+    for line in markdown.splitlines():
+        match = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
+        if match:
+            return re.sub(r"[*_`]+", "", match.group(1)).strip() or fallback
+    return fallback
+
+
+def _document_title(markdown: str, *, navigation: str, fallback: str) -> str:
+    for line in markdown.splitlines():
+        match = re.match(r"^#\s+(.+?)\s*$", line)
+        if match:
+            return re.sub(r"[*_`]+", "", match.group(1)).strip() or fallback
+    if navigation.strip():
+        return navigation.strip()
+    heading = _heading_title(markdown, "")
+    if heading:
+        return heading
+    first_block = next(
+        (" ".join(block.split()) for block in re.split(r"\n{2,}", markdown) if block.strip()),
+        "",
+    )
+    if first_block and len(first_block) <= 120:
+        return re.sub(r"[*_`]+", "", first_block).strip() or fallback
+    return fallback
+
+
+def _slug(value: str) -> str:
+    slug = re.sub(r"[^\w\-一-龥]+", "_", value, flags=re.UNICODE).strip("_")
+    return slug[:80] or "chapter"
+
+
+def _translation_units(chapter_id: str, markdown: str, source_href: str) -> list[dict[str, Any]]:
+    raw_blocks = [block.rstrip() for block in re.split(r"\n{2,}", markdown.strip()) if block.strip()]
+    blocks: list[str] = []
+    footnote_index: int | None = None
+    for raw_block in raw_blocks:
+        if re.match(r"^\[\^[^]]+\]:", raw_block.lstrip()):
+            blocks.append(raw_block.lstrip())
+            footnote_index = len(blocks) - 1
+            continue
+        if footnote_index is not None and re.match(r"^(?: {2,}|\t)\S", raw_block):
+            blocks[footnote_index] += "\n\n" + raw_block
+            continue
+        blocks.append(raw_block.strip())
+        footnote_index = None
+    units: list[dict[str, Any]] = []
+    for index, block in enumerate(blocks, start=1):
+        source_sha256 = _sha256_bytes(block.encode("utf-8"))
+        unit_digest = hashlib.sha256(
+            f"{source_href}\0{index}\0{source_sha256}".encode("utf-8")
+        ).hexdigest()[:16]
+        kind = (
+            "heading" if re.match(r"^#{1,6}\s", block)
+            else "footnote_definition" if re.match(r"^\[\^[^]]+\]:", block)
+            else "list" if re.match(r"^(?:[-*+] |\d+\. )", block)
+            else "paragraph"
+        )
+        units.append(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "id": f"{chapter_id}-u{index:04d}-{unit_digest}",
+                "chapter_id": chapter_id,
+                "sequence": index,
+                "kind": kind,
+                "source_href": source_href,
+                "source_sha256": source_sha256,
+                "source_markdown": block,
+            }
+        )
+    return units
+
+
+def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
+    """Import an EPUB spine into chapter Markdown and translation units."""
+
+    source = source.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
+    metadata, documents, roots, title_hints, opf_member = _package_documents(source)
+    renderer = _XhtmlRenderer(roots)
+    chapter_dir = output_dir / "chapters"
+    source_dir = output_dir / "semantic" / "source_chapters"
+    chapter_dir.mkdir(parents=True, exist_ok=True)
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest: list[dict[str, Any]] = []
+    audit_chapters: list[dict[str, Any]] = []
+    units: list[dict[str, Any]] = []
+    expected_files: set[str] = set()
+    for sequence, document in enumerate(documents, start=1):
+        body, definitions, issues = renderer.render(document)
+        fallback = PurePosixPath(document.href).stem
+        title = _document_title(
+            body,
+            navigation=title_hints.get(document.href, ""),
+            fallback=fallback,
+        )
+        if not re.match(r"^#\s+", body):
+            body = f"# {title}\n\n{body}".strip()
+        if definitions:
+            body += "\n\n" + "\n\n".join(
+                f"[^{note_id}]: " + text.replace("\n\n", "\n\n    ")
+                for note_id, text in definitions
+            )
+        markdown = body.rstrip() + "\n"
+        inventory = parse_markdown_footnotes(markdown)
+        for code, values in (
+            ("semantic_markdown_duplicate_definitions", inventory.duplicate_definitions),
+            ("semantic_markdown_missing_definitions", inventory.missing_definitions),
+            ("semantic_markdown_unused_definitions", inventory.unused_definitions),
+            ("semantic_markdown_duplicate_references", inventory.duplicate_references),
+        ):
+            if values:
+                issues.append(
+                    {
+                        "code": code,
+                        "message": "EPUB 章节脚注未形成一对一闭环。",
+                        "source_page": document.href,
+                        "note_label": None,
+                        "blocking": True,
+                        "evidence": {"values": list(values)},
+                    }
+                )
+        chapter_id = f"epub-{sequence:04d}"
+        filename = f"{sequence:03d}_{_slug(title)}.md"
+        expected_files.add(filename)
+        _atomic_write_text(chapter_dir / filename, markdown)
+        _atomic_write_text(source_dir / filename, markdown)
+        chapter_units = _translation_units(chapter_id, markdown, document.href)
+        units.extend(chapter_units)
+        manifest.append(
+            {
+                "id": chapter_id,
+                "sequence": sequence,
+                "level": 1,
+                "title": title,
+                "display_title": title,
+                "filename": filename,
+                "source_format": "epub",
+                "source_href": document.href,
+                "source_item_id": document.item_id,
+                "source_sha256": document.raw_sha256,
+                "reviewed_override": False,
+                "semantic_footnote_count": len(inventory.definitions),
+                "semantic_issue_count": len(issues),
+            }
+        )
+        audit_chapters.append(
+            {
+                "chapter_id": chapter_id,
+                "filename": filename,
+                "source_href": document.href,
+                "source_sha256": document.raw_sha256,
+                "markdown_sha256": _sha256_bytes(markdown.encode("utf-8")),
+                "footnote_contract_sha256": markdown_footnote_contract_sha256(markdown),
+                "footnote_count": len(inventory.definitions),
+                "translation_unit_count": len(chapter_units),
+                "continuation_merged_count": renderer.render_metrics.get(
+                    document.href, {}
+                ).get("continuation_merged_count", 0),
+                "issues": issues,
+                "release_blocked": any(bool(issue.get("blocking", True)) for issue in issues),
+            }
+        )
+
+    for directory in (chapter_dir, source_dir):
+        for stale in directory.glob("*.md"):
+            if stale.name not in expected_files:
+                stale.unlink()
+    summary = semantic_audit_summary(audit_chapters)
+    summary["continuation_merged_count"] = sum(
+        int(item["continuation_merged_count"]) for item in audit_chapters
+    )
+    audit = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "blocked" if summary["release_blocked"] else "passed",
+        "release_blocked": summary["release_blocked"],
+        "generated_by": "core.source.epub+core.reconstruct.semantic",
+        "contract_mode": "epub-spine-markdown-footnotes",
+        "importer_version": IMPORTER_VERSION,
+        "source": {
+            "path": str(source),
+            "sha256": _sha256_bytes(source.read_bytes()),
+            "package_document": opf_member,
+            "metadata": metadata.__dict__,
+        },
+        "summary": summary,
+        "chapters": audit_chapters,
+    }
+    _atomic_write_json(output_dir / "chapters.json", manifest)
+    _atomic_write_json(output_dir / "audit" / "semantic-reconstruction.json", audit)
+    units_path = output_dir / "semantic" / "translation-units.jsonl"
+    _atomic_write_text(
+        units_path,
+        "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units),
+    )
+    return {
+        "status": audit["status"],
+        "release_blocked": audit["release_blocked"],
+        "chapter_count": len(manifest),
+        "footnote_count": summary["footnote_count"],
+        "translation_unit_count": len(units),
+        "title": metadata.title,
+        "author": metadata.author,
+        "language": metadata.language,
+        "manifest": str((output_dir / "chapters.json").resolve()),
+        "chapters": str(chapter_dir.resolve()),
+        "translation_units": str(units_path.resolve()),
+        "audit": str((output_dir / "audit" / "semantic-reconstruction.json").resolve()),
+    }
+
+
+def _load_jsonl(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise EpubSemanticError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise EpubSemanticError(f"translation record must be an object: {path}:{line_number}")
+        records.append(value)
+    return records
+
+
+def apply_translations(output_dir: Path, translations_path: Path) -> dict[str, Any]:
+    """Apply translated Markdown units after proving source and note identity."""
+
+    output_dir = output_dir.expanduser().resolve()
+    source_units = _load_jsonl(output_dir / "semantic" / "translation-units.jsonl")
+    translated_units = _load_jsonl(translations_path.expanduser().resolve())
+    source_by_id = {str(item.get("id")): item for item in source_units}
+    translated_by_id = {str(item.get("id")): item for item in translated_units}
+    if len(source_by_id) != len(source_units) or len(translated_by_id) != len(translated_units):
+        raise EpubSemanticError("source or translated unit ids are duplicated")
+    if set(source_by_id) != set(translated_by_id):
+        missing = sorted(set(source_by_id) - set(translated_by_id))
+        extra = sorted(set(translated_by_id) - set(source_by_id))
+        raise EpubSemanticError(f"translation unit set mismatch: missing={missing[:8]}, extra={extra[:8]}")
+
+    by_chapter: dict[str, list[tuple[int, str]]] = {}
+    for unit_id, source in source_by_id.items():
+        translated = translated_by_id[unit_id]
+        source_markdown = str(source.get("source_markdown") or "")
+        source_sha256 = _sha256_bytes(source_markdown.encode("utf-8"))
+        if source_sha256 != source.get("source_sha256"):
+            raise EpubSemanticError(f"stored source unit hash is stale: {unit_id}")
+        if translated.get("source_sha256") != source_sha256:
+            raise EpubSemanticError(f"translated unit is bound to different source bytes: {unit_id}")
+        value = str(translated.get("translated_markdown") or "").strip()
+        if not value:
+            raise EpubSemanticError(f"translated_markdown is empty: {unit_id}")
+        by_chapter.setdefault(str(source["chapter_id"]), []).append((int(source["sequence"]), value))
+
+    manifest_path = output_dir / "chapters.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    audit_chapters: list[dict[str, Any]] = []
+    for item in manifest:
+        chapter_id = str(item["id"])
+        parts = [value for _, value in sorted(by_chapter.get(chapter_id, []))]
+        if not parts:
+            raise EpubSemanticError(f"no translations found for chapter: {chapter_id}")
+        translated_markdown = "\n\n".join(parts).rstrip() + "\n"
+        source_markdown = (output_dir / "semantic" / "source_chapters" / item["filename"]).read_text(encoding="utf-8")
+        source_inventory = parse_markdown_footnotes(source_markdown)
+        translated_inventory = parse_markdown_footnotes(translated_markdown)
+        if (
+            source_inventory.references != translated_inventory.references
+            or tuple(note_id for note_id, _ in source_inventory.definitions)
+            != tuple(note_id for note_id, _ in translated_inventory.definitions)
+            or not translated_inventory.valid
+        ):
+            raise EpubSemanticError(
+                f"translation changed the footnote reference-definition relation: {chapter_id}"
+            )
+        title = _heading_title(translated_markdown, str(item["display_title"]))
+        item["title"] = title
+        item["display_title"] = title
+        item["translation_applied"] = True
+        _atomic_write_text(output_dir / "chapters" / item["filename"], translated_markdown)
+        audit_chapters.append(
+            {
+                "chapter_id": chapter_id,
+                "filename": item["filename"],
+                "source_markdown_sha256": _sha256_bytes(source_markdown.encode("utf-8")),
+                "translated_markdown_sha256": _sha256_bytes(translated_markdown.encode("utf-8")),
+                "footnote_contract_sha256": markdown_footnote_contract_sha256(translated_markdown),
+                "translation_unit_count": len(parts),
+                "issues": [],
+                "release_blocked": False,
+            }
+        )
+    _atomic_write_json(manifest_path, manifest)
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "passed",
+        "release_blocked": False,
+        "generated_by": "core.pages.translate+core.reconstruct.semantic",
+        "contract_mode": "epub-spine-translated-markdown-footnotes",
+        "summary": {
+            "chapter_count": len(audit_chapters),
+            "translation_unit_count": sum(item["translation_unit_count"] for item in audit_chapters),
+            "issue_count": 0,
+            "blocking_issue_count": 0,
+            "release_blocked": False,
+        },
+        "chapters": audit_chapters,
+    }
+    _atomic_write_json(output_dir / "audit" / "semantic-translation.json", report)
+    reconstruction_path = output_dir / "audit" / "semantic-reconstruction.json"
+    if reconstruction_path.is_file():
+        reconstruction = json.loads(reconstruction_path.read_text(encoding="utf-8"))
+        reconstruction["status"] = "passed"
+        reconstruction["release_blocked"] = False
+        reconstruction["generated_by"] = "core.source.epub+core.pages.translate+core.reconstruct.semantic"
+        reconstruction["contract_mode"] = "epub-spine-translated-markdown-footnotes"
+        reconstruction["translated_audit"] = "audit/semantic-translation.json"
+        reconstruction["summary"] = {
+            "chapter_count": len(audit_chapters),
+            "footnote_count": sum(
+                len(
+                    parse_markdown_footnotes(
+                        (output_dir / "chapters" / item["filename"]).read_text(
+                            encoding="utf-8"
+                        )
+                    ).definitions
+                )
+                for item in manifest
+            ),
+            "translation_unit_count": report["summary"]["translation_unit_count"],
+            "issue_count": 0,
+            "blocking_issue_count": 0,
+            "release_blocked": False,
+        }
+        reconstruction["chapters"] = audit_chapters
+        _atomic_write_json(reconstruction_path, reconstruction)
+    return report["summary"] | {"status": "passed", "manifest": str(manifest_path)}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Import EPUB into translation-agent semantic chapters.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    importer = subparsers.add_parser("import", help="extract EPUB spine and semantic footnotes")
+    importer.add_argument("source")
+    importer.add_argument("-o", "--output-dir", required=True)
+    apply = subparsers.add_parser("apply-translations", help="validate and apply translated JSONL units")
+    apply.add_argument("-o", "--output-dir", required=True)
+    apply.add_argument("translations")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "import":
+            result = import_epub(Path(args.source), Path(args.output_dir))
+        else:
+            result = apply_translations(Path(args.output_dir), Path(args.translations))
+    except (OSError, zipfile.BadZipFile, EpubSemanticError) as exc:
+        print(json.dumps({"status": "blocked", "error": str(exc)}, ensure_ascii=False))
+        return 1
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if not result.get("release_blocked", False) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

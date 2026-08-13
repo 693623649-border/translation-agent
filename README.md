@@ -11,7 +11,23 @@
   → 文字版 EPUB/Word + AI 知识库 JSONL + 带书签的参考 PDF
 ```
 
-主入口是 `book_pipeline.py`。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的 `patch_translations.py` 和 `extract_textbook_layer.py` 是新格式检查点的人工辅助工具；一次性书籍脚本和旧监控器已移到 `archive/`，详情见 `archive/README.md`。
+Graph 还提供第三入口 `--source-mode text-pdf`，用于每页都有完整可复制
+文字层的 born-digital PDF。该模式执行
+`source.inspect → pages.text_extract → pages.translate → toc/compile → semantic`
+并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。默认仍是
+`scanned-pdf`，系统不会根据 PDF 内容自动猜测入口。
+
+推荐的新入口是 `graph_pipeline.py`；它把各阶段组织成可替换的依赖图，同时
+复用 `book_pipeline.py` 的成熟实现和全部旧参数。`book_pipeline.py` 仍是完全
+兼容的阶段式入口。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）
+仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的
+`patch_translations.py` 和 `extract_textbook_layer.py` 是新格式检查点的人工
+辅助工具；一次性书籍脚本和旧监控器已移到 `archive/`，详情见
+`archive/README.md`。
+
+影印 PDF、带文本层 PDF 和 EPUB 的统一语义层顺序、CLI 迁移名和发布阻断标准
+见 [`docs/unified-semantic-dag.md`](docs/unified-semantic-dag.md)。EPUB 当前可执行
+命令另见 [`docs/epub-semantic-input.md`](docs/epub-semantic-input.md)。
 
 ## 本版本改动（2026-08）
 
@@ -51,7 +67,8 @@
 
 ### 测试
 
-186 项单元测试覆盖发布清洗、页码处理、注释门禁、验收门与重组工具：
+完整单元测试套件覆盖 Graph 规划与缓存、发布清洗、页码处理、注释门禁、
+验收门与重组工具。测试数量会随功能演进，因此以命令实际输出为准：
 
 ```bash
 python -m unittest discover tests
@@ -61,8 +78,17 @@ python -m unittest discover tests
 
 ```text
 translation-agent/
-├── book_pipeline.py              # 当前主入口
-├── translation_agent_api.py      # 程序化调用接口
+├── graph_pipeline.py             # 可组合 DAG 命令行入口
+├── book_pipeline.py              # 兼容的阶段式执行入口与成熟节点实现
+├── pipeline_graph/
+│   ├── core.py                   # NodeSpec、拓扑规划、缓存、事件与执行器
+│   ├── book.py                   # book_pipeline 的 Graph 适配节点
+│   └── recipe.py                 # 严格 Recipe 与 allowlist 插件注册表
+├── recipes/
+│   ├── full-publication.toml     # 完整出版物
+│   ├── chinese-pdf-word.toml     # 中文 PDF → Word
+│   └── outline-word.toml         # PDF 内置目录 → Word
+├── translation_agent_api.py      # 传统与 Graph 程序化调用接口
 ├── frontend_app.py               # Streamlit 低代码控制台
 ├── frontend_service.py           # 安全子进程、日志和产物服务层
 ├── launch_frontend.py            # 一键启动前端
@@ -81,6 +107,285 @@ translation-agent/
 ├── requirements.txt
 └── .env.example
 ```
+
+## Graph 执行引擎
+
+`graph_pipeline.py` 是 `book_pipeline.py` 之上的轻量依赖图，不是另一套不兼容
+的流水线。内置节点仍调用原有 OCR、校勘、翻译、目录、编译及发布阶段，因此
+继续使用相同的 `pages/page_XXXX.json`、`toc.json`、章节目录、模型 Profile、
+页级 CAS 和断点检查点。Graph 只接管节点选择、依赖规划、节点缓存、事件记录
+和输出目录互斥。原有命令可以继续使用；要获得可组合能力时，把入口改为
+`graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
+
+### 先查看计划
+
+`--plan` 只解析配置并输出节点的 `requires`、`provides`、版本、资源锁和缓存
+设置，不调用模型，也不生成出版物：
+
+```bash
+python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+  --phase all --config pipeline.toml \
+  --recipe recipes/full-publication.toml --plan
+```
+
+执行时会根据目标自动选择依赖闭包，而不是依赖源码中的固定调用顺序。可用
+`--target publication.docx` 临时把目标收窄到 Word，但该目标只是未验收的
+中间产物；正式 Word 交付必须以 `publication.word_report` 为目标。
+
+### 内置 Recipe
+
+Recipe 只描述“启用哪些节点、禁用哪些节点、需要哪些最终产物”。常用调用为：
+
+```bash
+# 完整版本：章节 Markdown、知识库、EPUB、Word、参考 PDF 和发布验收
+python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+  --phase all --config pipeline.toml \
+  --recipe recipes/full-publication.toml
+
+# 已是中文的 PDF：OCR、目录、章节 Markdown，只发布 Word
+python graph_pipeline.py "book/中文书.pdf" -o "outputs/中文书" \
+  --phase all --config pipeline.toml \
+  --recipe recipes/chinese-pdf-word.toml
+
+# 使用 PDF 内置 outline 代替目录 LLM，只发布 Word
+python graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书" \
+  --phase all --config pipeline.toml \
+  --recipe recipes/outline-word.toml
+```
+
+`outline-word` 要求源 PDF 确实包含可用书签；没有 outline 时节点会明确失败，
+不会静默退回模型目录。Recipe 是严格、纯数据 TOML，支持的字段只有
+`schema_version`、`id`、`targets`、`enable`、`disable` 和
+`required_plugins`。两份 Word Recipe 的最终产物是
+`publication.word_report`；完整多格式 Recipe 的最终产物才是
+`publication.report`。
+
+### 节点与产物
+
+内置节点按实际 phase 和 Recipe 按需加入：
+
+| 节点 | 职责 / 主要产物 |
+| --- | --- |
+| `core.source.inspect` | 校验并指纹化源 PDF（`source.pdf`） |
+| `core.pages.import` | 一次性导入旧格式逐页检查点 |
+| `core.pages.load` | 读取已有逐页检查点（`pages.raw`） |
+| `core.pages.ocr` | PDF 逐页 OCR（`pages.raw`） |
+| `core.pages.text_extract` | 显式读取完整 PDF 文字层（`pages.raw`），不调用 OCR |
+| `core.pages.proofread` | 非破坏性 OCR 校勘覆盖层（`pages.proofread`） |
+| `core.pages.translate` | 非中文页面翻译（`pages.translated`） |
+| `core.toc.load` | 读取已有映射目录（`toc.mapped`） |
+| `core.toc.resolve` | 人工目录或目录 LLM 解析及页码映射 |
+| `core.toc.from_outline` | 从 PDF 内置 outline 生成映射目录 |
+| `core.chapters.load` | 读取已有章节 Markdown |
+| `core.chapters.compile` | 页面和目录编译为章节 Markdown |
+| `core.reconstruct.semantic` | 建立正文块与脚注引用—定义关系；不确定落点阻断发布 |
+| `core.publication.sanitize` | 幂等清除页眉、页码及内部出版标记 |
+| `core.publish.knowledge_base` | 发布知识库 JSONL |
+| `core.publish.epub` | 发布 EPUB |
+| `core.publish.docx` | 发布 Word |
+| `core.publish.reference_pdf` | 发布带书签的参考 PDF |
+| `core.publication.verify.word` | 验收真脚注 DOCX 的 OOXML 结构与固定字体渲染，产出 `publication.word_report` |
+| `core.publication.verify` | 验收完整多格式出版物，产出 `publication.report` |
+| `core.pipeline.status` | 读取检查点与产物状态 |
+
+每个 `NodeSpec` 明确声明 `requires`、`provides`、版本、缓存指纹和资源锁。
+规划器会在执行前阻断缺依赖、重复 Provider 和循环依赖。每次执行在输出目录
+写入：
+
+```text
+outputs/my_book/.pipeline_graph/
+├── source.json                    # 输出目录绑定的源 PDF 路径与 SHA-256
+├── ocr_identity.json              # OCR 内容语义身份，不含 Key/worker
+├── proofread_identity.json        # 校勘模型、提示词、分块等内容语义
+├── translation_identity.json      # 翻译模型、思考模式、分块等内容语义
+├── import_identity.json           # import 管理页与安全清理摘要
+├── publication_identity.json      # 框架管理的成品路径/摘要，用于安全换标题
+├── chapter_drafts/                # compile → sanitize 的不可变输入 bundle
+│   ├── chapters.json              # 与该快照配套的 manifest
+│   └── *.md                       # 尚未发布清洗的章节草稿
+├── state.json                     # 节点指纹、产物摘要和可恢复状态（原子替换）
+├── events.jsonl                   # run/node started、skipped、succeeded、failed
+└── output.lock                    # 持久诊断文件；内核 advisory lock 表示实际占用
+```
+
+artifact 中声明的 `path` 是权威数据位置，不能假定它一定等于输出目录中的
+传统文件名。需要调用旧阶段的 consumer 会先校验摘要，再把输入 artifact
+原子物化到兼容位置：页面 bundle 物化为 `pages/`，目录 artifact 物化为
+`toc.json`。发布器则直接读取 `chapters.reader` 的 `chapter_dir` 和 `manifest`，
+不会绕回读取可能陈旧的 canonical `chapters/`。最后由 verifier 把 reader
+bundle 发布到 `chapters/` / `chapters.json`，并把内置或替代 publisher 的
+文件 artifact 发布到 Word、EPUB、知识库和参考 PDF 的 canonical 文件名后再
+验收。这样插件可以在独立暂存目录生产结果，同时旧验证器仍只检查唯一的正式
+发布候选。替代 publisher 不得把非 canonical 文件直接放在输出根目录，否则
+会形成第二个同格式候选并被 Graph 明确拒绝；应写入 `.pipeline_graph/` 下的
+独立暂存目录，或直接提供 canonical 文件名。
+
+Graph 缓存不替代原有页级检查点。OCR 节点每次都会进入旧阶段，让 PageStore
+逐页核对自动推导出的**精确** `ocr_model` 身份；该身份包含后端、模型、阅读
+方向和提示词版本。显式 `--ocr-cache-model-prefix` 是导入旧检查点时保留的宽松
+兼容逃生口，会关闭 Graph 自动注入的 exact match，日常运行不应使用它放宽
+模型校验。OCR 的 DPI、端点或 MCP command 改变，以及校勘/翻译的模型、思考
+模式或 `max_chars` 改变时，对应 stage identity sidecar 会让旧阶段收到
+`--force`；worker、delay、timeout 和 Key 轮换不改变内容身份，也不会无谓重做。
+stage identity 按 PDF 页保存；局部执行只更新所选页，随后全书执行仍能发现并
+重做其他语义陈旧页。`--import-ocr-dir` 保持加法导入，不会删除无关检查点；
+导入源后来删页时，也只清除仍与上次导入摘要一致的旧管理页，人工或模型阶段
+改过的页会被保留并退出 import 管理范围。
+`--force-node` / `--force-graph` 控制 Graph 节点缓存，旧参数 `--force` 则显式
+要求旧阶段重做其页级结果。
+
+首次处理一个全新输出目录时，Graph 会把源 PDF 的 SHA-256 写入
+`.pipeline_graph/source.json`；以后若把另一份 PDF 指向同一输出目录会在 OCR
+前直接失败，防止按相同页号误用旧缓存。对升级前已经完整生成、但没有源绑定
+的旧输出，确认 PDF 无误后可仅在首次运行增加 `--adopt-existing-output`；该操作
+要求检查点恰好覆盖源 PDF 的 `1..N` 全部页面。无法确认来源时应使用新目录。
+
+`book_pipeline.py` 的公共 `main()` 与 Graph 共用同一个
+`.pipeline_graph/output.lock`，所以两个入口不能同时改写同一输出目录。Graph
+持锁期间只通过内部 unlocked seam 调用旧阶段，以避免嵌套自锁；外部代码仍应
+调用公共 CLI/API，不能直接调用这个内部 seam。`output.lock` 文件在释放后仍会
+保留，是否占用由内核 advisory lock 判定，而不是按文件是否存在或旧 PID 猜测；
+进程崩溃时内核会自动释放，因此不存在并发删除“陈旧锁”的竞态。
+
+Word、EPUB 与参考 PDF 的文件名随有效书名变化。Graph 在
+`publication_identity.json` 中记录自己生成的路径和 SHA-256；换标题时只删除
+仍与记录摘要一致的旧成品。若用户后来编辑过旧文件，Graph 会保留它并让发布门
+报告重复候选，不会替用户删除内容。
+
+### Python 中规划、替换和删除节点
+
+低代码 API 使用 `GraphRunRequest` 包装原有 `RunRequest`：
+
+```python
+from pipeline_graph import NodeResult, NodeSpec
+from translation_agent_api import GraphRunRequest, RunRequest, prepare_graph
+
+request = GraphRunRequest(
+    pipeline=RunRequest(
+        input_pdf="book/中文书.pdf",
+        output_dir="outputs/中文书",
+        phase="all",
+        config="pipeline.toml",
+        generate_epub=False,
+        generate_knowledge_base=False,
+        generate_bookmarked_pdf=False,
+        verify_publication=True,
+    ),
+    recipe="recipes/chinese-pdf-word.toml",
+)
+prepared = prepare_graph(request)       # 只构图，不执行
+print([node.name for node in prepared.plan()])
+
+# 用自己的清洗器替换同名节点；requires/provides 契约保持不变。
+def my_sanitize_handler(context):
+    drafts = context["chapters.markdown"]
+    # 该插件辅助函数必须把清洗结果写入独立目录，例如
+    # .pipeline_graph/my_reader/，并在该目录写自己的 chapters.json。
+    # 不要就地修改 drafts，也不要直接改 canonical chapters/。
+    chapters = build_reader_bundle(
+        drafts,
+        destination=context.output_dir / ".pipeline_graph" / "my_reader",
+    )
+    return NodeResult(
+        outputs={"chapters.reader": chapters},
+        fingerprints={"chapters.reader": chapters["sha256"]},
+    )
+
+old = next(
+    node for node in prepared.graph.nodes
+    if node.name == "core.publication.sanitize"
+)
+custom = NodeSpec(
+    name=old.name,
+    handler=my_sanitize_handler,         # (GraphContext) -> NodeResult
+    requires=old.requires,
+    provides=old.provides,
+    version="my-sanitizer-v1",
+    fingerprint="my-sanitizer-config-v1",
+    resources=old.resources,
+    cache=False,                         # 未提供文件校验器时不要复用节点缓存
+)
+prepared.graph.replace(old.name, custom)
+
+# remove 会真正移除节点；若目标仍依赖它，plan() 会在执行前报告缺依赖。
+removed = prepared.graph.remove("core.publication.sanitize")
+prepared.graph.add(custom)              # 可换成另一个提供 chapters.reader 的节点
+
+result = prepared.execute()
+```
+
+上例中的 `build_reader_bundle` 代表插件自己的实现：返回值至少应包含独立的
+`chapter_dir`、`manifest`、`sha256` 和 `count`。这个独立 bundle 是下游
+publisher 的直接输入；只有 verifier 才负责把它发布到 canonical 章节目录，
+因此替换 sanitize 不会污染 compile 的不可变 `chapter_drafts`。
+
+节点 Handler 必须返回 `NodeResult(outputs={...})`，且键必须与 `provides`
+完全一致。要删除 EPUB、知识库等发布模块，优先在 `RunRequest` 中关闭对应
+`generate_*`，或在 Recipe 的 `disable` 中删除节点并同步调整 `targets`；不要
+在依赖它的目标保持启用时强行删除。
+
+`pipeline.argv` 是私有控制输入：Key 与吞吐参数不会进入它的指纹，配置文件则
+只记录内容 SHA-256。外部节点若读取自定义文件或环境语义，仍必须提供自己的
+callable `fingerprint`（只纳入所依赖的非敏感内容），否则将该节点设为
+`cache=False`；不要让默认缓存猜测节点未声明的外部状态。Prepared Graph 创建后
+若同一路径的 Profile 内容发生变化，执行会要求重新 `prepare`，避免一次运行中
+不同节点读到不同配置版本。
+
+### Profile、Recipe 与插件安全边界
+
+Profile 和 Recipe 必须严格分离：
+
+- `pipeline.toml` / `--config` 是 **Profile**，只负责 Provider、模型、端点、
+  worker、阅读方向和 `credential_env`；原始 Key 仍只放环境变量。
+- `recipes/*.toml` / `--recipe` 是 **Recipe**，只负责目标和拓扑选择；禁止
+  API Key、端点、环境变量名、Python import/callable 或 shell command。
+
+外部节点由已安装 Python 包的
+`translation_agent.graph_nodes` entry-point group 提供。Recipe 只能声明：
+
+```toml
+required_plugins = ["acme_cleanup"]
+enable = ["acme.cleanup_headers"]
+```
+
+调用者还必须单独授权，Recipe 本身不能给插件执行权限：
+
+```bash
+python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+  --phase all --config pipeline.toml --recipe recipes/acme.toml \
+  --allow-plugin acme_cleanup
+```
+
+allowlist 只是显式授权，不是沙箱或代码签名。加载 entry point 会在当前进程
+执行该包的 Python 代码，因此只能安装并 allowlist 自己审查和信任的插件。
+外部插件默认禁用、不能注册或覆盖 `core.*`，并且必须同时出现在 Recipe 的
+`required_plugins` 和调用者的 `--allow-plugin` 中。插件也不能提供保留的私有
+控制值 `pipeline.argv`；其安装 distribution、版本和 entry-point 会进入节点
+身份，升级或换包后不会继承另一实现的旧缓存。
+
+要用插件替换中间组件，不需要让它冒充 `core.*`：让插件节点提供相同产物，
+例如 `chapters.reader`，并在 Recipe 中设置
+`disable = ["core.publication.sanitize"]`、
+`enable = ["acme.cleanup_headers"]`。规划器会在执行前确认新的 Provider 能
+完整接上所有下游；缺口或重复 Provider 都会直接报错。
+
+### `all` 与可选校勘
+
+为了保持旧行为和避免对整本书产生额外模型调用，传统入口及 Graph 的
+`--phase all` **默认都不包含** `core.pages.proofread`。需要校勘时任选一种：
+
+```bash
+# 单次命令启用
+python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+  --phase all --config pipeline.toml --include-proofread
+
+# 或在自定义 Recipe 中启用
+# enable = ["core.pages.proofread"]
+```
+
+Python 调用则设置 `GraphRunRequest(include_proofread=True)`。校勘节点会插在
+OCR 与翻译/目录/编译之间，仍使用 Profile 选择的 `proofread_profile`；仅在
+Profile 中填写 `proofread_profile` 不会自动启用该节点。
 
 ## 低代码 Web 控制台
 
@@ -124,8 +429,11 @@ python launch_frontend.py --host 0.0.0.0 --port 8501 --no-browser
 
 ## 安装与配置
 
+Graph 与 Profile/Recipe TOML 使用 Python 3.10+ 语法和标准库；推荐 Python
+3.12。macOS 自带的 Python 3.9 不能直接运行 `graph_pipeline.py`。
+
 ```bash
-pip install -r requirements.txt
+python3.12 -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
@@ -138,7 +446,7 @@ GLM_TOC_API_KEY=your-coding-plan-key
 GLM_CODING_API_BASE=https://open.bigmodel.cn/api/coding/paas/v4
 GLM_TEXT_MODEL=glm-5.2
 OCR_BACKEND=coding-plan-mcp
-CODING_PLAN_VISION_MCP_COMMAND=npx -y @z_ai/mcp-server@latest
+CODING_PLAN_VISION_MCP_COMMAND=npx -y @z_ai/mcp-server@0.1.4
 CODING_PLAN_SPREAD_SEGMENTS=2
 CODING_PLAN_VERTICAL_PAGE_ROWS=2
 CODING_PLAN_VERTICAL_PAGE_COLUMNS=3
@@ -199,8 +507,11 @@ Coding Plan 的 OpenAI 兼容文本端点负责目录 JSON，不直接接收图�
 
 ```bash
 node --version
-npx -y @z_ai/mcp-server@latest
+npx -y @z_ai/mcp-server@0.1.4
 ```
+
+仓库、示例 Profile 和诊断提示统一固定为 `@z_ai/mcp-server@0.1.4`；不要改成
+`@latest`，否则上游包更新会在没有配置变更的情况下改变 OCR 行为和缓存身份。
 
 密钥不会写入输出文件。OCR/目录 Key 与翻译 Key 必须分别使用 `GLM_CODING_API_KEY` 和 `DEEPSEEK_API_KEY`；推荐只用环境变量，避免密钥出现在 shell 历史或进程列表。
 
@@ -315,7 +626,7 @@ python book_pipeline.py "input.pdf" \
 
 Coding Plan OCR 的请求节流按 API Key 指纹在本机进程间共享：同时处理多本书时，各进程不会分别占满一套额度。初始请求间隔由 `CODING_PLAN_VISION_REQUEST_DELAY` 控制；每连续成功 `CODING_PLAN_VISION_SPEEDUP_WINDOW` 次会小幅缩短间隔，遇到 429 则立即延长，范围由 `CODING_PLAN_VISION_MIN_REQUEST_DELAY` 和 `CODING_PLAN_VISION_MAX_REQUEST_DELAY` 限定。Key 本身不会写入共享状态或日志。worker 数控制在途页面数，自适应间隔控制请求启动速率，两者作用不同。
 
-逐页 OCR 结果会自动断点续传；稳定输出目录可重复使用。`ocr_model` 同时记录模型、阅读方向和提示词版本（例如 `coding-plan/glm-4.6v-vision-mcp/vertical-v2`），提示词升级后可通过 `--ocr-cache-model-prefix` 安全刷新旧检查点。日志会输出每页开始、响应耗时和字符数，页级 `notes` 也保存耗时。临时页图默认删除，使用 `--keep-page-images` 可保留以便复核。分段补救会丢弃空白带返回的“无可见文字”说明，并以 `mcp-segmented-*` 请求标记保留审计线索；MCP stderr 会被脱敏后附到错误中，超时关闭整个 npx/Node 进程组，不遗留占用连接的孤儿进程。如果单列/行本身仍被服务拒绝，应只对该页使用本地 OCR 并对照原图复核，不能留下缺页或把过滤说明混入正文。
+逐页 OCR 结果会自动断点续传；稳定输出目录可重复使用。`ocr_model` 同时记录模型、阅读方向和提示词版本（例如 `coding-plan/glm-4.6v-vision-mcp/vertical-v2`）。Graph 默认把推导出的完整值作为 `--ocr-cache-model` 精确匹配，模型、方向或提示词版本升级后会自动刷新不相符的检查点；`--ocr-cache-model-prefix` 只用于经过人工确认的旧缓存兼容，不是刷新开关。日志会输出每页开始、响应耗时和字符数，页级 `notes` 也保存耗时。临时页图默认删除，使用 `--keep-page-images` 可保留以便复核。分段补救会丢弃空白带返回的“无可见文字”说明，并以 `mcp-segmented-*` 请求标记保留审计线索；MCP stderr 会被脱敏后附到错误中，超时关闭整个 npx/Node 进程组，不遗留占用连接的孤儿进程。如果单列/行本身仍被服务拒绝，应只对该页使用本地 OCR 并对照原图复核，不能留下缺页或把过滤说明混入正文。
 
 ## 推荐的可审计分步流程
 
@@ -334,8 +645,21 @@ python extract_textbook_layer.py "book/input.pdf" -o "outputs/my_book" \
   --strip-leading-page-number-offset 1 --reflow
 ```
 
-导入器会先验证整本 PDF，再写入 `PageRecord` 检查点；任一页没有文本层
-（包括只有图片的页面）都会在写入前停止。重复导入相同文字会保留新鲜译文；
+也可让 Graph 以第三入口一次执行后续翻译、编译、发布与验收：
+
+```bash
+python graph_pipeline.py "book/input.pdf" -o "outputs/my_book" --phase all \
+  --source-mode text-pdf --text-pdf-reflow --translate-non-chinese \
+  --recipe recipes/text-pdf-full-publication.toml
+```
+
+`--text-pdf-sort` 和 `--text-pdf-strip-leading-page-number-offset N` 对应独立
+导入器的同类选项；它们仅在显式 `text-pdf` 模式有效。任一正文页缺少文字层时，
+节点会在写入检查点前阻断并提示改用默认扫描 PDF/OCR 入口；纯空白的首尾页会
+写成显式空白检查点，以保持逐页来源覆盖，但内部空页仍会阻断待复核。
+
+导入器会先验证整本 PDF，再写入 `PageRecord` 检查点；任一非首尾空白页没有
+文本层（包括只有图片的页面）都会在写入前停止。重复导入相同文字会保留新鲜译文；
 文字变化时默认拒绝，只有显式传入 `--force` 才替换变化页并使其旧译文失效。
 默认使用 PDF 的逻辑内容顺序；`--sort` 可改用视觉位置排序，`--reflow`
 则按空行分段并合并段内视觉换行。页码清理默认关闭，而且只会删除严格等于
@@ -632,7 +956,9 @@ outputs/my_book/
 │   └── ...
 ├── chapters.json             # 章节文件清单与页区间
 ├── audit/
-│   └── release-report.json   # 统一发布质量门报告
+│   ├── semantic-reconstruction.json # 引用落点及阻断问题审计
+│   ├── word-release-report.json      # Word Recipe 的正式验收报告
+│   └── release-report.json           # 完整多格式发布报告
 ├── knowledge_base.jsonl      # 仅含章节、顺序和正文的无分页 RAG 记录
 ├── 书名.epub                  # 无原 PDF 分页信息的 EPUB3
 ├── 书名.docx                  # 无原 PDF 分页信息的 Word 文档

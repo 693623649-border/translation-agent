@@ -3,7 +3,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from translation_agent_api import RunRequest, run_book
+from pipeline_graph import UnknownTargetError
+from pipeline_graph.book import BookGraphConfigurationError
+from translation_agent_api import (
+    GraphRunRequest,
+    RunRequest,
+    plan_graph,
+    prepare_graph,
+    run_book,
+)
 
 
 class TranslationAgentApiTests(unittest.TestCase):
@@ -20,6 +28,26 @@ class TranslationAgentApiTests(unittest.TestCase):
         self.assertIn("deepseek_pro", argv)
         self.assertNotIn("--translation-api-key", argv)
         self.assertNotIn("--api-key", argv)
+
+    def test_docx_author_is_serialized_as_optional_metadata(self) -> None:
+        request = RunRequest(
+            output_dir="outputs/book",
+            phase="docx",
+            title="Book",
+            author="Author",
+        )
+
+        argv = request.to_argv()
+
+        self.assertEqual(argv[argv.index("--author") + 1], "Author")
+        self.assertNotIn(
+            "--author",
+            RunRequest(
+                output_dir="outputs/book",
+                phase="docx",
+                title="Book",
+            ).to_argv(),
+        )
 
     def test_low_code_advanced_options_are_structured(self) -> None:
         request = RunRequest(
@@ -89,6 +117,7 @@ class TranslationAgentApiTests(unittest.TestCase):
             phase="verify",
             verification_report="outputs/book/audit/custom.json",
             verification_chapter_ids=("chapter-5", "chapter-6"),
+            verification_profile="word",
             require_all_reviewed=True,
         )
         argv = request.to_argv()
@@ -97,7 +126,173 @@ class TranslationAgentApiTests(unittest.TestCase):
         self.assertIn("chapter-5", argv)
         self.assertIn("chapter-6", argv)
         self.assertIn("--require-all-reviewed", argv)
+        self.assertEqual(
+            argv[argv.index("--verification-profile") + 1],
+            "word",
+        )
         self.assertIn("--report", argv)
+
+    def test_graph_api_plans_standalone_docx_without_pdf_or_ocr(self) -> None:
+        request = GraphRunRequest(
+            pipeline=RunRequest(
+                output_dir="outputs/book",
+                phase="docx",
+                title="Book",
+            )
+        )
+        self.assertEqual(
+            plan_graph(request),
+            (
+                "core.chapters.load",
+                "core.reconstruct.semantic",
+                "core.publication.sanitize",
+                "core.publish.docx",
+            ),
+        )
+
+    def test_graph_api_exposes_explicit_text_pdf_mode(self) -> None:
+        request = GraphRunRequest(
+            pipeline=RunRequest(
+                input_pdf="book.pdf",
+                output_dir="outputs/book",
+                phase="all",
+                translate_non_chinese=True,
+            ),
+            source_mode="text-pdf",
+            text_pdf_reflow=True,
+            text_pdf_strip_leading_page_number_offset=1,
+        )
+
+        plan = plan_graph(request)
+
+        self.assertEqual(plan[0:3], (
+            "core.source.inspect",
+            "core.pages.text_extract",
+            "core.pages.translate",
+        ))
+        self.assertNotIn("core.pages.ocr", plan)
+
+    def test_text_pdf_recipe_selects_source_mode_when_api_omits_it(self) -> None:
+        recipe = (
+            Path(__file__).resolve().parents[1]
+            / "recipes"
+            / "text-pdf-full-publication.toml"
+        )
+        request = GraphRunRequest(
+            pipeline=RunRequest(
+                input_pdf="book.pdf",
+                output_dir="outputs/book",
+                phase="all",
+            ),
+            recipe=recipe,
+        )
+
+        plan = plan_graph(request)
+
+        self.assertIn("core.pages.text_extract", plan)
+        self.assertNotIn("core.pages.ocr", plan)
+        self.assertEqual(request.graph_options().source_mode, "text-pdf")
+
+    def test_explicit_scanned_pdf_api_mode_conflicts_with_text_pdf_recipe(self) -> None:
+        recipe = (
+            Path(__file__).resolve().parents[1]
+            / "recipes"
+            / "text-pdf-full-publication.toml"
+        )
+        request = GraphRunRequest(
+            pipeline=RunRequest(
+                input_pdf="book.pdf",
+                output_dir="outputs/book",
+                phase="all",
+            ),
+            recipe=recipe,
+            source_mode="scanned-pdf",
+        )
+
+        with self.assertRaisesRegex(
+            BookGraphConfigurationError,
+            "explicit source_mode='scanned-pdf'.*core.pages.text_extract",
+        ):
+            plan_graph(request)
+
+    def test_word_recipe_plans_a_verified_word_report(self) -> None:
+        recipe = (
+            Path(__file__).resolve().parents[1]
+            / "recipes"
+            / "chinese-pdf-word.toml"
+        )
+        request = GraphRunRequest(
+            pipeline=RunRequest(
+                input_pdf="book.pdf",
+                output_dir="outputs/book",
+                phase="all",
+                title="Book",
+            ),
+            recipe=recipe,
+        )
+
+        plan = plan_graph(request)
+
+        self.assertEqual(plan[-1], "core.publication.verify.word")
+        self.assertIn("core.publish.docx", plan)
+        self.assertNotIn("core.publish.epub", plan)
+        self.assertNotIn("core.publish.knowledge_base", plan)
+        self.assertNotIn("core.publish.reference_pdf", plan)
+
+    def test_graph_api_exposes_replaceable_registry_before_execution(self) -> None:
+        request = GraphRunRequest(
+            pipeline=RunRequest(
+                input_pdf="book.pdf",
+                output_dir="outputs/book",
+                phase="all",
+            ),
+            disable_nodes=(
+                "core.publish.epub",
+                "core.publish.knowledge_base",
+                "core.publish.reference_pdf",
+                "core.publication.verify",
+            ),
+            targets=("publication.docx",),
+        )
+        prepared = prepare_graph(request)
+        sanitizer = next(
+            node
+            for node in prepared.graph.nodes
+            if node.name == "core.publication.sanitize"
+        )
+        self.assertIs(prepared.graph.remove(sanitizer.name), sanitizer)
+        with self.assertRaises(UnknownTargetError):
+            prepared.plan()
+        prepared.graph.add(sanitizer)
+        self.assertIn("core.publication.sanitize", plan_graph(request))
+
+    def test_legacy_force_is_delegated_without_forcing_absent_graph_nodes(self) -> None:
+        status = GraphRunRequest(
+            pipeline=RunRequest(
+                output_dir="outputs/book",
+                phase="status",
+                force=True,
+            )
+        )
+        self.assertEqual(status.graph_options().force_nodes, frozenset())
+
+        ocr = GraphRunRequest(
+            pipeline=RunRequest(
+                input_pdf="book.pdf",
+                output_dir="outputs/book",
+                phase="ocr",
+                force=True,
+            )
+        )
+        self.assertEqual(
+            ocr.graph_options().force_nodes,
+            frozenset(),
+        )
+        prepared = prepare_graph(ocr)
+        ocr_node = next(
+            node for node in prepared.graph.nodes if node.name == "core.pages.ocr"
+        )
+        self.assertFalse(ocr_node.cache)
 
     def test_automatic_publication_verification_can_be_disabled(self) -> None:
         argv = RunRequest(

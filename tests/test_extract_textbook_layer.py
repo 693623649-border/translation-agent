@@ -151,6 +151,43 @@ class TextLayerExtractorTests(unittest.TestCase):
 
             self.assertFalse(output.exists())
 
+    def test_boundary_blank_pages_are_explicit_checkpoints_but_internal_gaps_block(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "boundary-blanks.pdf"
+            output = root / "output"
+            make_text_pdf(
+                pdf,
+                [
+                    "",
+                    "A complete embedded-text body page.",
+                    "",
+                ],
+            )
+
+            extract_text_layer(pdf, output)
+            records = PageStore(output).load_all()
+
+            self.assertEqual([record.text for record in records], [
+                "[空白页]",
+                "A complete embedded-text body page.",
+                "[空白页]",
+            ])
+            self.assertTrue(records[0].ocr_model.startswith(TEXT_LAYER_MODEL))
+            self.assertIn("boundary-blank", records[0].ocr_model)
+
+            internal = root / "internal-blank.pdf"
+            make_text_pdf(
+                internal,
+                [
+                    "A complete first embedded-text body page.",
+                    "",
+                    "A complete final embedded-text body page.",
+                ],
+            )
+            with self.assertRaisesRegex(ValueError, r"PDF 2 \(empty-text\)"):
+                extract_text_layer(internal, root / "internal-output")
+
     def test_optional_headings_mark_only_unique_exact_lines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

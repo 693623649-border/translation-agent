@@ -23,6 +23,15 @@ python book_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
 3. 仅在明确要求时运行 `--phase proofread` 校勘 OCR；非中文内容运行 `--phase translate --translate-non-chinese`。OCR、校勘和翻译可按页并行，分别保留检查点与模型指纹。
 4. 运行 `--phase compile --require-complete-ocr`，按结构化标题生成章节 Markdown、EPUB、Word、知识库和带书签 PDF；翻译任务同时加 `--require-translation`。未显式指定 `--granularity` 时保持已有清单粒度，避免续跑时意外改变章节数量；编译结束会自动执行发布质量门。
 
+只发布 Word 时使用内置 Recipe，并仍把发布报告作为最终目标：
+
+```bash
+python graph_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
+  --config pipeline.toml --recipe recipes/chinese-pdf-word.toml
+```
+
+PDF 自带可靠 outline 时改用 `recipes/outline-word.toml`。这两个 Recipe 只关闭知识库、EPUB 和参考 PDF publisher，不关闭验证节点，目标必须是 `publication.word_report`。Word gate 仍要求语义审计、真实脚注 OOXML 结构门及固定字体 LibreOffice 渲染门；`publication.docx` 只是未验收的中间产物。不要用 `--target publication.docx`、`--no-verify`、`--no-docx-render` 或 API 的 `verify_publication=false` 覆盖该发布契约。
+
 OCR 继续使用 GLM/Coding Plan Profile；中文翻译默认使用独立 DeepSeek `deepseek-v4-flash` Profile，并显式关闭思考模式。模型、端点、worker 和 `credential_env` 写入 `pipeline.toml`，原始 Key 只从环境变量注入；不要写入源码、argv、输出或日志。用 `--ocr-concurrency`、`--proofread-concurrency`、`--translation-concurrency` 独立调整 worker。
 
 简体转换必须调用框架的 `normalize_target_script()` 词法保护，不要用全局“著→着”替换：`望著→望着` 可以转换，但作者义和词汇义的 `所著`、`名著`、`显著` 必须保留。框架改动后保留这组三类回归样例。
@@ -52,6 +61,8 @@ python book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
 
 章节门从当前正文动态提取引注与注释定义：支持 `〔n〕`、Markdown `[^id]`，以及与本章尾注定义相互印证的 `[n]`；普通 `[2022]` 年份不误判。采用正文引注体系的审定章必须双向闭环，缺定义、正文删除后遗留的定义及重复定义都会失败；只包含注释清单而正文未引用的特殊章节给出 warning，必须人工确认。同时检查审定源稿经一次发布清洗后与发布 Markdown 的规范字节精确一致、唯一 H1、乱码、内部占位符、模型前言及来源分页痕迹。英文书目、专名和原文引文可以合法存在，不要仅凭拉丁字母比例自动删文。
 
+OCR 页脚或尾注进入正文语义层时，必须保存“正文引用落点—注释定义—来源页”关系及落点置信度。只有唯一且达到阈值的落点才能自动发布；多候选、仅靠距离猜测或低于阈值的映射必须写入 `audit/` 并阻断最终报告，不能静默把编号附到最近句子。人工复核后应修改上游审定 Markdown/语义记录，再重新生成 Word。
+
 ## 执行发布质量门
 
 在宣告任务完成前，必须阅读并遵守 [references/release-gate.md](references/release-gate.md)。独立验收命令不调用模型：
@@ -64,9 +75,13 @@ python book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
 
 上例为翻译任务；中文原书省略 `--require-translation`。整本均为人工审定稿时添加 `--require-all-reviewed`。只有命令退出码为 0，报告同时满足 `mode=full`、`ok=true`、`release_ready=true`、`status=passed`、`summary.skipped=0`，且 warnings 已人工判断并披露，才能宣告发布完成。按报告中的动态数字说明章节、引注、知识库块、PDF 页和书签结果，不复用其他书或历史运行的计数。
 
+Word Recipe 的正式报告为 `OUTPUT/audit/word-release-report.json`，还必须满足 `publication_profile=word`、`ok=true`、`release_ready=true`、`status=passed`；允许且只允许 EPUB、知识库和参考 PDF 三项因不在 Word 发布范围内而 skipped。`docx.structure`、`docx.render`、`semantics.integrity` 或任何基础检查不得 skipped。
+
 完整书签/PDF、逐页 OCR 覆盖和知识库稳定 ID 验收必须传入真正的源 PDF。省略源文件并加 `--no-bookmarked-pdf` 只能得到 `partial` 报告，不得声明完整发布。
 
-质量门验证：源 PDF 全页 OCR 检查点与应译范围的新鲜译文；`toc.json` 到 manifest 的章节、标题、层级、类型及页范围完整覆盖；审定稿往返一致；EPUB 书名/语言元数据、manifest/spine/nav、逐章全文与完整 H1–H6 签名；Word 书名与首章前置区、逐章全文、完整标题签名、表格、引文原文及粗体/斜体/下划线；知识库字段白名单、稳定 ID、顺序、逐章全文与全章覆盖；书签 PDF 页数、书签标题/层级/目标页，以及逐页几何、可复制文字层和低分辨率 RGB 外观均与源 PDF 相同；所有阅读格式无来源分页或模型痕迹；OCR、校勘、翻译阶段锁均已释放，且无临时文件或崩溃遗留图片目录。
+质量门验证：源 PDF 全页 OCR 检查点与应译范围的新鲜译文；`toc.json` 到 manifest 的章节、标题、层级、类型及页范围完整覆盖；审定稿往返一致；EPUB 书名/语言元数据、manifest/spine/nav、逐章全文与完整 H1–H6 签名；Word 书名与首章前置区、逐章全文、完整标题签名、表格、引文原文、粗体/斜体/下划线、真实脚注 OOXML 包及固定环境渲染结果；知识库字段白名单、稳定 ID、顺序、逐章全文与全章覆盖；书签 PDF 页数、书签标题/层级/目标页，以及逐页几何、可复制文字层和低分辨率 RGB 外观均与源 PDF 相同；所有阅读格式无来源分页或模型痕迹；OCR、校勘、翻译阶段锁均已释放，且无临时文件或崩溃遗留图片目录。
+
+Word publisher 只登记并交付图产物指向的单一 canonical DOCX；不要在输出目录用 `*.docx` glob 猜测成品，也不要并存手工修订副本。旧的框架托管成品只能由 publication identity 按已记录摘要安全替换；用户修改过的冲突文件必须保留并由质量门阻断，等待人工处理。
 
 ## 提高执行效率
 
