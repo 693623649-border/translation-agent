@@ -56,6 +56,7 @@ class RunRequest:
     printed_pages_per_pdf_page: int | None = None
     front_matter_pages: int | None = None
     ocr_reading_direction: str | None = None
+    ocr_horizontal_columns: int | None = None
     keep_page_images: bool = False
     force: bool = False
     require_complete_ocr: bool = True
@@ -104,6 +105,7 @@ class RunRequest:
             ("--printed-pages-per-pdf-page", self.printed_pages_per_pdf_page),
             ("--front-matter-pages", self.front_matter_pages),
             ("--ocr-reading-direction", self.ocr_reading_direction),
+            ("--ocr-horizontal-columns", self.ocr_horizontal_columns),
             ("--required-ocr-model-prefix", self.required_ocr_model_prefix),
             ("--verification-profile", self.verification_profile),
             ("--report", self.verification_report),

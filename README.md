@@ -11,11 +11,15 @@
   → 文字版 EPUB/Word + AI 知识库 JSONL + 带书签的参考 PDF
 ```
 
-Graph 还提供第三入口 `--source-mode text-pdf`，用于每页都有完整可复制
-文字层的 born-digital PDF。该模式执行
+Graph 当前只有两种 source mode：默认的 `scanned-pdf` 和显式的
+`text-pdf`。后者用于每页都有完整可复制文字层的 born-digital
+PDF，执行
 `source.inspect → pages.text_extract → pages.translate → toc/compile → semantic`
-并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。默认仍是
-`scanned-pdf`，系统不会根据 PDF 内容自动猜测入口。
+并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。
+系统不会根据 PDF 内容自动猜测入口。EPUB 目前不是第三种 Graph
+source mode；它仍通过 `epub_semantic_import.py` 和
+`semantic_translation_runner.py` 独立导入/翻译/回填，再调用现有发布与
+验证命令。
 
 推荐的新入口是 `graph_pipeline.py`；它把各阶段组织成可替换的依赖图，同时
 复用 `book_pipeline.py` 的成熟实现和全部旧参数。`book_pipeline.py` 仍是完全
@@ -62,7 +66,7 @@ Graph 还提供第三入口 `--source-mode text-pdf`，用于每页都有完整�
 
 - **增量门**（`--phase verify --chapter-id`）：审定稿单次清洗后精确往返、
   正文引注↔尾注定义双向闭环、唯一 H1、无乱码/占位符/模型前言/分页痕迹；
-- **全书门**（compile 自动执行）：11 项无模型检查，覆盖检查点、manifest、
+- **全书门**（compile 自动执行）：13 项无模型检查，覆盖检查点、manifest、
   EPUB/Word 结构、知识库稳定 ID、PDF 书签与页面外观、运行卫生。
 
 ### 测试
@@ -119,7 +123,7 @@ translation-agent/
 
 ### 先查看计划
 
-`--plan` 只解析配置并输出节点的 `requires`、`provides`、版本、资源锁和缓存
+`--plan` 只解析配置并输出节点的 `requires`、`provides`、版本、资源声明和缓存
 设置，不调用模型，也不生成出版物：
 
 ```bash
@@ -188,7 +192,7 @@ python graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书"
 | `core.publication.verify` | 验收完整多格式出版物，产出 `publication.report` |
 | `core.pipeline.status` | 读取检查点与产物状态 |
 
-每个 `NodeSpec` 明确声明 `requires`、`provides`、版本、缓存指纹和资源锁。
+每个 `NodeSpec` 明确声明 `requires`、`provides`、版本、缓存指纹和资源元数据。
 规划器会在执行前阻断缺依赖、重复 Provider 和循环依赖。每次执行在输出目录
 写入：
 
@@ -207,6 +211,12 @@ outputs/my_book/.pipeline_graph/
 ├── events.jsonl                   # run/node started、skipped、succeeded、failed
 └── output.lock                    # 持久诊断文件；内核 advisory lock 表示实际占用
 ```
+
+当前 `GraphExecutor` 会按拓扑计划**串行**执行节点；`resources` 会进入
+节点声明和事件日志，尚不是跨节点并行调度器或资源锁管理器。OCR、
+校勘和翻译的并行由各自节点内部的 worker 池实现，不代表多个 Graph
+节点同时运行。输出目录互斥则由整次 Graph/传统流水线共用的
+`output.lock` 提供。
 
 artifact 中声明的 `path` 是权威数据位置，不能假定它一定等于输出目录中的
 传统文件名。需要调用旧阶段的 consumer 会先校验摘要，再把输入 artifact
@@ -388,6 +398,11 @@ OCR 与翻译/目录/编译之间，仍使用 Profile 选择的 `proofread_profi
 Profile 中填写 `proofread_profile` 不会自动启用该节点。
 
 ## 低代码 Web 控制台
+
+> **当前边界：**Streamlit 界面通过 `frontend_service.PipelineJob` 启动
+> `book_pipeline.py`，还没有切换到 `graph_pipeline.py`。因此界面能调整传统
+> phase、Profile 和 worker，但尚不能选择 Graph Recipe/source mode，也不能在界面
+> 中替换或删除节点。Graph 能力请使用 CLI 或 `translation_agent_api.py`。
 
 安装依赖后，只需一条命令：
 
@@ -645,7 +660,7 @@ python extract_textbook_layer.py "book/input.pdf" -o "outputs/my_book" \
   --strip-leading-page-number-offset 1 --reflow
 ```
 
-也可让 Graph 以第三入口一次执行后续翻译、编译、发布与验收：
+也可让 Graph 以第二种 source mode 一次执行后续翻译、编译、发布与验收：
 
 ```bash
 python graph_pipeline.py "book/input.pdf" -o "outputs/my_book" --phase all \

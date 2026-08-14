@@ -478,16 +478,65 @@ def clean_ocr_text(text: str) -> str:
     cleaned = text.strip()
     lines = cleaned.splitlines()
     fence = re.compile(r"^```(?:markdown|md|text|plaintext)?\s*$", flags=re.I)
+
+    def fenced_page_furniture(value: str) -> bool:
+        """Recognize a running chapter title/page number outside an OCR fence."""
+
+        remainder_lines: list[str] = []
+        for raw_line in value.splitlines():
+            stripped = raw_line.strip()
+            # Segmented OCR may wrap the footer band in its own fence.  Fence
+            # tokens carry no page content, so judge only the enclosed lines.
+            if not stripped or fence.fullmatch(stripped) or stripped == "```":
+                continue
+            stripped = re.sub(r"^(?:#{1,6}\s*)?[*_`]+\s*", "", stripped)
+            stripped = re.sub(r"\s*[*_`]+$", "", stripped).strip()
+            if stripped:
+                remainder_lines.append(stripped)
+        if not remainder_lines or len(remainder_lines) > 3:
+            return False
+        if any(len(line) > 80 for line in remainder_lines):
+            return False
+        numeric_footer = lambda line: re.fullmatch(
+            r"[-—–\s]*(?:[●©◎]\s*)?\d{1,4}(?:\s*[●©◎])?[-—–\s]*",
+            line,
+        ) is not None
+        chapter_header_indexes = [
+            index
+            for index, line in enumerate(remainder_lines)
+            if re.fullmatch(
+                r"第[一二三四五六七八九十百零〇0-9]{1,8}[章节部篇卷](?:\s+.{1,50})?",
+                line,
+            )
+        ]
+        if all(numeric_footer(line) for line in remainder_lines):
+            return True
+        if chapter_header_indexes:
+            # A split band may return the ordinal and short chapter title on
+            # separate decorated lines, optionally followed by the page
+            # number.  Do not accept sentence-like prose as furniture.
+            return all(
+                index in chapter_header_indexes
+                or numeric_footer(line)
+                or (len(line) <= 50 and re.search(r"[。！？!?]", line) is None)
+                for index, line in enumerate(remainder_lines)
+            )
+        return False
+
     # Remove a fence only when it encloses the complete response.  The old
     # prefix-only match could erase real text after a leading empty code block.
     if len(lines) >= 2 and fence.fullmatch(lines[0].strip()):
         closing = next((index for index, line in enumerate(lines[1:], start=1) if line.strip() == "```"), None)
         if closing is not None:
             remainder = "\n".join(lines[closing + 1 :]).strip()
-            if not remainder or re.match(
-                r"^(?:\*\*)?(?:Content Type|Language/Format|OCR Corrections|Quality Notes)",
-                remainder,
-                flags=re.I,
+            if (
+                not remainder
+                or fenced_page_furniture(remainder)
+                or re.match(
+                    r"^(?:\*\*)?(?:Content Type|Language/Format|OCR Corrections|Quality Notes)",
+                    remainder,
+                    flags=re.I,
+                )
             ):
                 lines = lines[1:closing]
     while len(lines) >= 2 and fence.fullmatch(lines[0].strip()) and lines[1].strip() == "```":
@@ -1063,6 +1112,7 @@ class CodingPlanVisionOCR:
         api_key: str,
         command: str,
         reading_direction: str = "horizontal",
+        horizontal_columns: int = 1,
         vision_model: str = "glm-4.6v",
         request_timeout: int = 120,
     ) -> None:
@@ -1070,7 +1120,11 @@ class CodingPlanVisionOCR:
         self.command = shlex.split(command)
         self.vision_model = vision_model.strip() or "glm-4.6v"
         self.request_timeout = max(30, int(request_timeout))
-        self.prompt_version = f"{reading_direction}-v2"
+        self.horizontal_columns = max(1, int(horizontal_columns))
+        self.prompt_version = resolve_coding_plan_ocr_prompt_version(
+            reading_direction,
+            self.horizontal_columns,
+        )
         self.ocr_model = (
             f"coding-plan/{self.vision_model}-vision-mcp/{self.prompt_version}"
         )
@@ -1228,6 +1282,7 @@ class CodingPlanVisionOCR:
         *,
         segments: int,
         physical_spread: bool = False,
+        horizontal_columns: bool = False,
     ) -> tuple[str, str]:
         """OCR a filtered page as ordered horizontal bands using the same MCP."""
         part_paths: list[tuple[Path, int | None]] = []
@@ -1322,6 +1377,17 @@ class CodingPlanVisionOCR:
                                     physical_page_index if physical_spread else None,
                                 )
                             )
+                elif horizontal_columns:
+                    boundaries = [0, *self._blank_column_cuts(image, segments), width]
+                    # Two-column back matter places the printed page number in
+                    # the extreme lower margin.  Exclude only that narrow
+                    # footer band before OCR so it cannot be fused with the
+                    # final index entry when the model linearizes a column.
+                    content_bottom = max(1, int(height * 0.95))
+                    region_specs = [
+                        ((left, 0, right, content_bottom), None)
+                        for left, right in zip(boundaries, boundaries[1:])
+                    ]
                 else:
                     boundaries = [0, *self._blank_row_cuts(image, segments), height]
                     region_specs = [
@@ -1380,6 +1446,8 @@ class CodingPlanVisionOCR:
                     flush=True,
                 )
                 text = text.strip()
+                if horizontal_columns:
+                    text = self._strip_horizontal_column_furniture(text)
                 if text and not self._is_empty_band_text(text):
                     texts.append(text)
                     if physical_page_index is not None:
@@ -1410,6 +1478,28 @@ class CodingPlanVisionOCR:
                 flags=re.I,
             )
         )
+
+    @staticmethod
+    def _strip_horizontal_column_furniture(text: str) -> str:
+        """Drop a printed page number captured at either column's lower edge."""
+
+        lines = text.rstrip().splitlines()
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            lines[-1] = re.sub(
+                r"\s*[●©◎]\s*\d{1,3}\s*$",
+                "",
+                lines[-1],
+            ).rstrip()
+        if lines and re.fullmatch(
+            r"[-—–\s]*(?:[●©◎]\s*)?\d{1,3}(?:\s*[●©◎])?[-—–\s]*",
+            lines[-1].strip(),
+        ):
+            lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _merge_band_texts(texts: list[str]) -> str:
@@ -1550,6 +1640,21 @@ class CodingPlanVisionOCR:
             client = self._client()
             used_segmented_path = False
             try:
+                horizontal_columns = max(
+                    1,
+                    int(getattr(self, "horizontal_columns", 1)),
+                )
+                if (
+                    getattr(self, "reading_direction", "horizontal") == "horizontal"
+                    and horizontal_columns > 1
+                ):
+                    used_segmented_path = True
+                    return self._ocr_segmented(
+                        image_path,
+                        client,
+                        segments=horizontal_columns,
+                        horizontal_columns=True,
+                    )
                 if self._is_vertical_two_page_spread(image_path):
                     used_segmented_path = True
                     spread_segments = max(
@@ -3708,8 +3813,12 @@ def compile_chapters(
                     source_page = (
                         f"pdf-{page:04d}-physical-{physical_index:02d}"
                     )
+                    # Reapply the wrapper cleaner at compilation time so
+                    # checkpoints produced by an older cleaner cannot leak a
+                    # model code fence or post-fence running header into a
+                    # semantic footnote definition.
                     semantic_page = reconstruct_page_footnotes(
-                        physical_text,
+                        clean_ocr_text(physical_text),
                         source_page=source_page,
                     )
                     semantic_page_bodies.append(semantic_page.body)
@@ -3829,6 +3938,32 @@ def write_knowledge_base(output_path: Path, rows: list[dict[str, Any]]) -> None:
     with output_path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+_JOINED_INDEX_ENTRY_BOUNDARY = re.compile(
+    r"(?P<reference>[,，、;；]\s*[0-9０-９]{1,3})"
+    r"(?="
+    r"(?P<label>[\u3400-\u9fff]"
+    r"[\u3400-\u9fffA-Za-z·•・—－–\-\s，,.'’]{0,48}"
+    r"[（(][^（）()\n]{0,80}[A-Za-z][^（）()\n]{0,80}[）)])"
+    r")"
+)
+
+
+def _split_joined_index_entries(markdown_text: str) -> str:
+    """Separate an OCR-joined Chinese index entry without rewriting text.
+
+    The boundary is intentionally narrower than a general ``number + CJK``
+    heuristic: it requires a preceding reference-list delimiter, a 1–3 digit
+    page reference with zero following whitespace, and a Chinese entry label
+    carrying a parenthesized Latin alias.  This excludes year-led labels,
+    already-separated entries, prose, and Chinese-only parentheticals.
+    """
+
+    return _JOINED_INDEX_ENTRY_BOUNDARY.sub(
+        lambda match: f"{match.group('reference')}\n\n",
+        markdown_text,
+    )
 
 
 def strip_publication_metadata(
@@ -4049,7 +4184,10 @@ def strip_publication_metadata(
         if not line.strip() and compact and not compact[-1].strip():
             continue
         compact.append(line)
-    return "\n".join(compact).strip() + "\n"
+    cleaned = "\n".join(compact).strip() + "\n"
+    if normalized_chapter_title == "索引":
+        cleaned = _split_joined_index_entries(cleaned)
+    return cleaned
 
 
 def strip_reviewed_publication_metadata(markdown_text: str) -> str:
@@ -4275,13 +4413,36 @@ def _append_markdown_to_docx(
         def add_run(text: str | None, *, run_bold: bool, run_italic: bool, run_underline: bool) -> None:
             if not text:
                 return
-            run = paragraph.add_run(text)
-            if run_bold:
-                run.bold = True
-            if run_italic:
-                run.italic = True
-            if run_underline:
-                run.underline = True
+
+            def style_run(run: Any) -> None:
+                if run_bold:
+                    run.bold = True
+                if run_italic:
+                    run.italic = True
+                if run_underline:
+                    run.underline = True
+
+            # python-docx embeds ``\n`` and ``\t`` inside one run as w:br and
+            # w:tab children.  Keep those control elements in their own runs
+            # so a nearby stable footnote marker remains a plain text run that
+            # the strict OOXML footnote patcher can replace without discarding
+            # authored line breaks or formatting.
+            normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+            for fragment in re.split(r"(\n|\t)", normalized_text):
+                if not fragment:
+                    continue
+                if fragment == "\n":
+                    run = paragraph.add_run()
+                    style_run(run)
+                    run.add_break()
+                    continue
+                if fragment == "\t":
+                    run = paragraph.add_run()
+                    style_run(run)
+                    run.add_tab()
+                    continue
+                run = paragraph.add_run(fragment)
+                style_run(run)
 
         add_run(
             element.text,
@@ -4443,6 +4604,86 @@ def _docx_manifest_body_style(item: dict[str, Any]) -> str | None:
     return None
 
 
+def _reflow_backmatter_entries(
+    markdown_text: str,
+    *,
+    body_style: str | None,
+) -> str:
+    """Turn visual column lines into semantic bibliography/index entries.
+
+    OCR preserves useful visual wraps in back matter.  Markdown treats those
+    single newlines as one large paragraph, which makes a two-column index or
+    bibliography unreadable after Word reflow.  Group continuations without
+    changing visible characters, then separate each logical entry with a
+    blank line for reader formats.
+    """
+
+    if body_style not in {"Bibliography Entry", "Index Entry"}:
+        return markdown_text
+    lines = markdown_text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    headings: list[str] = []
+    body_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not body_lines and (not stripped or stripped.startswith("#")):
+            if stripped:
+                headings.append(line.rstrip())
+            continue
+        if stripped:
+            body_lines.append(stripped)
+
+    entries: list[str] = []
+    current_lines: list[str] = []
+    for line in body_lines:
+        current = " ".join(current_lines)
+        if body_style == "Index Entry":
+            section_heading = re.fullmatch(r"[A-Z]", line) is not None
+            current_is_section_heading = (
+                re.fullmatch(r"[A-Z]", current.strip()) is not None
+            )
+            unmatched_parenthesis = (
+                current.count("（") + current.count("(")
+                > current.count("）") + current.count(")")
+            )
+            continuation = bool(
+                current
+                and not section_heading
+                and not current_is_section_heading
+                and (
+                    re.match(r"^[\d０-９,，.．、;；:：–—－-]", line)
+                    or re.search(r"[A-Za-z]-$", current)
+                    or re.match(r"^[a-z]{1,8}\)", line)
+                    or unmatched_parenthesis
+                    or re.search(r"\d", current) is None
+                )
+            )
+        else:
+            section_heading = False
+            continuation = bool(
+                current
+                and re.search(r"[。.!?！？]$", current) is None
+            )
+        if not current_lines or continuation:
+            # Normalize a visual line boundary to exactly one whitespace
+            # character, including after an ASCII hyphen.  A previous
+            # implementation turned ``Rich-\nard`` into ``Rich-ard``, silently
+            # changing the canonical EPUB/DOCX text.  Logical entries are
+            # separated below with a blank line.
+            current_lines.append(line)
+            continue
+        entries.append(" ".join(current_lines))
+        current_lines = [line]
+    if current_lines:
+        entries.append(" ".join(current_lines))
+
+    rendered: list[str] = []
+    if headings:
+        rendered.extend(headings)
+        rendered.append("")
+    rendered.extend("\n\n".join(entries).splitlines())
+    return "\n".join(rendered).strip() + "\n"
+
+
 def _set_docx_style_font(
     style: Any,
     *,
@@ -4542,7 +4783,10 @@ def _configure_book_docx_styles(document: Any) -> str:
 
     semantic_styles = (
         ("Bibliography Entry", 10, 20, -20, 1.2, 2),
-        ("Index Entry", 9.5, 0, 0, 1.15, 1),
+        # Eight points keeps independent index entries visually distinct and,
+        # after LibreOffice rendering, prevents PyMuPDF from coalescing several
+        # neighbouring entries into a false multi-column-interleaving block.
+        ("Index Entry", 9.5, 0, 0, 1.15, 8),
         ("Table Text", 9.5, 0, 0, 1.1, 0),
     )
     for name, size, left, first, spacing, after in semantic_styles:
@@ -4784,6 +5028,11 @@ def build_docx(
                 chapter_title=str(item.get("display_title") or ""),
             )
         )
+        body_style = _docx_manifest_body_style(item)
+        publication = _reflow_backmatter_entries(
+            publication,
+            body_style=body_style,
+        )
         rendered_markdown, chapter_notes = markdown_footnotes_to_docx_markers(
             publication,
             namespace=str(item.get("id") or f"chapter-{sequence}"),
@@ -4795,7 +5044,7 @@ def build_docx(
         _append_markdown_to_docx(
             document,
             rendered_markdown,
-            body_style=_docx_manifest_body_style(item),
+            body_style=body_style,
         )
     _style_docx_tables(document)
     document.core_properties.title = book_title
@@ -4842,7 +5091,7 @@ def build_epub(
         md_path = chapter_dir / item["filename"]
         xhtml_name = md_path.with_suffix(".xhtml").name
         source_markdown = md_path.read_text(encoding="utf-8")
-        body = markdown_to_html(
+        publication = (
             strip_reviewed_publication_metadata(source_markdown)
             if item.get("reviewed_override")
             else strip_publication_metadata(
@@ -4851,6 +5100,11 @@ def build_epub(
                 chapter_title=str(item.get("display_title") or ""),
             )
         )
+        publication = _reflow_backmatter_entries(
+            publication,
+            body_style=_docx_manifest_body_style(item),
+        )
+        body = markdown_to_html(publication)
         title = html.escape(str(item["display_title"]))
         document = f'''<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{html.escape(language)}">
@@ -5001,6 +5255,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Page reading direction used by the content-filter band fallback. "
             "Use vertical for traditional Japanese right-to-left columns. "
             "Defaults to the OCR profile setting, then horizontal."
+        ),
+    )
+    parser.add_argument(
+        "--ocr-horizontal-columns",
+        type=int,
+        default=int(os.getenv("OCR_HORIZONTAL_COLUMNS", "1")),
+        help=(
+            "Split a horizontal page into this many left-to-right column images "
+            "before vision OCR (default: 1). Use 2 for two-column indexes or "
+            "bibliographies."
         ),
     )
     parser.add_argument("--tesseract-language", default="jpn_vert+eng")
@@ -5544,6 +5808,18 @@ def resolve_ocr_reading_direction(
     )
 
 
+def resolve_coding_plan_ocr_prompt_version(
+    reading_direction: str,
+    horizontal_columns: int = 1,
+) -> str:
+    """Return the content identity for the selected visual reading layout."""
+
+    columns = max(1, int(horizontal_columns))
+    if reading_direction == "horizontal" and columns > 1:
+        return f"horizontal-columns-{columns}-v6"
+    return f"{reading_direction}-v2"
+
+
 def resolve_expected_ocr_model_prefix(
     args: argparse.Namespace,
     ocr_profile: ModelProfile | None = None,
@@ -5556,7 +5832,11 @@ def resolve_expected_ocr_model_prefix(
         return str(args.ocr_cache_model_prefix)
     if ocr_profile is not None and ocr_profile.adapter == "coding-plan-mcp":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
-        return f"coding-plan/{ocr_profile.model}-vision-mcp/{direction}-v2"
+        prompt_version = resolve_coding_plan_ocr_prompt_version(
+            direction,
+            args.ocr_horizontal_columns,
+        )
+        return f"coding-plan/{ocr_profile.model}-vision-mcp/{prompt_version}"
     return None
 
 
@@ -5582,7 +5862,11 @@ def resolve_expected_ocr_model_exact(
             if ocr_profile is not None
             else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
         )
-        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
+        prompt_version = resolve_coding_plan_ocr_prompt_version(
+            direction,
+            args.ocr_horizontal_columns,
+        )
+        return f"coding-plan/{model}-vision-mcp/{prompt_version}"
     if backend == "glm-ocr":
         return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
@@ -6029,6 +6313,8 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
     )
     if ocr_workers < 1 or translation_workers < 1 or proofread_workers < 1:
         parser.error("OCR, proofreading, and translation worker counts must be positive.")
+    if args.ocr_horizontal_columns < 1:
+        parser.error("--ocr-horizontal-columns must be positive.")
     if args.translation_max_chars < 1 or args.proofread_max_chars < 1:
         parser.error("Translation and proofreading max-chars values must be positive.")
     if args.proofread_delay < 0:
@@ -6083,6 +6369,7 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         api_key=ocr_key,
                         command=ocr_command,
                         reading_direction=args.ocr_reading_direction,
+                        horizontal_columns=args.ocr_horizontal_columns,
                         vision_model=(
                             ocr_profile.model
                             if ocr_profile is not None

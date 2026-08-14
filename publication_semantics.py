@@ -24,7 +24,9 @@ from typing import Any, Iterable, Sequence
 
 
 LEGACY_NOTE_START = re.compile(
-    r"(?m)^[ \t]*(?P<token>\[(?P<square>\d{1,4})\]|〔(?P<corner>\d{1,4})〕)"
+    r"(?m)^[ \t]*(?P<token>\[[ \t]*(?P<square>\d{1,4})[ \t]*\]|"
+    r"［[ \t]*(?P<full_square>\d{1,4})[ \t]*］|"
+    r"〔[ \t]*(?P<corner>\d{1,4})[ \t]*〕)"
     r"[ \t]*(?=\S)"
 )
 MARKDOWN_NOTE_START = re.compile(
@@ -142,6 +144,22 @@ def _stable_note_id(source_page: str, label: str, occurrence: int) -> str:
     return f"{safe_page}-n{label}{suffix}"
 
 
+def _legacy_note_reference_pattern(label: str) -> re.Pattern[str]:
+    """Match visually equivalent bracket styles for one numeric note label.
+
+    Chinese publications commonly mix ASCII square brackets, lenticular
+    brackets, and ASCII/full-width parentheses between an inline marker and
+    its page-bottom definition.  They carry the same semantic label.  Plain
+    numbers are deliberately excluded so years, list items, and page numbers
+    can never become footnote landings by accident.
+    """
+
+    escaped = re.escape(label)
+    return re.compile(
+        rf"(?:\[{escaped}\]|［{escaped}］|〔{escaped}〕|\({escaped}\)|（{escaped}）)"
+    )
+
+
 def reconstruct_page_footnotes(text: str, *, source_page: str) -> SemanticPage:
     """Move only unambiguous page-local legacy notes into semantic footnotes.
 
@@ -171,13 +189,19 @@ def reconstruct_page_footnotes(text: str, *, source_page: str) -> SemanticPage:
 
     for index, match in enumerate(starts):
         token = match.group("token")
-        label = match.group("square") or match.group("corner") or ""
+        label = (
+            match.group("square")
+            or match.group("full_square")
+            or match.group("corner")
+            or ""
+        )
         end = starts[index + 1].start() if index + 1 < len(starts) else len(normalized)
         raw_note = _strip_trailing_page_furniture(normalized[match.end() : end])
         note_text = _join_visual_lines(raw_note)
+        reference_pattern = _legacy_note_reference_pattern(label)
         prior_references = [
             item
-            for item in re.finditer(re.escape(token), normalized[: match.start()])
+            for item in reference_pattern.finditer(normalized[: match.start()])
             if not any(
                 start <= item.start() < stop
                 for start, stop in definition_spans

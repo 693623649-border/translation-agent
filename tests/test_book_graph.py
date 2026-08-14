@@ -1305,6 +1305,56 @@ class BookGraphExecutionTests(unittest.TestCase):
             document.new_page()
             document.save(path)
 
+    def test_pages_load_normalizes_before_snapshotting_artifact_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            book_pipeline.save_page_record(
+                output,
+                book_pipeline.PageRecord(
+                    pdf_page=1,
+                    text="```markdown\n正文\n```",
+                    ocr_model="legacy-ocr",
+                ),
+            )
+            raw_artifact = _pages_fixture(output / "pages")
+            prepared = prepare_book_graph(
+                [
+                    "--output-dir",
+                    str(output),
+                    "--phase",
+                    "compile",
+                    "--no-verify",
+                ]
+            )
+            pages_load = next(
+                node
+                for node in prepared.graph.nodes
+                if node.name == NODE_PAGES_LOAD
+            )
+
+            result = pages_load.handler(prepared.context)
+            artifact = result.outputs[ART_PAGES_RAW]
+
+            self.assertEqual(book_pipeline.PageStore(output).load(1).text, "正文")
+            self.assertNotEqual(artifact["sha256"], raw_artifact["sha256"])
+            self.assertEqual(
+                artifact["sha256"],
+                _pages_fixture(output / "pages")["sha256"],
+            )
+
+            # Legacy compile normalizes checkpoints again.  The graph value
+            # must remain valid because pages.load fingerprinted cleaned bytes.
+            book_pipeline.normalize_cached_page_records(
+                output,
+                book_pipeline.load_page_records(output),
+            )
+            self.assertTrue(
+                prepared.context.value_validators[ART_PAGES_RAW](
+                    prepared.context,
+                    artifact,
+                )
+            )
+
     def test_legacy_main_shares_graph_output_lock_and_writes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
@@ -4025,7 +4075,16 @@ translation_profile = "translation"
                     )
 
                 with patch(builder_name, side_effect=build_fake) as builder:
-                    for title in ("Title A", "Title B"):
+                    for index, title in enumerate(("Title A", "Title A", "Title B")):
+                        if index == 1:
+                            # A lost/corrupt management sidecar must invalidate
+                            # the publisher cache so title migration remains
+                            # recoverable on the next run.
+                            (
+                                output
+                                / ".pipeline_graph"
+                                / "publication_identity.json"
+                            ).unlink()
                         prepared = prepare_book_graph(
                             [
                                 "--output-dir",
@@ -4043,7 +4102,7 @@ translation_profile = "translation"
                             f"Title_{title[-1]}{suffix}",
                         )
 
-                self.assertEqual(builder.call_count, 2)
+                self.assertEqual(builder.call_count, 3)
                 self.assertFalse((output / f"Title_A{suffix}").exists())
                 self.assertTrue((output / f"Title_B{suffix}").is_file())
                 self.assertEqual(

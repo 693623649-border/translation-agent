@@ -130,6 +130,34 @@ class PipelineGraphPlanningTests(unittest.TestCase):
 
 
 class GraphExecutorTests(unittest.TestCase):
+    def test_content_artifact_rejects_a_noncanonical_output_fingerprint(self):
+        artifact = {"sha256": "a" * 64, "value": "content"}
+        graph = PipelineGraph(
+            [
+                node(
+                    "produce",
+                    lambda _context: NodeResult(
+                        outputs={"artifact": artifact},
+                        fingerprints={"artifact": "constant"},
+                    ),
+                    provides={"artifact"},
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            context = GraphContext(
+                directory,
+                value_validators={"artifact": lambda _context, _value: True},
+                value_fingerprint_factories={
+                    "artifact": lambda _context, value: value["sha256"]
+                },
+            )
+            with self.assertRaises(NodeExecutionError) as raised:
+                GraphExecutor(graph).execute(context, targets={"artifact"})
+
+        self.assertIsInstance(raised.exception.cause, NodeContractError)
+        self.assertIn("non-content fingerprint", str(raised.exception.cause))
+
     def test_uncacheable_state_is_not_restored_after_node_becomes_cacheable(self):
         calls: list[int] = []
 

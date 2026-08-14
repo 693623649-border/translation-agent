@@ -14,6 +14,8 @@ from unittest.mock import patch
 import fitz
 from PIL import Image
 
+from docx_footnotes import inspect_docx_footnotes
+
 from book_pipeline import (
     ChatTranslator,
     CodingPlanVisionOCR,
@@ -23,12 +25,14 @@ from book_pipeline import (
     PageRecord,
     TocEntry,
     _exclusive_stage_lock,
+    _reflow_backmatter_entries,
     annotate_printed_page_markers,
     apply_page_mapping,
     build_parser,
     build_bookmarked_pdf,
     build_docx,
     build_epub,
+    build_knowledge_rows_from_manifest,
     build_translation_client,
     compile_chapters,
     clean_ocr_text,
@@ -44,6 +48,7 @@ from book_pipeline import (
     parse_page_spec,
     remove_duplicate_title,
     resolve_api_key,
+    resolve_expected_ocr_model_exact,
     resolve_translation_api_key,
     resolve_worker_counts,
     save_page_record,
@@ -702,6 +707,47 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(clean_ocr_text("14\n\n正文\n```"), "14\n\n正文")
         self.assertEqual(
             clean_ocr_text(
+                "```markdown\n正文。[1]\n\n[1] 完整注释。\n```\n"
+                "第二章 文化领导权\n163"
+            ),
+            "正文。[1]\n\n[1] 完整注释。",
+        )
+        self.assertEqual(
+            clean_ocr_text(
+                "```markdown\n正文。[1]\n\n[1] 完整注释。\n```\n"
+                "第五章 最后的革命"
+            ),
+            "正文。[1]\n\n[1] 完整注释。",
+        )
+        self.assertEqual(
+            clean_ocr_text(
+                "```markdown\n正文。\n```\n"
+                "```markdown\n© 292\n```"
+            ),
+            "正文。",
+        )
+        self.assertEqual(
+            clean_ocr_text(
+                "```markdown\n正文。\n```  \n"
+                "**第五章**\n**最后的革命**\n427 ©\n```"
+            ),
+            "正文。",
+        )
+        # A genuine internal code block followed by ordinary prose is not an
+        # OCR response wrapper and must remain byte-for-byte visible.
+        genuine_code = "```text\nprint('正文')\n```\n普通正文继续。"
+        self.assertEqual(clean_ocr_text(genuine_code), genuine_code)
+        self.assertEqual(clean_ocr_text("```\n14\n```"), "14")
+        second_substantive_block = (
+            "```markdown\n第一段正文。\n```\n"
+            "```markdown\n第二段正文。\n```"
+        )
+        self.assertEqual(
+            clean_ocr_text(second_substantive_block),
+            second_substantive_block,
+        )
+        self.assertEqual(
+            clean_ocr_text(
                 "```\n```\n\n**Content Type** 空白书页\n\n**Quality Notes** 截图内容为空白。"
             ),
             "",
@@ -810,6 +856,40 @@ class UtilityTests(unittest.TestCase):
         self.assertIn(
             "\n\n6\n",
             strip_publication_metadata(source, chapter_title="数据表"),
+        )
+
+    def test_index_reader_cleanup_splits_only_strong_joined_entry_boundaries(self) -> None:
+        joined = (
+            "# 索引\n\n"
+            "狄恩，詹姆斯（Dean，James） 106－108，111狄更斯，查尔斯 "
+            "(Dickens, Charles) 156, 197, 221\n"
+            "霍克海默（Horkheimer，Max） 44，84，144，284"
+            "霍夫斯塔德（Hofstadter，Richard） 59，282，442\n"
+        )
+
+        cleaned = strip_publication_metadata(joined, chapter_title="索引")
+
+        self.assertIn("106－108，111\n\n狄更斯", cleaned)
+        self.assertIn("84，144，284\n\n霍夫斯塔德", cleaned)
+        self.assertEqual(
+            re.sub(r"\s+", "", cleaned),
+            re.sub(r"\s+", "", joined),
+        )
+
+        negative = (
+            "# 索引\n\n"
+            "60年代运动（Sixties Movement） 20\n\n"
+            "事件（Event） 1，1968年运动（Movement of 1968） 20\n\n"
+            "已有空格（Spaced） 1，111 狄更斯（Dickens） 156\n\n"
+            "无拉丁别名 1，111狄更斯（英国作家） 156\n"
+        )
+        self.assertEqual(
+            strip_publication_metadata(negative, chapter_title="索引"),
+            negative,
+        )
+        self.assertIn(
+            "，111狄更斯",
+            strip_publication_metadata(joined, chapter_title="正文"),
         )
 
     def test_known_two_page_spread_numbers_are_removed_from_publication(self) -> None:
@@ -1322,6 +1402,48 @@ for line in sys.stdin:
                 backend.ocr_model,
                 "coding-plan/glm-4.6v-vision-mcp/vertical-v2",
             )
+
+    def test_horizontal_two_column_ocr_reads_left_column_before_right(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "two-column.jpg"
+            Image.new("RGB", (400, 600), "white").save(image_path)
+            backend = object.__new__(CodingPlanVisionOCR)
+            backend.reading_direction = "horizontal"
+            backend.horizontal_columns = 2
+            backend._ocr_filtered_band = lambda path, depth: (
+                (
+                    "左栏完整内容。\n484"
+                    if "_segment_1_" in path.stem
+                    else "右栏完整内容。"
+                ),
+                "request",
+            )
+
+            text, request_id = backend._ocr_segmented(
+                image_path,
+                object(),
+                segments=2,
+                horizontal_columns=True,
+            )
+
+        self.assertEqual(text, "左栏完整内容。\n\n右栏完整内容。")
+        self.assertTrue(request_id.startswith("mcp-segmented-"))
+
+    def test_horizontal_column_count_changes_exact_ocr_identity(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "sample.pdf",
+                "--ocr-reading-direction",
+                "horizontal",
+                "--ocr-horizontal-columns",
+                "2",
+            ]
+        )
+
+        self.assertEqual(
+            resolve_expected_ocr_model_exact(args),
+            "coding-plan/glm-4.6v-vision-mcp/horizontal-columns-2-v6",
+        )
 
     def test_coding_plan_content_filter_uses_segmented_fallback(self) -> None:
         class FilterThenReadClient:
@@ -2275,6 +2397,40 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertTrue(runs["斜体"].italic)
         self.assertFalse(bool(runs["普通文字、"].underline))
 
+    def test_docx_footnote_marker_next_to_visual_line_break_is_patchable(self) -> None:
+        output = self.root / "docx-soft-line-footnote"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n"
+            "第一条视觉行\n"
+            "第二条视觉行正文[^p1-n1]之后继续。\n"
+            "第三条视觉行。\n\n"
+            "[^p1-n1]: 完整注释。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "soft-line.docx"
+
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+
+        inventory = inspect_docx_footnotes(docx_path)
+        self.assertTrue(inventory.valid, inventory.problems)
+        self.assertEqual(inventory.reference_ids, (1,))
+        with zipfile.ZipFile(docx_path) as archive:
+            document_xml = archive.read("word/document.xml")
+        self.assertNotIn(b"[[FN:", document_xml)
+        self.assertGreaterEqual(document_xml.count(b"<w:br"), 3)
+
     def test_docx_book_layout_has_controlled_front_matter_and_footer(self) -> None:
         output = self.root / "docx-book-layout"
         chapter_dir = output / "chapters"
@@ -2341,8 +2497,14 @@ class MappingAndCompilationTests(unittest.TestCase):
         chapter_dir = output / "chapters"
         chapter_dir.mkdir(parents=True)
         chapters = (
-            ("001_主要参考书目.md", "# 主要参考书目\n\nSmith, A., A Book, 2001.\n"),
-            ("002_索引.md", "# 索引\n\n阿伦特 12, 18\n"),
+            (
+                "001_主要参考书目.md",
+                "# 主要参考书目\n\nSmith, A., A Book,\nUniversity Press, 2001.\n",
+            ),
+            (
+                "002_索引.md",
+                "# 索引\n\n阿伦特\n12, 18\n贝尔\n20, 21\n",
+            ),
             (
                 "003_表格.md",
                 "# 表格\n\n| 项目 | 很长的说明列 |\n| --- | --- |\n| A | 说明文字 |\n",
@@ -2374,13 +2536,26 @@ class MappingAndCompilationTests(unittest.TestCase):
 
         document = Document(path)
         paragraphs = {paragraph.text: paragraph.style.name for paragraph in document.paragraphs}
-        self.assertEqual(paragraphs["Smith, A., A Book, 2001."], "Bibliography Entry")
+        self.assertEqual(
+            paragraphs["Smith, A., A Book, University Press, 2001."],
+            "Bibliography Entry",
+        )
         self.assertEqual(paragraphs["阿伦特 12, 18"], "Index Entry")
+        self.assertEqual(paragraphs["贝尔 20, 21"], "Index Entry")
 
         namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
         attr = lambda name: f"{{{namespace['w']}}}{name}"
         with zipfile.ZipFile(path) as archive:
             body = ET.fromstring(archive.read("word/document.xml"))
+            styles = ET.fromstring(archive.read("word/styles.xml"))
+        index_style = next(
+            style
+            for style in styles.findall(".//w:style", namespace)
+            if style.get(attr("styleId")) == "IndexEntry"
+        )
+        index_spacing = index_style.find("w:pPr/w:spacing", namespace)
+        self.assertIsNotNone(index_spacing)
+        self.assertEqual(index_spacing.get(attr("after")), "160")
         table = body.find(".//w:tbl", namespace)
         self.assertIsNotNone(table)
         table_width = table.find("w:tblPr/w:tblW", namespace)
@@ -2400,6 +2575,94 @@ class MappingAndCompilationTests(unittest.TestCase):
                 ],
                 grid,
             )
+
+    def test_backmatter_reflow_preserves_visible_text_across_hyphen_wraps(self) -> None:
+        source = (
+            "# 索引\n\n"
+            "弗莱克斯（Flacks，Rich-\n"
+            "ard） 253，392\n"
+            "富兰克林（Franklin，Benjamin） 121\n"
+        )
+
+        rendered = _reflow_backmatter_entries(
+            source,
+            body_style="Index Entry",
+        )
+
+        # Reflow may add paragraph boundaries, but it must not silently join a
+        # visual line after a hyphen: that changes the reader-visible text and
+        # makes EPUB/DOCX diverge from the chapter Markdown completeness gate.
+        canonical = lambda value: re.sub(r"\s+", " ", value).strip()
+        self.assertEqual(canonical(rendered), canonical(source))
+        self.assertIn("Rich- ard", rendered)
+        self.assertIn(
+            "ard） 253，392\n\n富兰克林",
+            rendered,
+        )
+
+    def test_index_join_split_is_shared_by_markdown_kb_docx_and_epub(self) -> None:
+        chapter_dir = self.root / "chapters"
+        chapter_dir.mkdir()
+        source = (
+            "# 索引\n\n"
+            "狄恩，詹姆斯（Dean，James） 106－108，111狄更斯，查尔斯 "
+            "(Dickens, Charles) 156, 197, 221\n"
+        )
+        reader = strip_publication_metadata(source, chapter_title="索引")
+        chapter_path = chapter_dir / "001_索引.md"
+        chapter_path.write_text(reader, encoding="utf-8")
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "index",
+                "display_title": "索引",
+                "filename": chapter_path.name,
+                "reviewed_override": False,
+            }
+        ]
+
+        rows = build_knowledge_rows_from_manifest(
+            Path("source.pdf"),
+            chapter_dir,
+            manifest,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertIn("，111\n\n狄更斯", rows[0]["content"])
+
+        docx_path = self.root / "book.docx"
+        epub_path = self.root / "book.epub"
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+        build_epub(
+            epub_path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+            language="zh-CN",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        index_entries = [
+            paragraph.text
+            for paragraph in document.paragraphs
+            if paragraph.style.name == "Index Entry"
+        ]
+        self.assertEqual(
+            index_entries,
+            [
+                "狄恩，詹姆斯（Dean，James） 106－108，111",
+                "狄更斯，查尔斯 (Dickens, Charles) 156, 197, 221",
+            ],
+        )
+        with zipfile.ZipFile(epub_path) as archive:
+            root = ET.fromstring(archive.read("OEBPS/001_索引.xhtml"))
+        paragraphs = [
+            "".join(element.itertext())
+            for element in root.iter()
+            if element.tag.rsplit("}", 1)[-1] == "p"
+        ]
+        self.assertEqual(paragraphs, index_entries)
 
     def test_reviewed_override_round_trips_middle_dot_title_and_body(self) -> None:
         output = self.root / "reviewed-middle-dot"
@@ -2860,7 +3123,21 @@ class MappingAndCompilationTests(unittest.TestCase):
             0,
         )
         self.assertEqual(
-            main([str(self.pdf_path), "-o", str(output), "--phase", "compile", "--granularity", "chapter"]),
+            main(
+                [
+                    str(self.pdf_path),
+                    "-o",
+                    str(output),
+                    "--phase",
+                    "compile",
+                    "--granularity",
+                    "chapter",
+                    # This fixture exercises format construction.  Full and
+                    # Word release gates have dedicated tests and are outside
+                    # this unit's scope.
+                    "--no-verify",
+                ]
+            ),
             0,
         )
         self.assertTrue((output / "knowledge_base.jsonl").exists())

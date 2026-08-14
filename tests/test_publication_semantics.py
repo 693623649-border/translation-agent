@@ -68,6 +68,71 @@ class PublicationSemanticsTests(unittest.TestCase):
         self.assertNotIn("[1] First source", result.body)
         self.assertNotIn("[2] Second source", result.body)
 
+    def test_equivalent_bracket_styles_resolve_the_same_note_label(self) -> None:
+        cases = (
+            ("正文以圆括号引用资料。(1)\n\n[1] 第一条来源。", "(1)"),
+            ("正文以方括号引用资料。[1]\n\n〔1〕第二条来源。", "[1]"),
+            ("正文以全角圆括号引用。（1）\n\n[1] 第三条来源。", "（1）"),
+            ("正文以全角方括号引用。［1］\n\n〔1〕第四条来源。", "［1］"),
+        )
+
+        for index, (page, original_marker) in enumerate(cases, start=1):
+            with self.subTest(original_marker=original_marker):
+                result = reconstruct_page_footnotes(page, source_page=f"p{index}")
+                self.assertFalse(result.release_blocked)
+                self.assertEqual(len(result.footnotes), 1)
+                self.assertNotIn(original_marker, result.body)
+                self.assertIn(f"[^p{index}-n1]", result.body)
+
+    def test_full_width_square_definition_is_reconstructed(self) -> None:
+        result = reconstruct_page_footnotes(
+            "正文中的来源。[1]\n\n［1］原书页底注释。",
+            source_page="pdf-0012-physical-01",
+        )
+
+        self.assertFalse(result.release_blocked)
+        self.assertEqual(len(result.footnotes), 1)
+        self.assertEqual(result.footnotes[0].text, "原书页底注释。")
+        self.assertIn("[^pdf-0012-physical-01-n1]", result.body)
+        self.assertNotIn("［1］", result.body)
+
+    def test_spaced_square_definition_is_reconstructed(self) -> None:
+        result = reconstruct_page_footnotes(
+            "正文中的来源。[1]\n\n[ 1 ] 原书页底注释。",
+            source_page="pdf-0013-physical-01",
+        )
+
+        self.assertFalse(result.release_blocked)
+        self.assertEqual(len(result.footnotes), 1)
+        self.assertIn("[^pdf-0013-physical-01-n1]", result.body)
+        self.assertNotIn("[ 1 ]", result.body)
+
+    def test_equivalent_bracket_styles_remain_ambiguous_with_two_landings(self) -> None:
+        page = "正文先引用[1]，稍后又引用(1)。\n\n〔1〕来源说明。"
+
+        result = reconstruct_page_footnotes(page, source_page="p1")
+
+        self.assertTrue(result.release_blocked)
+        self.assertEqual(result.footnotes, ())
+        self.assertIn("〔1〕来源说明", result.body)
+        self.assertEqual(
+            {issue.code for issue in result.issues},
+            {"semantic_footnote_reference_ambiguous"},
+        )
+        self.assertEqual(result.issues[0].evidence["reference_count"], 2)
+
+    def test_plain_number_never_becomes_a_footnote_landing(self) -> None:
+        page = "正文中的裸数字 1 不是脚注标记。\n\n[1] 来源说明。"
+
+        result = reconstruct_page_footnotes(page, source_page="p1")
+
+        self.assertTrue(result.release_blocked)
+        self.assertEqual(result.footnotes, ())
+        self.assertEqual(
+            {issue.code for issue in result.issues},
+            {"semantic_footnote_reference_missing"},
+        )
+
     def test_markdown_inventory_and_docx_markers_are_one_to_one(self) -> None:
         markdown = (
             "# 第一章\n\n正文[^p1-n1]。\n\n"

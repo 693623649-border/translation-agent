@@ -1,9 +1,17 @@
-# 三入口文档语义 DAG
+# 三入口文档语义 DAG（当前实现与目标架构）
 
-本文件定义影印 PDF、EPUB 和带文本层 PDF 的三入口处理契约。三个入口可以有
-不同的提取实现；发布器不得直接读取 OCR 页、PDF 文本块或 EPUB XHTML。当前
-可执行实现已经共享章节语义、发布清洗和验证门，但仍有两种翻译粒度；目标架构
-再把三者收敛为同一种 `document.semantic.source` 后进行单元级翻译。
+本文件同时描述影印 PDF、EPUB 和带文本层 PDF 的目标三入口契约，
+以及当前已落地的过渡实现。阅读时必须区分两者：
+
+- **当前 Graph：**`graph_pipeline.py` 只接受 `scanned-pdf` 和 `text-pdf`
+  两种 source mode，它们共享后续章节语义、发布清洗和验证门。
+- **当前 EPUB：**`epub_semantic_import.py` 与
+  `semantic_translation_runner.py` 是独立工作流；EPUB 不是 Graph source
+  mode，也不能通过 Graph Recipe 从原始 EPUB 一键跑到全套发布门。
+- **目标架构：**三种来源都收敛为 `document.semantic.source`，再进行
+  统一的单元级翻译、清洗、发布与验证。
+
+目标契约要求发布器不得直接读取 OCR 页、PDF 文本块或 EPUB XHTML。
 
 > 当前代码中的 `core.chapters.compile` 是**语义重建前的章节草稿组装**，不是出版编译。
 > 它必须先于 `core.reconstruct.semantic`。为消除歧义，新接口和日志将这一职责
@@ -14,19 +22,20 @@
 
 ```mermaid
 flowchart LR
-    subgraph S["入口一：影印 PDF"]
+    subgraph S["Graph source mode 1：scanned-pdf"]
         S1["core.source.inspect"] --> S2["core.pages.ocr"]
         S2 --> SP["可选 core.pages.proofread"]
         SP --> ST["可选 core.pages.translate"]
     end
 
-    subgraph E["入口二：EPUB（当前为独立语义 CLI）"]
+    subgraph E["独立工作流：EPUB（不是 Graph source mode）"]
         E1["epub_semantic_import"] --> E2["translation-units.jsonl"]
         E2 --> E3["semantic_translation_runner"]
         E3 --> E4["apply-translations"]
+        E4 --> EP["独立调用现有 publisher / verifier"]
     end
 
-    subgraph P["入口三：带文本层 PDF"]
+    subgraph P["Graph source mode 2：text-pdf"]
         P1["core.source.inspect"] --> P2["core.pages.text_extract"]
         P2 --> PT["可选 core.pages.translate"]
     end
@@ -35,8 +44,6 @@ flowchart LR
     PT --> TOC
     TOC --> DRAFT["core.chapters.compile"]
     DRAFT --> SEM["core.reconstruct.semantic"]
-    E4 --> LOAD["core.chapters.load"]
-    LOAD --> SEM
     SEM --> SAN["core.publication.sanitize"]
     SAN --> PUB["EPUB / DOCX / KB"]
     PUB --> VERIFY["publication.word_report / publication.report"]
@@ -45,12 +52,25 @@ flowchart LR
     REFPDF --> VERIFY
 ```
 
-这张图是现在可以执行的事实：影印 PDF 和带文本层 PDF 在页层可选翻译；EPUB
-由语义导入器、runner 和回填命令生成章节后，再由 Graph 的
-`core.chapters.load` 接入共同下游。带文本层 PDF 不含
+这张图是现在可以执行的事实：影印 PDF 和带文本层 PDF 是两种 Graph
+source mode，在页层可选翻译。EPUB 命令可以生成与现有发布器兼容的
+章节文件，但尚没有 EPUB source adapter 或从原始 EPUB 出发的 Graph
+publication recipe。`core.chapters.load` 是 Graph 对已有章节 Markdown 的阶段复用
+节点，它本身不构成 EPUB source adapter。带文本层 PDF 不含
 `core.pages.ocr`；来源类型必须显式选择，不会自动猜测或静默回退。
 `reference PDF` 是保留原始页面的视觉旁路，只读取源 PDF 与 TOC，并与语义
 出版物一起进入最终 verifier；它不是由 reader Markdown 重新排版的文字出版物。
+
+### 当前执行与并发边界
+
+`GraphExecutor` 按拓扑计划逐节点串行执行。`NodeSpec.resources` 当前只是
+声明与事件日志元数据，不会调度多个 Graph 节点并行。OCR、校勘、
+翻译之所以可以并行，是因为对应节点内部使用独立 worker 池。
+
+Streamlit 界面当前由 `frontend_service.PipelineJob` 构造
+`book_pipeline.py` 子进程，仍是 legacy phase 入口。界面尚未暴露 Graph
+Recipe、`--source-mode`、节点替换/删除或 Graph 计划与缓存状态；这些能力
+目前必须使用 `graph_pipeline.py` 或 `translation_agent_api.py`。
 
 ## 目标统一依赖图
 
@@ -101,8 +121,9 @@ flowchart LR
 
 ## 三个入口的边界
 
-下表描述目标契约。当前 Graph 入口已经完成显式选择、全页文字覆盖、来源绑定与
-共同下游；几何栏序证明和 PDF 上标—脚注关系恢复目前仅由独立
+下表描述目标契约。当前两种 PDF Graph source mode 已经完成显式
+选择、全页文字覆盖、来源绑定与共同下游；EPUB 仍为独立入口。几何栏序
+证明和 PDF 上标—脚注关系恢复目前仅由独立
 `born_digital_pdf_import.py` 提供，尚未成为 Graph `core.pages.text_extract` 的
 发布能力。
 
@@ -238,8 +259,9 @@ token，翻译后逐 token 对账；例如 `158n.5` 不得被不一致地改成 
 `core.semantic.translate.run` 注册为三入口统一 Provider 时，可以替换这条页级
 翻译兼容边而不改变下游 semantic/sanitize/publisher 契约。
 
-这里的“统一”指三个入口共享语义、清洗、发布与验证不变量；当前可执行实现仍有
-两种翻译粒度：Graph 的文本 PDF 兼容边是 page-level translation，EPUB 与独立
-PDF importer 使用 `translation-units.jsonl`。文档中的
+这里的“统一”是目标不变量，不表示三种来源已在同一 Graph 拓扑中。
+当前可执行实现仍有两种翻译粒度：Graph 的文本 PDF 兼容边是
+page-level translation，独立的 EPUB/PDF importer 使用
+`translation-units.jsonl`。文档中的
 `core.semantic.translate.*` 是下一步统一 Provider 的目标命名，尚不能作为已注册
 Graph 节点调用。

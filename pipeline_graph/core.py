@@ -45,6 +45,7 @@ NodeHandler: TypeAlias = Callable[["GraphContext"], "NodeResult"]
 FingerprintFactory: TypeAlias = Callable[["GraphContext"], Any]
 CacheValidator: TypeAlias = Callable[["GraphContext", Mapping[str, JsonValue]], bool]
 ValueValidator: TypeAlias = Callable[["GraphContext", Any], bool]
+ValueFingerprintFactory: TypeAlias = Callable[["GraphContext", Any], str]
 
 
 class GraphError(RuntimeError):
@@ -269,6 +270,10 @@ class GraphContext:
         default_factory=dict,
         repr=False,
     )
+    value_fingerprint_factories: Mapping[str, ValueFingerprintFactory] = field(
+        default_factory=dict,
+        repr=False,
+    )
     run_id: str | None = field(default=None, init=False)
     node_name: str | None = field(default=None, init=False)
     _initial_value_names: frozenset[str] = field(
@@ -316,6 +321,14 @@ class GraphContext:
         for name, validator in self.value_validators.items():
             if not isinstance(name, str) or not name or not callable(validator):
                 raise ValueError("value_validators must map names to callables")
+        self.value_fingerprint_factories = MappingProxyType(
+            dict(self.value_fingerprint_factories)
+        )
+        for name, factory in self.value_fingerprint_factories.items():
+            if not isinstance(name, str) or not name or not callable(factory):
+                raise ValueError(
+                    "value_fingerprint_factories must map names to callables"
+                )
         self._initial_value_names = frozenset(self.values)
         self._initial_values = dict(self.values)
         self._initial_fingerprints = dict(self.fingerprints)
@@ -815,6 +828,10 @@ class GraphExecutor:
                         return None
                 except (OSError, ValueError, TypeError, json.JSONDecodeError):
                     return None
+                factory = context.value_fingerprint_factories.get(name)
+                canonical = factory(context, value) if factory is not None else None
+                if canonical is not None and output_fingerprints.get(name) != canonical:
+                    return None
         return outputs, output_fingerprints
 
     def execute(
@@ -952,6 +969,25 @@ class GraphExecutor:
                                 raise NodeContractError(
                                     f"node {node.name!r} produced invalid artifact {name!r}"
                                 )
+                        outputs = dict(result.outputs)
+                        output_fingerprints = {
+                            name: result.fingerprints.get(
+                                name, stable_fingerprint(outputs[name])
+                            )
+                            for name in node.provides
+                        }
+                        for name, value in outputs.items():
+                            factory = context.value_fingerprint_factories.get(name)
+                            if factory is None:
+                                continue
+                            canonical = factory(context, value)
+                            supplied = result.fingerprints.get(name)
+                            if supplied is not None and supplied != canonical:
+                                raise NodeContractError(
+                                    f"node {node.name!r} supplied a non-content "
+                                    f"fingerprint for artifact {name!r}"
+                                )
+                            output_fingerprints[name] = canonical
                     except Exception as exc:
                         safe_error = self._safe_error_text(context, exc)
                         self._append_event(
@@ -972,13 +1008,6 @@ class GraphExecutor:
                             safe_message=safe_error,
                         ) from exc
 
-                    outputs = dict(result.outputs)
-                    output_fingerprints = {
-                        name: result.fingerprints.get(
-                            name, stable_fingerprint(outputs[name])
-                        )
-                        for name in node.provides
-                    }
                     context.values.update(outputs)
                     context.fingerprints.update(output_fingerprints)
                     context._produced_value_names.update(node.provides)

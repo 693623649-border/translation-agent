@@ -733,7 +733,7 @@ def _safe_endpoint(value: Any) -> str:
         return f"opaque-sha256:{stable_fingerprint(raw)}"
 
 
-def _ocr_segmentation_semantics() -> dict[str, Any]:
+def _ocr_segmentation_semantics(args: Any) -> dict[str, Any]:
     split_value = os.getenv("CODING_PLAN_SPLIT_SPREADS", "1").strip().lower()
     return {
         "split_spreads": split_value not in {"0", "false", "no", "off"},
@@ -753,6 +753,7 @@ def _ocr_segmentation_semantics() -> dict[str, Any]:
             2,
             int(os.getenv("CODING_PLAN_SPREAD_SEGMENTS", "2")),
         ),
+        "horizontal_columns": max(1, int(args.ocr_horizontal_columns)),
     }
 
 
@@ -774,14 +775,17 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
                 if profile is not None and profile.command
                 else stable_fingerprint(args.ocr_command)
             ),
-            "prompt_version": f"{reading_direction}-v2",
+            "prompt_version": legacy.resolve_coding_plan_ocr_prompt_version(
+                reading_direction,
+                args.ocr_horizontal_columns,
+            ),
             "mode": os.getenv("Z_AI_MODE", "ZHIPU").strip().upper(),
             "max_output_tokens": max(
                 1,
                 int(os.getenv("Z_AI_VISION_MODEL_MAX_TOKENS", "4096")),
             ),
         }
-        segmentation: dict[str, Any] | None = _ocr_segmentation_semantics()
+        segmentation: dict[str, Any] | None = _ocr_segmentation_semantics(args)
     elif backend == "glm-ocr":
         identity = {
             "backend": backend,
@@ -991,7 +995,7 @@ def _sanitize_fingerprint(context: GraphContext) -> dict[str, Any]:
     args = _parsed_args(context)
     return {
         "adapter": GRAPH_ADAPTER_VERSION,
-        "sanitizer": "publication-metadata-v3",
+        "sanitizer": "publication-metadata-v4",
         "title": _book_title(context),
     }
 
@@ -1292,6 +1296,8 @@ def _import_pages_handler(context: GraphContext) -> NodeResult:
 
 
 def _load_pages_handler(context: GraphContext) -> NodeResult:
+    records = legacy.load_page_records(context.output_dir)
+    legacy.normalize_cached_page_records(context.output_dir, records)
     artifact = _pages_artifact(context.output_dir)
     return NodeResult(
         outputs={ART_PAGES_RAW: artifact},
@@ -2331,6 +2337,36 @@ def _book_artifact_validators() -> dict[str, Any]:
     return validators
 
 
+def _artifact_sha_fingerprint(_context: GraphContext, value: Any) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("content-addressed artifact must be an object")
+    return _required_artifact_sha256(value, name="artifact")
+
+
+def _semantic_artifact_fingerprint(_context: GraphContext, value: Any) -> str:
+    if not isinstance(value, dict):
+        raise ValueError("semantic artifact must be an object")
+    chapter_sha = _required_artifact_sha256(value, name=ART_SEMANTIC_CHAPTERS)
+    audit_sha = value.get("semantic_audit_sha256")
+    if not isinstance(audit_sha, str) or len(audit_sha) != 64:
+        raise ValueError("semantic artifact must contain an audit SHA-256")
+    return stable_fingerprint(
+        {
+            "chapters": chapter_sha,
+            "audit": audit_sha.lower(),
+        }
+    )
+
+
+def _book_artifact_fingerprint_factories() -> dict[str, Any]:
+    factories = {
+        name: _artifact_sha_fingerprint
+        for name in _book_artifact_validators()
+    }
+    factories[ART_SEMANTIC_CHAPTERS] = _semantic_artifact_fingerprint
+    return factories
+
+
 def _materialize_toc_artifact(context: GraphContext) -> Path:
     source = _validated_file_from_artifact(
         context.require(ART_TOC),
@@ -2511,28 +2547,96 @@ def _register_managed_publication(
         managed = {}
 
     previous = managed.get(artifact_name)
-    if isinstance(previous, dict) and previous.get("path"):
-        previous_path = Path(str(previous["path"])).expanduser().resolve()
-        try:
-            previous_path.relative_to(context.output_dir)
-        except ValueError:
-            previous_path = resolved
+    if isinstance(previous, dict) and (
+        previous.get("path") or previous.get("relative_path")
+    ):
+        previous_path = _managed_publication_path(context, previous)
         if previous_path != resolved and previous_path.is_file():
             expected_sha = previous.get("sha256")
             if expected_sha and _sha256_file(previous_path) == expected_sha:
                 previous_path.unlink()
 
     managed[artifact_name] = {
-        "path": str(resolved),
+        "relative_path": resolved.relative_to(context.output_dir).as_posix(),
         "sha256": _sha256_file(resolved),
     }
     legacy.write_json(
         identity_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "managed": managed,
         },
     )
+
+
+def _managed_publication_path(
+    context: GraphContext,
+    entry: Mapping[str, Any],
+) -> Path:
+    relative = entry.get("relative_path")
+    if isinstance(relative, str) and relative:
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or relative_path.name != relative
+            or "/" in relative
+            or "\\" in relative
+        ):
+            raise ValueError(f"unsafe managed publication path: {relative!r}")
+        candidate = (context.output_dir / relative_path).resolve()
+        try:
+            candidate.relative_to(context.output_dir)
+        except ValueError as exc:
+            raise ValueError(
+                f"managed publication path escapes output: {relative!r}"
+            ) from exc
+        return candidate
+
+    # Schema-v1 migration: if the output directory moved, relocate the former
+    # absolute path by its safe root-level filename and retain the digest gate.
+    old = entry.get("path")
+    if not isinstance(old, str) or not old:
+        raise ValueError("managed publication entry has no path")
+    old_path = Path(old).expanduser()
+    filename = old_path.name
+    if not filename or filename in {".", ".."}:
+        raise ValueError(f"unsafe managed publication path: {old!r}")
+    candidate = (context.output_dir / filename).resolve()
+    try:
+        candidate.relative_to(context.output_dir)
+    except ValueError as exc:
+        raise ValueError(
+            f"managed publication path escapes output: {old!r}"
+        ) from exc
+    return candidate
+
+
+def _publication_file_is_current(artifact_name: str) -> Any:
+    def validate(context: GraphContext, outputs: Mapping[str, Any]) -> bool:
+        if not _single_file_is_current(context, outputs):
+            return False
+        saved = outputs.get(artifact_name)
+        if not isinstance(saved, dict):
+            return False
+        identity_path = (
+            context.output_dir / ".pipeline_graph" / "publication_identity.json"
+        )
+        try:
+            payload = json.loads(identity_path.read_text(encoding="utf-8"))
+            managed = payload["managed"]
+            entry = managed[artifact_name]
+            managed_path = _managed_publication_path(context, entry)
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        saved_path = Path(str(saved.get("path") or "")).expanduser().resolve()
+        return (
+            managed_path == saved_path
+            and entry.get("sha256") == saved.get("sha256")
+            and saved_path.is_file()
+            and _sha256_file(saved_path) == saved.get("sha256")
+        )
+
+    return validate
 
 
 def _publish_artifacts_to_canonical(
@@ -3146,6 +3250,7 @@ def prepare_book_graph(
         private_value_names=frozenset({"pipeline.argv"}),
         redaction_values=_secret_redaction_values(args),
         value_validators=_book_artifact_validators(),
+        value_fingerprint_factories=_book_artifact_fingerprint_factories(),
     )
     graph = PipelineGraph()
     disabled = options.disabled_nodes
@@ -3221,7 +3326,7 @@ def prepare_book_graph(
         _semantic_handler(allow_missing_audit=phase in {"epub", "docx"}),
         requires=(ART_CHAPTERS,),
         provides=(ART_SEMANTIC_CHAPTERS,),
-        version="1",
+        version="3",
         cache_validator=_semantic_cache_is_current,
         description=(
             "Validate one-to-one Markdown footnotes and enforce the semantic "
@@ -3233,9 +3338,13 @@ def prepare_book_graph(
         _sanitize_handler,
         requires=(ART_SEMANTIC_CHAPTERS,),
         provides=(ART_READER_CHAPTERS,),
-        version="2",
+        version="3",
         fingerprint=_sanitize_fingerprint,
-        cache_validator=_artifact_is_current(_chapters_artifact),
+        # Sanitize also rebinds the semantic audit from immutable draft bytes
+        # to reader bytes.  Re-enter it even when Markdown output is unchanged;
+        # otherwise a semantic-node refresh can restore the draft audit while
+        # a cached sanitize node leaves the public audit stale.
+        cache=False,
         description="Apply idempotent reader-facing publication cleanup.",
     )
 
@@ -3309,9 +3418,9 @@ def prepare_book_graph(
                     _epub_handler(ART_READER_CHAPTERS),
                     requires=(ART_READER_CHAPTERS,),
                     provides=(ART_EPUB,),
-                    version="2",
+                    version="3",
                     fingerprint=_publisher_fingerprint("epub"),
-                    cache_validator=_single_file_is_current,
+                    cache_validator=_publication_file_is_current(ART_EPUB),
                     description="Build EPUB from chapter Markdown.",
                 )
             )
@@ -3323,9 +3432,9 @@ def prepare_book_graph(
                     _docx_handler(ART_READER_CHAPTERS),
                     requires=(ART_READER_CHAPTERS,),
                     provides=(ART_DOCX,),
-                    version="3",
+                    version="4",
                     fingerprint=_publisher_fingerprint("docx"),
-                    cache_validator=_single_file_is_current,
+                    cache_validator=_publication_file_is_current(ART_DOCX),
                     description="Build Word from chapter Markdown.",
                 )
             )
@@ -3498,7 +3607,7 @@ def prepare_book_graph(
                         ),
                         requires=(ART_SOURCE, current_pages, ART_TOC),
                         provides=(ART_CHAPTERS,),
-                        version="3",
+                        version="6",
                         fingerprint=_reviewed_fingerprint,
                         cache_validator=_compile_inputs_are_current(current_pages),
                         description="Compile page text and mapped TOC into chapter Markdown.",
@@ -3515,7 +3624,7 @@ def prepare_book_graph(
                             provides=(ART_KB,),
                             version="1",
                             fingerprint=_publisher_fingerprint("knowledge-base"),
-                            cache_validator=_single_file_is_current,
+                            cache_validator=_publication_file_is_current(ART_KB),
                             description="Publish knowledge-base JSONL from final chapter text.",
                         )
                     )
@@ -3526,9 +3635,9 @@ def prepare_book_graph(
                             _epub_handler(ART_READER_CHAPTERS),
                             requires=(ART_READER_CHAPTERS,),
                             provides=(ART_EPUB,),
-                            version="2",
+                            version="3",
                             fingerprint=_publisher_fingerprint("epub"),
-                            cache_validator=_single_file_is_current,
+                            cache_validator=_publication_file_is_current(ART_EPUB),
                             description="Publish EPUB from final chapter text.",
                         )
                     )
@@ -3539,9 +3648,9 @@ def prepare_book_graph(
                             _docx_handler(ART_READER_CHAPTERS),
                             requires=(ART_READER_CHAPTERS,),
                             provides=(ART_DOCX,),
-                            version="3",
+                            version="4",
                             fingerprint=_publisher_fingerprint("docx"),
-                            cache_validator=_single_file_is_current,
+                            cache_validator=_publication_file_is_current(ART_DOCX),
                             description="Publish Word from final chapter text.",
                         )
                     )
@@ -3554,7 +3663,9 @@ def prepare_book_graph(
                             provides=(ART_REFERENCE_PDF,),
                             version="1",
                             fingerprint=_publisher_fingerprint("reference-pdf"),
-                            cache_validator=_single_file_is_current,
+                            cache_validator=_publication_file_is_current(
+                                ART_REFERENCE_PDF
+                            ),
                             description="Publish a visual reference PDF with bookmarks.",
                         )
                     )

@@ -265,6 +265,9 @@ def _bundled_fontconfig(soffice: str) -> Path | None:
     candidates: list[Path] = []
     if explicit:
         candidates.append(Path(explicit).expanduser())
+    candidates.append(
+        Path(__file__).resolve().parent / "assets/fontconfig/fonts.conf"
+    )
     executable = Path(soffice).expanduser().resolve()
     for parent in executable.parents:
         candidates.extend(

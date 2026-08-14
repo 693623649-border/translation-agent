@@ -8,6 +8,7 @@ from unittest.mock import patch
 import fitz
 
 from docx_render_gate import (
+    _bundled_fontconfig,
     _interleaved_index_blocks,
     inspect_rendered_pdf,
     verify_docx_render,
@@ -15,6 +16,14 @@ from docx_render_gate import (
 
 
 class DocxRenderGateTests(unittest.TestCase):
+    def test_repository_fontconfig_is_available_for_headless_rendering(self) -> None:
+        path = _bundled_fontconfig("/usr/bin/soffice")
+
+        self.assertIsNotNone(path)
+        assert path is not None
+        self.assertEqual(path.name, "fonts.conf")
+        self.assertIn("assets/fontconfig", path.as_posix())
+
     def test_rendered_pdf_detects_blank_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "blank.pdf"
