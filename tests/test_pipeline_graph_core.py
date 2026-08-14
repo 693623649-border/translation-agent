@@ -130,6 +130,98 @@ class PipelineGraphPlanningTests(unittest.TestCase):
 
 
 class GraphExecutorTests(unittest.TestCase):
+    def test_handler_cannot_access_undeclared_input(self):
+        graph = PipelineGraph(
+            [
+                node(
+                    "consume",
+                    lambda context: NodeResult(
+                        outputs={"result": context["hidden"]}
+                    ),
+                    requires={"declared"},
+                    provides={"result"},
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(
+                NodeContractError,
+                "undeclared input 'hidden'",
+            ):
+                GraphExecutor(graph).execute(
+                    GraphContext(
+                        directory,
+                        {"declared": "yes", "hidden": "no"},
+                    ),
+                    targets={"result"},
+                )
+
+    def test_nested_downstream_mutation_is_rejected_without_polluting_state(self):
+        def attempt_mutation(context):
+            context["source"]["items"].append("mutated")
+            return NodeResult(outputs={"result": "unsafe"})
+
+        graph = PipelineGraph(
+            [
+                node(
+                    "produce",
+                    lambda _context: NodeResult(
+                        outputs={"source": {"items": ["original"]}}
+                    ),
+                    provides={"source"},
+                ),
+                node(
+                    "attempt-mutation",
+                    attempt_mutation,
+                    requires={"source"},
+                    provides={"result"},
+                ),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            context = GraphContext(directory)
+            with self.assertRaisesRegex(
+                NodeContractError,
+                "mutated required inputs.*source",
+            ):
+                GraphExecutor(graph).execute(context, targets={"result"})
+            state = json.loads(
+                (
+                    Path(directory) / ".pipeline_graph" / "state.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(context.values["source"], {"items": ["original"]})
+        self.assertEqual(
+            state["nodes"]["produce"]["outputs"]["source"],
+            {"items": ["original"]},
+        )
+        self.assertNotIn("attempt-mutation", state["nodes"])
+
+    def test_executor_detects_required_input_mutated_through_external_alias(self):
+        with tempfile.TemporaryDirectory() as directory:
+            context = GraphContext(directory, {"source": {"items": ["original"]}})
+
+            def mutate_canonical_store(_invocation_context):
+                context.values["source"]["items"].append("changed")
+                return NodeResult(outputs={"result": "unsafe"})
+
+            graph = PipelineGraph(
+                [
+                    node(
+                        "mutate",
+                        mutate_canonical_store,
+                        requires={"source"},
+                        provides={"result"},
+                    )
+                ]
+            )
+            with self.assertRaisesRegex(
+                NodeContractError,
+                "mutated required inputs.*source",
+            ):
+                GraphExecutor(graph).execute(context, targets={"result"})
+
     def test_uncacheable_state_is_not_restored_after_node_becomes_cacheable(self):
         calls: list[int] = []
 
@@ -305,6 +397,8 @@ class GraphExecutorTests(unittest.TestCase):
                 json.loads(line)
                 for line in first_run.events_path.read_text(encoding="utf-8").splitlines()
             ]
+            self.assertEqual(first_run.schema_version, 1)
+            self.assertTrue(all(event["schema_version"] == 1 for event in events))
             self.assertIn("node_succeeded", {event["event"] for event in events})
             self.assertIn("node_skipped", {event["event"] for event in events})
 

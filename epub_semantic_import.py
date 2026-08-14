@@ -34,6 +34,7 @@ from publication_semantics import (
     parse_markdown_footnotes,
     semantic_audit_summary,
 )
+from semantic_apply import SemanticApplyError, apply_translation_transaction
 
 
 EPUB_NS = "http://www.idpf.org/2007/ops"
@@ -755,133 +756,26 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     }
 
 
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise EpubSemanticError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
-        if not isinstance(value, dict):
-            raise EpubSemanticError(f"translation record must be an object: {path}:{line_number}")
-        records.append(value)
-    return records
+def apply_translations(
+    output_dir: Path,
+    translations_path: Path,
+    *,
+    target_language: str = "简体中文",
+    glossary: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Apply a complete EPUB translation without mutating source evidence."""
 
-
-def apply_translations(output_dir: Path, translations_path: Path) -> dict[str, Any]:
-    """Apply translated Markdown units after proving source and note identity."""
-
-    output_dir = output_dir.expanduser().resolve()
-    source_units = _load_jsonl(output_dir / "semantic" / "translation-units.jsonl")
-    translated_units = _load_jsonl(translations_path.expanduser().resolve())
-    source_by_id = {str(item.get("id")): item for item in source_units}
-    translated_by_id = {str(item.get("id")): item for item in translated_units}
-    if len(source_by_id) != len(source_units) or len(translated_by_id) != len(translated_units):
-        raise EpubSemanticError("source or translated unit ids are duplicated")
-    if set(source_by_id) != set(translated_by_id):
-        missing = sorted(set(source_by_id) - set(translated_by_id))
-        extra = sorted(set(translated_by_id) - set(source_by_id))
-        raise EpubSemanticError(f"translation unit set mismatch: missing={missing[:8]}, extra={extra[:8]}")
-
-    by_chapter: dict[str, list[tuple[int, str]]] = {}
-    for unit_id, source in source_by_id.items():
-        translated = translated_by_id[unit_id]
-        source_markdown = str(source.get("source_markdown") or "")
-        source_sha256 = _sha256_bytes(source_markdown.encode("utf-8"))
-        if source_sha256 != source.get("source_sha256"):
-            raise EpubSemanticError(f"stored source unit hash is stale: {unit_id}")
-        if translated.get("source_sha256") != source_sha256:
-            raise EpubSemanticError(f"translated unit is bound to different source bytes: {unit_id}")
-        value = str(translated.get("translated_markdown") or "").strip()
-        if not value:
-            raise EpubSemanticError(f"translated_markdown is empty: {unit_id}")
-        by_chapter.setdefault(str(source["chapter_id"]), []).append((int(source["sequence"]), value))
-
-    manifest_path = output_dir / "chapters.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    audit_chapters: list[dict[str, Any]] = []
-    for item in manifest:
-        chapter_id = str(item["id"])
-        parts = [value for _, value in sorted(by_chapter.get(chapter_id, []))]
-        if not parts:
-            raise EpubSemanticError(f"no translations found for chapter: {chapter_id}")
-        translated_markdown = "\n\n".join(parts).rstrip() + "\n"
-        source_markdown = (output_dir / "semantic" / "source_chapters" / item["filename"]).read_text(encoding="utf-8")
-        source_inventory = parse_markdown_footnotes(source_markdown)
-        translated_inventory = parse_markdown_footnotes(translated_markdown)
-        if (
-            source_inventory.references != translated_inventory.references
-            or tuple(note_id for note_id, _ in source_inventory.definitions)
-            != tuple(note_id for note_id, _ in translated_inventory.definitions)
-            or not translated_inventory.valid
-        ):
-            raise EpubSemanticError(
-                f"translation changed the footnote reference-definition relation: {chapter_id}"
-            )
-        title = _heading_title(translated_markdown, str(item["display_title"]))
-        item["title"] = title
-        item["display_title"] = title
-        item["translation_applied"] = True
-        _atomic_write_text(output_dir / "chapters" / item["filename"], translated_markdown)
-        audit_chapters.append(
-            {
-                "chapter_id": chapter_id,
-                "filename": item["filename"],
-                "source_markdown_sha256": _sha256_bytes(source_markdown.encode("utf-8")),
-                "translated_markdown_sha256": _sha256_bytes(translated_markdown.encode("utf-8")),
-                "footnote_contract_sha256": markdown_footnote_contract_sha256(translated_markdown),
-                "translation_unit_count": len(parts),
-                "issues": [],
-                "release_blocked": False,
-            }
+    try:
+        return apply_translation_transaction(
+            output_dir,
+            translations_path,
+            generated_by="core.source.epub+core.pages.translate+core.reconstruct.semantic",
+            contract_mode="epub-spine-translated-markdown-footnotes",
+            target_language=target_language,
+            glossary=glossary,
         )
-    _atomic_write_json(manifest_path, manifest)
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "status": "passed",
-        "release_blocked": False,
-        "generated_by": "core.pages.translate+core.reconstruct.semantic",
-        "contract_mode": "epub-spine-translated-markdown-footnotes",
-        "summary": {
-            "chapter_count": len(audit_chapters),
-            "translation_unit_count": sum(item["translation_unit_count"] for item in audit_chapters),
-            "issue_count": 0,
-            "blocking_issue_count": 0,
-            "release_blocked": False,
-        },
-        "chapters": audit_chapters,
-    }
-    _atomic_write_json(output_dir / "audit" / "semantic-translation.json", report)
-    reconstruction_path = output_dir / "audit" / "semantic-reconstruction.json"
-    if reconstruction_path.is_file():
-        reconstruction = json.loads(reconstruction_path.read_text(encoding="utf-8"))
-        reconstruction["status"] = "passed"
-        reconstruction["release_blocked"] = False
-        reconstruction["generated_by"] = "core.source.epub+core.pages.translate+core.reconstruct.semantic"
-        reconstruction["contract_mode"] = "epub-spine-translated-markdown-footnotes"
-        reconstruction["translated_audit"] = "audit/semantic-translation.json"
-        reconstruction["summary"] = {
-            "chapter_count": len(audit_chapters),
-            "footnote_count": sum(
-                len(
-                    parse_markdown_footnotes(
-                        (output_dir / "chapters" / item["filename"]).read_text(
-                            encoding="utf-8"
-                        )
-                    ).definitions
-                )
-                for item in manifest
-            ),
-            "translation_unit_count": report["summary"]["translation_unit_count"],
-            "issue_count": 0,
-            "blocking_issue_count": 0,
-            "release_blocked": False,
-        }
-        reconstruction["chapters"] = audit_chapters
-        _atomic_write_json(reconstruction_path, reconstruction)
-    return report["summary"] | {"status": "passed", "manifest": str(manifest_path)}
+    except SemanticApplyError as exc:
+        raise EpubSemanticError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:

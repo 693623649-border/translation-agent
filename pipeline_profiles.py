@@ -11,6 +11,30 @@ from typing import Mapping
 
 
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+PROFILE_SCHEMA_VERSION = 1
+TOP_LEVEL_FIELDS = frozenset({"schema_version", "profiles", "pipeline"})
+PROFILE_FIELDS = frozenset(
+    {
+        "adapter",
+        "provider",
+        "base_url",
+        "model",
+        "credential_env",
+        "timeout",
+        "concurrency",
+        "thinking",
+        "command",
+        "reading_direction",
+    }
+)
+PIPELINE_FIELDS = frozenset(
+    {
+        "ocr_profile",
+        "toc_profile",
+        "translation_profile",
+        "proofread_profile",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -37,6 +61,7 @@ class ModelIdentity:
     model: str
     target_language: str
     prompt_version: str
+    thinking: str = "disabled"
 
     @property
     def fingerprint(self) -> str:
@@ -47,6 +72,7 @@ class ModelIdentity:
             "model": self.model.strip(),
             "target_language": self.target_language.strip(),
             "prompt_version": self.prompt_version.strip(),
+            "thinking": self.thinking.strip().lower(),
         }
         encoded = json.dumps(
             payload,
@@ -110,6 +136,7 @@ class ModelProfile:
             model=self.model,
             target_language=target_language,
             prompt_version=prompt_version,
+            thinking=self.thinking,
         )
 
 
@@ -120,6 +147,7 @@ class PipelineProfiles:
     toc_profile: str = ""
     translation_profile: str = ""
     proofread_profile: str = ""
+    schema_version: int = PROFILE_SCHEMA_VERSION
 
     def get(self, name: str) -> ModelProfile:
         try:
@@ -147,6 +175,17 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("rb") as handle:
         payload = tomllib.load(handle)
+    unknown_top_level = sorted(set(payload) - TOP_LEVEL_FIELDS)
+    if unknown_top_level:
+        raise ValueError(
+            f"Profile config has unknown top-level fields: {unknown_top_level}"
+        )
+    schema_version = int(payload.get("schema_version", PROFILE_SCHEMA_VERSION))
+    if schema_version != PROFILE_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported Profile schema_version={schema_version}; "
+            f"expected {PROFILE_SCHEMA_VERSION}."
+        )
     raw_profiles = payload.get("profiles", {})
     if not isinstance(raw_profiles, dict):
         raise ValueError("Profile config [profiles] must be a TOML table.")
@@ -154,6 +193,11 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
     for name, raw in raw_profiles.items():
         if not isinstance(raw, dict):
             raise ValueError(f"Profile {name!r} must be a TOML table.")
+        unknown_profile_fields = sorted(set(raw) - PROFILE_FIELDS)
+        if unknown_profile_fields:
+            raise ValueError(
+                f"Profile {name!r} has unknown fields: {unknown_profile_fields}"
+            )
         adapter = str(raw.get("adapter") or "").strip()
         provider = str(raw.get("provider") or "").strip()
         model = str(raw.get("model") or "").strip()
@@ -197,12 +241,19 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
     pipeline = payload.get("pipeline", {})
     if not isinstance(pipeline, dict):
         raise ValueError("Profile config [pipeline] must be a TOML table.")
+    unknown_pipeline_fields = sorted(set(pipeline) - PIPELINE_FIELDS)
+    if unknown_pipeline_fields:
+        raise ValueError(
+            f"Profile config [pipeline] has unknown fields: "
+            f"{unknown_pipeline_fields}"
+        )
     result = PipelineProfiles(
         profiles=profiles,
         ocr_profile=str(pipeline.get("ocr_profile") or "").strip(),
         toc_profile=str(pipeline.get("toc_profile") or "").strip(),
         translation_profile=str(pipeline.get("translation_profile") or "").strip(),
         proofread_profile=str(pipeline.get("proofread_profile") or "").strip(),
+        schema_version=schema_version,
     )
     for stage in ("ocr", "toc", "translation", "proofread"):
         result.for_stage(stage)

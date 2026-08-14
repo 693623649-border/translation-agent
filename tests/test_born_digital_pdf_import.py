@@ -240,11 +240,13 @@ class BornDigitalPdfImportTests(unittest.TestCase):
                 "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units),
                 encoding="utf-8",
             )
+            reconstruction_path = output / "audit" / "semantic-reconstruction.json"
+            reconstruction_before = reconstruction_path.read_bytes()
 
             report = apply_translations(output, translations)
             manifest = json.loads((output / "chapters.json").read_text(encoding="utf-8"))
-            reconstruction = json.loads(
-                (output / "audit" / "semantic-reconstruction.json").read_text(
+            translation_audit = json.loads(
+                (output / "audit" / "semantic-translation.json").read_text(
                     encoding="utf-8"
                 )
             )
@@ -252,14 +254,52 @@ class BornDigitalPdfImportTests(unittest.TestCase):
 
             self.assertEqual(report["status"], "passed")
             self.assertEqual(manifest[0]["display_title"], "数字图书")
+            self.assertEqual(reconstruction_path.read_bytes(), reconstruction_before)
             self.assertEqual(
-                reconstruction["chapters"][0]["markdown_sha256"],
+                translation_audit["chapters"][0]["markdown_sha256"],
                 hashlib.sha256(translated).hexdigest(),
             )
             self.assertEqual(
-                reconstruction["contract_mode"],
+                translation_audit["contract_mode"],
                 "born-digital-pdf-translated-markdown",
             )
+
+    def test_summary_blocked_audit_prevents_pdf_translation_apply(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pdf = root / "book.pdf"
+            output = root / "output"
+            _text_pdf(pdf, ["A complete embedded English paragraph is ready for accurate translation."])
+            import_born_digital_pdf(pdf, output)
+            audit_path = output / "audit" / "semantic-reconstruction.json"
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            audit["summary"]["release_blocked"] = True
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
+            before = audit_path.read_bytes()
+            units = [
+                json.loads(line)
+                for line in (output / "semantic" / "translation-units.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            for unit in units:
+                unit["translated_markdown"] = unit["source_markdown"].replace(
+                    "Digital Book", "数字图书"
+                ).replace(
+                    "A complete embedded English paragraph is ready for accurate translation.",
+                    "一段完整的内嵌英文段落已经可以准确翻译。",
+                )
+            translations = root / "translations.jsonl"
+            translations.write_text(
+                "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "summary is blocked"):
+                apply_translations(output, translations)
+
+            self.assertEqual(audit_path.read_bytes(), before)
+            self.assertFalse((output / "audit" / "semantic-translation.json").exists())
 
 
 if __name__ == "__main__":

@@ -479,7 +479,8 @@ class BookGraphPlanningTests(unittest.TestCase):
                     target_artifacts=frozenset({ART_READER_CHAPTERS}),
                 ),
             ).execute()
-            self.assertIn(NODE_SEMANTIC, rerun.executed)
+            self.assertIn(NODE_SEMANTIC, rerun.skipped)
+            self.assertIn(NODE_SANITIZE, rerun.skipped)
             rerun_audit = json.loads(
                 (output / "audit" / "semantic-reconstruction.json").read_text(
                     encoding="utf-8"
@@ -1188,7 +1189,7 @@ translation_profile = "text"
                     self.assertTrue(staged[artifact_name].exists())
                     self.assertEqual(
                         prepared.context.values[artifact_name]["path"],
-                        str(path.resolve()),
+                        str(staged[artifact_name].resolve()),
                     )
                 self.assertEqual(
                     sorted(path.name for path in output.glob("*.docx")),
@@ -3482,12 +3483,134 @@ translation_profile = "translation"
                 str(
                     (
                         output
-                        / "audit"
-                        / "semantic-reconstruction.json"
+                        / ".pipeline_graph"
+                        / "draft-semantic-audit.json"
                     ).resolve()
                 ),
             )
             self.assertFalse(semantic_artifact["semantic_release_blocked"])
+
+    def test_semantic_and_sanitize_are_stable_across_four_reused_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            chapter_dir = output / "chapters"
+            chapter_dir.mkdir(parents=True)
+            (chapter_dir / "001_start.md").write_text(
+                "# Start\n\n"
+                "<!-- source-pdf: source.pdf -->\n"
+                "<!-- PDF_PAGE: 1 -->\n\n"
+                "Body.[^note]\n\n[^note]: Source note.\n",
+                encoding="utf-8",
+            )
+            book_pipeline.write_json(
+                output / "chapters.json",
+                [{"filename": "001_start.md"}],
+            )
+            prepared = prepare_book_graph(
+                [
+                    "--output-dir",
+                    str(output),
+                    "--phase",
+                    "docx",
+                    "--title",
+                    "book",
+                ],
+                options=BookGraphOptions(
+                    force_nodes=frozenset({NODE_SEMANTIC})
+                ),
+            )
+
+            def build_fake_docx(
+                output_path: Path,
+                _chapter_dir: Path,
+                _manifest: list[dict[str, object]],
+                **_kwargs: object,
+            ) -> None:
+                output_path.write_bytes(b"docx")
+
+            draft_audit_bytes: list[bytes] = []
+            semantic_values: list[object] = []
+            reader_values: list[object] = []
+            executions: list[tuple[str, ...]] = []
+            skips: list[tuple[str, ...]] = []
+            with patch(
+                "pipeline_graph.book.legacy.build_docx",
+                side_effect=build_fake_docx,
+            ):
+                for _ in range(4):
+                    result = prepared.execute()
+                    draft_audit_bytes.append(
+                        (
+                            output
+                            / ".pipeline_graph"
+                            / "draft-semantic-audit.json"
+                        ).read_bytes()
+                    )
+                    semantic_values.append(result.values[ART_SEMANTIC_CHAPTERS])
+                    reader_values.append(result.values[ART_READER_CHAPTERS])
+                    executions.append(result.executed)
+                    skips.append(result.skipped)
+
+            self.assertTrue(
+                all(value == draft_audit_bytes[0] for value in draft_audit_bytes)
+            )
+            self.assertTrue(
+                all(value == semantic_values[0] for value in semantic_values)
+            )
+            self.assertTrue(all(value == reader_values[0] for value in reader_values))
+            self.assertTrue(all(NODE_SEMANTIC in executed for executed in executions))
+            self.assertIn(NODE_SANITIZE, executions[0])
+            self.assertTrue(all(NODE_SANITIZE in skipped for skipped in skips[1:]))
+
+            semantic_artifact = semantic_values[-1]
+            reader_artifact = reader_values[-1]
+            self.assertIsInstance(semantic_artifact, dict)
+            self.assertIsInstance(reader_artifact, dict)
+            self.assertEqual(
+                semantic_artifact["semantic_audit"],
+                str(
+                    (
+                        output
+                        / ".pipeline_graph"
+                        / "draft-semantic-audit.json"
+                    ).resolve()
+                ),
+            )
+            self.assertEqual(
+                reader_artifact["reader_semantic_audit"],
+                str(
+                    (
+                        output
+                        / ".pipeline_graph"
+                        / "reader-semantic-audit.json"
+                    ).resolve()
+                ),
+            )
+            self.assertNotEqual(
+                semantic_artifact["semantic_audit"],
+                reader_artifact["reader_semantic_audit"],
+            )
+            self.assertNotIn(
+                "source_markdown_sha256",
+                json.loads(draft_audit_bytes[-1])["chapters"][0],
+            )
+            self.assertIn(
+                "source_markdown_sha256",
+                json.loads(
+                    Path(reader_artifact["reader_semantic_audit"]).read_text(
+                        encoding="utf-8"
+                    )
+                )["chapters"][0],
+            )
+            self.assertIn("PDF_PAGE", (
+                output / ".pipeline_graph" / "chapter_drafts" / "001_start.md"
+            ).read_text(encoding="utf-8"))
+            self.assertNotIn(
+                "PDF_PAGE",
+                (output / "chapters" / "001_start.md").read_text(
+                    encoding="utf-8"
+                ),
+            )
 
     def test_compile_semantic_node_requires_reconstruction_audit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

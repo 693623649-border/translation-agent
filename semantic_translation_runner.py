@@ -17,9 +17,10 @@ import urllib.error
 import urllib.request
 
 from pipeline_profiles import ModelProfile, load_pipeline_profiles
+from semantic_apply import SemanticApplyError, validate_translation_pair
 
 
-RUNNER_VERSION = "semantic-deepseek-batch-v3"
+RUNNER_VERSION = "semantic-provider-batch-v4"
 TOKEN_PATTERN = re.compile(
     r"\[\^[^\]\s]+\]"
     r"|\[\[[A-Z]+:[^\]]+\]\]"
@@ -168,12 +169,41 @@ def build_prompt(batch: list[dict[str, Any]], *, target_language: str, glossary:
     )
 
 
-def _batch_key(batch: list[dict[str, Any]], *, model: str, target_language: str, glossary: dict[str, str]) -> str:
-    payload = {"runner": RUNNER_VERSION, "units": [(u["id"], u["source_sha256"]) for u in batch], "model": model, "target": target_language, "glossary": glossary}
+def _batch_key(
+    batch: list[dict[str, Any]],
+    *,
+    model: str,
+    target_language: str,
+    glossary: dict[str, str],
+    provider: str = "custom",
+    base_url: str = "",
+    prompt_profile: str = RUNNER_VERSION,
+    thinking: str = "disabled",
+    temperature: float = 0.0,
+) -> str:
+    payload = {
+        "runner": RUNNER_VERSION,
+        "units": [(u["id"], u["source_sha256"]) for u in batch],
+        "provider": provider.strip().lower(),
+        "base_url": base_url.rstrip("/"),
+        "model": model,
+        "target": target_language,
+        "prompt_profile": prompt_profile,
+        "thinking": thinking,
+        "temperature": temperature,
+        "glossary": glossary,
+    }
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _parse_batch(raw: str, protected: list[tuple[str, tuple[str, ...]]], batch: list[dict[str, Any]], *, target_language: str) -> list[str]:
+def _parse_batch(
+    raw: str,
+    protected: list[tuple[str, tuple[str, ...]]],
+    batch: list[dict[str, Any]],
+    *,
+    target_language: str,
+    glossary: dict[str, str] | None = None,
+) -> list[str]:
     cursor = 0
     values: list[str] = []
     for (unit_id, tokens), unit in zip(protected, batch):
@@ -188,23 +218,80 @@ def _parse_batch(raw: str, protected: list[tuple[str, tuple[str, ...]]], batch: 
         source = str(unit["source_markdown"])
         if not value or len(value) < max(1, int(len(source) * 0.12)) or len(value) > max(300, int(len(source) * 4.5)):
             raise SemanticTranslationError(f"implausible translated length: {unit_id}")
-        if target_language == "简体中文" and re.search(r"[A-Za-z]{8,}", source) and not re.search(r"[\u4e00-\u9fff]", value):
-            raise SemanticTranslationError(f"translated unit has no Chinese coverage: {unit_id}")
+        try:
+            validate_translation_pair(
+                source,
+                value,
+                unit_id=unit_id,
+                target_language=target_language,
+                glossary=glossary or {},
+            )
+        except SemanticApplyError as exc:
+            raise SemanticTranslationError(str(exc)) from exc
         values.append(value); cursor = end_at + len(end)
     if re.search(r"⟦UNIT:[^:]+:(?:START|END)⟧", raw[cursor:]):
         raise SemanticTranslationError("unexpected trailing UNIT marker")
     return values
 
 
-def translate_units(units_path: Path, output_path: Path, *, target_language: str = "简体中文", glossary: dict[str, str] | None = None, model: str = "deepseek-v4-flash", cache_dir: Path | None = None, request: Callable[[str], str] | None = None, max_chars: int = 9000, concurrency: int = 16, retries: int = 3, progress: Callable[[int, int, bool], None] | None = None) -> dict[str, Any]:
+def translate_units(
+    units_path: Path,
+    output_path: Path,
+    *,
+    target_language: str = "简体中文",
+    glossary: dict[str, str] | None = None,
+    model: str = "deepseek-v4-flash",
+    provider: str = "custom",
+    base_url: str = "",
+    prompt_profile: str = RUNNER_VERSION,
+    thinking: str = "disabled",
+    temperature: float = 0.0,
+    cache_dir: Path | None = None,
+    request: Callable[[str], str] | None = None,
+    max_chars: int = 9000,
+    concurrency: int = 16,
+    retries: int = 3,
+    progress: Callable[[int, int, bool], None] | None = None,
+) -> dict[str, Any]:
+    if not provider.strip() or not prompt_profile.strip():
+        raise SemanticTranslationError("provider and prompt_profile must not be empty")
+    if thinking not in {"enabled", "disabled", "omit"}:
+        raise SemanticTranslationError("thinking must be enabled, disabled, or omit")
+    if not 0.0 <= temperature <= 2.0:
+        raise SemanticTranslationError("temperature must be between 0 and 2")
     glossary = glossary or {}; units = _read_jsonl(units_path); batches = batch_units(units, max_chars=max_chars)
     prepared = []
     for index, batch in enumerate(batches):
         prompt, protected = build_prompt(batch, target_language=target_language, glossary=glossary)
-        key = _batch_key(batch, model=model, target_language=target_language, glossary=glossary)
+        key = _batch_key(
+            batch,
+            model=model,
+            target_language=target_language,
+            glossary=glossary,
+            provider=provider,
+            base_url=base_url,
+            prompt_profile=prompt_profile,
+            thinking=thinking,
+            temperature=temperature,
+        )
         prepared.append((index, batch, prompt, protected, key))
     if request is None:
-        rows = [{"batch": index + 1, "unit_ids": [u["id"] for u in batch], "model": model, "target_language": target_language, "prompt": prompt, "cache_key": key} for index, batch, prompt, _, key in prepared]
+        rows = [
+            {
+                "batch": index + 1,
+                "unit_ids": [unit["id"] for unit in batch],
+                "provider": provider,
+                "base_url": base_url.rstrip("/"),
+                "model": model,
+                "target_language": target_language,
+                "prompt_profile": prompt_profile,
+                "thinking": thinking,
+                "temperature": temperature,
+                "prompt": prompt,
+                "cache_key": key,
+            }
+            for index, batch, prompt, _, key in prepared
+        ]
         _atomic_text(output_path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
         return {"status": "passed", "mode": "prepare", "unit_count": len(units), "batch_count": len(batches), "cache_hits": 0, "output": str(output_path.resolve())}
 
@@ -226,10 +313,33 @@ def translate_units(units_path: Path, output_path: Path, *, target_language: str
                         raw = str(json.loads(cache_path.read_text(encoding="utf-8"))["model_output"])
                     else:
                         raw = request(current_prompt)
-                    values = _parse_batch(raw, current_protected, current_batch, target_language=target_language)
+                    values = _parse_batch(
+                        raw,
+                        current_protected,
+                        current_batch,
+                        target_language=target_language,
+                        glossary=glossary,
+                    )
                     if cache_path and not cached:
                         _atomic_text(cache_path, json.dumps({"cache_key": current_key, "model_output": raw}, ensure_ascii=False) + "\n")
-                    rows = [{"schema_version": u.get("schema_version", 1), "id": u["id"], "chapter_id": u["chapter_id"], "sequence": u["sequence"], "source_sha256": u["source_sha256"], "translated_markdown": value, "translation_model": model, "translation_cache_key": current_key} for u, value in zip(current_batch, values)]
+                    rows = [
+                        {
+                            "schema_version": unit.get("schema_version", 1),
+                            "id": unit["id"],
+                            "chapter_id": unit["chapter_id"],
+                            "sequence": unit["sequence"],
+                            "source_sha256": unit["source_sha256"],
+                            "translated_markdown": value,
+                            "translation_provider": provider,
+                            "translation_base_url": base_url.rstrip("/"),
+                            "translation_model": model,
+                            "translation_prompt_profile": prompt_profile,
+                            "translation_thinking": thinking,
+                            "translation_temperature": temperature,
+                            "translation_cache_key": current_key,
+                        }
+                        for unit, value in zip(current_batch, values)
+                    ]
                     return rows, cached
                 except Exception as exc:
                     last_error = exc
@@ -244,7 +354,17 @@ def translate_units(units_path: Path, output_path: Path, *, target_language: str
                 split_cached = True
                 for child in (current_batch[:midpoint], current_batch[midpoint:]):
                     child_prompt, child_protected = build_prompt(child, target_language=target_language, glossary=glossary)
-                    child_key = _batch_key(child, model=model, target_language=target_language, glossary=glossary)
+                    child_key = _batch_key(
+                        child,
+                        model=model,
+                        target_language=target_language,
+                        glossary=glossary,
+                        provider=provider,
+                        base_url=base_url,
+                        prompt_profile=prompt_profile,
+                        thinking=thinking,
+                        temperature=temperature,
+                    )
                     child_rows, child_cached = run_batch(child, child_prompt, child_protected, child_key)
                     split_rows.extend(child_rows)
                     split_cached = split_cached and child_cached
@@ -266,11 +386,11 @@ def translate_units(units_path: Path, output_path: Path, *, target_language: str
     return {"status": "passed", "mode": "run", "unit_count": len(results), "batch_count": len(batches), "cache_hits": cache_hits, "output": str(output_path.resolve())}
 
 
-def _deepseek_request(*, api_key: str, base_url: str, model: str, timeout: int, thinking: str = "disabled", max_tokens: int = 32768) -> Callable[[str], str]:
+def _deepseek_request(*, api_key: str, base_url: str, model: str, timeout: int, thinking: str = "disabled", temperature: float = 0.0, max_tokens: int = 32768) -> Callable[[str], str]:
     def request(prompt: str) -> str:
         payload: dict[str, Any] = {
             "model": model,
-            "temperature": 0,
+            "temperature": temperature,
             "max_tokens": max_tokens,
             "messages": [
                 {
@@ -317,6 +437,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config"); parser.add_argument("--translation-profile")
     parser.add_argument("--model", default=None); parser.add_argument("--cache-dir", default=".translation-cache")
     parser.add_argument("--api-key-env", default=None); parser.add_argument("--api-base", default=None)
+    parser.add_argument("--provider", default=None); parser.add_argument("--prompt-profile", default=None)
+    parser.add_argument("--thinking", choices=("enabled", "disabled", "omit"), default=None)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--env-file", default=str(Path(__file__).with_name(".env")))
     parser.add_argument("--max-chars", type=int, default=9000); parser.add_argument("--concurrency", type=int, default=None); parser.add_argument("--retries", type=int, default=3)
     return parser
@@ -329,6 +452,9 @@ def main(argv: list[str] | None = None) -> int:
         profile = load_pipeline_profiles(args.config).for_stage("translation", args.translation_profile)
     model = args.model or (profile.model if profile else "deepseek-v4-flash")
     base_url = args.api_base or (profile.base_url if profile else "https://api.deepseek.com")
+    provider = args.provider or (profile.provider if profile else "deepseek")
+    prompt_profile = args.prompt_profile or (profile.name if profile else RUNNER_VERSION)
+    thinking = args.thinking or (profile.thinking if profile else "disabled")
     credential_env = args.api_key_env or (profile.credential_env if profile else "DEEPSEEK_API_KEY")
     concurrency = args.concurrency or (profile.concurrency if profile else 16)
     request = None
@@ -336,13 +462,18 @@ def main(argv: list[str] | None = None) -> int:
         api_key = os.getenv(credential_env, "")
         if not api_key:
             raise SystemExit(f"missing credential environment variable: {credential_env}")
-        request = _deepseek_request(api_key=api_key, base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=profile.thinking if profile else "disabled")
+        request = _deepseek_request(api_key=api_key, base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=thinking, temperature=args.temperature)
     result = translate_units(
         Path(args.units).expanduser(),
         Path(args.output).expanduser(),
         target_language=args.target_language,
         glossary=load_glossary(Path(args.glossary).expanduser() if args.glossary else None),
         model=model,
+        provider=provider,
+        base_url=base_url,
+        prompt_profile=prompt_profile,
+        thinking=thinking,
+        temperature=args.temperature,
         cache_dir=Path(args.cache_dir).expanduser(),
         request=request,
         max_chars=args.max_chars,

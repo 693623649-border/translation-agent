@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://translation-agent.local/schemas/run-spec-v1.schema.json",
+  "title": "Translation Agent RunSpec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source_mode",
+    "output_dir",
+    "phase",
+    "target_language",
+    "targets",
+    "translate",
+    "verify",
+    "options"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "source": {"type": ["string", "null"]},
+    "source_mode": {"enum": ["scanned-pdf", "text-pdf", "epub"]},
+    "output_dir": {"type": "string", "minLength": 1},
+    "phase": {"type": "string", "minLength": 1},
+    "title": {"type": ["string", "null"]},
+    "author": {"type": ["string", "null"]},
+    "target_language": {"type": "string", "minLength": 1},
+    "config": {"type": ["string", "null"]},
+    "recipe": {"type": ["string", "null"]},
+    "targets": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "translate": {"type": "boolean"},
+    "verify": {"type": "boolean"},
+    "options": {"type": "object"}
+  }
+}
+

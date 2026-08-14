@@ -20,6 +20,7 @@ from pipeline_graph.book import (
     prepare_book_graph,
 )
 from pipeline_graph.recipe import Recipe, RecipeError, load_recipe
+from product_contracts import APP_VERSION, CONTRACT_SCHEMA_VERSION
 
 
 def build_graph_control_parser() -> argparse.ArgumentParser:
@@ -119,6 +120,11 @@ def build_graph_control_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Show graph-only options; use --help for the inherited pipeline options.",
     )
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the application and public JSON schema versions.",
+    )
     return parser
 
 
@@ -135,6 +141,8 @@ def _print_graph_help() -> None:
 def _plan_payload(prepared: object) -> dict:
     plan = prepared.plan()
     return {
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
         "targets": sorted(prepared.targets),
         "nodes": [
             {
@@ -154,6 +162,17 @@ def _plan_payload(prepared: object) -> dict:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     controls, pipeline_argv = build_graph_control_parser().parse_known_args(argv)
+    if controls.version:
+        print(
+            json.dumps(
+                {
+                    "schema_version": CONTRACT_SCHEMA_VERSION,
+                    "app_version": APP_VERSION,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     if controls.graph_help:
         _print_graph_help()
         return 0
@@ -224,6 +243,8 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             {
+                "schema_version": CONTRACT_SCHEMA_VERSION,
+                "app_version": APP_VERSION,
                 "ok": True,
                 "run_id": result.run_id,
                 "plan": list(result.plan),

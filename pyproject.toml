@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "translation-agent"
+version = "0.1.0"
+description = "Local-first semantic translation and publication pipeline for books"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "Markdown>=3.6,<4",
+  "Pillow>=10,<13",
+  "PyMuPDF>=1.24,<2",
+  "lxml>=5,<7",
+  "opencc-python-reimplemented>=0.1.7,<1",
+  "python-docx>=1.1,<2",
+]
+
+[project.optional-dependencies]
+web = ["streamlit>=1.48,<2"]
+legacy = ["openai>=1,<3", "reportlab>=4,<5"]
+dev = [
+  "build>=1.2,<2",
+  "streamlit>=1.48,<2",
+]
+
+[project.scripts]
+translation-agent = "document_pipeline:cli"
+translation-agent-doctor = "doctor:main"
+translation-agent-web = "launch_frontend:main"
+translation-agent-repo-guard = "repository_guard:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = [
+  "book_pipeline",
+  "born_digital_pdf_import",
+  "document_pipeline",
+  "doctor",
+  "docx_footnotes",
+  "docx_render_gate",
+  "docx_semantic_migration",
+  "epub_semantic_import",
+  "extract_textbook_layer",
+  "frontend_app",
+  "frontend_service",
+  "frontend_runtime",
+  "graph_pipeline",
+  "launch_frontend",
+  "patch_translations",
+  "pdf_text_agent",
+  "pipeline_profiles",
+  "pipeline_runtime",
+  "product_contracts",
+  "product_paths",
+  "publication_semantics",
+  "publication_verifier",
+  "repository_guard",
+  "regenerate_reviewed_chapters",
+  "semantic_translation_runner",
+  "semantic_apply",
+  "semantic_ir",
+  "application_service",
+  "streamlit_app",
+  "translation_agent_api",
+]
+
+[tool.setuptools.packages.find]
+include = ["pipeline_graph*", "app_pages*"]
+
+[tool.setuptools.data-files]
+"share/translation-agent" = ["pipeline.example.toml"]
+"share/translation-agent/schemas" = ["schemas/*.json"]
+"share/translation-agent/recipes" = ["recipes/*.toml"]

@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 import tempfile
 import unicodedata
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import fitz
 
@@ -26,6 +26,7 @@ from publication_semantics import (
     parse_markdown_footnotes,
     semantic_audit_summary,
 )
+from semantic_apply import SemanticApplyError, apply_translation_transaction
 
 
 SCHEMA_VERSION = 1
@@ -635,146 +636,26 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
     }
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise BornDigitalPdfError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
-        if not isinstance(value, dict):
-            raise BornDigitalPdfError(f"translation unit must be an object: {path}:{line_number}")
-        records.append(value)
-    return records
+def apply_translations(
+    output_dir: Path,
+    translations_path: Path,
+    *,
+    target_language: str = "简体中文",
+    glossary: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Apply a complete PDF-text translation without mutating source evidence."""
 
-
-def apply_translations(output_dir: Path, translations_path: Path) -> dict[str, Any]:
-    """Apply hash-bound translations while preserving the semantic structure."""
-
-    output_dir = output_dir.expanduser().resolve()
-    reconstruction_path = output_dir / "audit" / "semantic-reconstruction.json"
     try:
-        reconstruction = json.loads(reconstruction_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise BornDigitalPdfError(
-            "semantic reconstruction audit is missing or invalid"
-        ) from exc
-    if not isinstance(reconstruction, dict):
-        raise BornDigitalPdfError("semantic reconstruction audit root must be an object")
-    summary_value = reconstruction.get("summary")
-    if (
-        reconstruction.get("status") == "blocked"
-        or reconstruction.get("release_blocked") is True
-        or (
-            isinstance(summary_value, dict)
-            and summary_value.get("release_blocked") is True
+        return apply_translation_transaction(
+            output_dir,
+            translations_path,
+            generated_by="core.source.pdf.text+core.pages.translate+core.reconstruct.semantic",
+            contract_mode="born-digital-pdf-translated-markdown",
+            target_language=target_language,
+            glossary=glossary,
         )
-    ):
-        raise BornDigitalPdfError(
-            "semantic reconstruction is blocked; translations cannot be applied"
-        )
-    source_units = _jsonl(output_dir / "semantic" / "translation-units.jsonl")
-    translated_units = _jsonl(translations_path.expanduser().resolve())
-    source_by_id = {str(item.get("id") or ""): item for item in source_units}
-    translated_by_id = {str(item.get("id") or ""): item for item in translated_units}
-    if len(source_by_id) != len(source_units) or len(translated_by_id) != len(translated_units):
-        raise BornDigitalPdfError("source or translated unit ids are duplicated")
-    if set(source_by_id) != set(translated_by_id):
-        raise BornDigitalPdfError("translation unit set does not match the imported source")
-    by_chapter: dict[str, list[tuple[int, str]]] = {}
-    for unit_id, source in source_by_id.items():
-        translated = translated_by_id[unit_id]
-        source_text = str(source.get("source_markdown") or "")
-        source_sha = _sha256_bytes(source_text.encode())
-        if source_sha != source.get("source_sha256") or translated.get("source_sha256") != source_sha:
-            raise BornDigitalPdfError(f"translation source hash mismatch: {unit_id}")
-        value = str(translated.get("translated_markdown") or "").strip()
-        if not value:
-            raise BornDigitalPdfError(f"translated_markdown is empty: {unit_id}")
-        by_chapter.setdefault(str(source["chapter_id"]), []).append(
-            (int(source["sequence"]), value)
-        )
-    manifest_path = output_dir / "chapters.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    audit_chapters: list[dict[str, Any]] = []
-    for item in manifest:
-        chapter_id = str(item["id"])
-        parts = [value for _, value in sorted(by_chapter.get(chapter_id, []))]
-        if not parts:
-            raise BornDigitalPdfError(f"translation is missing chapter: {chapter_id}")
-        markdown = "\n\n".join(parts).rstrip() + "\n"
-        source_markdown = (
-            output_dir / "semantic" / "source_chapters" / item["filename"]
-        ).read_text(encoding="utf-8")
-        source_inventory = parse_markdown_footnotes(source_markdown)
-        translated_inventory = parse_markdown_footnotes(markdown)
-        if (
-            source_inventory.references != translated_inventory.references
-            or tuple(note_id for note_id, _ in source_inventory.definitions)
-            != tuple(note_id for note_id, _ in translated_inventory.definitions)
-            or not translated_inventory.valid
-        ):
-            raise BornDigitalPdfError(
-                f"translation changed the footnote contract: {chapter_id}"
-            )
-        heading = re.match(r"^#\s+(.+?)\s*$", markdown.splitlines()[0])
-        if heading:
-            item["title"] = heading.group(1).strip()
-            item["display_title"] = heading.group(1).strip()
-        item["translation_applied"] = True
-        _atomic_text(output_dir / "chapters" / item["filename"], markdown)
-        audit_chapters.append(
-            {
-                "chapter_id": chapter_id,
-                "filename": item["filename"],
-                "source_markdown_sha256": _sha256_bytes(source_markdown.encode()),
-                "translated_markdown_sha256": _sha256_bytes(markdown.encode()),
-                "markdown_sha256": _sha256_bytes(markdown.encode()),
-                "footnote_contract_sha256": markdown_footnote_contract_sha256(markdown),
-                "footnote_count": len(translated_inventory.definitions),
-                "translation_unit_count": len(parts),
-                "issues": [],
-                "release_blocked": False,
-            }
-        )
-    _atomic_json(manifest_path, manifest)
-    report = {
-        "schema_version": SCHEMA_VERSION,
-        "status": "passed",
-        "release_blocked": False,
-        "generated_by": "core.source.pdf.text+core.pages.translate+core.reconstruct.semantic",
-        "contract_mode": "born-digital-pdf-translated-markdown",
-        "summary": {
-            "chapter_count": len(audit_chapters),
-            "translation_unit_count": sum(item["translation_unit_count"] for item in audit_chapters),
-            "issue_count": 0,
-            "blocking_issue_count": 0,
-            "release_blocked": False,
-        },
-        "chapters": audit_chapters,
-    }
-    _atomic_json(output_dir / "audit" / "semantic-translation.json", report)
-    reconstruction["status"] = "passed"
-    reconstruction["release_blocked"] = False
-    reconstruction["generated_by"] = (
-        "core.source.pdf.text+core.pages.translate+core.reconstruct.semantic"
-    )
-    reconstruction["contract_mode"] = "born-digital-pdf-translated-markdown"
-    reconstruction["translated_audit"] = "audit/semantic-translation.json"
-    reconstruction["summary"] = {
-        "chapter_count": len(audit_chapters),
-        "footnote_count": sum(item["footnote_count"] for item in audit_chapters),
-        "translation_unit_count": report["summary"]["translation_unit_count"],
-        "issue_count": 0,
-        "blocking_issue_count": 0,
-        "release_blocked": False,
-    }
-    reconstruction["issues"] = []
-    reconstruction["chapters"] = audit_chapters
-    _atomic_json(reconstruction_path, reconstruction)
-    return {**report["summary"], "status": "passed", "manifest": str(manifest_path)}
+    except SemanticApplyError as exc:
+        raise BornDigitalPdfError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:

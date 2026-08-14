@@ -80,6 +80,9 @@ ART_STATUS = "pipeline.status"
 
 SEMANTIC_AUDIT_SCHEMA_VERSION = 1
 SEMANTIC_AUDIT_RELATIVE_PATH = Path("audit/semantic-reconstruction.json")
+DRAFT_SEMANTIC_AUDIT_RELATIVE_PATH = Path(
+    ".pipeline_graph/draft-semantic-audit.json"
+)
 
 KNOWN_NODE_NAMES = frozenset(
     {
@@ -1519,7 +1522,8 @@ def _write_stage_identity(
 
 
 def _selected_stage_pages(context: GraphContext, args: Any) -> list[int]:
-    if ART_SOURCE in context.values:
+    declared_inputs = set(context.values)
+    if ART_SOURCE in declared_inputs:
         source = context.require(ART_SOURCE)
         page_count = int(source.get("page_count") or 0)
         if page_count <= 0 and source.get("path"):
@@ -1709,7 +1713,44 @@ def _toc_outline_handler(context: GraphContext) -> NodeResult:
 
 
 def _load_chapters_handler(context: GraphContext) -> NodeResult:
-    artifact = _chapters_artifact(context.output_dir)
+    reuse_draft = False
+    reader_audit_path = _require_output_directory(
+        context.output_dir,
+        context.output_dir / ".pipeline_graph" / "reader-semantic-audit.json",
+    )
+    try:
+        reader_audit = _read_semantic_audit(reader_audit_path)
+        canonical = _chapters_artifact(context.output_dir)
+        manifest_path = Path(str(canonical["manifest"]))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        filenames = _validated_chapter_filenames(manifest, manifest_path)
+        reader_digest = _files_digest(
+            [
+                _chapter_path(
+                    Path(str(canonical["chapter_dir"])),
+                    filename,
+                )
+                for filename in filenames
+            ]
+        )
+        reuse_draft = bool(
+            reader_audit.get("reader_chapters_sha256") == reader_digest
+            and reader_audit.get("reader_manifest_sha256")
+            == _sha256_file(manifest_path)
+        )
+        if reuse_draft:
+            _draft_chapters_artifact(context.output_dir)
+    except (
+        FileNotFoundError,
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        SemanticReconstructionError,
+    ):
+        reuse_draft = False
+    if not reuse_draft:
+        _snapshot_chapter_drafts(context.output_dir)
+    artifact = _draft_chapters_artifact(context.output_dir)
     return NodeResult(
         outputs={ART_CHAPTERS: artifact},
         fingerprints={ART_CHAPTERS: str(artifact["sha256"])},
@@ -1778,6 +1819,13 @@ def _semantic_audit_path(output_dir: Path) -> Path:
     return _require_output_directory(
         output_dir,
         output_dir / SEMANTIC_AUDIT_RELATIVE_PATH,
+    )
+
+
+def _draft_semantic_audit_path(output_dir: Path) -> Path:
+    return _require_output_directory(
+        output_dir,
+        output_dir / DRAFT_SEMANTIC_AUDIT_RELATIVE_PATH,
     )
 
 
@@ -1976,14 +2024,28 @@ def _semantic_handler(*, allow_missing_audit: bool) -> Any:
                 + "; ".join(failures)
             )
 
-        audit_path = _semantic_audit_path(context.output_dir)
+        publication_audit_path = _semantic_audit_path(context.output_dir)
+        audit_path = _draft_semantic_audit_path(context.output_dir)
         minimal_payload = _minimal_semantic_audit(
             chapter_artifact,
             manifest,
             inventories,
         )
-        if audit_path.is_file():
+        payload: dict[str, Any] | None = None
+        if publication_audit_path.is_file():
+            published_payload = _read_semantic_audit(publication_audit_path)
+            is_reader_audit = bool(
+                published_payload.get("reader_chapters_sha256")
+            )
+            if not is_reader_audit:
+                payload = published_payload
+            elif not audit_path.is_file():
+                # One-time migration from graph adapter v2, which overwrote
+                # the only audit with reader-byte evidence.
+                payload = minimal_payload
+        if payload is None and audit_path.is_file():
             payload = _read_semantic_audit(audit_path)
+        if payload is not None:
             if _semantic_audit_is_blocked(payload):
                 summary = payload["summary"]
                 raise SemanticReconstructionError(
@@ -1999,29 +2061,14 @@ def _semantic_handler(*, allow_missing_audit: bool) -> Any:
                 != chapter_artifact["sha256"]
             ):
                 payload = minimal_payload
-                _atomic_write_text(
-                    audit_path,
-                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-                    + "\n",
-                )
-            elif all(
-                isinstance(item, dict)
-                and str(item.get("source_markdown_sha256") or "")
-                == expected["markdown_sha256"]
-                for item, expected in zip(
-                    payload.get("chapters") or [],
-                    inventories,
-                )
-            ):
-                # A previous sanitize run deliberately rebound the public audit
-                # to reader bytes.  Re-entering semantic reconstruction must
-                # restore its immutable draft view before validating it again.
-                payload = minimal_payload
-                _atomic_write_text(
-                    audit_path,
-                    json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-                    + "\n",
-                )
+            serialized = (
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n"
+            )
+            if not audit_path.is_file() or audit_path.read_text(
+                encoding="utf-8"
+            ) != serialized:
+                _atomic_write_text(audit_path, serialized)
         elif allow_missing_audit:
             payload = minimal_payload
             _atomic_write_text(
@@ -2032,7 +2079,7 @@ def _semantic_handler(*, allow_missing_audit: bool) -> Any:
         else:
             raise SemanticReconstructionError(
                 "semantic reconstruction audit is missing after chapter compile: "
-                f"{audit_path}"
+                f"{publication_audit_path}"
             )
 
         payload = _read_semantic_audit(audit_path)
@@ -2255,7 +2302,7 @@ def _validate_semantic_chapter_artifact_value(
     ):
         return False
     audit_path = Path(str(value.get("semantic_audit") or "")).expanduser().resolve()
-    if audit_path != _semantic_audit_path(context.output_dir):
+    if audit_path != _draft_semantic_audit_path(context.output_dir):
         return False
     expected_sha = value.get("semantic_audit_sha256")
     if not (
@@ -2283,7 +2330,7 @@ def _semantic_cache_is_current(
         return False
     return saved == _semantic_artifact(
         chapters,
-        _semantic_audit_path(context.output_dir),
+        _draft_semantic_audit_path(context.output_dir),
     )
 
 
@@ -2405,7 +2452,18 @@ def _reader_semantic_audit(
 ) -> Path:
     """Record the post-sanitize chapter bytes without losing source evidence."""
 
-    source_audit_path = _semantic_audit_path(context.output_dir)
+    semantic_artifact = context.require(ART_SEMANTIC_CHAPTERS)
+    if not isinstance(semantic_artifact, dict):
+        raise SemanticReconstructionError(
+            f"{ART_SEMANTIC_CHAPTERS} artifact must be an object"
+        )
+    source_audit_path = Path(
+        str(semantic_artifact.get("semantic_audit") or "")
+    ).expanduser().resolve()
+    if source_audit_path != _draft_semantic_audit_path(context.output_dir):
+        raise SemanticReconstructionError(
+            "semantic reader audit requires the immutable draft audit artifact"
+        )
     payload = _read_semantic_audit(source_audit_path)
     audit_by_filename = {
         str(item.get("filename") or ""): item
@@ -2442,6 +2500,9 @@ def _reader_semantic_audit(
             for item in manifest
         ]
     )
+    payload["reader_manifest_sha256"] = _sha256_file(
+        context.output_dir / "chapters.json"
+    )
     audit_path = _require_output_directory(
         context.output_dir,
         context.output_dir / ".pipeline_graph" / "reader-semantic-audit.json",
@@ -2451,6 +2512,25 @@ def _reader_semantic_audit(
         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
     )
     return audit_path
+
+
+def _reader_chapters_artifact(output_dir: Path) -> dict[str, Any]:
+    """Return reader chapters together with their independent audit evidence."""
+
+    artifact = _chapters_artifact(output_dir)
+    audit_path = _require_output_directory(
+        output_dir,
+        output_dir / ".pipeline_graph" / "reader-semantic-audit.json",
+    )
+    if not audit_path.is_file():
+        raise FileNotFoundError(audit_path)
+    artifact.update(
+        {
+            "reader_semantic_audit": str(audit_path),
+            "reader_semantic_audit_sha256": _sha256_file(audit_path),
+        }
+    )
+    return artifact
 
 
 def _publication_target_path(context: GraphContext, artifact_name: str) -> Path:
@@ -2563,9 +2643,6 @@ def _publish_artifacts_to_canonical(
                 )
             _atomic_copy_file(source, target)
         _register_managed_publication(context, artifact_name, target)
-        canonical = _file_artifact(target)
-        context.values[artifact_name] = canonical
-        context.fingerprints[artifact_name] = str(canonical["sha256"])
 
 
 def _sanitize_handler(context: GraphContext) -> NodeResult:
@@ -2615,25 +2692,20 @@ def _sanitize_handler(context: GraphContext) -> NodeResult:
         chapter_dir=target_dir,
         manifest=manifest,
     )
+    # The legacy verifier consumes this canonical reader-audit location.  The
+    # upstream semantic artifact points at the immutable draft audit instead,
+    # so publication compatibility no longer mutates an upstream contract.
     _atomic_copy_file(reader_audit_path, _semantic_audit_path(context.output_dir))
-    semantic_value = context.values.get(ART_SEMANTIC_CHAPTERS)
-    if isinstance(semantic_value, dict):
-        rebound = dict(semantic_value)
-        rebound["semantic_audit_sha256"] = _sha256_file(
-            _semantic_audit_path(context.output_dir)
-        )
-        context.values[ART_SEMANTIC_CHAPTERS] = rebound
-        context.fingerprints[ART_SEMANTIC_CHAPTERS] = stable_fingerprint(
-            {
-                "chapters": rebound.get("sha256"),
-                "audit": rebound["semantic_audit_sha256"],
-            }
-        )
-    artifact = _chapters_artifact(context.output_dir)
+    artifact = _reader_chapters_artifact(context.output_dir)
     return NodeResult(
         outputs={ART_READER_CHAPTERS: artifact},
+        # Publishers consume reader bytes; audit-only metadata changes are
+        # independently covered by chapters.semantic and the release gate.
         fingerprints={ART_READER_CHAPTERS: str(artifact["sha256"])},
-        metadata={"changed_files": changed},
+        metadata={
+            "changed_files": changed,
+            "reader_semantic_audit": str(reader_audit_path),
+        },
     )
 
 
@@ -2785,17 +2857,18 @@ def _verify_handler(
     }
 
     def handler(context: GraphContext) -> NodeResult:
-        if ART_SOURCE in context.values:
+        declared_inputs = set(context.values)
+        if ART_SOURCE in declared_inputs:
             _require_source_argument(context)
-        if page_artifact is not None and page_artifact in context.values:
+        if page_artifact is not None and page_artifact in declared_inputs:
             _materialize_pages_artifact(context, page_artifact)
-        if ART_TOC in context.values:
+        if ART_TOC in declared_inputs:
             _materialize_toc_artifact(context)
-        if ART_READER_CHAPTERS in context.values:
+        if ART_READER_CHAPTERS in declared_inputs:
             _publish_reader_bundle_to_canonical(context)
         _publish_artifacts_to_canonical(
             context,
-            selected_artifacts & context.values.keys(),
+            selected_artifacts & declared_inputs,
         )
         add = tuple(
             option
@@ -3221,7 +3294,7 @@ def prepare_book_graph(
         _semantic_handler(allow_missing_audit=phase in {"epub", "docx"}),
         requires=(ART_CHAPTERS,),
         provides=(ART_SEMANTIC_CHAPTERS,),
-        version="1",
+        version="2",
         cache_validator=_semantic_cache_is_current,
         description=(
             "Validate one-to-one Markdown footnotes and enforce the semantic "
@@ -3233,9 +3306,9 @@ def prepare_book_graph(
         _sanitize_handler,
         requires=(ART_SEMANTIC_CHAPTERS,),
         provides=(ART_READER_CHAPTERS,),
-        version="2",
+        version="3",
         fingerprint=_sanitize_fingerprint,
-        cache_validator=_artifact_is_current(_chapters_artifact),
+        cache_validator=_artifact_is_current(_reader_chapters_artifact),
         description="Apply idempotent reader-facing publication cleanup.",
     )
 

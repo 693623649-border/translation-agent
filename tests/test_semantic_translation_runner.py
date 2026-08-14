@@ -65,7 +65,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
                 return (
                     "⟦UNIT:c-u1:START⟧\n"
                     "译文⟦SEMANTIC_TOKEN_0000⟧。\n\n"
-                    "⟦SEMANTIC_TOKEN_0001⟧：注释。\n"
+                    "⟦SEMANTIC_TOKEN_0001⟧: 注释。\n"
                     "⟦UNIT:c-u1:END⟧"
                 )
 
@@ -157,6 +157,73 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
         self.assertIn("SEMANTIC_TOKEN", protected)
         with self.assertRaises(SemanticTranslationError):
             restore_tokens("⟦SEMANTIC_TOKEN_0001⟧ ⟦SEMANTIC_TOKEN_0000⟧", tokens)
+
+    def test_source_as_translation_is_rejected_before_cache_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = "A complete English sentence must be translated."
+            unit = {
+                "id": "c-1",
+                "chapter_id": "c",
+                "sequence": 1,
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "source_markdown": source,
+            }
+            units = root / "units.jsonl"
+            units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SemanticTranslationError, "unchanged source"):
+                translate_units(
+                    units,
+                    root / "translated.jsonl",
+                    cache_dir=root / "cache",
+                    request=lambda _: (
+                        "⟦UNIT:c-1:START⟧\n"
+                        f"{source}\n"
+                        "⟦UNIT:c-1:END⟧"
+                    ),
+                    retries=1,
+                )
+
+            self.assertFalse((root / "translated.jsonl").exists())
+            self.assertFalse((root / "cache").exists())
+
+    def test_cache_identity_includes_provider_endpoint_and_prompt_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = "A complete English sentence."
+            unit = {
+                "id": "c-1",
+                "chapter_id": "c",
+                "sequence": 1,
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "source_markdown": source,
+            }
+            units = root / "units.jsonl"
+            units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
+
+            translate_units(
+                units,
+                root / "one.jsonl",
+                provider="provider-a",
+                base_url="https://one.example/v1",
+                prompt_profile="academic-v1",
+                thinking="disabled",
+                temperature=0.0,
+            )
+            translate_units(
+                units,
+                root / "two.jsonl",
+                provider="provider-a",
+                base_url="https://two.example/v1",
+                prompt_profile="academic-v2",
+                thinking="enabled",
+                temperature=0.2,
+            )
+            one = json.loads((root / "one.jsonl").read_text(encoding="utf-8"))
+            two = json.loads((root / "two.jsonl").read_text(encoding="utf-8"))
+
+            self.assertNotEqual(one["cache_key"], two["cache_key"])
 
 
 if __name__ == "__main__":

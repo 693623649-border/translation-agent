@@ -1,6 +1,37 @@
 # 影印书编译 Agent
 
-这个仓库的主流程是：
+这是一个 local-first 的文档语义翻译与出版工具。扫描 PDF、带文字层 PDF 和
+EPUB 通过显式 Source Adapter 进入同一语义、清洗与发布契约；DAG 负责依赖闭包、
+断点缓存和产物身份；已接入对应 verification profile 的文件必须通过发布门后才
+可以正式交付。
+
+## 五分钟开始
+
+需要 Python 3.11+（推荐 3.12）：
+
+```bash
+python3.12 -m pip install -e ".[web]"
+translation-agent-doctor --web
+cp pipeline.example.toml pipeline.toml
+```
+
+先预览 DAG，不调用模型：
+
+```bash
+translation-agent plan book/input.pdf -o outputs/input \
+  --source-mode text-pdf --config pipeline.toml
+```
+
+本地启动任务工作台：
+
+```bash
+translation-agent-web
+```
+
+浏览器访问 `http://127.0.0.1:8501`。WebUI 只允许 loopback 监听；远程使用时，
+请保持服务绑定 `127.0.0.1`，再通过带认证的 SSH 隧道访问。
+
+扫描 PDF 的成熟主流程是：
 
 ```text
 影印版 PDF
@@ -11,13 +42,14 @@
   → 文字版 EPUB/Word + AI 知识库 JSONL + 带书签的参考 PDF
 ```
 
-Graph 还提供第三入口 `--source-mode text-pdf`，用于每页都有完整可复制
+Graph 还提供 `--source-mode text-pdf`，用于每页都有完整可复制
 文字层的 born-digital PDF。该模式执行
 `source.inspect → pages.text_extract → pages.translate → toc/compile → semantic`
 并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。默认仍是
 `scanned-pdf`，系统不会根据 PDF 内容自动猜测入口。
 
-推荐的新入口是 `graph_pipeline.py`；它把各阶段组织成可替换的依赖图，同时
+产品入口是 `translation-agent`（`document_pipeline.py`）；现有 PDF 全链仍由
+`graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
 复用 `book_pipeline.py` 的成熟实现和全部旧参数。`book_pipeline.py` 仍是完全
 兼容的阶段式入口。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）
 仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的
@@ -27,7 +59,10 @@ Graph 还提供第三入口 `--source-mode text-pdf`，用于每页都有完整�
 
 影印 PDF、带文本层 PDF 和 EPUB 的统一语义层顺序、CLI 迁移名和发布阻断标准
 见 [`docs/unified-semantic-dag.md`](docs/unified-semantic-dag.md)。EPUB 当前可执行
-命令另见 [`docs/epub-semantic-input.md`](docs/epub-semantic-input.md)。
+命令另见 [`docs/epub-semantic-input.md`](docs/epub-semantic-input.md)。EPUB-native
+正式发布门尚未接入，因此 CLI/WebUI 会明确将这条路径标为草稿，不能伪造
+`release_ready`。产品层、版本化契约和 WebUI 安全边界见
+[`docs/product-architecture.md`](docs/product-architecture.md)。
 
 ## 本版本改动（2026-08）
 
@@ -47,7 +82,7 @@ Graph 还提供第三入口 `--source-mode text-pdf`，用于每页都有完整�
    （"导论 17"）按标题子片段匹配剥离；验证器期望文本镜像同一规则，
    保证 EPUB/Word 与章节 Markdown 精确一致。
 
-### 章节注释重组工具（work/note_reflow.py）
+### 章节注释重组工具（tools/note_reflow.py）
 
 针对从 Word/LaTeX 导出的论文型 PDF（正文段与页脚注定义段交错导入，
 注释定义插在正文段落之间），提供上游重组：
@@ -78,6 +113,7 @@ python -m unittest discover tests
 
 ```text
 translation-agent/
+├── document_pipeline.py          # 版本化 RunSpec 的统一产品 CLI
 ├── graph_pipeline.py             # 可组合 DAG 命令行入口
 ├── book_pipeline.py              # 兼容的阶段式执行入口与成熟节点实现
 ├── pipeline_graph/
@@ -88,10 +124,18 @@ translation-agent/
 │   ├── full-publication.toml     # 完整出版物
 │   ├── chinese-pdf-word.toml     # 中文 PDF → Word
 │   └── outline-word.toml         # PDF 内置目录 → Word
+├── product_contracts.py          # RunSpec / ArtifactRecord / Event 公共契约
+├── semantic_ir.py                # 版本化文档语义 IR 与人工复核决定
+├── semantic_apply.py             # 翻译集合验证与事务回填
 ├── translation_agent_api.py      # 传统与 Graph 程序化调用接口
-├── frontend_app.py               # Streamlit 低代码控制台
-├── frontend_service.py           # 安全子进程、日志和产物服务层
-├── launch_frontend.py            # 一键启动前端
+├── application_service.py        # CLI/WebUI 共用任务应用服务
+├── frontend_runtime.py           # SQLite WAL、后台任务、安全环境与产物目录
+├── streamlit_app.py              # Streamlit 多页产品入口
+├── app_pages/                    # 新任务、状态、产物、设置页面
+├── frontend_app.py               # 旧入口兼容 shim
+├── launch_frontend.py            # local-only 一键启动前端
+├── doctor.py                     # 运行环境预检
+├── repository_guard.py           # 密钥、大文件和本地书稿防泄漏门
 ├── pipeline_profiles.py          # Provider/Profile 配置与模型指纹
 ├── pipeline_runtime.py           # 共享重试和起始限速器
 ├── publication_verifier.py       # 无模型调用的统一发布质量门
@@ -99,11 +143,12 @@ translation-agent/
 ├── pdf_text_agent.py             # 兼容旧检查点的旧入口
 ├── patch_translations.py         # 新格式译文人工修补工具
 ├── extract_textbook_layer.py     # 新格式文本层提取工具
-├── work/note_reflow.py           # 章节注释重组工具（见下文）
+├── tools/note_reflow.py          # 章节注释重组工具（见下文）
 ├── archive/
 │   ├── karatani/                 # 硬编码单本书的一次性脚本
 │   └── legacy/monitor.py         # 仅适用旧 Windows 流程
 ├── tests/
+├── pyproject.toml
 ├── requirements.txt
 └── .env.example
 ```
@@ -389,31 +434,40 @@ Profile 中填写 `proofread_profile` 不会自动启用该节点。
 
 ## 低代码 Web 控制台
 
-安装依赖后，只需一条命令：
+WebUI 是 `ApplicationService` 的薄客户端：每个任务使用独立 UUID 工作区，任务
+状态和事件保存在 SQLite WAL；浏览器关闭后后台任务继续运行，失败或取消后可从
+Graph 检查点恢复。密钥只进入本次子进程的 allowlist 环境，不写入 RunSpec、
+SQLite、日志或命令行。
+
+安装 Web extra 后启动：
 
 ```bash
-python launch_frontend.py
+python3.12 -m pip install -e ".[web]"
+translation-agent-web
 ```
 
-浏览器会打开 `http://127.0.0.1:8501`。界面按“选择任务 → 填写凭据与
-输出 → 开始/继续任务”组织，可直接完成：
+浏览器会打开 `http://127.0.0.1:8501`。顶部导航包含“新任务、任务状态、产物、
+设置”四页，可直接完成：
 
-- 上传 PDF 或填写服务器 PDF 路径；
+- 上传扫描 PDF、文字 PDF、EPUB，或选择 allowlist 根目录内的服务器文件；
 - 下拉切换 OCR、目录和翻译 Profile；
 - 密码框临时注入各 Profile 对应的 API Key；
-- 选择一键全流程或单独的 OCR、目录、翻译、Markdown、EPUB、Word、发布验收阶段；
-- 调整 OCR/翻译 worker、页范围、目录页、页码偏移和日文竖排模式；
-- 查看实时日志、断点状态并下载 EPUB、Word、知识库或带书签 PDF。
+- 先预览真实 DAG，再创建后台任务；
+- 查看结构化状态、最近日志、取消/恢复任务；
+- 只下载与 Graph 产物身份和通过的 release report 哈希一致的正式产物。
 
-在远程服务器运行：
+EPUB 原生发布验证尚未接入，界面会固定关闭该入口的“正式发布质量门”，产物只
+标记为草稿。PDF 任务只有在 `release_ready=true` 且报告与 Graph 身份匹配时才
+显示“正式产物”。
+
+启动器拒绝 `0.0.0.0` 和其他非 loopback 地址。远程服务器请保持本机绑定：
 
 ```bash
-python launch_frontend.py --host 0.0.0.0 --port 8501 --no-browser
+translation-agent-web --host 127.0.0.1 --port 8501 --no-browser
+# 在客户端另建带认证的 SSH 隧道：localhost:8501 → server:127.0.0.1:8501
 ```
 
-如服务器没有额外访问控制，建议通过 SSH 端口转发访问，不要把该端口直接
-暴露到公网。前端密码框中的 Key 只进入任务子进程的环境变量；不会拼进命令
-参数或保存到 Profile。子进程日志在显示前还会再次执行密钥脱敏。
+在加入认证、租户隔离和反向代理安全策略之前，不支持直接公网暴露。
 
 ## 为什么原框架不够
 
@@ -429,11 +483,13 @@ python launch_frontend.py --host 0.0.0.0 --port 8501 --no-browser
 
 ## 安装与配置
 
-Graph 与 Profile/Recipe TOML 使用 Python 3.10+ 语法和标准库；推荐 Python
-3.12。macOS 自带的 Python 3.9 不能直接运行 `graph_pipeline.py`。
+Graph 与 Profile/Recipe TOML 需要 Python 3.11+；推荐 Python 3.12。macOS
+自带的 Python 3.9 不能直接运行 `graph_pipeline.py`。
 
 ```bash
-python3.12 -m pip install -r requirements.txt
+python3.12 -m pip install -e .          # 核心 CLI
+python3.12 -m pip install -e ".[web]"  # 加 WebUI
+# 兼容旧脚本时使用：python3.12 -m pip install -e ".[legacy]"
 cp .env.example .env
 ```
 
@@ -822,7 +878,7 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 Word 表格、引文归属、粗体/斜体/下划线，并将带书签 PDF 的页面几何、文字层
 和低分辨率 RGB 外观逐页与源 PDF 比对，而不只检查数量。
 
-### 章节注释重组（work/note_reflow.py）
+### 章节注释重组（tools/note_reflow.py）
 
 当章节出现"注释定义散布在正文段落之间、正文被逐条打断"时（常见于从
 Word/LaTeX 导出的论文 PDF），先在审定稿层面重排，再走常规增量门+全书门：
@@ -830,9 +886,9 @@ Word/LaTeX 导出的论文 PDF），先在审定稿层面重排，再走常规�
 ```bash
 # 1. 将问题章节放入 reviewed_chapters/（人工审定稿）
 # 2. 预览统计：定义/引用数量、闭环缺口（不写盘）
-python work/note_reflow.py --dry
+python tools/note_reflow.py --dry
 # 3. 写回审定稿：定义归入章末 ## 注释，正文引用标记化为 〔n〕
-python work/note_reflow.py
+python tools/note_reflow.py
 # 4. 轻量编译更新发布章
 python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase compile \
   --no-verify --no-epub --no-docx --no-kb --no-bookmarked-pdf

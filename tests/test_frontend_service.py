@@ -3,6 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import launch_frontend
+
 from frontend_service import (
     PipelineJob,
     artifact_mime_type,
@@ -22,6 +24,13 @@ class _FakeProcess:
 
 
 class FrontendServiceTests(unittest.TestCase):
+    def test_launcher_rejects_non_loopback_bind_address(self) -> None:
+        with patch("launch_frontend.subprocess.Popen") as popen:
+            with self.assertRaises(SystemExit) as caught:
+                launch_frontend.main(["--host", "0.0.0.0", "--no-browser"])
+        self.assertEqual(caught.exception.code, 2)
+        popen.assert_not_called()
+
     def test_credentials_are_only_in_child_environment(self) -> None:
         request = RunRequest(
             output_dir="outputs/book",
@@ -35,11 +44,14 @@ class FrontendServiceTests(unittest.TestCase):
             credentials={"DEEPSEEK_API_KEY": "secret-value"},
         )
         self.assertNotIn("secret-value", " ".join(job.command()))
+        self.assertIn("graph_pipeline.py", " ".join(job.command()))
+        self.assertNotIn("book_pipeline.py", " ".join(job.command()))
         self.assertEqual(
             job.environment(base={})["DEEPSEEK_API_KEY"],
             "secret-value",
         )
         self.assertNotIn("secret-value", repr(job))
+        self.assertNotIn("UNRELATED_SECRET", job.environment(base={"UNRELATED_SECRET": "x"}))
 
     def test_invalid_credential_environment_name_is_rejected(self) -> None:
         job = PipelineJob(
@@ -70,7 +82,7 @@ class FrontendServiceTests(unittest.TestCase):
             epub = root / "book.epub"
             epub.write_bytes(b"epub")
             (root / "notes.txt").write_text("ignore", encoding="utf-8")
-            self.assertEqual(discover_artifacts(root), [epub])
+            self.assertEqual(discover_artifacts(root), [epub.resolve()])
             self.assertEqual(artifact_mime_type(epub), "application/epub+zip")
 
     def test_uploaded_pdf_name_is_sanitized(self) -> None:

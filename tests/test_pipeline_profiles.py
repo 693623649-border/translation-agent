@@ -30,6 +30,24 @@ class PipelineProfileTests(unittest.TestCase):
         assert translation is not None
         self.assertEqual(translation.model, "deepseek-v4-flash")
         self.assertEqual(loaded.get("deepseek_pro").model, "deepseek-v4-pro")
+        self.assertEqual(loaded.schema_version, 1)
+
+    def test_profile_schema_rejects_unknown_fields_and_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pipeline.toml"
+            path.write_text(
+                "schema_version=1\n"
+                "[profiles.model]\n"
+                "adapter='openai-chat'\nprovider='test'\nmodel='x'\n"
+                "tempertaure=0\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unknown fields.*tempertaure"):
+                load_pipeline_profiles(path)
+
+            path.write_text("schema_version=2\n[profiles]\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schema_version=2"):
+                load_pipeline_profiles(path)
 
     def test_raw_secret_is_rejected_as_credential_environment_name(self) -> None:
         with self.assertRaisesRegex(ValueError, "environment variable name"):
@@ -227,6 +245,7 @@ translation_profile = "deepseek_pro"
             replace(identity, base_url="https://gateway.example.invalid/deepseek"),
             replace(identity, target_language="繁体中文"),
             replace(identity, prompt_version="translation-v3"),
+            replace(identity, thinking="enabled"),
         ):
             self.assertNotEqual(changed.fingerprint, fingerprint)
 

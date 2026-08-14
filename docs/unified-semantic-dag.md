@@ -158,24 +158,24 @@ publication recipe：它不会伪造 `pages/page_XXXX.json`。需要正式
 抽取器检测到不能闭合为定义的可见上标，则以
 `pdf_visible_superscript_unresolved` 阻断，待人工恢复脚注关系后才可回填译文。
 
-统一 Provider 实现后的目标 CLI 使用“动作 + 来源类型”，不再用含义重叠的
-`compile`：
+当前产品 facade 已使用“动作 + 来源类型”，不再让 WebUI 直接拼 legacy CLI；
+PDF 动作委托给 Graph，EPUB 动作委托给语义 importer/runner，并明确保持草稿状态：
 
 ```text
-document_pipeline.py plan      SOURCE -o OUTPUT [--source-format auto|pdf-ocr|pdf-text|epub]
-document_pipeline.py ingest    SOURCE -o OUTPUT [--source-format pdf-ocr|pdf-text|epub]
-document_pipeline.py translate        -o OUTPUT [--prepare-only]
-document_pipeline.py review           -o OUTPUT
-document_pipeline.py publish          -o OUTPUT --target publication.word_report
-document_pipeline.py verify           -o OUTPUT --target publication.report
-document_pipeline.py status           -o OUTPUT
+translation-agent plan      SOURCE -o OUTPUT [--source-mode scanned-pdf|text-pdf|epub]
+translation-agent ingest    SOURCE -o OUTPUT [--source-mode scanned-pdf|text-pdf|epub]
+translation-agent translate        -o OUTPUT [--prepare-only]
+translation-agent apply            -o OUTPUT [--translations FILE]
+translation-agent review           -o OUTPUT
+translation-agent publish          -o OUTPUT [--format epub|docx]
+translation-agent status           -o OUTPUT
 ```
 
-`ingest` 结束于 `document.semantic.source`；`translate` 结束于经过自动 QA 的
-`document.semantic.translated`，但不能独自授权发布；`review` 消解待复核项并生成
-`document.semantic.reviewed`；`publish` 总是包含 sanitize、包结构门和目标对应的
-渲染门。正式 Word 的目标仍是 `publication.word_report`，不能以裸
-`publication.docx` 作为成功条件。
+`translate` 的模型结果仍必须经过共享 `semantic_apply` 复验后才能写入章节；
+`publish` 在没有兼容 verifier 时只返回 `publication_status=draft`。正式 Word 的
+Graph 目标仍是 `publication.word_report`，不能以裸 `publication.docx` 作为成功
+条件。EPUB 运行必须显式 `--no-verify` 才允许生成草稿，避免把未实现的原生门
+静默当作成功。
 
 ## 发布硬阻断
 

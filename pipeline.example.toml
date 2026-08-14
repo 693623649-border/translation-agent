@@ -1,3 +1,5 @@
+schema_version = 1
+
 [profiles.glm_vision]
 adapter = "coding-plan-mcp"
 provider = "zhipu"
@@ -8,7 +10,8 @@ command = ["npx", "-y", "@z_ai/mcp-server@0.1.4"]
 timeout = 180
 concurrency = 4
 thinking = "omit"
-reading_direction = "vertical"
+# Generic preset: choose "vertical" explicitly for Japanese/Chinese tategaki.
+reading_direction = "horizontal"
 
 [profiles.glm_toc]
 adapter = "openai-chat"

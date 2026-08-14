@@ -7,13 +7,35 @@
 
 # 保留 .env.example 作为模板
 !.env.example
+.streamlit/secrets.toml
 
 # 输出目录（翻译结果和中间产物）
 outputs/
 
+# 本地工作区、模型缓存与产品任务状态（可能含版权内容）
+work/
+translation_cache/
+.translation-cache/
+.translation-agent/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# 本地 agent / IDE 自动化配置，不属于产品源码
+.agents/
+.claude/
+
+# 历史书籍专用脚本只保留在本机
+archive/states_of_injury/
+
 # Python 缓存
 __pycache__/
 *.pyc
+.pytest_cache/
+.coverage*
+build/
+dist/
+*.egg-info/
 *.pyo
 *.pyd
 .Python

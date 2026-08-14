@@ -8,6 +8,7 @@ pipeline functions be wrapped without rewriting their checkpoint formats.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import errno
 import hashlib
@@ -75,6 +76,61 @@ class NodeContractError(GraphError):
     """Raised when a node returns data inconsistent with its declaration."""
 
 
+class _DeclaredValueView(MutableMapping[str, Any]):
+    """Isolated node-local view of values declared in ``NodeSpec.requires``.
+
+    The executor owns the canonical value store.  Handlers receive a private
+    copy so mutating a nested list or mapping cannot silently change an
+    upstream artifact while retaining its old fingerprint.  Looking up a name
+    outside the declared contract is an error instead of an accidental hidden
+    DAG dependency.
+    """
+
+    def __init__(
+        self,
+        *,
+        node_name: str,
+        allowed: Iterable[str],
+        values: Mapping[str, Any],
+    ) -> None:
+        self._node_name = node_name
+        self._allowed = frozenset(allowed)
+        self._values = {
+            name: _isolated_copy(value)
+            for name, value in values.items()
+            if name in self._allowed
+        }
+
+    def _check(self, name: object) -> None:
+        if name not in self._allowed:
+            raise NodeContractError(
+                f"node {self._node_name!r} accessed undeclared input {name!r}; "
+                "add it to NodeSpec.requires"
+            )
+
+    def __getitem__(self, name: str) -> Any:
+        self._check(name)
+        return self._values[name]
+
+    def __setitem__(self, name: str, value: Any) -> None:
+        self._check(name)
+        self._values[name] = value
+
+    def __delitem__(self, name: str) -> None:
+        self._check(name)
+        del self._values[name]
+
+    def __iter__(self):  # type annotation is inferred by collections.abc.
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+    def __contains__(self, name: object) -> bool:
+        self._check(name)
+        return name in self._values
+
+
 class NodeExecutionError(GraphError):
     """Wrap a handler failure while retaining the original exception as cause."""
 
@@ -104,6 +160,22 @@ def _name_set(values: Iterable[str], *, field_name: str) -> frozenset[str]:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field_name} must contain non-empty strings")
     return result
+
+
+def _isolated_copy(value: Any) -> Any:
+    """Copy graph-compatible containers, including non-picklable proxies."""
+
+    if isinstance(value, Mapping):
+        return {key: _isolated_copy(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_isolated_copy(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_isolated_copy(item) for item in value)
+    if isinstance(value, set):
+        return {_isolated_copy(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(_isolated_copy(item) for item in value)
+    return copy.deepcopy(value)
 
 
 def _json_value(value: Any, *, location: str = "value") -> JsonValue:
@@ -294,8 +366,8 @@ class GraphContext:
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir).expanduser().resolve()
-        self.values = dict(self.values)
-        self.config = MappingProxyType(dict(self.config))
+        self.values = _isolated_copy(dict(self.values))
+        self.config = MappingProxyType(_isolated_copy(dict(self.config)))
         self.fingerprints = dict(self.fingerprints)
         self.private_value_names = _name_set(
             self.private_value_names,
@@ -317,7 +389,7 @@ class GraphContext:
             if not isinstance(name, str) or not name or not callable(validator):
                 raise ValueError("value_validators must map names to callables")
         self._initial_value_names = frozenset(self.values)
-        self._initial_values = dict(self.values)
+        self._initial_values = _isolated_copy(dict(self.values))
         self._initial_fingerprints = dict(self.fingerprints)
         _name_set(self.values, field_name="values")
         _name_set(self.fingerprints, field_name="fingerprints")
@@ -346,12 +418,50 @@ class GraphContext:
     def __getitem__(self, name: str) -> Any:
         return self.require(name)
 
+    def _for_node(self, node: NodeSpec) -> "GraphContext":
+        """Build the isolated contract view passed to one node callback."""
+
+        required_values = {
+            name: self.values[name]
+            for name in node.requires
+            if name in self.values
+        }
+        required_fingerprints = {
+            name: self.fingerprints[name]
+            for name in node.requires
+            if name in self.fingerprints
+        }
+        invocation = GraphContext(
+            self.output_dir,
+            values=required_values,
+            config=self.config,
+            fingerprints=required_fingerprints,
+            private_value_names=frozenset(
+                set(self.private_value_names) & set(node.requires)
+            ),
+            redaction_values=self.redaction_values,
+            value_validators=self.value_validators,
+        )
+        invocation.values = _DeclaredValueView(
+            node_name=node.name,
+            allowed=node.requires,
+            values=required_values,
+        )
+        invocation.fingerprints = _DeclaredValueView(
+            node_name=node.name,
+            allowed=node.requires,
+            values=required_fingerprints,
+        )
+        invocation.run_id = self.run_id
+        invocation.node_name = node.name
+        return invocation
+
     def _reset_produced_values(self) -> None:
         """Drop values restored or produced by a previous executor run."""
 
         for name in self._produced_value_names:
             if name in self._initial_value_names:
-                self.values[name] = self._initial_values[name]
+                self.values[name] = _isolated_copy(self._initial_values[name])
                 if name in self._initial_fingerprints:
                     self.fingerprints[name] = self._initial_fingerprints[name]
                 else:
@@ -698,6 +808,7 @@ class GraphRunResult:
     values: Mapping[str, Any]
     state_path: Path
     events_path: Path
+    schema_version: int = 1
 
 
 class GraphExecutor:
@@ -739,7 +850,10 @@ class GraphExecutor:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_symlink():
             raise GraphStateError(f"refusing symlinked graph event log: {path}")
-        payload = (_canonical_json(_json_value(event)) + "\n").encode("utf-8")
+        versioned_event = {**event, "schema_version": 1}
+        payload = (_canonical_json(_json_value(versioned_event)) + "\n").encode(
+            "utf-8"
+        )
         flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -783,6 +897,39 @@ class GraphExecutor:
                 "requires": requirements,
             }
         )
+
+    @staticmethod
+    def _required_input_snapshot(
+        node: NodeSpec,
+        context: GraphContext,
+    ) -> dict[str, tuple[str, str | None]]:
+        """Capture both content and declared fingerprints for node inputs."""
+
+        return {
+            name: (
+                stable_fingerprint(context.values[name]),
+                context.fingerprints.get(name),
+            )
+            for name in sorted(node.requires)
+        }
+
+    @classmethod
+    def _assert_required_inputs_unchanged(
+        cls,
+        node: NodeSpec,
+        context: GraphContext,
+        before: Mapping[str, tuple[str, str | None]],
+    ) -> None:
+        after = cls._required_input_snapshot(node, context)
+        if after != before:
+            changed = sorted(
+                name
+                for name in set(before) | set(after)
+                if before.get(name) != after.get(name)
+            )
+            raise NodeContractError(
+                f"node {node.name!r} mutated required inputs: {changed}"
+            )
 
     @staticmethod
     def _cached_outputs(
@@ -892,17 +1039,31 @@ class GraphExecutor:
             try:
                 for node in plan:
                     context.node_name = node.name
-                    fingerprint = self._node_fingerprint(node, context)
+                    required_snapshot = self._required_input_snapshot(node, context)
+                    fingerprint = self._node_fingerprint(
+                        node,
+                        context._for_node(node),
+                    )
+                    self._assert_required_inputs_unchanged(
+                        node,
+                        context,
+                        required_snapshot,
+                    )
                     is_forced = forced is None or node.name in forced
                     cached = None if is_forced else self._cached_outputs(
                         node,
                         state["nodes"].get(node.name),
                         fingerprint,
+                        context._for_node(node),
+                    )
+                    self._assert_required_inputs_unchanged(
+                        node,
                         context,
+                        required_snapshot,
                     )
                     if cached is not None:
                         outputs, output_fingerprints = cached
-                        context.values.update(outputs)
+                        context.values.update(_isolated_copy(outputs))
                         context.fingerprints.update(output_fingerprints)
                         context._produced_value_names.update(node.provides)
                         skipped.append(node.name)
@@ -933,7 +1094,22 @@ class GraphExecutor:
                         },
                     )
                     try:
-                        result = node.handler(context)
+                        invocation_context = context._for_node(node)
+                        invocation_snapshot = self._required_input_snapshot(
+                            node,
+                            invocation_context,
+                        )
+                        result = node.handler(invocation_context)
+                        self._assert_required_inputs_unchanged(
+                            node,
+                            invocation_context,
+                            invocation_snapshot,
+                        )
+                        self._assert_required_inputs_unchanged(
+                            node,
+                            context,
+                            required_snapshot,
+                        )
                         if not isinstance(result, NodeResult):
                             raise NodeContractError(
                                 f"node {node.name!r} must return NodeResult, got "
@@ -948,11 +1124,22 @@ class GraphExecutor:
                             )
                         for name, value in result.outputs.items():
                             validator = context.value_validators.get(name)
-                            if validator is not None and not validator(context, value):
+                            if validator is not None and not validator(
+                                context._for_node(node),
+                                value,
+                            ):
                                 raise NodeContractError(
                                     f"node {node.name!r} produced invalid artifact {name!r}"
                                 )
                     except Exception as exc:
+                        try:
+                            self._assert_required_inputs_unchanged(
+                                node,
+                                context,
+                                required_snapshot,
+                            )
+                        except NodeContractError as mutation_error:
+                            exc = mutation_error
                         safe_error = self._safe_error_text(context, exc)
                         self._append_event(
                             events_path,
@@ -966,13 +1153,15 @@ class GraphExecutor:
                                 "timestamp": _utc_now(),
                             },
                         )
+                        if isinstance(exc, NodeContractError):
+                            raise exc
                         raise NodeExecutionError(
                             node.name,
                             exc,
                             safe_message=safe_error,
                         ) from exc
 
-                    outputs = dict(result.outputs)
+                    outputs = _isolated_copy(dict(result.outputs))
                     output_fingerprints = {
                         name: result.fingerprints.get(
                             name, stable_fingerprint(outputs[name])
@@ -1021,11 +1210,11 @@ class GraphExecutor:
                     executed=tuple(executed),
                     skipped=tuple(skipped),
                     values=MappingProxyType(
-                        {
+                        _isolated_copy({
                             name: value
                             for name, value in context.values.items()
                             if name not in context.private_value_names
-                        }
+                        })
                     ),
                     state_path=state_path,
                     events_path=events_path,

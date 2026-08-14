@@ -683,6 +683,7 @@ class GlmClient:
             model=self.text_model,
             target_language=target_language,
             prompt_version=prompt_version,
+            thinking=self.thinking,
         )
 
     def _post(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -5468,6 +5469,7 @@ def resolve_translation_identity(
         model=model,
         target_language=args.target_language,
         prompt_version=TRANSLATION_PROMPT_VERSION,
+        thinking=profile.thinking if profile is not None else "disabled",
     )
 
 
@@ -5528,6 +5530,7 @@ def resolve_proofread_identity(
         model=fallback.model,
         target_language=args.proofread_language,
         prompt_version=PROOFREAD_PROMPT_VERSION,
+        thinking=fallback.thinking,
     )
 
 
