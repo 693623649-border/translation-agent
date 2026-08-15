@@ -406,26 +406,147 @@ class BookGraphPlanningTests(unittest.TestCase):
             toc = output / "toc.json"
             toc.write_text("{}", encoding="utf-8")
             prepared.context.values.update({
-                ART_SOURCE: {"path": str(Path(directory) / "book.pdf")},
+                ART_SOURCE: {
+                    "path": str(Path(directory) / "book.pdf"),
+                    "page_count": 1,
+                },
                 ART_PAGES_RAW: {"path": str(pages)},
                 ART_TOC: {"path": str(toc)},
             })
+            record = book_pipeline.PageRecord(
+                pdf_page=1,
+                text="Page",
+                ocr_model="text-layer/pymupdf-v1",
+            )
 
             with (
-                patch("pipeline_graph.book._require_source_argument"),
+                patch(
+                    "pipeline_graph.book._require_source_argument",
+                    return_value=Path(directory) / "book.pdf",
+                ),
                 patch("pipeline_graph.book._materialize_pages_artifact"),
                 patch("pipeline_graph.book._materialize_toc_artifact"),
+                patch(
+                    "pipeline_graph.book.legacy.load_page_records",
+                    side_effect=([record], [record]),
+                ) as load_records,
+                patch(
+                    "pipeline_graph.book.legacy.normalize_cached_page_records"
+                ) as normalize_records,
+                patch(
+                    "pipeline_graph.book.legacy.load_env_file"
+                ) as load_env_file,
+                patch("pipeline_graph.book.run_chapter_compile") as compile_service,
                 patch("pipeline_graph.book._run_phase") as run_phase,
                 patch("pipeline_graph.book._snapshot_chapter_drafts"),
                 patch("pipeline_graph.book._draft_chapters_artifact", return_value={"sha256": "0" * 64})
             ):
                 compile_node.handler(prepared.context)
 
-            add = run_phase.call_args.kwargs["add"]
+            run_phase.assert_not_called()
+            load_env_file.assert_called_once_with(
+                Path(book_pipeline.__file__).with_name(".env")
+            )
+            self.assertEqual(load_records.call_count, 2)
+            normalize_records.assert_called_once_with(output.resolve(), [record])
+            request = compile_service.call_args.args[0]
             self.assertEqual(
-                add[add.index("--required-ocr-model-prefix") + 1],
+                request.required_ocr_model_prefix,
                 "text-layer/pymupdf-v1",
             )
+            self.assertIsNotNone(request.expected_translation_identity)
+            self.assertFalse(request.require_translation)
+            self.assertEqual(request.page_records, (record,))
+
+    def test_compile_service_failure_preserves_legacy_stage_error_contract(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "book.pdf"
+            output = Path(directory) / "output"
+            prepared = prepare_book_graph(
+                [
+                    str(source),
+                    "--output-dir",
+                    str(output),
+                    "--phase",
+                    "compile",
+                ],
+                options=BookGraphOptions(load_dotenv=False),
+            )
+            compile_node = next(
+                node for node in prepared.graph.nodes if node.name == NODE_COMPILE
+            )
+            prepared.context.values.update(
+                {
+                    ART_SOURCE: {"path": str(source), "page_count": 1},
+                    ART_PAGES_RAW: {"path": str(output / "pages")},
+                    ART_TOC: {"path": str(output / "toc.json")},
+                }
+            )
+            record = book_pipeline.PageRecord(
+                pdf_page=1,
+                text="Page",
+                ocr_model="ocr/v1",
+            )
+            failure = ValueError("compile failed")
+            with (
+                patch(
+                    "pipeline_graph.book._require_source_argument",
+                    return_value=source,
+                ),
+                patch("pipeline_graph.book._materialize_pages_artifact"),
+                patch("pipeline_graph.book._materialize_toc_artifact"),
+                patch(
+                    "pipeline_graph.book.legacy.load_page_records",
+                    side_effect=([record], [record]),
+                ),
+                patch("pipeline_graph.book.legacy.normalize_cached_page_records"),
+                patch(
+                    "pipeline_graph.book.legacy.load_env_file"
+                ) as load_env_file,
+                patch(
+                    "pipeline_graph.book.run_chapter_compile",
+                    side_effect=failure,
+                ),
+                patch("pipeline_graph.book._snapshot_chapter_drafts") as snapshot,
+            ):
+                with self.assertRaises(LegacyStageError) as raised:
+                    compile_node.handler(prepared.context)
+
+            self.assertEqual(raised.exception.phase, "compile")
+            self.assertEqual(raised.exception.exit_code, 1)
+            self.assertIs(raised.exception.__cause__, failure)
+            load_env_file.assert_not_called()
+            snapshot.assert_not_called()
+
+            normalization_failure = OSError("checkpoint cleanup failed")
+            with (
+                patch(
+                    "pipeline_graph.book._require_source_argument",
+                    return_value=source,
+                ),
+                patch("pipeline_graph.book._materialize_pages_artifact"),
+                patch("pipeline_graph.book._materialize_toc_artifact"),
+                patch(
+                    "pipeline_graph.book.legacy.load_page_records",
+                    return_value=[record],
+                ),
+                patch(
+                    "pipeline_graph.book.legacy.normalize_cached_page_records",
+                    side_effect=normalization_failure,
+                ),
+                patch(
+                    "pipeline_graph.book.run_chapter_compile"
+                ) as compile_service,
+            ):
+                with self.assertRaises(LegacyStageError) as raised:
+                    compile_node.handler(prepared.context)
+
+            self.assertEqual(raised.exception.phase, "compile")
+            self.assertEqual(raised.exception.exit_code, 1)
+            self.assertIs(raised.exception.__cause__, normalization_failure)
+            compile_service.assert_not_called()
 
     def test_text_pdf_executes_through_semantic_reader_without_ocr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1887,11 +2008,10 @@ class BookGraphExecutionTests(unittest.TestCase):
                     ),
                 )
 
-            compile_calls: list[list[str]] = []
+            compile_calls: list[object] = []
 
-            def fake_compile(argv: list[str]) -> int:
-                compile_calls.append(list(argv))
-                self.assertEqual(argv[argv.index("--phase") + 1], "compile")
+            def fake_compile(request: object) -> None:
+                compile_calls.append(request)
                 canonical_page = json.loads(
                     (output / "pages" / "page_0001.json").read_text(
                         encoding="utf-8"
@@ -1915,11 +2035,13 @@ class BookGraphExecutionTests(unittest.TestCase):
                     json.dumps([{"filename": "001.md"}]),
                     encoding="utf-8",
                 )
-                return 0
 
-            with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
-                side_effect=fake_compile,
+            with (
+                patch(
+                    "pipeline_graph.book.run_chapter_compile",
+                    side_effect=fake_compile,
+                ),
+                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
             ):
                 first = prepared.execute()
                 canonical_page = output / "pages" / "page_0001.json"
@@ -1950,6 +2072,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 )
                 second = prepared.execute()
 
+            legacy_main.assert_not_called()
             self.assertIn(NODE_COMPILE, first.executed)
             self.assertIn(NODE_COMPILE, second.executed)
             self.assertNotIn(NODE_COMPILE, second.skipped)

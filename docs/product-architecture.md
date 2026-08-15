@@ -79,13 +79,18 @@ Provider、Source Adapter 和 publisher 可以迭代，但不能绕过这些契�
 
 ## Legacy 收敛状态
 
-发布验收是首个完成抽离的 PDF 节点边界。阶段式 CLI 与 PDF DAG 现在共用类型化
-`publication_service`；Graph verify 直接提交请求对象，不再拼接 argv 或调用 legacy
-私有 `_main_unlocked`。`runtime.hygiene` 是首个移入 `publication_checks/` 的模块化
-确定性检查，抽离没有改变既有报告 ID、schema 或检查顺序。
+章节编译与发布验收是首批完成抽离的 PDF 节点边界。阶段式 CLI 与 PDF DAG 现在
+分别共用类型化 `compile_service` 和 `publication_service`；Graph 的
+`core.chapters.compile` 与 verify 节点直接提交请求对象，不再拼接 argv 或调用
+legacy 私有 `_main_unlocked`。`runtime.hygiene` 是首个移入
+`publication_checks/` 的模块化确定性检查，抽离没有改变既有报告 ID、schema 或
+检查顺序。
 
-OCR、目录、校勘、翻译和编译仍由 Graph 节点委托 legacy 阶段代码。这些兼容 seam
-继续保留，但新行为应优先落在类型化服务与 Graph 路径，再按节点边界逐项抽离。
+`compile_service` 保留完整页集合、OCR 模型约束、TOC 页码映射、章节粒度和翻译
+身份校验，并返回章节清单与知识库行；publisher 与 release verifier 仍是独立节点，
+不会被编译服务隐式触发。剩余 argv legacy seam 是 OCR、目录、校勘和翻译；这些
+兼容 seam 继续保留，但新行为应优先落在类型化服务与 Graph 路径，再按节点边界逐项
+抽离。
 
 ## EPUB Graph 与发布契约
 

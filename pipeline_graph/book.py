@@ -23,6 +23,7 @@ import pymupdf as fitz
 
 import book_pipeline as legacy
 import extract_textbook_layer
+from compile_service import ChapterCompileRequest, run_chapter_compile
 from pipeline_profiles import load_pipeline_profiles
 from publication_service import (
     BOOKMARKED_PDF as VERIFY_BOOKMARKED_PDF,
@@ -1788,34 +1789,69 @@ def _load_chapters_handler(context: GraphContext) -> NodeResult:
 
 def _compile_handler(page_artifact: str, *, required_page_model: str | None = None) -> Any:
     def handler(context: GraphContext) -> NodeResult:
-        _require_source_argument(context)
+        source_path = _require_source_argument(context)
         _materialize_pages_artifact(context, page_artifact)
         _materialize_toc_artifact(context)
-        # Translation, all publishers, and the release gate are independent
-        # graph nodes. Keep require-translation intact so the legacy guard
-        # still validates every selected page against the model identity.
-        _run_phase(
-            context,
-            "compile",
-            add=(
-                "--no-kb",
-                "--no-epub",
-                "--no-docx",
-                "--no-bookmarked-pdf",
-                "--no-verify",
-                *(
-                    ("--required-ocr-model-prefix", required_page_model)
-                    if required_page_model
-                    else ()
-                ),
-            ),
-            remove=(
-                ("--translate-non-chinese", False),
-                *((
-                    ("--required-ocr-model-prefix", True),
-                ) if required_page_model else ()),
-            ),
-        )
+        try:
+            if _load_dotenv(context):
+                legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
+            args = _parsed_args(context)
+            profiles = _selected_model_profiles(args)
+            expected_translation_identity = legacy.resolve_expected_translation_identity(
+                args,
+                toc_profile=profiles["toc"],
+                translation_profile=profiles["translation"],
+            )
+            required_ocr_model_prefix = (
+                required_page_model or args.required_ocr_model_prefix
+            )
+            if not required_ocr_model_prefix and args.require_complete_ocr:
+                required_ocr_model_prefix = legacy.resolve_expected_ocr_model_prefix(
+                    args,
+                    profiles["ocr"],
+                )
+            # The old phase normalized every cached page immediately before
+            # compilation. Preserve that CAS-aware cleanup and reload committed
+            # records; compile intentionally consumes all pages, not start/end.
+            records = legacy.load_page_records(context.output_dir)
+            legacy.normalize_cached_page_records(context.output_dir, records)
+            records = legacy.load_page_records(context.output_dir)
+            source = context.require(ART_SOURCE)
+            declared_page_count = (
+                int(source.get("page_count") or 0)
+                if isinstance(source, Mapping)
+                else 0
+            )
+            if declared_page_count:
+                source_page_count = declared_page_count
+            else:
+                with fitz.open(source_path) as document:
+                    source_page_count = document.page_count
+            run_chapter_compile(
+                ChapterCompileRequest(
+                    source_pdf=source_path,
+                    output_dir=context.output_dir,
+                    page_records=tuple(records),
+                    source_page_count=source_page_count,
+                    publication_title=_book_title(context),
+                    toc_path=context.output_dir / "toc.json",
+                    page_offset=args.page_offset,
+                    printed_pages_per_pdf_page=args.printed_pages_per_pdf_page,
+                    granularity=args.granularity,
+                    require_complete_ocr=args.require_complete_ocr,
+                    required_ocr_model_prefix=required_ocr_model_prefix,
+                    require_translation=args.require_translation,
+                    expected_translation_identity=expected_translation_identity,
+                )
+            )
+        except SystemExit as exc:
+            try:
+                exit_code = int(exc.code)
+            except (TypeError, ValueError):
+                exit_code = 1
+            raise LegacyStageError("compile", exit_code) from exc
+        except Exception as exc:
+            raise LegacyStageError("compile", 1) from exc
         _snapshot_chapter_drafts(context.output_dir)
         artifact = _draft_chapters_artifact(context.output_dir)
         return NodeResult(

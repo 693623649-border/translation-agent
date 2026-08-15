@@ -40,6 +40,7 @@ from typing import Any, Iterable, Iterator, Protocol
 import pymupdf as fitz
 from PIL import Image
 
+from compile_service import ChapterCompileRequest, run_chapter_compile
 from pipeline_profiles import (
     ModelIdentity,
     ModelProfile,
@@ -6340,77 +6341,40 @@ def _main_unlocked(
 
         if args.phase in {"all", "compile"}:
             assert pdf_path is not None
-            if args.require_complete_ocr:
-                cached_pages = {record.pdf_page for record in records}
-                missing_pages = [
-                    page for page in range(1, pdf_page_count + 1) if page not in cached_pages
-                ]
-                extra_pages = sorted(
-                    page for page in cached_pages if page < 1 or page > pdf_page_count
-                )
-                if missing_pages or extra_pages:
-                    preview = missing_pages[:20]
-                    suffix = "..." if len(missing_pages) > len(preview) else ""
-                    raise ValueError(
-                        "Complete OCR is required but cached page numbers do not exactly "
-                        f"match the source PDF: missing={preview}{suffix}, "
-                        f"extra={extra_pages[:20]}"
-                    )
             required_ocr_model_prefix = args.required_ocr_model_prefix
             if not required_ocr_model_prefix and args.require_complete_ocr:
                 required_ocr_model_prefix = resolve_expected_ocr_model_prefix(
                     args,
                     ocr_profile,
                 )
-            if required_ocr_model_prefix:
-                required_prefixes = parse_model_prefixes(
-                    required_ocr_model_prefix
-                )
-                wrong_models = [
-                    (record.pdf_page, record.ocr_model)
-                    for record in records
-                    if not required_prefixes
-                    or not record.ocr_model.startswith(required_prefixes)
-                ]
-                if wrong_models:
-                    preview = wrong_models[:12]
-                    suffix = "..." if len(wrong_models) > len(preview) else ""
-                    raise ValueError(
-                        f"OCR model prefix {required_ocr_model_prefix!r} is required, "
-                        f"but cached pages do not match: {preview}{suffix}"
-                    )
-            toc_payload = load_toc(toc_path)
-            if (
-                not isinstance(toc_payload.get("page_offset"), int)
-                or args.page_offset is not None
-                or args.printed_pages_per_pdf_page is not None
-            ):
-                toc_payload = apply_page_mapping(
-                    toc_payload,
-                    records,
-                    page_offset=args.page_offset,
+            compile_result = run_chapter_compile(
+                ChapterCompileRequest(
+                    source_pdf=pdf_path,
+                    output_dir=output_dir,
+                    page_records=tuple(records),
                     source_page_count=pdf_page_count,
-                    printed_pages_per_pdf_page=args.printed_pages_per_pdf_page,
+                    toc_path=toc_path,
+                    page_offset=args.page_offset,
+                    printed_pages_per_pdf_page=(
+                        args.printed_pages_per_pdf_page
+                    ),
+                    granularity=args.granularity,
+                    require_complete_ocr=args.require_complete_ocr,
+                    required_ocr_model_prefix=required_ocr_model_prefix,
+                    require_translation=args.require_translation,
+                    expected_translation_identity=expected_translation_identity,
+                    publication_title=book_title,
                 )
-                write_json(toc_path, toc_payload)
-            compile_granularity = resolve_compile_granularity(
-                output_dir,
-                toc_payload,
-                args.granularity,
             )
-            print(f"[compile] granularity={compile_granularity}")
-            manifest, knowledge_rows = compile_chapters(
-                pdf_path,
-                output_dir,
-                records,
-                toc_payload,
-                granularity=compile_granularity,
-                publication_title=book_title,
-                require_translation=args.require_translation,
-                expected_translation_identity=expected_translation_identity,
-            )
+            print(f"[compile] granularity={compile_result.granularity}")
+            manifest = compile_result.manifest
+            knowledge_rows = compile_result.knowledge_rows
+            toc_payload = compile_result.toc_payload
             if not args.no_kb:
-                write_knowledge_base(output_dir / "knowledge_base.jsonl", knowledge_rows)
+                write_knowledge_base(
+                    output_dir / "knowledge_base.jsonl",
+                    knowledge_rows,
+                )
             if not args.no_epub:
                 build_epub(
                     output_dir / f"{slugify(book_title)}.epub",

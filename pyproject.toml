@@ -36,6 +36,7 @@ include-package-data = true
 py-modules = [
   "book_pipeline",
   "born_digital_pdf_import",
+  "compile_service",
   "document_pipeline",
   "doctor",
   "docx_footnotes",

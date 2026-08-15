@@ -160,6 +160,7 @@ translation-agent/
 ├── repository_guard.py           # 密钥、大文件和本地书稿防泄漏门
 ├── pipeline_profiles.py          # Provider/Profile 配置与模型指纹
 ├── pipeline_runtime.py           # 共享重试和起始限速器
+├── compile_service.py            # CLI/PDF Graph 共用的类型化章节编译服务
 ├── publication_service.py        # CLI/PDF Graph 共用的类型化发布验收服务
 ├── publication_checks/           # 可独立测试的确定性发布检查
 ├── publication_verifier.py       # 无模型调用的统一发布质量门
@@ -183,18 +184,19 @@ translation-agent/
 ## Graph 执行引擎
 
 PDF 的 `graph_pipeline.py` 是 `book_pipeline.py` 之上的轻量依赖图，不是另一套
-不兼容的流水线。内置节点仍调用原有 OCR、校勘、翻译、目录、编译及发布阶段，因此
-继续使用相同的 `pages/page_XXXX.json`、`toc.json`、章节目录、模型 Profile、
-页级 CAS 和断点检查点。Graph 只接管节点选择、依赖规划、节点缓存、事件记录
-和输出目录互斥。原有命令可以继续使用；要获得可组合能力时，把入口改为
-`graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
+不兼容的流水线。内置节点继续使用相同的 `pages/page_XXXX.json`、`toc.json`、
+章节目录、模型 Profile、页级 CAS 和断点检查点。Graph 接管节点选择、依赖规划、
+节点缓存、事件记录和输出目录互斥；OCR、目录、校勘和翻译仍委托兼容阶段实现，
+章节编译与发布验收则已抽离为类型化服务。原有命令可以继续使用；要获得可组合
+能力时，把入口改为 `graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
 
-发布验收是当前 legacy 收敛的第一个完成边界：`book_pipeline.py` 与 PDF Graph
-共同调用类型化 `publication_service`，Graph verify 不再通过 argv 或私有
-`_main_unlocked` 回调阶段入口。`runtime.hygiene` 也已成为
-`publication_checks/` 下首个可独立测试的检查；拆分保持既有报告 ID、schema 和
-检查顺序不变。OCR、目录、校勘、翻译与编译节点仍委托 legacy 阶段实现，后续按节点
-边界逐步收敛。
+章节编译和发布验收是当前 legacy 收敛的两个完成边界。阶段式 CLI 与 PDF Graph
+共同调用类型化 `compile_service` 和 `publication_service`；Graph 的
+`core.chapters.compile` 与 verify 节点不再通过 argv 或私有 `_main_unlocked` 回放
+阶段入口。编译服务保留完整页集合、OCR 模型约束、TOC 页码映射、章节粒度和翻译
+身份校验，并返回章节清单与知识库行；publisher 与 verifier 仍保持独立节点。
+`runtime.hygiene` 也已成为 `publication_checks/` 下首个可独立测试的检查，且不改变
+既有报告 ID、schema 或顺序。剩余 argv legacy seam 是 OCR、目录、校勘和翻译。
 
 EPUB 走 `pipeline_graph/epub.py` 的独立 first-class Graph：它绑定源 ZIP 字节，
 按 spine 重建不可变语义章节和 canonical `TranslationUnit`，可选运行或回填翻译，
@@ -266,7 +268,7 @@ python graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书"
 | `core.toc.resolve` | 人工目录或目录 LLM 解析及页码映射 |
 | `core.toc.from_outline` | 从 PDF 内置 outline 生成映射目录 |
 | `core.chapters.load` | 读取已有章节 Markdown |
-| `core.chapters.compile` | 页面和目录编译为章节 Markdown |
+| `core.chapters.compile` | 经类型化服务把页面和目录编译为章节 Markdown，并返回知识库行 |
 | `core.reconstruct.semantic` | 建立正文块与脚注引用—定义关系；不确定落点阻断发布 |
 | `core.publication.sanitize` | 幂等清除页眉、页码及内部出版标记 |
 | `core.publish.knowledge_base` | 发布知识库 JSONL |

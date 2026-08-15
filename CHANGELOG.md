@@ -26,6 +26,10 @@
 - 发布验收改由 legacy CLI 与 PDF DAG 共用的类型化 `publication_service` 调用；Graph
   verify 不再拼接 argv 或调用私有 `_main_unlocked`。首个确定性检查
   `runtime.hygiene` 已拆入 `publication_checks/`，报告 ID、schema 与检查顺序不变。
+- 章节编译改由阶段式 CLI 与 PDF DAG 共用的类型化 `compile_service` 调用；
+  `core.chapters.compile` 不再经 argv 或私有 `_main_unlocked` 回放阶段入口，并完整保留
+  页集合、OCR 模型、目录映射、粒度和翻译身份校验。编译仅返回章节清单与知识库行，
+  publisher 和 release verifier 仍由独立节点负责。
 
 ## 0.1.0 — 2026-08-14
 
