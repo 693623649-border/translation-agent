@@ -46,3 +46,12 @@ desktop.ini
 venv/
 env/
 .venv/
+work/venvs/
+
+# Local OCR model/runtime caches are machine-specific and can be very large.
+work/paddleocr-models/
+work/paddle-chunk-*
+work/paddlepaddle_gpu-*.whl*
+work/paddle-gpu-wheelhouse/
+work/paddle-wheelhouse/
+work/nvidia-ranges/

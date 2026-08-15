@@ -16,6 +16,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from pipeline_runtime import (
     StartRateLimiter,
     retry_with_backoff,
 )
+from local_ocr.runtime_paths import ensure_private_directory
 from publication_verifier import verify_publication
 from docx_footnotes import patch_docx_footnotes
 from publication_semantics import (
@@ -2485,16 +2487,72 @@ def import_existing_ocr(source_dir: Path, output_dir: Path) -> int:
     return count
 
 
-def render_pdf_page(pdf_path: Path, pdf_page: int, image_path: Path, *, dpi: int, max_side: int, quality: int) -> None:
-    with fitz.open(pdf_path) as document:
-        page = document.load_page(pdf_page - 1)
-        desired_scale = dpi / 72.0
-        max_dimension = max(float(page.rect.width), float(page.rect.height))
-        scale = min(desired_scale, max_side / max_dimension)
-        pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csRGB)
-    image_path.parent.mkdir(parents=True, exist_ok=True)
+def _render_open_pdf_page(
+    document: fitz.Document,
+    pdf_page: int,
+    image_path: Path,
+    *,
+    dpi: int,
+    max_side: int,
+    quality: int,
+    optimize: bool = True,
+) -> None:
+    page = document.load_page(pdf_page - 1)
+    desired_scale = dpi / 72.0
+    max_dimension = max(float(page.rect.width), float(page.rect.height))
+    scale = min(desired_scale, max_side / max_dimension)
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        alpha=False,
+        colorspace=fitz.csRGB,
+    )
+    ensure_private_directory(image_path.parent)
     image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-    image.save(image_path, "JPEG", quality=quality, optimize=True)
+    temporary = image_path.with_name(
+        f".{image_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError(f"render target is not a regular file: {temporary}")
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            image.save(handle, "JPEG", quality=quality, optimize=optimize)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, image_path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def render_pdf_page(
+    pdf_path: Path,
+    pdf_page: int,
+    image_path: Path,
+    *,
+    dpi: int,
+    max_side: int,
+    quality: int,
+    optimize: bool = True,
+) -> None:
+    with fitz.open(pdf_path) as document:
+        _render_open_pdf_page(
+            document,
+            pdf_page,
+            image_path,
+            dpi=dpi,
+            max_side=max_side,
+            quality=quality,
+            optimize=optimize,
+        )
 
 
 @_stage_process_locked("ocr")
@@ -2537,31 +2595,53 @@ def ocr_pdf(
     # Separate concurrent CLI processes (whole-book OCR plus a targeted
     # fallback, or several books sharing one output root) must never delete
     # one another's in-flight rendered pages.
-    image_dir = (
-        output_dir / "_page_images"
-        if keep_page_images
-        else output_dir / f"_page_images_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    )
+    if keep_page_images:
+        image_dir = output_dir / "_page_images"
+    else:
+        configured_spool = getattr(client, "spool_dir", None)
+        spool_root = (
+            Path(str(configured_spool)).expanduser().resolve()
+            if configured_spool
+            else output_dir
+        )
+        image_dir = spool_root / (
+            f"translation-agent-pages-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        )
+    jpeg_optimize = bool(getattr(client, "jpeg_optimize", True))
     rate_limiter = StartRateLimiter(max(0.0, request_delay))
+    render_state = threading.local()
+    render_documents: list[fitz.Document] = []
+    render_documents_lock = threading.Lock()
 
-    def process(pdf_page: int) -> PageRecord:
-        started_at = time.monotonic()
-        print(f"[ocr-start] page={pdf_page}", flush=True)
-        image_path = image_dir / f"page_{pdf_page:04d}.jpg"
-        render_pdf_page(
-            pdf_path,
+    def render_for_worker(pdf_page: int, image_path: Path) -> None:
+        document = getattr(render_state, "document", None)
+        if document is None:
+            document = fitz.open(pdf_path)
+            render_state.document = document
+            with render_documents_lock:
+                render_documents.append(document)
+        _render_open_pdf_page(
+            document,
             pdf_page,
             image_path,
             dpi=dpi,
             max_side=max_image_side,
             quality=jpeg_quality,
+            optimize=jpeg_optimize,
         )
+
+    def process(pdf_page: int) -> PageRecord:
+        started_at = time.monotonic()
+        print(f"[ocr-start] page={pdf_page}", flush=True)
+        image_path = image_dir / f"page_{pdf_page:04d}.jpg"
+        render_for_worker(pdf_page, image_path)
         try:
             rate_limiter.wait()
             text, request_id = client.ocr_image(image_path)
             physical_page_texts = list(
                 getattr(text, "physical_page_texts", ())
             )
+            ocr_metadata = getattr(text, "ocr_metadata", {})
             text = str(text).strip()
             if physical_page_texts and (
                 join_physical_page_texts(physical_page_texts) != text
@@ -2574,15 +2654,27 @@ def ocr_pdf(
                 f"[ocr-response] page={pdf_page} elapsed={elapsed:.1f}s chars={len(text)}",
                 flush=True,
             )
+            note_parts = [f"elapsed_seconds={elapsed:.1f}"]
+            if request_id:
+                note_parts.insert(0, f"request_id={request_id}")
+            if isinstance(ocr_metadata, dict):
+                for key, label, formatter in (
+                    ("line_count", "ocr_line_count", lambda value: str(int(value))),
+                    ("mean_score", "ocr_mean_score", lambda value: f"{float(value):.6f}"),
+                    (
+                        "minimum_score",
+                        "ocr_minimum_score",
+                        lambda value: f"{float(value):.6f}",
+                    ),
+                ):
+                    value = ocr_metadata.get(key)
+                    if isinstance(value, (int, float)):
+                        note_parts.append(f"{label}={formatter(value)}")
             record = PageRecord(
                 pdf_page=pdf_page,
                 text=text,
                 language=detect_language(text),
-                notes=(
-                    f"request_id={request_id}; elapsed_seconds={elapsed:.1f}"
-                    if request_id
-                    else f"elapsed_seconds={elapsed:.1f}"
-                ),
+                notes="; ".join(note_parts),
                 ocr_model=client.ocr_model,
                 physical_page_texts=physical_page_texts,
             )
@@ -2630,6 +2722,9 @@ def ocr_pdf(
         finally:
             if not interrupted:
                 executor.shutdown(wait=True)
+            for document in render_documents:
+                document.close()
+            render_documents.clear()
         if not keep_page_images and image_dir.exists() and not any(image_dir.iterdir()):
             image_dir.rmdir()
         if failures:
@@ -3982,6 +4077,15 @@ def strip_publication_metadata(
         "tableofcontents",
     }
     normalized_titles: list[str] = []
+    structural_chapter_prefixes: list[str] = []
+    if chapter_title:
+        compact_chapter_title = re.sub(r"\s+", "", chapter_title)
+        structural_match = re.match(
+            r"^(第[一二三四五六七八九十百零〇0-9]+[章节部篇卷])",
+            compact_chapter_title,
+        )
+        if structural_match:
+            structural_chapter_prefixes.append(structural_match.group(1))
     for title in (publication_title, chapter_title):
         if not title:
             continue
@@ -4003,6 +4107,9 @@ def strip_publication_metadata(
             stripped = re.sub(r"^#{1,6}\s*", "", stripped)
         without_page = re.sub(r"^\s*\d{1,4}\s*", "", stripped)
         without_page = re.sub(r"\s*\d{1,4}\s*$", "", without_page)
+        compact_candidate = re.sub(r"[\s·•・：:|｜—－–_-]+", "", without_page)
+        if compact_candidate in structural_chapter_prefixes:
+            return True
         candidate = normalize_match_text(without_page)
         if not candidate:
             return False
@@ -4065,7 +4172,18 @@ def strip_publication_metadata(
             ):
                 glyphs.append(lines[end].strip())
                 end += 1
-            candidate = normalize_match_text("".join(glyphs))
+            raw_candidate = "".join(glyphs)
+            candidate = normalize_match_text(raw_candidate)
+            collapsed_candidate = re.sub(r"(.)\1+", r"\1", raw_candidate)
+            structural_match = any(
+                raw_candidate == prefix
+                or collapsed_candidate == prefix
+                or (
+                    len(collapsed_candidate) == 2
+                    and collapsed_candidate == prefix[0] + prefix[-1]
+                )
+                for prefix in structural_chapter_prefixes
+            )
             matched = any(
                 candidate == normalized_title
                 or (
@@ -4074,7 +4192,7 @@ def strip_publication_metadata(
                     and len(candidate) <= len(normalized_title) + 2
                 )
                 for normalized_title in normalized_titles
-            )
+            ) or structural_match
             if not matched:
                 cleaned.extend(lines[index:end])
             index = end
@@ -5243,9 +5361,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["coding-plan-mcp", "glm-ocr", "tesseract"],
+        choices=["coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local"],
         default=os.getenv("OCR_BACKEND", "coding-plan-mcp"),
-        help="Coding Plan vision MCP (recommended) or separately billed standard GLM-OCR API.",
+        help=(
+            "OCR adapter: Coding Plan vision MCP, separately billed GLM-OCR, "
+            "Tesseract, or the credential-free local PaddleOCR GPU service."
+        ),
     )
     parser.add_argument(
         "--ocr-reading-direction",
@@ -5871,6 +5992,22 @@ def resolve_expected_ocr_model_exact(
         return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
+    if backend == "paddleocr-local":
+        if ocr_profile is None:
+            raise ValueError(
+                "paddleocr-local requires an OCR Profile with explicit content "
+                "and runtime settings."
+            )
+        from ocr_backends.paddle_local import paddle_checkpoint_identity
+
+        return paddle_checkpoint_identity(
+            ocr_profile,
+            reading_direction=resolve_ocr_reading_direction(args, ocr_profile),
+            horizontal_columns=args.ocr_horizontal_columns,
+            dpi=args.dpi,
+            max_image_side=args.max_image_side,
+            jpeg_quality=args.jpeg_quality,
+        )
     return None
 
 
@@ -6412,6 +6549,25 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         language=args.tesseract_language,
                         psm=args.tesseract_psm,
                     )
+                elif ocr_backend_name == "paddleocr-local":
+                    if ocr_profile is None:
+                        raise ValueError(
+                            "paddleocr-local requires --config with an OCR Profile; "
+                            "the Profile pins model content separately from GPU tuning."
+                        )
+                    from ocr_backends.paddle_local import PaddleLocalOCR
+
+                    ocr_backend = PaddleLocalOCR.from_profile(
+                        ocr_profile,
+                        reading_direction=resolve_ocr_reading_direction(
+                            args,
+                            ocr_profile,
+                        ),
+                        horizontal_columns=args.ocr_horizontal_columns,
+                        dpi=args.dpi,
+                        max_image_side=args.max_image_side,
+                        jpeg_quality=args.jpeg_quality,
+                    )
                 else:
                     raise ValueError(
                         f"Unsupported OCR profile adapter: {ocr_backend_name}"
@@ -6429,7 +6585,15 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                     keep_page_images=args.keep_page_images,
                     force=args.force,
                     cache_model_prefix=args.ocr_cache_model_prefix,
-                    cache_model_exact=args.ocr_cache_model,
+                    cache_model_exact=(
+                        args.ocr_cache_model
+                        or (
+                            ocr_backend.ocr_model
+                            if ocr_backend_name == "paddleocr-local"
+                            and not args.ocr_cache_model_prefix
+                            else None
+                        )
+                    ),
                     request_delay=args.ocr_delay,
                 )
             # Release the model subprocess as soon as its stage finishes so
@@ -6593,12 +6757,35 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         f"extra={extra_pages[:20]}"
                     )
             required_ocr_model_prefix = args.required_ocr_model_prefix
+            required_ocr_model_exact = None
             if not required_ocr_model_prefix and args.require_complete_ocr:
+                required_ocr_model_exact = resolve_expected_ocr_model_exact(
+                    args,
+                    ocr_profile,
+                )
+            if (
+                not required_ocr_model_prefix
+                and required_ocr_model_exact is None
+                and args.require_complete_ocr
+            ):
                 required_ocr_model_prefix = resolve_expected_ocr_model_prefix(
                     args,
                     ocr_profile,
                 )
-            if required_ocr_model_prefix:
+            if required_ocr_model_exact is not None:
+                wrong_models = [
+                    (record.pdf_page, record.ocr_model)
+                    for record in records
+                    if record.ocr_model != required_ocr_model_exact
+                ]
+                if wrong_models:
+                    preview = wrong_models[:12]
+                    suffix = "..." if len(wrong_models) > len(preview) else ""
+                    raise ValueError(
+                        f"Exact OCR model {required_ocr_model_exact!r} is required, "
+                        f"but cached pages do not match: {preview}{suffix}"
+                    )
+            elif required_ocr_model_prefix:
                 required_prefixes = parse_model_prefixes(
                     required_ocr_model_prefix
                 )

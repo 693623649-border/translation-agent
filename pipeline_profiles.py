@@ -2,15 +2,130 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tomllib
+from collections.abc import Mapping as MappingABC
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping
 
 
 ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TOML_INT_MIN = -(2**63)
+_TOML_INT_MAX = 2**63 - 1
+_SECRET_FIELD_NAMES = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "api_token",
+        "auth_header",
+        "authorization",
+        "bearer_token",
+        "client_secret",
+        "credential",
+        "credentials",
+        "id_token",
+        "password",
+        "passwd",
+        "private_key",
+        "refresh_token",
+        "secret",
+        "token",
+        "access_key",
+        "access_token",
+    }
+)
+_SECRET_FIELD_SUFFIXES = tuple(f"_{name}" for name in _SECRET_FIELD_NAMES)
+
+
+def _normalise_field_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def _looks_like_secret_field(value: str) -> bool:
+    """Return whether a config key is likely to contain credential material.
+
+    The check deliberately does not reject ordinary inference settings such as
+    ``max_tokens`` or ``tokenizer``.  Credentials belong in ``credential_env``;
+    allowing them in the serialisable settings maps would leak them into cache
+    fingerprints, logs, and graph reports.
+    """
+
+    normalised = _normalise_field_name(value)
+    return normalised in _SECRET_FIELD_NAMES or normalised.endswith(
+        _SECRET_FIELD_SUFFIXES
+    )
+
+
+def _freeze_config_value(value: object, *, path: str) -> object:
+    """Validate and deeply freeze a JSON/TOML-safe configuration value."""
+
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, int):
+        if not _TOML_INT_MIN <= value <= _TOML_INT_MAX:
+            raise ValueError(f"{path} integer is outside TOML's signed 64-bit range.")
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"{path} must not contain NaN or infinity.")
+        return value
+    if isinstance(value, MappingABC):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(f"{path} keys must be strings, got {type(key).__name__}.")
+            if _looks_like_secret_field(key):
+                raise ValueError(
+                    f"{path}.{key} looks like a secret field; put only its environment "
+                    "variable name in credential_env."
+                )
+            frozen[key] = _freeze_config_value(item, path=f"{path}.{key}")
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _freeze_config_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        )
+    raise ValueError(
+        f"{path} contains unsupported {type(value).__name__}; only nested mappings, "
+        "arrays, strings, booleans, finite numbers, and null are allowed."
+    )
+
+
+def _freeze_config_mapping(value: object, *, path: str) -> Mapping[str, object]:
+    if not isinstance(value, MappingABC):
+        raise ValueError(f"{path} must be a mapping/TOML table.")
+    frozen = _freeze_config_value(value, path=path)
+    assert isinstance(frozen, MappingABC)
+    return frozen
+
+
+def _plain_config_value(value: object) -> object:
+    """Convert a validated frozen value into canonical JSON-compatible data."""
+
+    if isinstance(value, MappingABC):
+        return {
+            key: _plain_config_value(value[key])
+            for key in sorted(value)
+        }
+    if isinstance(value, tuple):
+        return [_plain_config_value(item) for item in value]
+    return value
+
+
+def _config_fingerprint(value: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        _plain_config_value(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -70,6 +185,12 @@ class ModelProfile:
     thinking: str = "disabled"
     command: tuple[str, ...] = ()
     reading_direction: str = ""
+    # MappingProxyType is deliberately unhashable.  Excluding these maps from
+    # the generated dataclass hash preserves ModelProfile's historic hashable
+    # behaviour; their explicit fingerprints are used where settings identity
+    # matters.
+    content: Mapping[str, object] = field(default_factory=dict, hash=False)
+    runtime: Mapping[str, object] = field(default_factory=dict, hash=False)
 
     def __post_init__(self) -> None:
         if self.credential_env and not ENV_NAME_PATTERN.fullmatch(self.credential_env):
@@ -81,6 +202,28 @@ class ModelProfile:
             raise ValueError(
                 f"Profile {self.name!r} reading_direction must be horizontal or vertical."
             )
+        object.__setattr__(
+            self,
+            "content",
+            _freeze_config_mapping(self.content, path=f"profiles.{self.name}.content"),
+        )
+        object.__setattr__(
+            self,
+            "runtime",
+            _freeze_config_mapping(self.runtime, path=f"profiles.{self.name}.runtime"),
+        )
+
+    @property
+    def content_fingerprint(self) -> str:
+        """Stable identity for settings that can change OCR output semantics."""
+
+        return _config_fingerprint(self.content)
+
+    @property
+    def runtime_fingerprint(self) -> str:
+        """Stable identity for deployment settings, useful for observability only."""
+
+        return _config_fingerprint(self.runtime)
 
     def resolve_credential(
         self,
@@ -90,11 +233,16 @@ class ModelProfile:
     ) -> SecretValue:
         source = os.environ if environ is None else environ
         value = str(source.get(self.credential_env, "") if self.credential_env else "").strip()
-        if required and not value:
-            raise ValueError(
-                f"Profile {self.name!r} requires credential environment variable "
-                f"{self.credential_env!r}."
-            )
+        credential_free_local = (
+            self.provider.strip().lower() == "local"
+            and self.adapter.strip().lower() == "paddleocr-local"
+        )
+        if required and not value and not credential_free_local:
+            if self.credential_env:
+                detail = f"environment variable {self.credential_env!r}"
+            else:
+                detail = "a credential_env setting"
+            raise ValueError(f"Profile {self.name!r} requires {detail}.")
         return SecretValue(value)
 
     def identity(
@@ -193,6 +341,8 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
             thinking=thinking,
             command=command,
             reading_direction=str(raw.get("reading_direction") or "").strip().lower(),
+            content=raw.get("content", {}),
+            runtime=raw.get("runtime", {}),
         )
     pipeline = payload.get("pipeline", {})
     if not isinstance(pipeline, dict):

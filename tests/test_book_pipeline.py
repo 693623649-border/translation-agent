@@ -1069,6 +1069,42 @@ M.E.Sharpe, Inc., 1983.
             "# 第一章 歌德的《浮士德》：发展的悲剧\n\n正文。\n\n后文。\n",
         )
 
+    def test_fragmented_structural_chapter_running_title_is_removed(self) -> None:
+        source = """# 第一章 历史想象力
+
+第
+第
+章
+章
+
+正文第一页。
+
+<span epub:type="pagebreak" id="pdf-page-40" title="40"></span>
+<!-- PDF_PAGE: 40 -->
+
+第一章
+
+正文第二页。
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="中产阶级的孩子们：60年代与文化领导权",
+                chapter_title="第一章 历史想象力",
+            ),
+            "# 第一章 历史想象力\n\n正文第一页。\n\n正文第二页。\n",
+        )
+
+    def test_structural_prefix_inside_body_sentence_is_preserved(self) -> None:
+        source = "# 第一章 历史想象力\n\n本文将在第一章讨论历史想象力。\n"
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                chapter_title="第一章 历史想象力",
+            ),
+            source,
+        )
+
     def test_markdown_formatted_short_running_title_is_removed(self) -> None:
         source = """# 讲故事的人 论尼古拉·列斯科夫
 

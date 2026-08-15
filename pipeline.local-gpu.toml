@@ -1,0 +1,61 @@
+# Local dual-A100 OCR profile. This file contains no credential values.
+[profiles.paddle_v6_medium]
+adapter = "paddleocr-local"
+provider = "local"
+model = "PP-OCRv6_medium"
+timeout = 180
+concurrency = 64
+thinking = "omit"
+reading_direction = "horizontal"
+
+# Content fields change both service and page identities; CLI render settings
+# change only the exact per-page checkpoint identity.
+[profiles.paddle_v6_medium.content]
+engine = "paddle_static"
+precision = "fp32"
+text_detection_model = "PP-OCRv6_medium_det"
+text_recognition_model = "PP-OCRv6_medium_rec"
+use_doc_orientation_classify = false
+use_doc_unwarping = false
+use_textline_orientation = false
+reading_order_version = "book-order-v2"
+
+# Runtime fields affect throughput/placement only and do not invalidate OCR text.
+[profiles.paddle_v6_medium.runtime]
+devices = ["gpu:0", "gpu:1"]
+instances_per_device = 8
+text_recognition_batch_size = 64
+queue_depth = 64
+python_executable = "work/venvs/paddleocr-cu118/bin/python"
+socket_path = "/tmp/translation-agent-paddleocr-{uid}/ppocrv6-medium.sock"
+spool_dir = "/tmp/translation-agent-ocr-{uid}"
+model_cache_dir = "work/paddleocr-models"
+auto_start = true
+persistent = true
+startup_timeout = 600
+
+[profiles.glm_toc]
+adapter = "openai-chat"
+provider = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.2"
+credential_env = "GLM_TOC_API_KEY"
+timeout = 120
+concurrency = 1
+thinking = "disabled"
+
+[profiles.deepseek_flash]
+adapter = "openai-chat"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+credential_env = "DEEPSEEK_API_KEY"
+timeout = 120
+concurrency = 32
+thinking = "disabled"
+
+[pipeline]
+ocr_profile = "paddle_v6_medium"
+toc_profile = "glm_toc"
+translation_profile = "deepseek_flash"
+proofread_profile = "deepseek_flash"

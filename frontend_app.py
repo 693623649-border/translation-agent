@@ -32,7 +32,12 @@ PHASES = {
 }
 PDF_REQUIRED_PHASES = {"all", "ocr", "toc", "compile"}
 TEXT_ADAPTERS = {"openai-chat", "glm-chat"}
-OCR_ADAPTERS = {"coding-plan-mcp", "glm-ocr", "tesseract"}
+OCR_ADAPTERS = {
+    "coding-plan-mcp",
+    "glm-ocr",
+    "tesseract",
+    "paddleocr-local",
+}
 PROGRESS_PATTERN = re.compile(r"(?:completed|cached)=(\d+)/(\d+)")
 
 
@@ -60,6 +65,23 @@ def selected_index(options: list[ModelProfile], default_name: str) -> int:
         if profile.name == default_name:
             return index
     return 0
+
+
+def profile_selectbox(
+    label: str,
+    options: list[ModelProfile],
+    default_name: str,
+) -> ModelProfile:
+    """Select by stable name so Streamlit never deep-copies frozen profiles."""
+
+    by_name = {profile.name: profile for profile in options}
+    selected = st.selectbox(
+        label,
+        list(by_name),
+        index=selected_index(options, default_name),
+        format_func=lambda name: profile_label(by_name[name]),
+    )
+    return by_name[selected]
 
 
 def render_status(status: dict) -> None:
@@ -170,35 +192,25 @@ def main() -> None:
             st.error("配置中至少需要一个 OCR Profile 和一个文本模型 Profile。")
             st.stop()
 
-        ocr_profile = st.selectbox(
+        ocr_profile = profile_selectbox(
             "OCR 模型",
             ocr_options,
-            index=selected_index(ocr_options, profiles.ocr_profile),
-            format_func=profile_label,
+            profiles.ocr_profile,
         )
-        toc_profile = st.selectbox(
+        toc_profile = profile_selectbox(
             "目录模型",
             toc_options,
-            index=selected_index(toc_options, profiles.toc_profile),
-            format_func=profile_label,
+            profiles.toc_profile,
         )
-        proofread_profile = st.selectbox(
+        proofread_profile = profile_selectbox(
             "OCR 校勘模型",
             proofread_options,
-            index=selected_index(
-                proofread_options,
-                profiles.proofread_profile or profiles.translation_profile,
-            ),
-            format_func=profile_label,
+            profiles.proofread_profile or profiles.translation_profile,
         )
-        translation_profile = st.selectbox(
+        translation_profile = profile_selectbox(
             "翻译模型",
             translation_options,
-            index=selected_index(
-                translation_options,
-                profiles.translation_profile,
-            ),
-            format_func=profile_label,
+            profiles.translation_profile,
         )
 
     left, right = st.columns([1.15, 0.85], gap="large")
@@ -339,6 +351,11 @@ def main() -> None:
         direction = st.selectbox(
             "OCR 阅读方向",
             ["horizontal", "vertical"],
+            index=1 if ocr_profile.reading_direction == "vertical" else 0,
+            key=(
+                f"ocr_reading_direction_{ocr_profile.name}_"
+                f"{ocr_profile.reading_direction or 'auto'}"
+            ),
             format_func=lambda value: "横排" if value == "horizontal" else "日文竖排",
         )
         force = st.checkbox("强制重跑已有检查点", value=False)

@@ -1,0 +1,4 @@
+# Keep PaddlePaddle on its CUDA-specific official index; install.sh installs it
+# separately before consuming this file.
+paddleocr==3.7.0
+paddlex[ocr-core]==3.7.0

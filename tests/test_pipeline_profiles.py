@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from unittest.mock import patch
 
 from pipeline_profiles import ModelProfile, PipelineProfiles, load_pipeline_profiles
@@ -16,6 +17,165 @@ from book_pipeline import (
 
 
 class PipelineProfileTests(unittest.TestCase):
+    def test_local_paddle_profile_loads_strict_content_and_runtime_tables(self) -> None:
+        config = """
+[profiles.paddle_v6_medium]
+adapter = "paddleocr-local"
+provider = "local"
+model = "PP-OCRv6_medium"
+credential_env = ""
+concurrency = 32
+reading_direction = "horizontal"
+
+[profiles.paddle_v6_medium.content]
+engine = "paddle_static"
+precision = "fp32"
+use_doc_orientation_classify = false
+thresholds = { det = 0.30, recognition = 0.65 }
+
+[profiles.paddle_v6_medium.runtime]
+devices = ["gpu:0", "gpu:1"]
+instances_per_device = 2
+text_recognition_batch_size = 64
+queue_depth = 64
+
+[pipeline]
+ocr_profile = "paddle_v6_medium"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pipeline.toml"
+            path.write_text(config, encoding="utf-8")
+            loaded = load_pipeline_profiles(path)
+
+        profile = loaded.get("paddle_v6_medium")
+        self.assertEqual(profile.adapter, "paddleocr-local")
+        self.assertEqual(profile.credential_env, "")
+        self.assertEqual(profile.content["engine"], "paddle_static")
+        self.assertEqual(profile.content["thresholds"]["det"], 0.30)
+        self.assertEqual(profile.runtime["devices"], ("gpu:0", "gpu:1"))
+        self.assertEqual(profile.resolve_credential().get_secret_value(), "")
+
+    def test_only_local_paddle_profile_may_omit_credentials(self) -> None:
+        remote = ModelProfile(
+            name="remote",
+            adapter="openai-chat",
+            provider="custom",
+            model="remote-model",
+        )
+        with self.assertRaisesRegex(ValueError, "credential_env"):
+            remote.resolve_credential()
+
+    def test_content_and_runtime_are_deeply_frozen(self) -> None:
+        original = {
+            "engine": "paddle_static",
+            "models": {"det": "PP-OCRv6_medium_det"},
+            "features": ["orientation", {"unwarp": False}],
+        }
+        profile = ModelProfile(
+            name="paddle",
+            adapter="paddleocr-local",
+            provider="local",
+            model="PP-OCRv6_medium",
+            content=original,
+            runtime={"devices": ["gpu:0", "gpu:1"]},
+        )
+        original["engine"] = "changed-after-construction"
+        original["models"]["det"] = "changed-after-construction"
+        original["features"].append("changed-after-construction")
+
+        self.assertIsInstance(profile.content, MappingProxyType)
+        self.assertIsInstance(profile.content["models"], MappingProxyType)
+        self.assertEqual(profile.content["engine"], "paddle_static")
+        self.assertEqual(profile.content["models"]["det"], "PP-OCRv6_medium_det")
+        self.assertEqual(len(profile.content["features"]), 2)
+        with self.assertRaises(TypeError):
+            profile.content["engine"] = "onnx"  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            profile.content["models"]["det"] = "tiny"  # type: ignore[index]
+        with self.assertRaises(AttributeError):
+            profile.runtime["devices"].append("gpu:2")
+        self.assertIsInstance(hash(profile), int)
+
+    def test_settings_fingerprints_are_canonical_and_section_specific(self) -> None:
+        first = ModelProfile(
+            name="paddle",
+            adapter="paddleocr-local",
+            provider="local",
+            model="PP-OCRv6_medium",
+            content={"nested": {"b": 2, "a": ["中", 1]}, "engine": "paddle"},
+            runtime={"devices": ["gpu:0", "gpu:1"], "batch": 64},
+        )
+        reordered = ModelProfile(
+            name="another-name",
+            adapter="paddleocr-local",
+            provider="local",
+            model="PP-OCRv6_medium",
+            content={"engine": "paddle", "nested": {"a": ["中", 1], "b": 2}},
+            runtime={"batch": 64, "devices": ["gpu:0", "gpu:1"]},
+        )
+        tuned_runtime = replace(first, runtime={"devices": ["gpu:0"], "batch": 32})
+        changed_content = replace(first, content={"engine": "onnx"})
+
+        self.assertRegex(first.content_fingerprint, re.compile(r"^[0-9a-f]{64}$"))
+        self.assertEqual(first.content_fingerprint, reordered.content_fingerprint)
+        self.assertEqual(first.runtime_fingerprint, reordered.runtime_fingerprint)
+        self.assertEqual(first.content_fingerprint, tuned_runtime.content_fingerprint)
+        self.assertNotEqual(first.runtime_fingerprint, tuned_runtime.runtime_fingerprint)
+        self.assertNotEqual(first.content_fingerprint, changed_content.content_fingerprint)
+
+    def test_settings_reject_secret_like_fields_at_any_depth(self) -> None:
+        for settings in (
+            {"api_key": "raw-key"},
+            {"client": {"access-token": "raw-token"}},
+            {"worker_password": "raw-password"},
+            {"authorization": "Bearer raw-token"},
+        ):
+            with self.subTest(settings=settings), self.assertRaisesRegex(
+                ValueError, "looks like a secret field"
+            ):
+                ModelProfile(
+                    name="unsafe",
+                    adapter="paddleocr-local",
+                    provider="local",
+                    model="PP-OCRv6_medium",
+                    content=settings,
+                )
+
+        safe = ModelProfile(
+            name="safe",
+            adapter="openai-chat",
+            provider="local",
+            model="local-model",
+            content={"max_tokens": 4096, "tokenizer": "example"},
+        )
+        self.assertEqual(safe.content["max_tokens"], 4096)
+
+    def test_settings_reject_non_portable_or_dangerous_values(self) -> None:
+        cases = (
+            ({"path": Path("model.bin")}, "unsupported PosixPath"),
+            ({"devices": {"gpu:0", "gpu:1"}}, "unsupported set"),
+            ({"threshold": float("nan")}, "NaN or infinity"),
+            ({"too_large": 2**63}, "signed 64-bit"),
+        )
+        for settings, error in cases:
+            with self.subTest(settings=settings), self.assertRaisesRegex(ValueError, error):
+                ModelProfile(
+                    name="unsafe",
+                    adapter="paddleocr-local",
+                    provider="local",
+                    model="PP-OCRv6_medium",
+                    runtime=settings,
+                )
+
+        with self.assertRaisesRegex(ValueError, "must be a mapping/TOML table"):
+            ModelProfile(
+                name="unsafe",
+                adapter="paddleocr-local",
+                provider="local",
+                model="PP-OCRv6_medium",
+                content=["not", "a", "mapping"],  # type: ignore[arg-type]
+            )
+
     def test_example_config_defaults_to_deepseek_flash(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "pipeline.example.toml"
         loaded = load_pipeline_profiles(config_path)

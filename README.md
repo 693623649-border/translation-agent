@@ -98,8 +98,12 @@ translation-agent/
 ├── launch_frontend.py            # 一键启动前端
 ├── pipeline_profiles.py          # Provider/Profile 配置与模型指纹
 ├── pipeline_runtime.py           # 共享重试和起始限速器
+├── ocr_backends/                 # OCR adapter registry 与本地 PaddleOCR client
+├── local_ocr/                    # Unix socket 服务、双卡 worker 池和阅读顺序
+├── deploy/paddleocr/             # 隔离的 PaddleOCR GPU 安装与部署说明
 ├── publication_verifier.py       # 无模型调用的统一发布质量门
 ├── pipeline.example.toml         # 不含密钥的模型配置示例
+├── pipeline.local-gpu.toml       # 双 A100 / PP-OCRv6 Medium Profile
 ├── pdf_text_agent.py             # 兼容旧检查点的旧入口
 ├── patch_translations.py         # 新格式译文人工修补工具
 ├── extract_textbook_layer.py     # 新格式文本层提取工具
@@ -580,6 +584,62 @@ GLM_OCR_API_KEY=your-standard-api-key
 
 标准 `glm-ocr` 不计入 Coding Plan；两种 Key 和端点不要混用。
 
+### 本地 PaddleOCR GPU（双 A100 高吞吐后端）
+
+不希望把影像页发往 OCR API 时，可使用 `paddleocr-local`。该后端保持
+原有 `pages/page_XXXX.json` 和 Markdown 检查点协议，因此目录、翻译、章节
+编译和发布节点无需更换。默认部署是 PaddleOCR 3.7.0 + PaddlePaddle
+GPU 3.3.0 cu118 + PP-OCRv6 Medium，两张 A100 按页数据并行。
+
+首次安装使用与主 Agent 隔离的虚拟环境：
+
+```bash
+bash deploy/paddleocr/install.sh
+```
+
+安装完成后，用专用 Profile 执行 20 页冒烟测试：
+
+```bash
+python book_pipeline.py "book/input.pdf" \
+  -o "outputs/paddle-smoke" \
+  --phase ocr \
+  --config pipeline.local-gpu.toml \
+  --start-page 1 --end-page 20
+```
+
+正式 Graph 编译只需替换 Profile：
+
+```bash
+python graph_pipeline.py "book/input.pdf" \
+  -o "outputs/input" \
+  --phase all \
+  --config pipeline.local-gpu.toml \
+  --recipe recipes/full-publication.toml
+```
+
+Profile 的 `content` 保存模型、引擎、精度、方向模块和阅读顺序版本，
+这些字段会进入 OCR 内容指纹。`runtime` 只保存 GPU 列表、每卡实例数、
+batch、队列和临时目录；调整这些吞吐参数不会使已有页面失效。图片通过
+本机 Unix socket 传递路径，不走 HTTP/Base64，也不需要 OCR Key；目录和
+翻译阶段仍使用各自 Profile 的环境变量凭据。
+
+缓存身份分成两层：常驻服务身份只包含模型内容，逐页 checkpoint 身份在其上
+继续包含 DPI、最大图片边长和 JPEG 质量。调整渲染参数会准确刷新页面文字，
+但不会重启内容相同的已预热 GPU 服务。
+
+默认 `persistent = true` 会让服务在 OCR 阶段后继续占用两张 GPU，
+以便下本书复用已预热模型；释放 GPU 的正常停服命令见部署文档。
+
+本机基准后的默认值是 `paddle_static` + FP32、每卡 8 个实例、总并发 64；
+在 250 DPI、最大边长 3200、JPEG 质量 92 的代表页上，纯推理约
+8.64 页/秒。每卡 12/16 个实例仅提升到约
+8.84/9.01 页/秒，却显著增加启动时间、显存和尾延迟，因此保留为常驻服务的
+极限吞吐选项。不同版式仍应通过代表页逐步测试实例数与识别 batch；不要在
+没有字错率基线时盲目启用 TensorRT。详细安装、健康检查和调优方法见
+[`deploy/paddleocr/README.md`](deploy/paddleocr/README.md)。
+仓库同时提供 `deploy/paddleocr/benchmark.py`，可在不污染正式输出目录的
+前提下记录渲染与推理的 pages/s、p50/p95 和置信度。
+
 ### 本地 Tesseract OCR（可选后端）
 
 视觉 MCP 暂时受限或希望完全在本机完成 OCR 时，可使用 Tesseract。程序会继续生成相同的逐页 JSON/Markdown 检查点，后续目录、翻译和编译流程不变。Debian/Ubuntu 上处理日语书页至少需要：
@@ -994,7 +1054,7 @@ outputs/my_book/
 --page-offset N              人工指定 PDF 页码减书内页码
 --printed-pages-per-pdf-page 1|2  单页或双页扫描；默认根据章节标题自动检测
 --api-mode coding-plan|standard
---ocr-backend coding-plan-mcp|glm-ocr|tesseract
+--ocr-backend coding-plan-mcp|glm-ocr|tesseract|paddleocr-local
 --ocr-concurrency 4          逐页 OCR worker 数
 --ocr-reading-direction horizontal|vertical  OCR 与分段阅读方向；日文竖排用 vertical
 --ocr-cache-model-prefix coding-plan/  仅复用指定模型来源，自动覆盖本地兜底页

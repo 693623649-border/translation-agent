@@ -693,6 +693,17 @@ def _profile_model_semantics(profile: Any) -> dict[str, Any] | None:
 
     if profile is None:
         return None
+    if profile.adapter == "paddleocr-local":
+        # Socket location, device IDs, instance counts, queue depth, and batch
+        # sizes are deployment details.  Only the strictly validated content
+        # table is allowed to invalidate local OCR checkpoints.
+        return {
+            "adapter": profile.adapter,
+            "provider": profile.provider,
+            "model": profile.model,
+            "reading_direction": profile.reading_direction,
+            "content_sha256": profile.content_fingerprint,
+        }
     return {
         "adapter": profile.adapter,
         "provider": profile.provider,
@@ -798,6 +809,27 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
             "model": profile.model if profile is not None else args.ocr_model,
         }
         segmentation = None
+    elif backend == "paddleocr-local":
+        if profile is None:
+            raise BookGraphConfigurationError(
+                "paddleocr-local requires an explicit OCR Profile"
+            )
+        identity = {
+            "backend": backend,
+            "model": profile.model,
+            "checkpoint_identity": legacy.resolve_expected_ocr_model_exact(
+                args,
+                profile,
+            ),
+            "reading_direction": reading_direction,
+            "content_sha256": profile.content_fingerprint,
+        }
+        segmentation = {
+            "horizontal_columns": max(1, int(args.ocr_horizontal_columns)),
+            "reading_order": str(
+                profile.content.get("reading_order_version", "book-order-v1")
+            ),
+        }
     else:
         identity = {
             "backend": backend,
@@ -995,7 +1027,7 @@ def _sanitize_fingerprint(context: GraphContext) -> dict[str, Any]:
     args = _parsed_args(context)
     return {
         "adapter": GRAPH_ADAPTER_VERSION,
-        "sanitizer": "publication-metadata-v4",
+        "sanitizer": "publication-metadata-v5",
         "title": _book_title(context),
     }
 
@@ -3338,7 +3370,7 @@ def prepare_book_graph(
         _sanitize_handler,
         requires=(ART_SEMANTIC_CHAPTERS,),
         provides=(ART_READER_CHAPTERS,),
-        version="3",
+        version="4",
         fingerprint=_sanitize_fingerprint,
         # Sanitize also rebinds the semantic audit from immutable draft bytes
         # to reader bytes.  Re-enter it even when Markdown output is unchanged;
@@ -3470,7 +3502,7 @@ def prepare_book_graph(
                     _ocr_page_handler,
                     requires=(ART_SOURCE, *import_requirement),
                     provides=(ART_PAGES_RAW,),
-                    version="2",
+                    version="3",
                     # PageStore owns the precise per-page model/source cache.
                     # Always enter the stage so it can validate the exact OCR
                     # identity; fully fresh books return with pending=0 and no
@@ -3607,7 +3639,7 @@ def prepare_book_graph(
                         ),
                         requires=(ART_SOURCE, current_pages, ART_TOC),
                         provides=(ART_CHAPTERS,),
-                        version="6",
+                        version="7",
                         fingerprint=_reviewed_fingerprint,
                         cache_validator=_compile_inputs_are_current(current_pages),
                         description="Compile page text and mapped TOC into chapter Markdown.",
