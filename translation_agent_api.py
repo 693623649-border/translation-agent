@@ -176,6 +176,11 @@ class GraphRunRequest:
     text_pdf_reflow: bool = False
     text_pdf_strip_leading_page_number_offset: int | None = None
     plugin_allowlist: tuple[str, ...] = ()
+    load_dotenv: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.load_dotenv) is not bool:
+            raise ValueError("load_dotenv must be a boolean")
 
     def resolved_recipe(self) -> Recipe | None:
         recipe = load_recipe(self.recipe) if self.recipe is not None else None
@@ -217,6 +222,7 @@ class GraphRunRequest:
             "text-pdf" if recipe_selects_text_pdf else "scanned-pdf"
         )
         return BookGraphOptions(
+            load_dotenv=self.load_dotenv,
             include_proofread=(
                 self.include_proofread or NODE_PROOFREAD in enabled
             ),

@@ -153,8 +153,11 @@ class BookGraphOptions:
     text_pdf_sort: bool = False
     text_pdf_reflow: bool = False
     text_pdf_strip_leading_page_number_offset: int | None = None
+    load_dotenv: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.load_dotenv) is not bool:
+            raise BookGraphConfigurationError("load_dotenv must be a boolean")
         if self.source_mode not in {"scanned-pdf", "text-pdf"}:
             raise BookGraphConfigurationError(
                 "source_mode must be 'scanned-pdf' or 'text-pdf'"
@@ -922,7 +925,8 @@ def _run_phase(
 ) -> None:
     try:
         exit_code = _call_legacy_main(
-            _phase_argv(context, phase, add=add, remove=remove)
+            _phase_argv(context, phase, add=add, remove=remove),
+            load_dotenv=_load_dotenv(context),
         )
     except SystemExit as exc:
         try:
@@ -933,11 +937,19 @@ def _run_phase(
         raise LegacyStageError(phase, exit_code)
 
 
-def _call_legacy_main(argv: list[str]) -> int:
+def _call_legacy_main(
+    argv: list[str],
+    *,
+    load_dotenv: bool = True,
+) -> int:
     # GraphExecutor already owns the same output-directory lock.  Calling the
     # private unlocked implementation avoids a nested lock without using a
     # process-global environment bypass (which would be unsafe across threads).
-    return legacy._main_unlocked(argv)
+    # Preserve the historical positional-only call shape for the default CLI
+    # policy.  Isolated callers opt out explicitly at the legacy boundary.
+    if load_dotenv:
+        return legacy._main_unlocked(argv)
+    return legacy._main_unlocked(argv, load_dotenv=False)
 
 
 def _source_fingerprint(context: GraphContext) -> dict[str, Any]:
@@ -1026,6 +1038,15 @@ def _source_mode(context: GraphContext) -> str:
             f"Invalid source mode in Graph context: {source_mode!r}"
         )
     return source_mode
+
+
+def _load_dotenv(context: GraphContext) -> bool:
+    value = context.config.get("load_dotenv", True)
+    if type(value) is not bool:
+        raise BookGraphConfigurationError(
+            "Graph context load_dotenv policy must be a boolean"
+        )
+    return value
 
 
 def _source_adapter(source_mode: str) -> str:
@@ -2909,7 +2930,10 @@ def _verify_handler(
         if use_fallback_title and not args.title:
             argv.extend(["--title", _book_title(context)])
         try:
-            exit_code = _call_legacy_main(argv)
+            exit_code = _call_legacy_main(
+                argv,
+                load_dotenv=_load_dotenv(context),
+            )
         except SystemExit as exc:
             try:
                 exit_code = int(exc.code)
@@ -2942,7 +2966,8 @@ def _verify_handler(
 
 
 def _status_handler(context: GraphContext) -> NodeResult:
-    legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
+    if _load_dotenv(context):
+        legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
     args = _parsed_args(context)
     profile_config = load_pipeline_profiles(args.config) if args.config else None
     ocr_profile = (
@@ -3192,9 +3217,11 @@ def prepare_book_graph(
             options,
             disabled_nodes=frozenset({*options.disabled_nodes, NODE_OCR}),
         )
-    # Match book_pipeline.main(): parser defaults may be supplied by the repo
-    # .env, but resolved secrets themselves are never fingerprinted.
-    legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
+    # Match book_pipeline.main() for trusted CLI callers.  Web workers pass an
+    # explicit false policy so planning cannot import ambient repo credentials.
+    # Resolved secrets themselves are never fingerprinted.
+    if options.load_dotenv:
+        legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
     argv = list(pipeline_argv)
     args = legacy.build_parser().parse_args(argv)
     if args.ocr_cache_model and args.ocr_cache_model_prefix:
@@ -3214,6 +3241,7 @@ def prepare_book_graph(
         config={
             "adapter_version": GRAPH_ADAPTER_VERSION,
             "adopt_existing_output": options.adopt_existing_output,
+            "load_dotenv": options.load_dotenv,
             "source_mode": options.source_mode,
         },
         private_value_names=frozenset({"pipeline.argv"}),

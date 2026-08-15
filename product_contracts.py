@@ -46,6 +46,49 @@ def _path_text(value: Path | str | None) -> str | None:
     return text or None
 
 
+def _require_exact_bool(value: Any, *, location: str) -> bool:
+    """Reject truthy strings and integers at the public JSON boundary."""
+
+    if type(value) is not bool:
+        raise ContractError(f"{location} must be a boolean")
+    return value
+
+
+def _require_string(
+    value: Any,
+    *,
+    location: str,
+    allow_empty: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise ContractError(f"{location} must be a string")
+    if not allow_empty and not value.strip():
+        raise ContractError(f"{location} must not be empty")
+    return value
+
+
+def _require_optional_string(value: Any, *, location: str) -> str | None:
+    if value is None:
+        return None
+    return _require_string(value, location=location)
+
+
+def _require_path_value(
+    value: Any,
+    *,
+    location: str,
+    optional: bool,
+) -> Path | str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, (Path, str)):
+        expected = "a path string or null" if optional else "a path string"
+        raise ContractError(f"{location} must be {expected}")
+    if not str(value).strip():
+        raise ContractError(f"{location} must not be empty")
+    return value
+
+
 def _secret_field(name: str) -> bool:
     normalized = name.strip().casefold().replace("-", "_")
     if normalized.endswith("_env"):
@@ -135,23 +178,56 @@ class RunSpec:
     )
 
     def __post_init__(self) -> None:
+        if type(self.schema_version) is not int:
+            raise ContractError("RunSpec.schema_version must be an integer")
         if self.schema_version != CONTRACT_SCHEMA_VERSION:
             raise ContractError(
                 f"RunSpec requires schema_version={CONTRACT_SCHEMA_VERSION}"
             )
+        _require_path_value(
+            self.source,
+            location="RunSpec.source",
+            optional=True,
+        )
+        _require_path_value(
+            self.output_dir,
+            location="RunSpec.output_dir",
+            optional=False,
+        )
+        _require_path_value(
+            self.config,
+            location="RunSpec.config",
+            optional=True,
+        )
+        _require_path_value(
+            self.recipe,
+            location="RunSpec.recipe",
+            optional=True,
+        )
+        _require_string(self.source_mode, location="RunSpec.source_mode")
         if self.source_mode not in SOURCE_MODES:
             raise ContractError(
                 f"unsupported source_mode {self.source_mode!r}; "
                 f"expected one of {sorted(SOURCE_MODES)}"
             )
-        if not str(self.output_dir).strip():
-            raise ContractError("RunSpec.output_dir must not be empty")
-        if not self.phase.strip():
-            raise ContractError("RunSpec.phase must not be empty")
-        if not self.target_language.strip():
-            raise ContractError("RunSpec.target_language must not be empty")
+        _require_string(self.phase, location="RunSpec.phase")
+        _require_optional_string(self.title, location="RunSpec.title")
+        _require_optional_string(self.author, location="RunSpec.author")
+        _require_string(
+            self.target_language,
+            location="RunSpec.target_language",
+        )
+        _require_exact_bool(self.translate, location="RunSpec.translate")
+        _require_exact_bool(self.verify, location="RunSpec.verify")
+        if isinstance(self.targets, (str, bytes)) or not isinstance(
+            self.targets,
+            (list, tuple),
+        ):
+            raise ContractError("RunSpec.targets must be an array")
         if not all(isinstance(item, str) and item for item in self.targets):
             raise ContractError("RunSpec.targets must contain non-empty strings")
+        if len(set(self.targets)) != len(self.targets):
+            raise ContractError("RunSpec.targets must not contain duplicates")
         if not isinstance(self.options, Mapping):
             raise ContractError("RunSpec.options must be a mapping")
         object.__setattr__(self, "targets", tuple(self.targets))
@@ -194,21 +270,19 @@ class RunSpec:
         if not isinstance(options, Mapping):
             raise ContractError("RunSpec.options must be an object")
         return cls(
-            schema_version=int(payload["schema_version"]),
+            schema_version=payload["schema_version"],
             source=payload.get("source"),
-            source_mode=str(payload.get("source_mode") or ""),
-            output_dir=str(payload.get("output_dir") or ""),
-            phase=str(payload.get("phase") or ""),
-            title=(str(payload["title"]) if payload.get("title") is not None else None),
-            author=(
-                str(payload["author"]) if payload.get("author") is not None else None
-            ),
-            target_language=str(payload.get("target_language") or ""),
+            source_mode=payload.get("source_mode"),
+            output_dir=payload.get("output_dir"),
+            phase=payload.get("phase"),
+            title=payload.get("title"),
+            author=payload.get("author"),
+            target_language=payload.get("target_language"),
             config=payload.get("config"),
             recipe=payload.get("recipe"),
-            targets=tuple(str(item) for item in targets),
-            translate=bool(payload.get("translate", True)),
-            verify=bool(payload.get("verify", True)),
+            targets=tuple(targets),
+            translate=payload.get("translate", True),
+            verify=payload.get("verify", True),
             options=dict(options),
         )
 

@@ -7,16 +7,19 @@ description: 将影印版或文字层 PDF 转换为可审计的逐页文本、�
 
 ## 使用主入口
 
-在仓库根目录运行 `book_pipeline.py`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。
+新任务使用产品入口 `translation-agent`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。`translation-agent` 与 WebUI 共用 RunSpec 编译和执行服务；`book_pipeline.py` 只作为尚未迁出的高级阶段参数兼容入口。
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
-  --config pipeline.toml --granularity chapter
+translation-agent run SOURCE.pdf -o OUTPUT --source-mode scanned-pdf \
+  --config pipeline.toml --target publication.report
 ```
 
 把 `pages/*.json`、`toc.json`、`chapters.json` 和 `audit/` 视为可追溯审计层。把 `chapters/*.md`、EPUB、Word 和知识库 JSONL 视为阅读发布层；发布层不得保留来源 PDF 字段、PDF/书内页码、分页锚点、内部物理页边界或模型处理痕迹。带书签 PDF 是保留原书外观的参考件，不适用去分页规则。
 
-## 按阶段执行
+## 按阶段执行（兼容层）
+
+标准全链、Recipe 和目标选择使用 `translation-agent`。以下细粒度阶段参数尚在迁移，
+需要时可继续调用兼容的 `book_pipeline.py`；不得因此绕过最终发布报告。
 
 1. 运行 `--phase ocr`，将每个 PDF 页保存为独立稳定检查点。默认并行 4 个 Coding Plan GLM-4.6V worker；续跑时复用匹配当前模型指纹的完成页，不要无故使用 `--force`。
 2. 运行 `--phase toc`，从完整候选目录文本生成 `toc.json` 并校准书内页到 PDF 页的映射。目录是一个全局结构请求，不要为了并行而拆坏上下文；证据不足时要求显式 `--toc-pages`、`--printed-pages-per-pdf-page` 或 `--page-offset`。
@@ -26,8 +29,9 @@ python book_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
 只发布 Word 时使用内置 Recipe，并仍把发布报告作为最终目标：
 
 ```bash
-python graph_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
-  --config pipeline.toml --recipe recipes/chinese-pdf-word.toml
+translation-agent run SOURCE.pdf -o OUTPUT --source-mode scanned-pdf \
+  --config pipeline.toml --recipe recipes/chinese-pdf-word.toml \
+  --target publication.word_report
 ```
 
 PDF 自带可靠 outline 时改用 `recipes/outline-word.toml`。这两个 Recipe 只关闭知识库、EPUB 和参考 PDF publisher，不关闭验证节点，目标必须是 `publication.word_report`。Word gate 仍要求语义审计、真实脚注 OOXML 结构门及固定字体 LibreOffice 渲染门；`publication.docx` 只是未验收的中间产物。不要用 `--target publication.docx`、`--no-verify`、`--no-docx-render` 或 API 的 `verify_publication=false` 覆盖该发布契约。

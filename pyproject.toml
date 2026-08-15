@@ -54,6 +54,7 @@ py-modules = [
   "pipeline_runtime",
   "product_contracts",
   "product_paths",
+  "run_execution_service",
   "publication_semantics",
   "publication_verifier",
   "repository_guard",

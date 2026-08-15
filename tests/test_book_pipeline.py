@@ -36,6 +36,7 @@ from book_pipeline import (
     detect_language,
     infer_page_offset,
     import_existing_ocr,
+    load_env_file,
     main,
     markdown_inline_to_plain_text,
     normalize_target_script,
@@ -55,6 +56,64 @@ from book_pipeline import (
 
 
 class UtilityTests(unittest.TestCase):
+    def test_public_cli_defaults_to_dotenv_and_can_disable_it_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            output.mkdir()
+            argv = ["--output-dir", str(output), "--phase", "status"]
+
+            with (
+                patch("book_pipeline.load_env_file") as loader,
+                patch("book_pipeline._main_unlocked", return_value=0) as unlocked,
+            ):
+                self.assertEqual(main(argv), 0)
+            loader.assert_called_once()
+            unlocked.assert_called_once_with(argv, load_dotenv=True)
+
+            with (
+                patch("book_pipeline.load_env_file") as loader,
+                patch("book_pipeline._main_unlocked", return_value=0) as unlocked,
+            ):
+                self.assertEqual(main(argv, load_dotenv=False), 0)
+            loader.assert_not_called()
+            unlocked.assert_called_once_with(argv, load_dotenv=False)
+
+            with self.assertRaisesRegex(TypeError, "load_dotenv must be a boolean"):
+                main(argv, load_dotenv="false")  # type: ignore[arg-type]
+
+    def test_load_env_file_can_be_disabled_for_isolated_workers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "DOTENV_ONLY_FAKE_KEY=must-not-be-loaded\n",
+                encoding="utf-8",
+            )
+            for value in ("1", "true", "YES", " on "):
+                with self.subTest(value=value), patch.dict(
+                    os.environ,
+                    {"TRANSLATION_AGENT_DISABLE_DOTENV": value},
+                    clear=True,
+                ):
+                    load_env_file(env_file)
+                    self.assertNotIn("DOTENV_ONLY_FAKE_KEY", os.environ)
+
+    def test_load_env_file_remains_enabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            os.environ,
+            {},
+            clear=True,
+        ):
+            env_file = Path(directory) / ".env"
+            env_file.write_text(
+                "DOTENV_ONLY_FAKE_KEY=legacy-compatible\n",
+                encoding="utf-8",
+            )
+            load_env_file(env_file)
+            self.assertEqual(
+                os.environ.get("DOTENV_ONLY_FAKE_KEY"),
+                "legacy-compatible",
+            )
+
     def test_model_stage_lock_decorator_preserves_keyword_call_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)

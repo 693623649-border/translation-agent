@@ -27,6 +27,8 @@ class FrontendAppTests(unittest.TestCase):
         self.assertNotIn("use_container_width", combined)
         self.assertNotIn("unsafe_allow_html", combined)
         self.assertIn("st.navigation", combined)
+        self.assertIn('"cancel_requested"', combined)
+        self.assertIn("正在取消…", combined)
 
 
 if __name__ == "__main__":

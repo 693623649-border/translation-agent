@@ -17,13 +17,13 @@ from frontend_runtime import (
     PathPolicy,
     artifact_catalog,
     cancel_job,
-    plan_runspec,
     safe_upload_name,
     start_job_process,
     tail_log,
 )
 from product_contracts import ArtifactRecord, RunSpec
 from product_paths import resource_root
+from run_execution_service import RunExecutionService
 
 
 class ApplicationService:
@@ -33,6 +33,7 @@ class ApplicationService:
         self.settings = settings or FrontendSettings.from_environment()
         self.settings.jobs_root.mkdir(parents=True, exist_ok=True)
         self.registry = JobRegistry(self.settings.database)
+        self.execution = RunExecutionService(load_dotenv=False)
         self.source_policy = PathPolicy(self.settings.source_roots)
         self.control_policy = PathPolicy(
             (*self.settings.source_roots, resource_root())
@@ -73,20 +74,6 @@ class ApplicationService:
     ) -> RunSpec:
         config = self._validate_control_file(spec.config, suffix=".toml")
         recipe = self._validate_control_file(spec.recipe, suffix=".toml")
-        if spec.source_mode == "epub" and spec.verify:
-            raise ValueError(
-                "EPUB-native release verification is not available yet; "
-                "EPUB tasks currently produce reviewable drafts only"
-            )
-        if spec.source_mode == "epub" and spec.targets and not set(spec.targets) <= {
-            "publication.epub",
-            "publication.docx",
-            "publication.report",
-            "publication.word_report",
-        }:
-            raise ValueError(
-                "EPUB jobs currently support EPUB, Word, and their release report"
-            )
         return replace(
             spec,
             source=source,
@@ -115,8 +102,15 @@ class ApplicationService:
         try:
             output.mkdir(parents=True)
             normalized = self._normalized_spec(spec, source=source, output=output)
+            plan = self.execution.plan(normalized)
             self._write_spec(workspace, normalized)
-            job = self.registry.create(job_id, workspace, normalized)
+            job = self.registry.create(
+                job_id,
+                workspace,
+                normalized,
+                resolved_targets=plan.targets,
+                release_profile=plan.release_profile,
+            )
             registered = True
         except Exception:
             if not registered:
@@ -145,10 +139,17 @@ class ApplicationService:
             input_dir.mkdir()
             output.mkdir()
             source = input_dir / safe_upload_name(filename, source_mode=spec.source_mode)
-            self._write_upload(source, content)
             normalized = self._normalized_spec(spec, source=source, output=output)
+            plan = self.execution.plan(normalized)
+            self._write_upload(source, content)
             self._write_spec(workspace, normalized)
-            job = self.registry.create(job_id, workspace, normalized)
+            job = self.registry.create(
+                job_id,
+                workspace,
+                normalized,
+                resolved_targets=plan.targets,
+                release_profile=plan.release_profile,
+            )
             registered = True
         except Exception:
             if not registered:
@@ -216,7 +217,7 @@ class ApplicationService:
             source=source,
             output=preview_output,
         )
-        return plan_runspec(normalized)
+        return self.execution.plan(normalized).node_names
 
     def preview_upload_plan(self, spec: RunSpec, *, filename: str) -> tuple[str, ...]:
         """Plan an uploaded source without persisting its bytes or a job row."""
@@ -228,7 +229,7 @@ class ApplicationService:
             source=preview_root / safe_name,
             output=preview_root / "output",
         )
-        return plan_runspec(normalized)
+        return self.execution.plan(normalized).node_names
 
     def get_job(self, job_id: str) -> JobRecord:
         self.registry.reconcile_workers()

@@ -25,7 +25,11 @@ filter_value = st.segmented_control(
     default="全部",
 )
 if filter_value == "运行中":
-    visible = [job for job in jobs if job.status in {"queued", "running"}]
+    visible = [
+        job
+        for job in jobs
+        if job.status in {"queued", "running", "cancel_requested"}
+    ]
 elif filter_value == "已完成":
     visible = [job for job in jobs if job.status == "succeeded"]
 elif filter_value == "需处理":
@@ -60,9 +64,9 @@ st.caption(f"更新时间：{job.updated_at} · 工作区：{job.workspace}")
 with st.container(horizontal=True):
     refresh = st.button("刷新", icon=":material/refresh:")
     cancel = st.button(
-        "取消任务",
+        "正在取消…" if job.status == "cancel_requested" else "取消任务",
         icon=":material/cancel:",
-        disabled=job.status not in {"queued", "running", "cancel_requested"},
+        disabled=job.status not in {"queued", "running"},
     )
 if refresh:
     st.rerun()

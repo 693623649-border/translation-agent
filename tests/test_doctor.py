@@ -6,12 +6,28 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import doctor
 
 
 class DoctorTests(unittest.TestCase):
+    def test_unsupported_python_fails_before_loading_runtime_contracts(self) -> None:
+        stderr = io.StringIO()
+        unsupported = SimpleNamespace(major=3, minor=10, micro=14)
+
+        with patch.object(doctor.sys, "version_info", unsupported), patch.object(
+            doctor,
+            "_runtime_contract_metadata",
+            side_effect=AssertionError("must remain behind the interpreter gate"),
+        ), contextlib.redirect_stderr(stderr):
+            code = doctor.main([])
+
+        self.assertEqual(code, 2)
+        self.assertIn("requires Python >= 3.11", stderr.getvalue())
+        self.assertIn("found 3.10.14", stderr.getvalue())
+
     def test_report_never_contains_credential_value(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

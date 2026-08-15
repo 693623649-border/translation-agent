@@ -48,6 +48,34 @@ class ProductContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "NaN"):
             RunSpec(options={"temperature": float("nan")})
 
+    def test_run_spec_booleans_are_not_truthiness_coerced(self) -> None:
+        payload = RunSpec().to_dict()
+        payload["translate"] = "false"
+        with self.assertRaisesRegex(ContractError, "translate must be a boolean"):
+            RunSpec.from_dict(payload)
+
+        payload = RunSpec().to_dict()
+        payload["verify"] = 0
+        with self.assertRaisesRegex(ContractError, "verify must be a boolean"):
+            RunSpec.from_dict(payload)
+
+        with self.assertRaisesRegex(ContractError, "translate must be a boolean"):
+            RunSpec(translate=1)  # type: ignore[arg-type]
+
+    def test_run_spec_does_not_coerce_target_or_string_fields(self) -> None:
+        payload = RunSpec().to_dict()
+        payload["targets"] = ["publication.docx", 7]
+        with self.assertRaisesRegex(ContractError, "non-empty strings"):
+            RunSpec.from_dict(payload)
+
+        payload = RunSpec().to_dict()
+        payload["source_mode"] = 7
+        with self.assertRaisesRegex(ContractError, "source_mode must be a string"):
+            RunSpec.from_dict(payload)
+
+        with self.assertRaisesRegex(ContractError, "must not contain duplicates"):
+            RunSpec(targets=("publication.docx", "publication.docx"))
+
     def test_artifact_and_event_are_json_safe(self) -> None:
         artifact = ArtifactRecord(
             schema_version=1,

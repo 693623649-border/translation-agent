@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from product_contracts import APP_VERSION, CONTRACT_SCHEMA_VERSION, RunSpec
+from run_execution_service import (
+    SEMANTIC_CACHE_DIRNAME,
+    execute_runspec,
+    plan_runspec,
+)
 
 
 def _json(payload: Mapping[str, Any]) -> None:
@@ -56,104 +61,22 @@ def _spec_from_args(args: argparse.Namespace) -> RunSpec:
     )
 
 
-def _graph_request(spec: RunSpec):
-    if spec.source_mode not in {"scanned-pdf", "text-pdf"}:
-        raise ValueError("Graph PDF request requires scanned-pdf or text-pdf source_mode")
-    if spec.source is None and spec.phase not in {"epub", "docx", "verify", "status"}:
-        raise ValueError(f"phase {spec.phase!r} requires a PDF source")
-    from translation_agent_api import GraphRunRequest, RunRequest
-
-    options = dict(spec.options)
-    request = RunRequest(
-        input_pdf=spec.source,
-        output_dir=spec.output_dir,
-        phase=spec.phase,
-        config=spec.config,
-        translation_profile=options.get("translation_profile"),
-        title=spec.title,
-        author=spec.author,
-        target_language=spec.target_language,
-        translate_non_chinese=spec.translate,
-        verify_publication=spec.verify,
-    )
-    return GraphRunRequest(
-        pipeline=request,
-        recipe=spec.recipe,
-        targets=spec.targets,
-        source_mode=spec.source_mode,
-        toc_source=str(options.get("toc_source") or "pipeline"),
-        text_pdf_sort=bool(options.get("text_pdf_sort")),
-        text_pdf_reflow=bool(options.get("text_pdf_reflow")),
-    )
-
-
 def plan_spec(spec: RunSpec) -> dict[str, Any]:
-    if spec.source_mode == "epub":
-        nodes = [
-            "core.source.epub.inspect",
-            "core.source.epub.import",
-        ]
-        if spec.translate:
-            nodes.extend(
-                [
-                    "core.semantic.translate.prepare",
-                    "core.semantic.translate.run",
-                    "core.semantic.verify",
-                    "core.semantic.apply",
-                ]
-            )
-        nodes.extend(
-            [
-                "core.chapters.load",
-                "core.reconstruct.semantic",
-                "core.publication.sanitize",
-                "core.publish.requested",
-            ]
-        )
-        return {
-            "schema_version": CONTRACT_SCHEMA_VERSION,
-            "app_version": APP_VERSION,
-            "source_mode": spec.source_mode,
-            "targets": list(spec.targets),
-            "nodes": nodes,
-            "release_profile": "draft-until-epub-native-verifier",
-        }
-    from translation_agent_api import prepare_graph
+    """Compatibility wrapper around the single product compiler."""
 
-    prepared = prepare_graph(_graph_request(spec))
-    return {
-        "schema_version": CONTRACT_SCHEMA_VERSION,
-        "app_version": APP_VERSION,
-        "source_mode": spec.source_mode,
-        "targets": sorted(prepared.targets),
-        "nodes": [
-            {
-                "name": node.name,
-                "version": node.version,
-                "requires": sorted(node.requires),
-                "provides": sorted(node.provides),
-                "cache": node.cache,
-            }
-            for node in prepared.plan()
-        ],
-    }
+    return plan_runspec(spec).to_dict()
 
 
 def run_pdf_spec(spec: RunSpec) -> dict[str, Any]:
-    from translation_agent_api import run_graph
+    if spec.source_mode == "epub":
+        raise ValueError("run_pdf_spec requires scanned-pdf or text-pdf source_mode")
+    return execute_runspec(spec).to_dict()
 
-    result = run_graph(_graph_request(spec))
-    return {
-        "schema_version": CONTRACT_SCHEMA_VERSION,
-        "app_version": APP_VERSION,
-        "status": "passed",
-        "run_id": result.run_id,
-        "plan": list(result.plan),
-        "executed": list(result.executed),
-        "skipped": list(result.skipped),
-        "state": str(result.state_path),
-        "events": str(result.events_path),
-    }
+
+def run_spec(spec: RunSpec) -> dict[str, Any]:
+    """Execute a RunSpec through the same service used by product clients."""
+
+    return execute_runspec(spec).to_dict()
 
 
 def ingest_spec(spec: RunSpec) -> dict[str, Any]:
@@ -203,7 +126,7 @@ def translate_spec(spec: RunSpec, *, prepare_only: bool = False) -> int:
         "--target-language",
         spec.target_language,
         "--cache-dir",
-        str(output / ".translation-cache"),
+        str(output / SEMANTIC_CACHE_DIRNAME),
     ]
     if spec.config:
         argv.extend(["--config", str(spec.config)])
@@ -398,27 +321,7 @@ def main(argv: list[str] | None = None) -> int:
         _json(plan_spec(spec))
         return 0
     if args.command == "run":
-        if spec.source_mode == "epub":
-            if spec.verify:
-                raise ValueError(
-                    "EPUB-native release verification is not available; "
-                    "rerun with --no-verify to explicitly authorize draft artifacts"
-                )
-            imported = ingest_spec(spec)
-            _json(imported)
-            if _result_is_blocked(imported):
-                raise ValueError(
-                    "EPUB semantic ingest is blocked; review the reconstruction "
-                    "audit before translation or publication"
-                )
-            if spec.translate:
-                exit_code = translate_spec(spec)
-                if exit_code:
-                    return exit_code
-                _json(apply_spec(spec))
-            _json(publish_spec(spec, ("epub", "docx")))
-            return 0
-        _json(run_pdf_spec(spec))
+        _json(run_spec(spec))
         return 0
     if args.command == "ingest":
         imported = ingest_spec(spec)

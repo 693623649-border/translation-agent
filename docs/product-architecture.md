@@ -7,10 +7,11 @@
 
 ```mermaid
 flowchart TB
-    CLI["translation-agent CLI"] --> APP["Application / RunSpec service"]
-    UI["Streamlit WebUI"] --> APP
+    CLI["translation-agent CLI"] --> RUN["RunExecutionService / RunSpec compiler"]
+    UI["Streamlit WebUI"] --> APP["ApplicationService"]
     APP --> JOBS["UUID workspace + SQLite WAL jobs"]
-    APP --> ADAPTER{"explicit Source Adapter"}
+    JOBS --> RUN
+    RUN --> ADAPTER{"explicit Source Adapter"}
     ADAPTER -->|"scanned-pdf"| OCR["PDF OCR Graph"]
     ADAPTER -->|"text-pdf"| TEXT["PDF text-layer Graph"]
     ADAPTER -->|"epub"| EPUB["EPUB spine semantic importer"]
@@ -31,11 +32,16 @@ EPUB 当前能完成导入、语义翻译、事务回填和草稿发布，但尚
 EPUB-native release profile。因此产品壳不会给 EPUB 草稿签发
 `release_ready=true`。
 
+`RunExecutionService` 是 RunSpec 的唯一产品级解释器：CLI 与 Web worker 均从这里
+获得相同的来源能力、targets、计划和执行结果。计划中的 `executor=graph` 表示真实
+`NodeSpec`，`executor=adapter` 表示尚在 Graph 外、但受同一能力和阻断契约约束的
+有界步骤；二者不得使用相同名称伪装成同一种执行机制。
+
 ## 公共契约
 
 | 契约 | 版本 | 责任 |
 | --- | --- | --- |
-| `RunSpec` | v1 | 统一 CLI、服务与 UI 的输入；严格拒绝未知字段，不保存密钥 |
+| `RunSpec` | v1 | 统一 CLI、服务与 UI 的输入；严格类型、来源/目标能力，不保存密钥 |
 | `DocumentSemantic` | v1 | 文档、章节、块、来源定位、翻译单元与人工决定 |
 | `ArtifactRecord` | v1 | 文件身份、SHA-256、草稿/阻断/正式状态 |
 | `RunEvent` | v1 | 可序列化任务事件与错误摘要 |
@@ -66,15 +72,24 @@ Provider、Source Adapter 和 publisher 可以迭代，但不能绕过这些契�
 - 所有章节、manifest 和 translation audit 先写 staging；提交失败回滚；
 - reconstruction audit 保持不可变，新的 translation audit 记录其 SHA-256。
 
-人工复核记录使用 append-only `review-decisions.jsonl`，决定绑定 issue/unit/source
-hash；来源改变后旧决定自然失效。
+人工复核的目标契约是 append-only `review-decisions.jsonl`，决定绑定
+issue/unit/source hash；当前数据模型和安全追加写已经存在，但 resolution → apply
+→ verifier 尚未接通，不能把手工改写 audit 当作正式复核。该链闭合前，原审计的
+blocking 状态仍必须 fail closed。
 
 ## WebUI 安全模型
 
 - 只绑定 `localhost`、`127.0.0.1` 或 `::1`；远程访问使用带认证的隧道。
 - 文件路径必须位于配置的 allowlist 根目录；上传有扩展名、文件名和大小门。
-- 每个任务拥有 UUID 工作区，数据库使用 SQLite WAL；支持取消、恢复和断点复用。
+- 每个任务拥有 UUID 工作区，数据库使用 SQLite WAL 和顺序 schema migration；支持
+  取消、恢复和断点复用。
+- worker 使用一次性 identity token；取消任务前必须验证 PID 仍属于该任务，无法
+  证明身份时不得发送信号。
+- 取消采用两阶段状态：先进入 `cancel_requested` 并保留租约，确认旧进程退出后
+  才进入 `cancelled`；取消未完成前禁止恢复，避免两个 worker 并发写同一输出。
 - 子进程环境采用 allowlist；模型凭据只在内存中传递，不进 RunSpec/SQLite/argv。
+- Web 计划与 worker 显式关闭仓库 `.env` 自动加载；兼容 CLI 默认行为不会穿透到
+  Web 凭证沙箱。
 - 产物页只把 Graph state 中登记、且 release report 身份与哈希匹配的文件标为正式。
 
 默认运行根为 `~/.translation-agent/webui/`，属于用户级本地状态，不应提交到 Git；

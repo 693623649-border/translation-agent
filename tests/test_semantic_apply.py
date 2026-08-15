@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
+import semantic_apply
 from semantic_apply import SemanticApplyError, validate_translation_set
 from semantic_ir import ReviewDecision, SemanticContractError, SourceLocator
 
@@ -132,6 +136,116 @@ class SemanticApplyValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(result.schema_version, 1)
+
+
+class SemanticApplyCommitSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _stage(stage_dir: Path, relative: Path, value: str = "new\n") -> None:
+        path = stage_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+
+    def test_commit_preflight_rejects_symlink_parent_before_any_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            stage = root / "stage"
+            external = root / "external"
+            output.mkdir()
+            stage.mkdir()
+            external.mkdir()
+            (output / "safe.txt").write_text("old\n", encoding="utf-8")
+            (output / "chapters").symlink_to(external, target_is_directory=True)
+            self._stage(stage, Path("safe.txt"))
+            self._stage(stage, Path("chapters") / "chapter.md")
+
+            with mock.patch.object(semantic_apply, "_replace_file") as replace:
+                with self.assertRaisesRegex(SemanticApplyError, "symlink"):
+                    semantic_apply._commit_staged_files(
+                        output,
+                        stage,
+                        [Path("safe.txt"), Path("chapters") / "chapter.md"],
+                    )
+
+            replace.assert_not_called()
+            self.assertEqual((output / "safe.txt").read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((external / "chapter.md").exists())
+
+    def test_commit_creates_missing_safe_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            stage = root / "stage"
+            output.mkdir()
+            stage.mkdir()
+            relative = Path("audit") / "semantic-translation.json"
+            self._stage(stage, relative, "{}\n")
+
+            semantic_apply._commit_staged_files(output, stage, [relative])
+
+            self.assertEqual((output / relative).read_text(encoding="utf-8"), "{}\n")
+
+    def test_commit_preflight_rejects_symlink_and_nonregular_targets(self) -> None:
+        cases = ("symlink", "directory")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                output = root / "output"
+                stage = root / "stage"
+                output.mkdir()
+                stage.mkdir()
+                relative = Path("chapters.json")
+                self._stage(stage, relative)
+                if case == "symlink":
+                    external = root / "external.json"
+                    external.write_text("outside\n", encoding="utf-8")
+                    (output / relative).symlink_to(external)
+                    expected = "symlink"
+                else:
+                    (output / relative).mkdir()
+                    expected = "not a regular file"
+
+                with mock.patch.object(semantic_apply, "_replace_file") as replace:
+                    with self.assertRaisesRegex(SemanticApplyError, expected):
+                        semantic_apply._commit_staged_files(output, stage, [relative])
+
+                replace.assert_not_called()
+                if case == "symlink":
+                    self.assertEqual(external.read_text(encoding="utf-8"), "outside\n")
+
+    def test_commit_failure_still_rolls_back_already_replaced_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            stage = root / "stage"
+            output.mkdir()
+            stage.mkdir()
+            paths = [Path("first.txt"), Path("second.txt")]
+            for relative in paths:
+                (output / relative).write_text(f"old-{relative.name}\n", encoding="utf-8")
+                self._stage(stage, relative, f"new-{relative.name}\n")
+
+            real_replace = semantic_apply._replace_file
+            calls = 0
+
+            def fail_second(source: Path, target: Path) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("injected commit failure")
+                real_replace(source, target)
+
+            with mock.patch.object(
+                semantic_apply, "_replace_file", side_effect=fail_second
+            ):
+                with self.assertRaisesRegex(SemanticApplyError, "rolled back"):
+                    semantic_apply._commit_staged_files(output, stage, paths)
+
+            for relative in paths:
+                self.assertEqual(
+                    (output / relative).read_text(encoding="utf-8"),
+                    f"old-{relative.name}\n",
+                )
 
 
 if __name__ == "__main__":

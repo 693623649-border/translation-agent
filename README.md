@@ -30,6 +30,8 @@ translation-agent-web
 
 浏览器访问 `http://127.0.0.1:8501`。WebUI 只允许 loopback 监听；远程使用时，
 请保持服务绑定 `127.0.0.1`，再通过带认证的 SSH 隧道访问。
+Web 任务不会读取仓库 `.env`；所需凭证只从创建/恢复任务时选择的 Profile 环境变量
+注入到对应 worker，且不写入 RunSpec、SQLite、命令行或任务日志。
 
 扫描 PDF 的成熟主流程是：
 
@@ -48,8 +50,10 @@ Graph 还提供 `--source-mode text-pdf`，用于每页都有完整可复制
 并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。默认仍是
 `scanned-pdf`，系统不会根据 PDF 内容自动猜测入口。
 
-产品入口是 `translation-agent`（`document_pipeline.py`）；现有 PDF 全链仍由
-`graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
+产品入口是 `translation-agent`（`document_pipeline.py`）。CLI 与 WebUI 通过
+`run_execution_service.py` 共用同一套 RunSpec 解析、来源能力、目标选择、计划和
+执行语义；计划会明确标出步骤由 `graph` 还是受限 `adapter` 执行。现有 PDF 全链
+仍由 `graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
 复用 `book_pipeline.py` 的成熟实现和全部旧参数。`book_pipeline.py` 仍是完全
 兼容的阶段式入口。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）
 仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的
@@ -114,6 +118,7 @@ python -m unittest discover tests
 ```text
 translation-agent/
 ├── document_pipeline.py          # 版本化 RunSpec 的统一产品 CLI
+├── run_execution_service.py      # CLI/WebUI 共用的计划、能力与执行服务
 ├── graph_pipeline.py             # 可组合 DAG 命令行入口
 ├── book_pipeline.py              # 兼容的阶段式执行入口与成熟节点实现
 ├── pipeline_graph/
@@ -128,7 +133,7 @@ translation-agent/
 ├── semantic_ir.py                # 版本化文档语义 IR 与人工复核决定
 ├── semantic_apply.py             # 翻译集合验证与事务回填
 ├── translation_agent_api.py      # 传统与 Graph 程序化调用接口
-├── application_service.py        # CLI/WebUI 共用任务应用服务
+├── application_service.py        # WebUI 的持久任务与安全工作区 facade
 ├── frontend_runtime.py           # SQLite WAL、后台任务、安全环境与产物目录
 ├── streamlit_app.py              # Streamlit 多页产品入口
 ├── app_pages/                    # 新任务、状态、产物、设置页面

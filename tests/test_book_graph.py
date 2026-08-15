@@ -71,6 +71,7 @@ from pipeline_graph.book import (
     SemanticReconstructionError,
     SourceBindingError,
     _phase_argv,
+    _run_phase,
     _single_file_is_current,
     _translation_stage_semantics,
     prepare_book_graph,
@@ -123,6 +124,41 @@ def _chapters_fixture(
 
 
 class BookGraphPlanningTests(unittest.TestCase):
+    def test_isolated_graph_plan_status_and_legacy_call_skip_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            output.mkdir()
+            with patch(
+                "pipeline_graph.book.legacy.load_env_file"
+            ) as load_env_file:
+                prepared = prepare_book_graph(
+                    ["--output-dir", str(output), "--phase", "status"],
+                    options=BookGraphOptions(load_dotenv=False),
+                )
+                status_node = next(
+                    node
+                    for node in prepared.graph.nodes
+                    if node.name == NODE_STATUS
+                )
+                status_node.handler(prepared.context)
+            load_env_file.assert_not_called()
+            self.assertIs(prepared.context.config["load_dotenv"], False)
+
+            with patch(
+                "pipeline_graph.book.legacy._main_unlocked",
+                return_value=0,
+            ) as legacy_main:
+                _run_phase(prepared.context, "status")
+            legacy_main.assert_called_once()
+            self.assertIs(legacy_main.call_args.kwargs["load_dotenv"], False)
+
+    def test_load_dotenv_graph_option_requires_a_real_boolean(self) -> None:
+        with self.assertRaisesRegex(
+            BookGraphConfigurationError,
+            "load_dotenv must be a boolean",
+        ):
+            BookGraphOptions(load_dotenv="false")  # type: ignore[arg-type]
+
     def test_text_pdf_mode_replaces_ocr_with_explicit_text_extraction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             prepared = prepare_book_graph(

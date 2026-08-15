@@ -15,6 +15,18 @@ from translation_agent_api import (
 
 
 class TranslationAgentApiTests(unittest.TestCase):
+    def test_graph_request_propagates_explicit_dotenv_policy(self) -> None:
+        request = GraphRunRequest(
+            pipeline=RunRequest(output_dir="outputs/book", phase="status"),
+            load_dotenv=False,
+        )
+        self.assertIs(request.graph_options().load_dotenv, False)
+        with self.assertRaisesRegex(ValueError, "load_dotenv must be a boolean"):
+            GraphRunRequest(
+                pipeline=request.pipeline,
+                load_dotenv="false",  # type: ignore[arg-type]
+            )
+
     def test_profile_request_never_serializes_api_key(self) -> None:
         request = RunRequest(
             input_pdf="book.pdf",

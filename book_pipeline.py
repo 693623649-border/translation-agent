@@ -326,6 +326,17 @@ class OCRBackend(Protocol):
 
 
 def load_env_file(path: Path) -> None:
+    # Web workers receive credentials through an explicit, allowlisted child
+    # environment.  They must not silently widen that authority by loading a
+    # repository-local ``.env`` file.  Keep dotenv loading enabled by default
+    # for the legacy CLI, while allowing trusted launchers to disable it.
+    if os.environ.get("TRANSLATION_AGENT_DISABLE_DOTENV", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
     if not path.exists():
         return
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -5745,33 +5756,47 @@ def _shared_output_directory_locked(operation: Any) -> Any:
     """Serialize legacy and Graph entry points on the same output directory."""
 
     @functools.wraps(operation)
-    def wrapped(argv: list[str] | None = None) -> int:
+    def wrapped(
+        argv: list[str] | None = None,
+        *,
+        load_dotenv: bool = True,
+    ) -> int:
+        if type(load_dotenv) is not bool:
+            raise TypeError("load_dotenv must be a boolean")
         effective_argv = list(sys.argv[1:] if argv is None else argv)
-        load_env_file(Path(__file__).with_name(".env"))
+        if load_dotenv:
+            load_env_file(Path(__file__).with_name(".env"))
         lock_args = build_parser().parse_args(effective_argv)
         output_dir = Path(lock_args.output_dir).expanduser().resolve()
         # Preserve the established read-only failure semantics for a missing
         # status directory instead of creating it merely to acquire a lock.
         if lock_args.phase == "status" and not output_dir.exists():
-            return operation(effective_argv)
+            return operation(effective_argv, load_dotenv=load_dotenv)
         from pipeline_graph.core import OutputDirectoryLock
 
         with OutputDirectoryLock(
             output_dir / ".pipeline_graph" / "output.lock"
         ):
-            return operation(effective_argv)
+            return operation(effective_argv, load_dotenv=load_dotenv)
 
     return wrapped
 
 
-def _main_unlocked(argv: list[str] | None = None) -> int:
+def _main_unlocked(
+    argv: list[str] | None = None,
+    *,
+    load_dotenv: bool = True,
+) -> int:
     """Run the pipeline without taking the shared output lock.
 
     This is an internal integration seam for ``pipeline_graph``.  Public
     callers must use :func:`main`, which owns the output-directory lock.
     """
 
-    load_env_file(Path(__file__).with_name(".env"))
+    if type(load_dotenv) is not bool:
+        raise TypeError("load_dotenv must be a boolean")
+    if load_dotenv:
+        load_env_file(Path(__file__).with_name(".env"))
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.ocr_cache_model and args.ocr_cache_model_prefix:
@@ -6436,10 +6461,14 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
 
 
 @_shared_output_directory_locked
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    load_dotenv: bool = True,
+) -> int:
     """Run the legacy-compatible CLI under the shared output lock."""
 
-    return _main_unlocked(argv)
+    return _main_unlocked(argv, load_dotenv=load_dotenv)
 
 
 if __name__ == "__main__":

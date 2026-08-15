@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 from typing import Any, Mapping, Sequence
 
@@ -499,6 +500,107 @@ def _replace_file(source: Path, target: Path) -> None:
     os.replace(source, target)
 
 
+def _lstat(path: Path) -> os.stat_result | None:
+    """Inspect one path entry without following a symbolic link."""
+
+    try:
+        return path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise SemanticApplyError(f"cannot inspect semantic output path: {path}") from exc
+
+
+def _assert_safe_output_root(output_dir: Path) -> None:
+    entry = _lstat(output_dir)
+    if entry is None:
+        raise SemanticApplyError(f"semantic output directory is missing: {output_dir}")
+    if stat.S_ISLNK(entry.st_mode):
+        raise SemanticApplyError(f"semantic output directory must not be a symlink: {output_dir}")
+    if not stat.S_ISDIR(entry.st_mode):
+        raise SemanticApplyError(f"semantic output root is not a directory: {output_dir}")
+
+
+def _assert_safe_output_target(output_dir: Path, relative: Path) -> None:
+    """Reject links and non-directory ancestors without following either."""
+
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise SemanticApplyError(f"unsafe semantic output path: {relative}")
+
+    _assert_safe_output_root(output_dir)
+    current = output_dir
+    for index, part in enumerate(relative.parts):
+        current = current / part
+        entry = _lstat(current)
+        if entry is None:
+            # A descendant cannot exist when this path component is absent.
+            return
+        if stat.S_ISLNK(entry.st_mode):
+            raise SemanticApplyError(f"semantic output path must not contain a symlink: {relative}")
+        is_target = index == len(relative.parts) - 1
+        if is_target:
+            if not stat.S_ISREG(entry.st_mode):
+                raise SemanticApplyError(
+                    f"semantic output target is not a regular file: {relative}"
+                )
+        elif not stat.S_ISDIR(entry.st_mode):
+            raise SemanticApplyError(
+                f"semantic output parent is not a directory: {relative}"
+            )
+
+
+def _ensure_safe_output_parent(output_dir: Path, relative: Path) -> None:
+    """Create missing parents one component at a time without traversing links."""
+
+    _assert_safe_output_root(output_dir)
+    current = output_dir
+    for part in relative.parts[:-1]:
+        current = current / part
+        entry = _lstat(current)
+        if entry is None:
+            try:
+                current.mkdir()
+            except FileExistsError:
+                # Another process created the entry; validate what won.
+                pass
+            except OSError as exc:
+                raise SemanticApplyError(
+                    f"cannot create semantic output parent: {relative}"
+                ) from exc
+            entry = _lstat(current)
+        if entry is None:
+            raise SemanticApplyError(f"semantic output parent is missing: {relative}")
+        if stat.S_ISLNK(entry.st_mode):
+            raise SemanticApplyError(f"semantic output path must not contain a symlink: {relative}")
+        if not stat.S_ISDIR(entry.st_mode):
+            raise SemanticApplyError(
+                f"semantic output parent is not a directory: {relative}"
+            )
+
+
+def _preflight_commit_paths(
+    output_dir: Path,
+    stage_dir: Path,
+    relative_paths: Sequence[Path],
+) -> tuple[Path, ...]:
+    """Validate the complete commit set before the first output is replaced."""
+
+    normalized = tuple(Path(relative) for relative in relative_paths)
+    if len(set(normalized)) != len(normalized):
+        raise SemanticApplyError("semantic output commit contains duplicate paths")
+    for relative in normalized:
+        _assert_safe_output_target(output_dir, relative)
+        staged = stage_dir / relative
+        staged_entry = _lstat(staged)
+        if staged_entry is None or not stat.S_ISREG(staged_entry.st_mode):
+            raise SemanticApplyError(f"staged semantic output is missing or unsafe: {relative}")
+    return normalized
+
+
 def _commit_staged_files(
     output_dir: Path,
     stage_dir: Path,
@@ -507,20 +609,24 @@ def _commit_staged_files(
     rollback_dir = stage_dir / ".rollback"
     backups: dict[Path, Path | None] = {}
     committed: list[Path] = []
+    normalized_paths = _preflight_commit_paths(output_dir, stage_dir, relative_paths)
     try:
-        for relative in relative_paths:
+        for relative in normalized_paths:
             staged = stage_dir / relative
             target = output_dir / relative
-            if not staged.is_file():
-                raise SemanticApplyError(f"staged semantic output is missing: {relative}")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
+            _ensure_safe_output_parent(output_dir, relative)
+            # Re-check after mkdir and immediately before copying/replacing so
+            # an unsafe entry introduced after preflight fails closed.
+            _assert_safe_output_target(output_dir, relative)
+            target_entry = _lstat(target)
+            if target_entry is not None:
                 backup = rollback_dir / relative
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(target, backup)
                 backups[relative] = backup
             else:
                 backups[relative] = None
+            _assert_safe_output_target(output_dir, relative)
             _replace_file(staged, target)
             committed.append(relative)
     except Exception as exc:
@@ -550,7 +656,10 @@ def apply_translation_transaction(
 ) -> dict[str, Any]:
     """Validate, stage and transactionally commit a complete translation."""
 
-    output_dir = output_dir.expanduser().resolve()
+    expanded_output_dir = output_dir.expanduser()
+    _assert_safe_output_root(expanded_output_dir)
+    output_dir = expanded_output_dir.resolve()
+    _assert_safe_output_root(output_dir)
     translations_path = translations_path.expanduser().resolve()
     reconstruction_path = output_dir / "audit" / "semantic-reconstruction.json"
     reconstruction, reconstruction_sha256 = load_reconstruction_audit(reconstruction_path)
