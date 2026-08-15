@@ -539,13 +539,16 @@ class PublicationVerifierTests(unittest.TestCase):
             {issue["code"] for issue in check["issues"]},
         )
 
-    def test_standard_footnotes_with_legacy_markers_only_warn(self) -> None:
+    def test_standard_footnotes_with_legacy_markers_block_semantic_release(self) -> None:
         manifest = json.loads(
             (self.output / "chapters.json").read_text(encoding="utf-8")
         )
         mixed = self._chapter_one().replace(
             "正文含引注[^101]和[^102]。",
-            "正文含引注[^101]和[^102]，另有待迁移旧标记〔7〕和 [8]。",
+            (
+                "正文含引注[^101]和[^102]，另有待迁移旧标记"
+                "引用⑳及㉑，另有㊿、〔7〕和 [8]。"
+            ),
             1,
         )
         (self.output / "reviewed_chapters" / "ch-1.md").write_text(
@@ -560,12 +563,16 @@ class PublicationVerifierTests(unittest.TestCase):
             chapter_ids=["ch-1"],
             report_name="standard-with-legacy-markers.json",
         )
-        check = self._checks(report)["citations.integrity"]
-        chapter = check["metrics"]["chapters"]["ch-1"]
-        warning_codes = {warning["code"] for warning in check["warnings"]}
+        checks = self._checks(report)
+        citation_check = checks["citations.integrity"]
+        semantic_check = checks["semantics.integrity"]
+        chapter = citation_check["metrics"]["chapters"]["ch-1"]
+        warning_codes = {
+            warning["code"] for warning in citation_check["warnings"]
+        }
 
-        self.assertTrue(report["ok"], report.get("errors"))
-        self.assertEqual(check["status"], "passed")
+        self.assertFalse(report["ok"])
+        self.assertEqual(citation_check["status"], "passed")
         self.assertEqual(chapter["reference_count"], 2)
         self.assertEqual(chapter["definition_count"], 2)
         self.assertEqual(chapter["missing_definitions"], [])
@@ -573,6 +580,172 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(chapter["legacy_reference_markers"], ["〔7〕", "[8]"])
         self.assertIn("legacy_citation_markers_ignored", warning_codes)
         self.assertNotIn("ambiguous_plain_numeric_markers", warning_codes)
+        self.assertIn(
+            "semantic_legacy_footnote_marker_residue",
+            {issue["code"] for issue in semantic_check["issues"]},
+        )
+        self.assertEqual(
+            semantic_check["metrics"]["legacy_footnote_marker_count"],
+            4,
+        )
+
+    def test_separated_line_start_circled_markers_are_not_list_exempt(self) -> None:
+        manifest = json.loads(
+            (self.output / "chapters.json").read_text(encoding="utf-8")
+        )
+        contaminated = self._chapter_one().replace(
+            "普通文字与",
+            "① 第一处疑似定义。\n中间仍有正文。\n② 第二处疑似定义。\n\n普通文字与",
+            1,
+        )
+        (self.output / "reviewed_chapters" / "ch-1.md").write_text(
+            contaminated, encoding="utf-8"
+        )
+        (self.output / "chapters" / manifest[0]["filename"]).write_text(
+            contaminated, encoding="utf-8"
+        )
+        self._refresh_semantic_markdown_digest("ch-1")
+
+        report = self._verify(
+            chapter_ids=["ch-1"],
+            report_name="separated-circled-markers.json",
+        )
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(check["metrics"]["legacy_footnote_marker_count"], 2)
+        self.assertIn(
+            "semantic_legacy_footnote_marker_residue",
+            {issue["code"] for issue in check["issues"]},
+        )
+
+    def test_interleaved_markdown_footnote_definitions_block_release(self) -> None:
+        manifest = json.loads(
+            (self.output / "chapters.json").read_text(encoding="utf-8")
+        )
+        definition = "\n\n[^101]: 与正文一一对应的完整注释。"
+        interleaved = self._chapter_one().replace(definition, "", 1).replace(
+            "> 引文第二段。\n\n",
+            "> 引文第二段。\n\n[^101]: 与正文一一对应的完整注释。\n\n",
+            1,
+        )
+        (self.output / "reviewed_chapters" / "ch-1.md").write_text(
+            interleaved, encoding="utf-8"
+        )
+        (self.output / "chapters" / manifest[0]["filename"]).write_text(
+            interleaved, encoding="utf-8"
+        )
+        self._refresh_semantic_markdown_digest("ch-1")
+
+        report = self._verify(
+            chapter_ids=["ch-1"],
+            report_name="interleaved-footnotes.json",
+        )
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "semantic_footnote_definitions_interleaved",
+            {issue["code"] for issue in check["issues"]},
+        )
+        self.assertEqual(check["metrics"]["interleaved_definition_chapter_count"], 1)
+
+    def test_standalone_footnote_heading_residue_blocks_release(self) -> None:
+        manifest = json.loads(
+            (self.output / "chapters.json").read_text(encoding="utf-8")
+        )
+        contaminated = self._chapter_one().replace(
+            "\n\n[^101]:",
+            "\n\n注释：\n\n[^101]:",
+            1,
+        )
+        (self.output / "reviewed_chapters" / "ch-1.md").write_text(
+            contaminated, encoding="utf-8"
+        )
+        (self.output / "chapters" / manifest[0]["filename"]).write_text(
+            contaminated, encoding="utf-8"
+        )
+        self._refresh_semantic_markdown_digest("ch-1")
+
+        report = self._verify(
+            chapter_ids=["ch-1"],
+            report_name="footnote-heading-residue.json",
+        )
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "semantic_footnote_heading_residue",
+            {issue["code"] for issue in check["issues"]},
+        )
+        self.assertEqual(check["metrics"]["standalone_footnote_heading_count"], 1)
+
+    def test_ordinary_numbered_and_circled_lists_do_not_trip_footnote_gate(self) -> None:
+        manifest = json.loads(
+            (self.output / "chapters.json").read_text(encoding="utf-8")
+        )
+        ordinary = self._chapter_one().replace(
+            "普通文字与",
+            (
+                "这是评论性的注释：不得删除。\n\n"
+                "注释：\n\n"
+                "这里仍是正文，不是脚注版面标题。\n\n"
+                "1. 普通数字列表第一项。\n"
+                "2. 普通数字列表第二项。\n\n"
+                "普通圈号列表如下：\n"
+                "① 第一项。\n"
+                "② 第二项。\n\n"
+                "普通文字与"
+            ),
+            1,
+        )
+        (self.output / "reviewed_chapters" / "ch-1.md").write_text(
+            ordinary, encoding="utf-8"
+        )
+        (self.output / "chapters" / manifest[0]["filename"]).write_text(
+            ordinary, encoding="utf-8"
+        )
+        self._refresh_semantic_markdown_digest("ch-1")
+
+        report = self._verify(
+            chapter_ids=["ch-1"],
+            report_name="ordinary-numbered-lists.json",
+        )
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertTrue(report["ok"], report.get("errors"))
+        self.assertEqual(check["metrics"]["legacy_footnote_marker_count"], 0)
+
+    def test_nonblocking_unresolved_footnote_audit_issue_blocks_release(self) -> None:
+        audit_path = self.output / "audit" / "semantic-reconstruction.json"
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit["chapters"][0]["issues"] = [
+            {
+                "code": "semantic_footnote_reference_missing",
+                "message": "疑似圈号脚注没有引用落点。",
+                "blocking": False,
+                "source_page": "pdf-0001-physical-01",
+                "note_label": "1",
+                "evidence": {"notation": "circled"},
+            }
+        ]
+        audit_path.write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        report = self._verify(
+            chapter_ids=["ch-1"],
+            report_name="unresolved-nonblocking-footnote.json",
+        )
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "semantic_audit_blocking_issue",
+            {issue["code"] for issue in check["issues"]},
+        )
+        self.assertEqual(check["metrics"]["blocking_audit_issue_count"], 1)
 
     def test_legacy_interleaved_square_notes_are_blocked_by_semantic_gate(self) -> None:
         manifest = json.loads(
@@ -745,12 +918,11 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertIn("docx_quote_structure_mismatch", codes)
         self.assertIn("docx_inline_style_mismatch", codes)
 
-    def test_docx_sanctioned_book_layout_and_page_footer_pass(self) -> None:
+    def test_docx_sanctioned_book_layout_without_header_footer_passes(self) -> None:
         from docx import Document
         from docx.enum.style import WD_STYLE_TYPE
         from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
         from docx.oxml import OxmlElement
-        from docx.oxml.ns import qn
 
         path = self.output / f"{self.book_title}.docx"
         document = Document(path)
@@ -804,17 +976,6 @@ class PublicationVerifierTests(unittest.TestCase):
             page_break_before = OxmlElement("w:pageBreakBefore")
             paragraph._p.get_or_add_pPr().append(page_break_before)
 
-        footer = document.sections[0].footer.paragraphs[0]
-        footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        if not footer._p.xpath(".//w:fldSimple[contains(@w:instr, 'PAGE')]"):
-            field = OxmlElement("w:fldSimple")
-            field.set(qn("w:instr"), "PAGE")
-            run = OxmlElement("w:r")
-            text = OxmlElement("w:t")
-            text.text = "1"
-            run.append(text)
-            field.append(run)
-            footer._p.append(field)
         document.save(path)
 
         report = self._verify(report_name="docx-book-layout.json")
@@ -823,6 +984,31 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(check["metrics"]["chapter_page_break_before_count"], 2)
         self.assertEqual(check["metrics"]["title_page_break_count"], 1)
         self.assertEqual(check["metrics"]["unexpected_page_break_count"], 0)
+        self.assertEqual(check["metrics"]["page_number_footer_count"], 0)
+
+    def test_docx_page_footer_is_blocked_even_without_source_text(self) -> None:
+        from docx import Document
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        path = self.output / f"{self.book_title}.docx"
+        document = Document(path)
+        footer = document.sections[0].footer.paragraphs[0]
+        field = OxmlElement("w:fldSimple")
+        field.set(qn("w:instr"), "PAGE")
+        run = OxmlElement("w:r")
+        text = OxmlElement("w:t")
+        text.text = "1"
+        run.append(text)
+        field.append(run)
+        footer._p.append(field)
+        document.save(path)
+
+        report = self._verify(report_name="docx-page-footer.json")
+        check = self._checks(report)["docx.structure"]
+        codes = {issue["code"] for issue in check["issues"]}
+        self.assertFalse(report["ok"])
+        self.assertIn("docx_unexpected_header_footer_or_notes", codes)
         self.assertEqual(check["metrics"]["page_number_footer_count"], 1)
 
     def test_docx_page_footer_with_leaked_source_text_is_blocked(self) -> None:

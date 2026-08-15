@@ -235,6 +235,12 @@ class ProofreadCheckpointTests(unittest.TestCase):
 
 
 class ProofreadExecutionTests(unittest.TestCase):
+    def test_prompt_version_invalidates_legacy_japanese_only_cache(self) -> None:
+        self.assertEqual(
+            PROOFREAD_PROMPT_VERSION,
+            "book-ocr-proofread-zh-ja-v2",
+        )
+
     def test_runner_is_resumable_and_binds_profile_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -291,6 +297,44 @@ class ProofreadExecutionTests(unittest.TestCase):
             self.assertTrue(PageStore(output).load(1).proofread_is_fresh)
             self.assertFalse(PageStore(output).load(2).proofread_is_fresh)
 
+    def test_runner_treats_zh_and_zh_cn_as_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            simplified = PageRecord(1, "这是中文 OCR 正文。", language="zh")
+            locale_tagged = PageRecord(2, "这是另一页中文正文。", language="zh-CN")
+            save_page_record(output, simplified)
+            save_page_record(output, locale_tagged)
+            fake = FakeProofreader(output="校勘后的中文正文")
+            zh_cn_identity = ModelIdentity(
+                provider="deepseek",
+                adapter="openai-chat",
+                base_url="https://api.deepseek.com",
+                model="deepseek-v4-flash",
+                target_language="zh-CN",
+                prompt_version=PROOFREAD_PROMPT_VERSION,
+            )
+
+            proofread_ocr_pages(
+                [simplified, locale_tagged],
+                output,
+                fake,
+                language="zh-CN",
+                identity=zh_cn_identity,
+                force=False,
+                concurrency=2,
+            )
+
+            self.assertCountEqual(
+                fake.inputs,
+                [(simplified.text, "zh-CN"), (locale_tagged.text, "zh-CN")],
+            )
+            self.assertTrue(
+                PageStore(output).load(1).proofread_is_fresh_for(zh_cn_identity)
+            )
+            self.assertTrue(
+                PageStore(output).load(2).proofread_is_fresh_for(zh_cn_identity)
+            )
+
     def test_chat_prompt_explicitly_forbids_translation(self) -> None:
         client = FakeChatClient()
         result = ChatOCRProofreader(client, max_chars=100).proofread(
@@ -303,6 +347,27 @@ class ProofreadExecutionTests(unittest.TestCase):
         self.assertIn("严禁翻译", prompt)
         self.assertIn("输出必须仍是原文日语", prompt)
         self.assertIn("绝不翻译", system)
+
+    def test_chat_prompt_strictly_preserves_chinese_ocr_for_zh_aliases(self) -> None:
+        for language in ("zh", "zh-CN"):
+            with self.subTest(language=language):
+                client = FakeChatClient(output="校勘后的中文正文")
+                result = ChatOCRProofreader(client, max_chars=100).proofread(
+                    "这是一段中又 OCR 原文。",
+                    language=language,
+                )
+
+                self.assertEqual(result, client.output)
+                prompt, system = client.prompts[0]
+                self.assertIn("严格校勘下面的中文 OCR 原文", prompt)
+                self.assertIn("输出必须仍是原稿中文", prompt)
+                self.assertIn("不得翻译外文内容", prompt)
+                self.assertIn("不得擅自转换简繁体或异体字", prompt)
+                self.assertIn("不得因内容重复或看似页眉页脚而自行删除", prompt)
+                self.assertIn("脚注及脚注定义", prompt)
+                self.assertIn("[原文存疑]", prompt)
+                self.assertIn("中文书籍 OCR 校勘员", system)
+                self.assertIn("绝不翻译、改写、概述或创作", system)
 
     def test_cli_proofread_runs_without_source_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

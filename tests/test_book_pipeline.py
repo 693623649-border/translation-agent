@@ -15,6 +15,7 @@ import fitz
 from PIL import Image
 
 from docx_footnotes import inspect_docx_footnotes
+from publication_semantics import parse_markdown_footnotes
 
 from book_pipeline import (
     ChatTranslator,
@@ -47,12 +48,14 @@ from book_pipeline import (
     output_status,
     parse_page_spec,
     remove_duplicate_title,
+    reflow_reader_markdown_soft_wraps,
     resolve_api_key,
     resolve_expected_ocr_model_exact,
     resolve_translation_api_key,
     resolve_worker_counts,
     save_page_record,
     strip_publication_metadata,
+    strip_reviewed_publication_metadata,
     trim_before_next_title,
     translate_non_chinese_pages,
     write_json,
@@ -803,6 +806,174 @@ class UtilityTests(unittest.TestCase):
         result = strip_publication_metadata(source)
         self.assertEqual(result, "# 第一章\n\n第一页正文。\n\n第二页正文。\n")
 
+    def test_reader_reflow_collapses_only_ordinary_ocr_soft_wraps(self) -> None:
+        source = """# 第一章
+
+扫描版正文在这里被
+视觉行框强制截断，中文不应
+继续保留扫描行换行。English,
+words remain separated and hyphen-
+ated text keeps its visible hyphen.
+"""
+        expected = (
+            "# 第一章\n\n"
+            "扫描版正文在这里被视觉行框强制截断，中文不应继续保留扫描行换行。"
+            "English, words remain separated and hyphen-ated text keeps its visible hyphen.\n"
+        )
+        cleaned = reflow_reader_markdown_soft_wraps(source)
+        self.assertEqual(cleaned, expected)
+        self.assertEqual(reflow_reader_markdown_soft_wraps(cleaned), cleaned)
+        # Whitespace layout may change, but no reader-visible source glyph may
+        # disappear (in particular, an OCR hyphen is never guessed away).
+        visible = lambda value: re.sub(r"\s+", "", value)
+        self.assertEqual(visible(cleaned), visible(source))
+
+    def test_reader_reflow_preserves_markdown_structures_and_hard_breaks(self) -> None:
+        source = (
+            "# H1\n\n## H2\n\n"
+            "- first item\n- second item\n\n"
+            "| A | B |\n|---|---|\n| 1 | 2 |\n\n"
+            "```text\ncode\nline\n```\n\n"
+            "Body line  \n"
+            "authored break\nthen soft wrap\n\n"
+            "Body with <br>\nHTML break\n\n"
+            "Reference.[^n]\n\n"
+            "[^n]: standard footnote\n    continuation\n"
+        )
+        cleaned = reflow_reader_markdown_soft_wraps(source)
+        self.assertIn("# H1\n\n## H2", cleaned)
+        self.assertIn("- first item\n- second item", cleaned)
+        self.assertIn("| A | B |\n|---|---|\n| 1 | 2 |", cleaned)
+        self.assertIn("```text\ncode\nline\n```", cleaned)
+        self.assertIn("Body line  \nauthored break then soft wrap", cleaned)
+        self.assertIn("Body with <br>\nHTML break", cleaned)
+        self.assertIn("[^n]: standard footnote\n    continuation", cleaned)
+        self.assertEqual(reflow_reader_markdown_soft_wraps(cleaned), cleaned)
+
+    def test_reader_reflow_preserves_punctuated_verse_but_joins_short_prose(self) -> None:
+        verse = """江水流向夜色，
+星光落在船边。
+风穿过旧城，
+谁也没有说话。
+"""
+        self.assertEqual(
+            reflow_reader_markdown_soft_wraps(verse),
+            "江水流向夜色，  \n星光落在船边。  \n风穿过旧城，  \n谁也没有说话。\n",
+        )
+        short_prose = """这是被扫描版式截断的普通正文
+仍然属于同一个连续的句子
+直到这里才完整结束。
+"""
+        self.assertEqual(
+            reflow_reader_markdown_soft_wraps(short_prose),
+            "这是被扫描版式截断的普通正文仍然属于同一个连续的句子直到这里才完整结束。\n",
+        )
+
+        epigraph = """太阳，你要小心自己！
+A·J·维尔茨：文学作品
+（巴黎，一八七〇）
+随着钢铁在建筑中的应用，建筑学便开始超越艺术；
+这一行只是同一段正文的视觉续行。
+"""
+        self.assertEqual(
+            reflow_reader_markdown_soft_wraps(epigraph),
+            (
+                "太阳，你要小心自己！  \n"
+                "A·J·维尔茨：文学作品  \n"
+                "（巴黎，一八七〇）\n\n"
+                "随着钢铁在建筑中的应用，建筑学便开始超越艺术；"
+                "这一行只是同一段正文的视觉续行。\n"
+            ),
+        )
+
+    def test_reader_reflow_preserves_bare_chinese_subdivision_ordinal(self) -> None:
+        source = """前一段在这里完整结束。
+三
+为更具体地说明这个问题，
+这一行仍是同一段的视觉续行。
+"""
+        cleaned = reflow_reader_markdown_soft_wraps(source)
+        self.assertEqual(
+            cleaned,
+            "前一段在这里完整结束。\n\n三\n\n"
+            "为更具体地说明这个问题，这一行仍是同一段的视觉续行。\n",
+        )
+
+    def test_reader_page_boundary_does_not_join_bare_chinese_ordinal(self) -> None:
+        source = """# 第一章
+
+前页末行没有标点
+
+<span epub:type="pagebreak" id="pdf-page-2" title="2"></span>
+<!-- PDF_PAGE: 2 -->
+
+三
+为更具体地说明这个问题。
+"""
+        cleaned = strip_publication_metadata(source)
+        self.assertIn("前页末行没有标点\n\n三\n\n为更具体", cleaned)
+
+    def test_reader_removes_only_matching_duplicate_leading_subdivision_ordinal(self) -> None:
+        source = """# 第三部·二 巴黎，十九世纪的都城：达盖尔与西洋景
+
+二
+达盖尔发明摄影以后，
+视觉经验发生变化。
+
+2
+独立数据仍须保留。
+"""
+        cleaned = strip_publication_metadata(
+            source,
+            chapter_title="第三部·二 巴黎，十九世纪的都城：达盖尔与西洋景",
+        )
+        self.assertEqual(
+            cleaned,
+            (
+                "# 第三部·二 巴黎，十九世纪的都城：达盖尔与西洋景\n\n"
+                "达盖尔发明摄影以后，视觉经验发生变化。\n\n"
+                "2\n\n独立数据仍须保留。\n"
+            ),
+        )
+        self.assertIn(
+            "\n\n二\n",
+            strip_publication_metadata(
+                "# 第三部 巴黎，十九世纪的都城\n\n二\n\n普通正文。\n",
+                chapter_title="第三部 巴黎，十九世纪的都城",
+            ),
+        )
+
+    def test_reader_output_removes_only_exact_non_content_marker_lines(self) -> None:
+        source = (
+            "# 第一章\n\n"
+            "第一页正文。\n\n"
+            "[空白页]\n\n"
+            "   [无法辨认]   \n\n"
+            "原稿在这里使用了[空白页]这一标记。\n\n"
+            "> [空白页]\n"
+        )
+        self.assertEqual(
+            strip_publication_metadata(source),
+            (
+                "# 第一章\n\n第一页正文。\n\n"
+                "原稿在这里使用了[空白页]这一标记。\n\n> [空白页]\n"
+            ),
+        )
+
+    def test_reviewed_cleanup_preserves_exact_non_content_marker_lines(self) -> None:
+        source = """# 第一章
+
+<!-- source-pdf: source.pdf -->
+
+[空白页]
+
+人工审定正文。
+"""
+        self.assertEqual(
+            strip_reviewed_publication_metadata(source),
+            "# 第一章\n\n\n[空白页]\n\n人工审定正文。\n",
+        )
+
     def test_reader_output_removes_trailing_split_printed_page(self) -> None:
         # Column-aware OCR split printed page 40 into two lines; both are a
         # page footer and must be discarded, unlike mid-text numbers.
@@ -1216,6 +1387,14 @@ M.E.Sharpe, Inc., 1983.
         self.assertEqual(
             markdown_inline_to_plain_text("术语<sup>[原文存疑]</sup>与[链接](https://example.test)"),
             "术语[原文存疑]与链接",
+        )
+
+    def test_docx_inline_markup_preserves_chinese_angle_bracket_title(self) -> None:
+        self.assertEqual(
+            markdown_inline_to_plain_text(
+                "本雅明：<打开我的图书馆>，见<启迪)，一九六四年英文版。"
+            ),
+            "本雅明：<打开我的图书馆>，见<启迪)，一九六四年英文版。",
         )
 
     def test_remove_multiline_duplicate_title(self) -> None:
@@ -1952,6 +2131,200 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertNotIn("\n中产阶级的孩子们\n", rows[0]["content"])
         self.assertIn("正文提到中产阶级的孩子们参与了运动。", rows[0]["content"])
 
+    def test_chapter_compile_reconstructs_one_proven_adjacent_page_note(self) -> None:
+        entries = [
+            TocEntry("chapter-1", "第一章", "正文", 1, "chapter", 1, pdf_page=1),
+        ]
+        records = [
+            PageRecord(1, "前页正文。" * 80 + "唯一的跨页引用②而后继续。"),
+            PageRecord(2, "后页正文。" * 80 + "\n\n②参看《文集》，第416页。\n2"),
+        ]
+        output = self.root / "adjacent-page-footnote"
+
+        manifest, _rows = compile_chapters(
+            self.pdf_path,
+            output,
+            records,
+            {"page_offset": 0, "entries": [entry.__dict__ for entry in entries]},
+            granularity="chapter",
+        )
+
+        markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("[^pdf-0002-physical-01-n2]", markdown)
+        self.assertIn(
+            "[^pdf-0002-physical-01-n2]: 参看《文集》，第416页。",
+            markdown,
+        )
+        self.assertNotIn("②参看", markdown)
+        self.assertEqual(manifest[0]["semantic_footnote_count"], 1)
+        self.assertEqual(manifest[0]["semantic_issue_count"], 0)
+
+    def test_chapter_compile_preserves_existing_definition_after_numeric_note(self) -> None:
+        entries = [
+            TocEntry(
+                "chapter-1",
+                "第一章",
+                "混合脚注",
+                1,
+                "chapter",
+                1,
+                pdf_page=1,
+            ),
+        ]
+        records = [
+            PageRecord(1, "前页正文使用已有脚注[^legacy-one]。"),
+            PageRecord(
+                2,
+                "本页正文使用数字\n"
+                "脚注①结束。\n"
+                "①本页数字脚注。\n"
+                "注释：\n"
+                "[^legacy-one]: 前页已有脚注的定义。",
+            ),
+        ]
+        output = self.root / "mixed-existing-and-numeric-footnotes"
+
+        manifest, _rows = compile_chapters(
+            self.pdf_path,
+            output,
+            records,
+            {"page_offset": 0, "entries": [entry.__dict__ for entry in entries]},
+            granularity="chapter",
+        )
+
+        markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        inventory = parse_markdown_footnotes(markdown)
+        numeric_id = "pdf-0002-physical-01-n1"
+        self.assertTrue(inventory.valid)
+        self.assertEqual(inventory.references, ("legacy-one", numeric_id))
+        self.assertEqual(
+            dict(inventory.definitions),
+            {
+                "legacy-one": "前页已有脚注的定义。",
+                numeric_id: "本页数字脚注。",
+            },
+        )
+        self.assertNotIn("[^legacy-one]: 前页已有脚注的定义。", inventory.body)
+        self.assertNotIn("注释：", markdown)
+        self.assertIn("本页正文使用数字脚注", markdown)
+        self.assertEqual(manifest[0]["semantic_footnote_count"], 2)
+        self.assertEqual(manifest[0]["semantic_issue_count"], 0)
+
+    def test_chapter_compile_rejects_duplicate_existing_definitions(self) -> None:
+        entry = TocEntry(
+            "chapter-1",
+            "第一章",
+            "重复定义",
+            1,
+            "chapter",
+            1,
+            pdf_page=1,
+        )
+        payload = {"page_offset": 0, "entries": [entry.__dict__]}
+        cases = (
+            (
+                "same-text",
+                "[^legacy-one]: 相同定义。",
+                "duplicate_ids=['legacy-one']",
+            ),
+            (
+                "conflicting-text",
+                "[^legacy-one]: 冲突定义。",
+                "conflicting_text_ids=['legacy-one']",
+            ),
+        )
+
+        for name, second_definition, expected in cases:
+            with self.subTest(name=name):
+                records = [
+                    PageRecord(
+                        1,
+                        "正文引用[^legacy-one]。\n\n"
+                        "[^legacy-one]: 相同定义。",
+                    ),
+                    PageRecord(2, second_definition),
+                ]
+                with self.assertRaisesRegex(ValueError, re.escape(expected)):
+                    compile_chapters(
+                        self.pdf_path,
+                        self.root / f"duplicate-existing-{name}",
+                        records,
+                        payload,
+                        granularity="chapter",
+                    )
+
+    def test_chapter_compile_rejects_duplicate_existing_references(self) -> None:
+        entry = TocEntry(
+            "chapter-1",
+            "第一章",
+            "重复引用",
+            1,
+            "chapter",
+            1,
+            pdf_page=1,
+        )
+        records = [
+            PageRecord(
+                1,
+                "第一次引用[^legacy-one]，第二次引用[^legacy-one]。",
+            ),
+            PageRecord(2, "[^legacy-one]: 唯一定义。"),
+        ]
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"duplicate_references=\['legacy\-one'\]",
+        ):
+            compile_chapters(
+                self.pdf_path,
+                self.root / "duplicate-existing-reference",
+                records,
+                {"page_offset": 0, "entries": [entry.__dict__]},
+                granularity="chapter",
+            )
+
+    def test_existing_definitions_do_not_hide_final_scanned_page_number(self) -> None:
+        entry = TocEntry(
+            "chapter-1",
+            "第一章",
+            "尾页脚注",
+            1,
+            "chapter",
+            1,
+            pdf_page=1,
+        )
+        records = [
+            PageRecord(1, "前页正文引用[^legacy-one]。"),
+            PageRecord(
+                2,
+                "尾页正文。\n\n"
+                "[^legacy-one]: 已有脚注定义。\n"
+                "180",
+            ),
+        ]
+        output = self.root / "existing-definition-final-page-number"
+
+        manifest, _rows = compile_chapters(
+            self.pdf_path,
+            output,
+            records,
+            {"page_offset": 0, "entries": [entry.__dict__]},
+            granularity="chapter",
+        )
+
+        markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        inventory = parse_markdown_footnotes(markdown)
+        self.assertTrue(inventory.valid)
+        self.assertEqual(inventory.definitions, (("legacy-one", "已有脚注定义。"),))
+        self.assertNotRegex(markdown, r"(?m)^180$")
+        self.assertTrue(markdown.rstrip().endswith("[^legacy-one]: 已有脚注定义。"))
+
     def test_infer_page_offset(self) -> None:
         offset, evidence = infer_page_offset(self.sample_entries(), self.sample_records(), toc_end=2)
         self.assertEqual(offset, 3)
@@ -2467,7 +2840,40 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertNotIn(b"[[FN:", document_xml)
         self.assertGreaterEqual(document_xml.count(b"<w:br"), 3)
 
-    def test_docx_book_layout_has_controlled_front_matter_and_footer(self) -> None:
+    def test_docx_footnote_before_ascii_parenthetical_is_patchable(self) -> None:
+        output = self.root / "docx-footnote-parenthetical"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n"
+            "正文。[^p1-n1](这里是括号内正文。)\n\n"
+            "[^p1-n1]: 完整注释。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "parenthetical.docx"
+
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+
+        inventory = inspect_docx_footnotes(docx_path)
+        self.assertTrue(inventory.valid, inventory.problems)
+        self.assertEqual(inventory.reference_ids, (1,))
+        from docx import Document
+
+        document = Document(docx_path)
+        body = "\n".join(paragraph.text for paragraph in document.paragraphs)
+        self.assertIn("正文。(这里是括号内正文。)", body)
+
+    def test_docx_book_layout_has_no_header_footer_or_page_field(self) -> None:
         output = self.root / "docx-book-layout"
         chapter_dir = output / "chapters"
         chapter_dir.mkdir(parents=True)
@@ -2516,17 +2922,24 @@ class MappingAndCompilationTests(unittest.TestCase):
         with zipfile.ZipFile(path) as archive:
             body = ET.fromstring(archive.read("word/document.xml"))
             styles = ET.fromstring(archive.read("word/styles.xml"))
-            footer = ET.fromstring(archive.read("word/footer1.xml"))
+            auxiliary_parts = [
+                name
+                for name in archive.namelist()
+                if re.fullmatch(r"word/(?:header|footer)\d*\.xml", name)
+            ]
+            word_xml = b"\n".join(
+                archive.read(name)
+                for name in archive.namelist()
+                if name.startswith("word/") and name.endswith(".xml")
+            )
         self.assertEqual(len(body.findall(".//w:br[@w:type='page']", namespace)), 1)
         heading_style = styles.find(
             ".//w:style[@w:styleId='Heading1']", namespace
         )
         self.assertIsNotNone(heading_style)
         self.assertIsNotNone(heading_style.find(".//w:pageBreakBefore", namespace))
-        self.assertEqual(
-            [field.get(f"{{{namespace['w']}}}instr") for field in footer.findall(".//w:fldSimple", namespace)],
-            ["PAGE"],
-        )
+        self.assertEqual(auxiliary_parts, [])
+        self.assertNotRegex(word_xml.decode("utf-8"), r"\b(?:PAGE|NUMPAGES)\b")
 
     def test_docx_book_layout_styles_backmatter_and_table_geometry(self) -> None:
         output = self.root / "docx-book-backmatter"

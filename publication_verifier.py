@@ -466,6 +466,181 @@ def _citation_parts(text: str) -> tuple[str, str]:
     return text[:boundary], text[boundary:]
 
 
+_CIRCLED_NUMBER = re.compile(r"[①-⑳㉑-㉟㊱-㊿]")
+_LENTICULAR_NUMERIC_MARKER = re.compile(r"〔[ \t]*\d{1,4}[ \t]*〕")
+_STANDALONE_FOOTNOTE_HEADING = re.compile(r"^[ \t]*注释：[ \t]*$")
+_MARKDOWN_FOOTNOTE_DEFINITION = re.compile(
+    r"^[ \t]*\[\^(?P<id>[^\]\s]+)\]:[ \t]*(?P<text>.*)$"
+)
+_CIRCLED_LIST_INTRODUCTION = re.compile(
+    r"(?:如下|以下|分为|包括|步骤|列举)[^。！？\n]{0,40}[：:][ \t]*$"
+)
+_UNRESOLVED_SEMANTIC_FOOTNOTE_CODES = frozenset(
+    {
+        "semantic_footnote_reference_missing",
+        "semantic_footnote_reference_ambiguous",
+    }
+)
+
+
+def _circled_number_value(token: str) -> int:
+    value = ord(token)
+    if 0x2460 <= value <= 0x2473:
+        return value - 0x2460 + 1
+    if 0x3251 <= value <= 0x325F:
+        return value - 0x3251 + 21
+    if 0x32B1 <= value <= 0x32BF:
+        return value - 0x32B1 + 36
+    raise ValueError(f"not a supported circled number: {token!r}")
+
+
+def _ordinary_circled_list_spans(text: str) -> set[tuple[int, int]]:
+    """Return markers that form an obvious ordinary circled-number list.
+
+    A single circled glyph is ambiguous and therefore remains release
+    blocking.  Two or more ascending markers are treated as list furniture
+    only when they occupy immediately adjacent lines and the preceding
+    nonblank line explicitly introduces a list with a colon.  In particular,
+    a same-line ``引用⑳及㉑`` sequence is never exempted.  Plain ``1.``, ``2、``
+    and other numbered-list syntax is not inspected by this detector.
+    """
+
+    allowed: set[tuple[int, int]] = set()
+    line_start = re.compile(
+        rf"(?m)^[ \t]*(?P<token>{_CIRCLED_NUMBER.pattern})(?=[ \t]+\S)"
+    )
+    raw_lines = text.splitlines(keepends=True)
+    line_offsets: list[int] = []
+    offset = 0
+    entries: list[tuple[int, re.Match[str]]] = []
+    for line_index, raw_line in enumerate(raw_lines):
+        line_offsets.append(offset)
+        match = line_start.match(raw_line)
+        if match is not None:
+            entries.append((line_index, match))
+        offset += len(raw_line)
+    run: list[tuple[int, re.Match[str]]] = []
+
+    def accept_run() -> None:
+        if len(run) < 2:
+            return
+        first_line = run[0][0]
+        introduction = next(
+            (
+                raw_lines[line_index].strip()
+                for line_index in range(first_line - 1, -1, -1)
+                if raw_lines[line_index].strip()
+            ),
+            "",
+        )
+        if _CIRCLED_LIST_INTRODUCTION.search(introduction) is None:
+            return
+        allowed.update(
+            (
+                line_offsets[line_index] + match.start("token"),
+                line_offsets[line_index] + match.end("token"),
+            )
+            for line_index, match in run
+        )
+
+    for line_index, match in entries:
+        if run and (
+            line_index != run[-1][0] + 1
+            or _circled_number_value(match.group("token"))
+            != _circled_number_value(run[-1][1].group("token")) + 1
+        ):
+            accept_run()
+            run = []
+        run.append((line_index, match))
+    accept_run()
+    return allowed
+
+
+def _semantic_markdown_residue(markdown_text: str) -> dict[str, Any]:
+    """Inventory footnote-shaped residue that a closed ID set cannot prove safe."""
+
+    allowed_circled = _ordinary_circled_list_spans(markdown_text)
+    legacy_markers: list[dict[str, Any]] = []
+    for pattern, notation in (
+        (_LENTICULAR_NUMERIC_MARKER, "lenticular"),
+        (_CIRCLED_NUMBER, "circled"),
+    ):
+        for match in pattern.finditer(markdown_text):
+            if notation == "circled" and match.span() in allowed_circled:
+                continue
+            legacy_markers.append(
+                {
+                    "marker": match.group(0),
+                    "line": markdown_text.count("\n", 0, match.start()) + 1,
+                    "notation": notation,
+                }
+            )
+
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.splitlines()
+    heading_lines: list[int] = []
+    for line_index, line in enumerate(lines):
+        if _STANDALONE_FOOTNOTE_HEADING.fullmatch(line) is None:
+            continue
+        next_nonblank = next(
+            (
+                lines[candidate]
+                for candidate in range(line_index + 1, len(lines))
+                if lines[candidate].strip()
+            ),
+            None,
+        )
+        if (
+            next_nonblank is not None
+            and _MARKDOWN_FOOTNOTE_DEFINITION.match(next_nonblank) is not None
+        ):
+            heading_lines.append(line_index + 1)
+
+    definition_starts: list[int] = []
+    definition_lines: set[int] = set()
+    index = 0
+    while index < len(lines):
+        if _MARKDOWN_FOOTNOTE_DEFINITION.match(lines[index]) is None:
+            index += 1
+            continue
+        definition_starts.append(index)
+        definition_lines.add(index)
+        index += 1
+        while index < len(lines):
+            line = lines[index]
+            if re.match(r"^(?: {2,}|\t)\S", line):
+                definition_lines.add(index)
+                index += 1
+                continue
+            if not line.strip() and index + 1 < len(lines):
+                lookahead = index + 1
+                while lookahead < len(lines) and not lines[lookahead].strip():
+                    lookahead += 1
+                if lookahead < len(lines) and re.match(
+                    r"^(?: {2,}|\t)\S", lines[lookahead]
+                ):
+                    definition_lines.add(index)
+                    index += 1
+                    continue
+            break
+
+    interleaved_body = []
+    if definition_starts:
+        interleaved_body = [
+            {"line": line_index + 1, "text": lines[line_index].strip()[:160]}
+            for line_index in range(definition_starts[0] + 1, len(lines))
+            if lines[line_index].strip() and line_index not in definition_lines
+        ]
+    return {
+        "legacy_markers": legacy_markers,
+        "standalone_heading_lines": heading_lines,
+        "first_definition_line": (
+            definition_starts[0] + 1 if definition_starts else None
+        ),
+        "interleaved_body": interleaved_body,
+    }
+
+
 def _citation_inventory(text: str) -> dict[str, Any]:
     standard = parse_markdown_footnotes(text)
     if standard.references or standard.definitions:
@@ -1730,12 +1905,54 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
 
     footnote_count = 0
     blocking_audit_issue_count = 0
+    legacy_marker_count = 0
+    standalone_heading_count = 0
+    interleaved_definition_chapter_count = 0
     for item in context.selected:
         chapter_id = str(item.get("id") or "")
         chapter_path = context.chapter_dir / str(item.get("filename") or "")
         text = context.chapter_texts.get(chapter_id)
         if text is None:
             continue
+        residue = _semantic_markdown_residue(text)
+        legacy_markers = residue["legacy_markers"]
+        legacy_marker_count += len(legacy_markers)
+        if legacy_markers:
+            issues.append(
+                _issue(
+                    "semantic_legacy_footnote_marker_residue",
+                    "成品 Markdown 仍含未转换的圈号或〔n〕脚注形标记。",
+                    path=chapter_path,
+                    chapter_id=chapter_id,
+                    count=len(legacy_markers),
+                    markers=legacy_markers[:20],
+                )
+            )
+        heading_lines = residue["standalone_heading_lines"]
+        standalone_heading_count += len(heading_lines)
+        if heading_lines:
+            issues.append(
+                _issue(
+                    "semantic_footnote_heading_residue",
+                    "成品 Markdown 仍含独占一行的“注释：”脚注版面标题。",
+                    path=chapter_path,
+                    chapter_id=chapter_id,
+                    lines=heading_lines[:20],
+                )
+            )
+        interleaved_body = residue["interleaved_body"]
+        if interleaved_body:
+            interleaved_definition_chapter_count += 1
+            issues.append(
+                _issue(
+                    "semantic_footnote_definitions_interleaved",
+                    "Markdown 脚注定义必须组成章节尾部后缀，不得夹在正文中。",
+                    path=chapter_path,
+                    chapter_id=chapter_id,
+                    first_definition_line=residue["first_definition_line"],
+                    body_after_definition=interleaved_body[:20],
+                )
+            )
         inventory = parse_markdown_footnotes(text)
         footnote_count += len(inventory.definitions)
         for code, message, values in (
@@ -1842,7 +2059,12 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
         blocking = [
             value
             for value in (audited.get("issues") or [])
-            if isinstance(value, dict) and bool(value.get("blocking", True))
+            if isinstance(value, dict)
+            and (
+                bool(value.get("blocking", True))
+                or str(value.get("code") or "")
+                in _UNRESOLVED_SEMANTIC_FOOTNOTE_CODES
+            )
         ]
         if bool(audited.get("release_blocked")) and not blocking:
             blocking = [
@@ -1877,6 +2099,11 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
             "selected_chapter_count": len(context.selected),
             "footnote_count": footnote_count,
             "blocking_audit_issue_count": blocking_audit_issue_count,
+            "legacy_footnote_marker_count": legacy_marker_count,
+            "standalone_footnote_heading_count": standalone_heading_count,
+            "interleaved_definition_chapter_count": (
+                interleaved_definition_chapter_count
+            ),
         },
         issues=issues,
     )
@@ -3246,6 +3473,14 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
                 ).strip()
                 if _docx_page_field_only_footer(part_root):
                     page_number_footer_count += 1
+                    issues.append(
+                        _issue(
+                            "docx_unexpected_header_footer_or_notes",
+                            "Word 成品不得包含 PAGE 页码字段或其他页眉页脚内容。",
+                            path=f"{path}!/{member}",
+                            text=visible_part[:300],
+                        )
+                    )
                     continue
                 if visible_part or re.search(r"\b(?:PAGE|NUMPAGES)\b", raw_part, re.I):
                     issues.append(

@@ -1,4 +1,4 @@
-# 影印书编译 Agent
+# 影印书与数字文档编译 Agent
 
 这个仓库的主流程是：
 
@@ -14,7 +14,7 @@
 Graph 当前只有两种 source mode：默认的 `scanned-pdf` 和显式的
 `text-pdf`。后者用于每页都有完整可复制文字层的 born-digital
 PDF，执行
-`source.inspect → pages.text_extract → pages.translate → toc/compile → semantic`
+`source.inspect → pages.text_extract → [可选 pages.translate] → toc/compile → semantic`
 并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。
 系统不会根据 PDF 内容自动猜测入口。EPUB 目前不是第三种 Graph
 source mode；它仍通过 `epub_semantic_import.py` 和
@@ -91,7 +91,8 @@ translation-agent/
 ├── recipes/
 │   ├── full-publication.toml     # 完整出版物
 │   ├── chinese-pdf-word.toml     # 中文 PDF → Word
-│   └── outline-word.toml         # PDF 内置目录 → Word
+│   ├── outline-word.toml         # PDF 内置目录 → Word
+│   └── text-pdf-full-publication.toml # 文本层 PDF → 完整出版物
 ├── translation_agent_api.py      # 传统与 Graph 程序化调用接口
 ├── frontend_app.py               # Streamlit 低代码控制台
 ├── frontend_service.py           # 安全子进程、日志和产物服务层
@@ -102,12 +103,23 @@ translation-agent/
 ├── local_ocr/                    # Unix socket 服务、双卡 worker 池和阅读顺序
 ├── deploy/paddleocr/             # 隔离的 PaddleOCR GPU 安装与部署说明
 ├── publication_verifier.py       # 无模型调用的统一发布质量门
+├── publication_semantics.py      # 正文块、引注与注释关系重建
+├── evidence_contract.py          # 证据路径、SHA 和来源绑定的只读验证器
+├── audit_paddle_footnote_layout.py # 本地 OCR 全页脚注版面审计
+├── epub_semantic_import.py       # EPUB 独立语义导入/回填入口
+├── born_digital_pdf_import.py    # 数字 PDF 独立语义单元导入器
+├── semantic_translation_runner.py # 语义单元翻译准备/运行器
+├── docx_footnotes.py             # Word 真脚注生成与检查
+├── docx_render_gate.py           # LibreOffice 固定字体渲染门
 ├── pipeline.example.toml         # 不含密钥的模型配置示例
 ├── pipeline.local-gpu.toml       # 双 A100 / PP-OCRv6 Medium Profile
 ├── pdf_text_agent.py             # 兼容旧检查点的旧入口
 ├── patch_translations.py         # 新格式译文人工修补工具
 ├── extract_textbook_layer.py     # 新格式文本层提取工具
 ├── work/note_reflow.py           # 章节注释重组工具（见下文）
+├── docs/
+│   ├── unified-semantic-dag.md   # 当前语义路线与统一架构目标
+│   └── epub-semantic-input.md    # EPUB 独立导入说明
 ├── archive/
 │   ├── karatani/                 # 硬编码单本书的一次性脚本
 │   └── legacy/monitor.py         # 仅适用旧 Windows 流程
@@ -124,6 +136,312 @@ translation-agent/
 页级 CAS 和断点检查点。Graph 只接管节点选择、依赖规划、节点缓存、事件记录
 和输出目录互斥。原有命令可以继续使用；要获得可组合能力时，把入口改为
 `graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
+
+### 全路线总览
+
+先区分“当前可执行路线”和“目标架构”，以免把路线图当成已经实现的入口：
+
+| 输入 / 调用面 | 当前状态 | 推荐出口 |
+| --- | --- | --- |
+| 影印 PDF | Graph `scanned-pdf`，视觉 OCR | `publication.word_report` 或 `publication.report` |
+| 完整文字层 PDF | Graph `text-pdf`，不注册 OCR | `publication.word_report` 或 `publication.report` |
+| 已有逐页检查点 | Graph `pages.load` / 可选 `pages.import` | 从校勘、翻译、目录或编译续跑 |
+| 已有章节 Markdown | 独立 `epub` / `docx` phase | 单独重建对应容器 |
+| EPUB | 独立语义导入、翻译、回填流程；尚不是 Graph source mode | 回填章节后调用现有 publisher / verifier |
+| born-digital PDF 语义单元 | 独立导入器可用；完整发布仍推荐 `text-pdf` Graph | 语义翻译单元或完整多格式发布 |
+| Streamlit | 当前启动 `book_pipeline.py` 子进程，不是 Graph 编辑器 | 传统 phase / Profile 低代码运行 |
+| 统一三入口语义 Graph | 设计目标，尚未实现 | 见 `docs/unified-semantic-dag.md` |
+
+当前调用面如下。Graph CLI 与 Graph Python API 进入同一个规划器；传统 API、
+Streamlit 和旧检查点入口仍保留，但不会被文档误标为 Graph：
+
+```mermaid
+flowchart LR
+    GCLI["graph_pipeline.py<br/>Graph CLI"] --> PREP["prepare_book_graph"]
+    GAPI["GraphRunRequest<br/>prepare_graph / plan_graph / run_graph"] --> PREP
+    PREP --> EXEC["GraphExecutor<br/>依赖闭包、缓存、事件、输出锁"]
+    EXEC --> ADAPTER["pipeline_graph.book<br/>Graph adapter"]
+    ADAPTER --> STAGE["复用 book_pipeline 的成熟 stage 实现"]
+
+    WEB["Streamlit 前端"] --> JOB["frontend_service.PipelineJob"]
+    JOB --> LEGACYPROC["book_pipeline.py 子进程<br/>当前非 Graph"]
+    LEGACYPROC --> STAGE
+    LEGACYCLI["直接运行 book_pipeline.py"] --> STAGE
+    LAPI["RunRequest / run_book<br/>进程内调用"] --> STAGE
+    OLD["pdf_text_agent.py"] --> CHECKPOINT["旧 _checkpoints 兼容路线"]
+```
+
+Graph 的完整数据流如下。`toc.resolve`、`toc.from_outline` 与 compile 时读取的
+`toc.load` 是互斥目录 Provider；虚线表示续跑或可选层，不表示每次都会调用：
+
+```mermaid
+flowchart LR
+    PDF["PDF"] --> SRC["core.source.inspect<br/>source.pdf"]
+
+    SRC -->|"scanned-pdf"| OCR["core.pages.ocr"]
+    SRC -->|"text-pdf"| TEXT["core.pages.text_extract"]
+    DISK["已有 pages/ 检查点"] -.-> LOAD["core.pages.load"]
+    SRC -.-> IMPORT["可选 core.pages.import"]
+    IMPORT -.-> LOAD
+    IMPORT -.-> OCR
+
+    OCR --> RAW["pages.raw"]
+    TEXT --> RAW
+    LOAD --> RAW
+    RAW -. "可选，仅扫描 PDF" .-> PROOF["core.pages.proofread"]
+    RAW --> ACTIVE["当前页面文本"]
+    PROOF --> ACTIVE
+    ACTIVE -. "可选：非中文翻译" .-> TRANS["core.pages.translate"]
+    ACTIVE --> FINAL["最终页面文本"]
+    TRANS --> FINAL
+
+    SRC --> RESOLVE["core.toc.resolve<br/>人工 JSON 或目录 LLM"]
+    FINAL --> RESOLVE
+    SRC --> OUTLINE["core.toc.from_outline"]
+    TOCDISK["已有 toc.json"] -.-> TOCLOAD["core.toc.load"]
+    RESOLVE --> TOC["toc.mapped"]
+    OUTLINE --> TOC
+    TOCLOAD --> TOC
+
+    SRC --> COMPILE["core.chapters.compile"]
+    FINAL --> COMPILE
+    TOC --> COMPILE
+    COMPILE --> DRAFT["chapters.markdown"]
+    DRAFT --> SEM["core.reconstruct.semantic<br/>chapters.semantic"]
+    SEM --> SAN["core.publication.sanitize<br/>chapters.reader"]
+
+    SAN --> KB["core.publish.knowledge_base"]
+    SRC --> KB
+    SAN --> EPUB["core.publish.epub"]
+    SAN --> DOCX["core.publish.docx"]
+    SRC --> REFPDF["core.publish.reference_pdf"]
+    TOC --> REFPDF
+
+    KB --> FULL["core.publication.verify"]
+    EPUB --> FULL
+    REFPDF --> FULL
+    FULL --> REPORT["publication.report"]
+    DOCX --> VMODE{"验收目标<br/>二选一"}
+    VMODE -->|"完整多格式"| FULL
+    VMODE -->|"正式 Word"| WORD["core.publication.verify.word"]
+    WORD --> WORDREPORT["publication.word_report"]
+```
+
+完整 verifier 还会直接核对源 PDF、当前页面、目录、语义审计和 reader bundle；
+主图只画发布物边是为了保持可读性。参考 PDF 是视觉旁路，依赖源 PDF 与目录，
+不依赖章节 Markdown。Graph 节点之间当前按拓扑**串行**执行，只有 OCR、校勘和
+翻译节点内部使用 worker 池并行。
+
+### 两种 PDF source mode
+
+`scanned-pdf` 是影印页路线，可从四种 OCR adapter 中选择；`text-pdf` 会先对
+整本逐页验证文字层，正文内部缺少文字层时在写入检查点前阻断，不会静默回退
+OCR。两条路线最终收敛到同一种 `PageRecord`：
+
+```mermaid
+flowchart TD
+    MODE{"--source-mode<br/>默认 scanned-pdf，不自动检测"}
+    MODE -->|"scanned-pdf"| RENDER["PDF 页面渲染"]
+    RENDER --> ADAPTER{"OCR adapter"}
+    ADAPTER --> MCP["Coding Plan MCP<br/>GLM-4.6V"]
+    ADAPTER --> LOCAL["paddleocr-local<br/>双 A100"]
+    ADAPTER --> GLM["标准 glm-ocr API"]
+    ADAPTER --> TESS["本地 Tesseract"]
+    MCP --> SCANPAGE["scanned pages.raw"]
+    LOCAL --> SCANPAGE
+    GLM --> SCANPAGE
+    TESS --> SCANPAGE
+    SCANPAGE -. "仅扫描 PDF 可选校勘" .-> PROOFPAGE["pages.proofread"]
+    SCANPAGE --> PAGE["当前 PageRecord"]
+    PROOFPAGE --> PAGE
+
+    MODE -->|"text-pdf"| VALIDATE["逐页验证完整文字层"]
+    VALIDATE -->|"通过"| EXTRACT["core.pages.text_extract"]
+    VALIDATE -->|"正文内部空页"| STOP["阻断：改用 scanned-pdf"]
+    EXTRACT --> TEXTPAGE["text-layer pages.raw"]
+    TEXTPAGE --> PAGE
+
+    PAGE --> OPTIONAL["两种来源均可选翻译"]
+    OPTIONAL --> TOCANDCOMPILE["TOC、章节、语义、发布、验收"]
+```
+
+`text-pdf` 不允许 OCR、OCR import 或 `core.pages.proofread`；两种 source mode
+都可按需翻译非中文页面。纯空白首尾页可以显式保留，文本层 PDF 的内部空页则
+必须修复文字层或改走扫描路线。
+
+### 四个内置 Recipe
+
+Recipe 可以改变来源节点、目录 Provider、publisher 集合和最终验收目标；它们
+不携带模型或 Key。下图前三条显示默认 `scanned-pdf` 计划，但也可显式组合
+`--source-mode text-pdf`；第四条 Recipe 则强制 text extract 并禁用 OCR：
+
+```mermaid
+flowchart TB
+    subgraph FULL["full-publication.toml"]
+        F1["inspect → page source → toc.resolve"] --> F2["compile → semantic → sanitize"]
+        F2 --> F3["KB + EPUB + DOCX"]
+        F1 --> F4["带书签参考 PDF"]
+        F3 --> F5["publication.report"]
+        F4 --> F5
+    end
+
+    subgraph WORD["chinese-pdf-word.toml"]
+        W1["inspect → page source → toc.resolve"] --> W2["compile → semantic → sanitize"]
+        W2 --> W3["DOCX"] --> W4["publication.word_report"]
+    end
+
+    subgraph OUTLINEWORD["outline-word.toml"]
+        O1["inspect → page source"] --> O2["compile"]
+        O3["inspect → toc.from_outline"] --> O2
+        O2 --> O4["semantic → sanitize → DOCX"] --> O5["publication.word_report"]
+    end
+
+    subgraph TEXTPDF["text-pdf-full-publication.toml"]
+        T1["inspect → text_extract → toc.resolve"] --> T2["compile → semantic → sanitize"]
+        T2 --> T3["KB + EPUB + DOCX"]
+        T1 --> T4["带书签参考 PDF"]
+        T3 --> T5["publication.report"]
+        T4 --> T5
+    end
+```
+
+`outline-word` 只替换目录来源；默认扫描模式的正文走 OCR，也可显式组合
+`text-pdf` 文字层来源。`publication.docx` 只是未验收的
+中间文件；正式 Word 交付以 `publication.word_report` 为目标，完整多格式交付
+以 `publication.report` 为目标，两种报告目标不能同时选择。
+
+### 全部 phase 与续跑路线
+
+`--phase` 先确定候选节点，source mode、Recipe 与 `--target` 再取依赖闭包。
+下面列出当前全部 phase 的默认路线；在支持该来源的 translate、toc、compile、
+all 中，`text-pdf` 会把 `pages.load` / OCR 换为 `pages.text_extract`；ocr 与
+proofread phase 在 `text-pdf` 下会明确报错。outline 模式会替换目录节点：
+
+```mermaid
+flowchart TB
+    subgraph P1["phase=ocr"]
+        P1A["source.inspect"] --> P1B["pages.ocr"] --> P1C["pages.raw"]
+    end
+    subgraph P2["phase=proofread"]
+        P2A["pages.load"] --> P2B["pages.proofread"]
+    end
+    subgraph P3["phase=translate"]
+        P3A["pages.load 或 text_extract"] --> P3B["pages.translate"]
+    end
+    subgraph P4["phase=toc"]
+        P4A["source.inspect + 当前 pages"] --> P4B["toc.resolve"]
+        P4C["source.inspect"] --> P4D["toc.from_outline"]
+    end
+    subgraph P5["phase=compile"]
+        P5A["source + pages + toc.load / outline"] --> P5B["compile → semantic → sanitize"]
+        P5B --> P5C["所选 publishers → verifier"]
+    end
+    subgraph P6["phase=epub"]
+        P6A["chapters.load"] --> P6B["semantic → sanitize → EPUB"]
+    end
+    subgraph P7["phase=docx"]
+        P7A["chapters.load"] --> P7B["semantic → sanitize → DOCX"]
+    end
+    subgraph P8["phase=verify"]
+        P8A["读取已有 canonical 产物"] --> P8B["独立 verifier → 审计报告"]
+    end
+    subgraph P9["phase=status"]
+        P9A["core.pipeline.status"] --> P9B["检查点与产物状态"]
+    end
+    subgraph P10["phase=all"]
+        P10A["source adapter → 可选校勘（仅扫描）/翻译 → TOC"] --> P10B["compile → semantic → sanitize"]
+        P10B --> P10C["Recipe publishers → 正式验收报告"]
+    end
+```
+
+独立 `verify` 刻意从磁盘检查 canonical 产物，而不把它们声明成 Graph 上游；
+这样缺失或损坏会进入结构化验收报告，而不是先被 planner 截断。增量
+`--chapter-id` 只运行章节、语义、引注与内容卫生检查，不等于完整发布验收。
+
+常用 target 的含义如下：
+
+| target | 自动拉取的闭包 / 含义 |
+| --- | --- |
+| `pages.raw` | 由当前 phase 注册的 OCR、text extract 或 `pages.load` 提供；可有 import barrier |
+| `pages.proofread` | 已启用校勘时的逐页覆盖层 |
+| `pages.translated` | 已启用翻译时的逐页译文覆盖层 |
+| `toc.mapped` | `toc.resolve` 拉 source + 当前 pages；outline 只拉 source；`toc.load` 只读已有 `toc.json` |
+| `chapters.markdown` | source + 当前 pages + TOC + compile |
+| `chapters.semantic` | 章节草稿 + 引用/注释语义重建 |
+| `chapters.reader` | 语义稿 + 发布清洗 |
+| `publication.epub` / `publication.docx` / `publication.knowledge_base` | 只生成对应未整体验收的文件 |
+| `publication.reference_pdf` | source + TOC 的视觉参考旁路 |
+| `publication.word_report` | source + 当前 pages + TOC + semantic + reader + DOCX 的 Word 正式验收 |
+| `publication.report` | source + 当前 pages + TOC + semantic + reader + 全部选定 publisher 的完整验收 |
+
+`--target` 可重复指定并取依赖闭包的并集。`--import-ocr-dir` 是扫描路线的可选
+前置 barrier，不是第三种 source adapter；导入完成后仍由 `pages.ocr` 精确核对
+缓存身份，或由 `pages.load` 提供当前检查点。
+
+### EPUB 与独立语义导入路线
+
+EPUB 和高阶 born-digital PDF 语义抽取已经可以执行，但当前位于 Graph 之外。
+两种 importer 都生成带源摘要和结构保护标记的翻译单元，并与同一个 runner
+协作：
+
+```mermaid
+flowchart TB
+    subgraph EPUBLANE["EPUB：文件与译文始终绑定同一 source SHA"]
+        EPUBSRC["原始 EPUB"] --> EPUBIMP["epub_semantic_import.py import"]
+        EPUBIMP --> EUNITS["EPUB translation-units.jsonl"]
+        EUNITS --> EPREP["runner prepare → 离线 prompts 供检查"]
+        EUNITS --> ERUN["runner run → 验证后的 translations.jsonl"]
+        ERUN --> EAPPLY["epub importer apply-translations"]
+        EAPPLY --> ECHAPTERS["EPUB 语义章节 Markdown"]
+    end
+
+    subgraph PDFLANE["born-digital PDF：独立来源，不能复用 EPUB 译文"]
+        PDFSRC["born-digital PDF"] --> PDFIMP["born_digital_pdf_import.py import"]
+        PDFIMP --> PUNITS["PDF translation-units.jsonl"]
+        PUNITS --> PPREP["runner prepare → 离线 prompts 供检查"]
+        PUNITS --> PRUN["runner run → 验证后的 translations.jsonl"]
+        PRUN --> PAPPLY["PDF importer apply-translations"]
+        PAPPLY --> PCHAPTERS["PDF 语义章节 Markdown"]
+    end
+
+    ECHAPTERS --> PUBLISH["现有 EPUB / DOCX publisher"]
+    PCHAPTERS --> PUBLISH
+    ECHAPTERS --> INCREMENTAL["增量章节 gate"]
+    PCHAPTERS --> INCREMENTAL
+    ECHAPTERS -.-> WAITFULL["完整 publication.report<br/>待 Graph source adapter 与 checkpoint gate 接入"]
+    PCHAPTERS -.-> WAITFULL
+```
+
+`prepare` 与 `run` 是并列命令：前者只生成离线 prompts 供人工检查，后者才
+调用模型并产出通过结构验证的译文。翻译单元和结果均绑定来源 SHA，不允许在
+EPUB 与 PDF 之间交叉回填。
+独立 importer 不生成 PDF Graph 所需的 `pages/` 检查点，因此可以运行现有
+publisher 和增量章节 gate，但不能据此声称完整 `publication.report` 已通过。
+
+需要从带文字层 PDF 获得正式 `publication.report` 时，仍应使用
+`--source-mode text-pdf` 的完整 Graph。未来三种来源将收敛到统一语义 Provider；
+下面只是明确标注的目标架构，节点名当前不可调用：
+
+```mermaid
+flowchart LR
+    SCANF["未来影印 PDF semantic adapter"] -.-> SOURCE["document.semantic.source<br/>当前未注册"]
+    TEXTF["未来文本 PDF semantic adapter"] -.-> SOURCE
+    EPUBF["未来 EPUB semantic adapter"] -.-> SOURCE
+    SOURCE --> TPREP["core.semantic.translate.prepare"]
+    TPREP --> TRUN["core.semantic.translate.run"]
+    TRUN --> TQA["core.semantic.verify"]
+    TQA --> DECIDE{"结构、术语、定位符通过？"}
+    DECIDE -->|"否"| QUEUE["audit / review queue"]
+    DECIDE -->|"是"| APPLY["core.semantic.apply"]
+    APPLY --> PSAN["core.publication.sanitize"]
+    PSAN --> PPUB["KB / EPUB / DOCX"]
+    PPUB --> PGATE["包结构门 + 固定环境渲染门"]
+    PGATE --> PREPORT["publication.report"]
+```
+
+目标架构的完整契约、迁移名和硬阻断条件见
+[`docs/unified-semantic-dag.md`](docs/unified-semantic-dag.md)；当前 EPUB 命令见
+[`docs/epub-semantic-input.md`](docs/epub-semantic-input.md)。
 
 ### 先查看计划
 
@@ -159,14 +477,20 @@ python graph_pipeline.py "book/中文书.pdf" -o "outputs/中文书" \
 python graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书" \
   --phase all --config pipeline.toml \
   --recipe recipes/outline-word.toml
+
+# 带完整文字层的 PDF：不调用 OCR，发布全部格式
+python graph_pipeline.py "book/文本书.pdf" -o "outputs/文本书" \
+  --phase all --source-mode text-pdf --config pipeline.toml \
+  --recipe recipes/text-pdf-full-publication.toml
 ```
 
 `outline-word` 要求源 PDF 确实包含可用书签；没有 outline 时节点会明确失败，
 不会静默退回模型目录。Recipe 是严格、纯数据 TOML，支持的字段只有
 `schema_version`、`id`、`targets`、`enable`、`disable` 和
 `required_plugins`。两份 Word Recipe 的最终产物是
-`publication.word_report`；完整多格式 Recipe 的最终产物才是
-`publication.report`。
+`publication.word_report`；两份完整多格式 Recipe 的最终产物才是
+`publication.report`。`text-pdf-full-publication` 会禁用 OCR 并启用文字层
+提取，任一正文内部页面没有可信文字层时都会停止。
 
 ### 节点与产物
 
@@ -383,6 +707,31 @@ allowlist 只是显式授权，不是沙箱或代码签名。加载 entry point 
 `enable = ["acme.cleanup_headers"]`。规划器会在执行前确认新的 Provider 能
 完整接上所有下游；缺口或重复 Provider 都会直接报错。
 
+插件替换遵循 artifact 契约，而不是把任意 Python import 写入 Recipe：
+
+```mermaid
+flowchart LR
+    RECIPE["Recipe<br/>required_plugins + enable / disable"] --> AUTH{"调用方也传入<br/>--allow-plugin？"}
+    DIST["已安装 distribution<br/>translation_agent.graph_nodes"] --> REG["NodeRegistry"]
+    AUTH -->|"否"| BLOCK["加载前阻断"]
+    AUTH -->|"是"| REG
+    REG --> PLUGIN["acme.cleanup_headers"]
+
+    SEM["chapters.semantic"] -.-> DISABLED["core.publication.sanitize<br/>Recipe 中禁用"]
+    SEM --> PLUGIN
+    PLUGIN --> READER["chapters.reader"]
+    READER --> EXISTING["现有 EPUB / DOCX / KB publisher"]
+
+    PY["可信 Python 调用方"] --> PREPARED["prepare_graph"]
+    PREPARED --> REPLACE["graph.replace / remove / add"]
+    REPLACE --> CUSTOM["自定义 NodeSpec"]
+    CUSTOM --> READER
+```
+
+外部 entry point 不能注册或覆盖 `core.*`，也不能提供私有
+`pipeline.argv`。Recipe 不能包含 Key、端点、环境变量名、Python callable 或
+shell command；allowlist 是显式执行授权，不是沙箱或代码签名。
+
 ### `all` 与可选校勘
 
 为了保持旧行为和避免对整本书产生额外模型调用，传统入口及 Graph 的
@@ -400,6 +749,51 @@ python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
 Python 调用则设置 `GraphRunRequest(include_proofread=True)`。校勘节点会插在
 OCR 与翻译/目录/编译之间，仍使用 Profile 选择的 `proofread_profile`；仅在
 Profile 中填写 `proofread_profile` 不会自动启用该节点。
+
+### 模型 Agent 与确定性节点
+
+模型只参与 OCR、可选校勘、可选翻译和自动目录结构化。章节装配、语义重建、
+发布清洗、容器生成和验收全部是确定性代码：
+
+```mermaid
+flowchart LR
+    PROFILE["Profile TOML<br/>模型、端点、credential_env"] --> SELECT["按 stage 解析 Profile"]
+    KEY["环境变量中的 API Key"] -.-> SELECT
+    PDFPAGE["PDF 页面"] --> OCRSEL{"OCR adapter"}
+    SELECT --> OCRSEL
+    OCRSEL --> GLMV["GLM-4.6V<br/>Coding Plan MCP"]
+    OCRSEL --> PADDLE["PP-OCRv6 Medium<br/>本地双 A100"]
+    OCRSEL --> GLMOCR["标准 GLM OCR API"]
+    OCRSEL --> TESS["Tesseract"]
+    GLMV --> RAW["原始 OCR text"]
+    PADDLE --> RAW
+    GLMOCR --> RAW
+    TESS --> RAW
+    RAW --> STORE["PageStore<br/>page_XXXX.json"]
+
+    STORE -. "显式启用" .-> PROOF["校勘 Profile<br/>默认 DeepSeek V4 Flash"]
+    STORE --> EFFECTIVE["effective_text"]
+    PROOF --> EFFECTIVE
+    EFFECTIVE --> LANG{"非中文且启用翻译？"}
+    LANG -->|"是"| TRANSLATE["翻译 Profile<br/>默认 DeepSeek V4 Flash"]
+    LANG -->|"否"| COMPILETEXT["compile_text"]
+    TRANSLATE --> COMPILETEXT
+
+    COMPILETEXT --> TOCLLM["目录 Profile<br/>默认 GLM-5.2"]
+    TOCLLM --> MAP["确定性 schema 规范化与页码映射"]
+    MANUAL["人工 toc.json"] --> MAP
+    COMPILETEXT --> MAP
+    MAP --> TOCJSON["toc.mapped"]
+    PDFPAGE --> OUTLINEDET["确定性 PDF outline 解析"]
+    OUTLINEDET --> TOCJSON
+    COMPILETEXT --> DET["章节、语义、清洗、publisher"]
+    TOCJSON --> DET
+    DET --> VERIFYDET["无模型 publication verifier"]
+```
+
+原始 OCR `text` 永远不会被校勘或翻译覆盖；校勘写入基于原文 SHA 的覆盖层，
+翻译写入基于新鲜 `effective_text` SHA 的覆盖层。目录 Agent 保持完整目录上下文，
+不按页拆成多个并发请求。Key 只在运行时解析，不进入 Recipe、缓存指纹或状态文件。
 
 ## 低代码 Web 控制台
 
@@ -456,7 +850,10 @@ python3.12 -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-OCR 和目录结构化默认使用 Coding Plan；非中文翻译使用独立的 DeepSeek API。在本地 `.env` 中分别填写两套凭据：
+使用 `pipeline.example.toml` 时，OCR 与目录结构化走 Coding Plan，非中文翻译
+走独立 DeepSeek API；使用 `pipeline.local-gpu.toml` 时只有 OCR 改为本地
+PaddleOCR，目录和翻译 Profile 保持独立。在本地 `.env` 中按所选 Profile
+填写所需凭据：
 
 ```bash
 GLM_API_MODE=coding-plan
@@ -491,7 +888,7 @@ TRANSLATION_CONCURRENCY=16
 推荐把非敏感的端点、模型和 worker 数放进
 `pipeline.example.toml` 这样的 Profile 文件；Profile 只保存
 `credential_env = "DEEPSEEK_API_KEY"`，绝不保存 Key 本身。
-`credential_env` 必须是合法的环境变量名；若误填原始 Key，配置加载会立即拒绝：
+`credential_env` 必须是合法的环境变量名；若误填原始 Key，配置加载会立即拒绝。
 
 日文竖排书可直接在 OCR Profile 中设置
 `reading_direction = "vertical"`；命令行参数仍可临时覆盖。OCR 执行、缓存
@@ -504,8 +901,9 @@ export GLM_CODING_API_KEY='...'
 export GLM_TOC_API_KEY='...'
 export DEEPSEEK_API_KEY='...'
 
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
-  --phase all --config pipeline.toml
+python graph_pipeline.py "input.pdf" -o "outputs/my_book" \
+  --phase all --config pipeline.toml \
+  --recipe recipes/full-publication.toml
 ```
 
 切换模型只需选择另一个 Profile：
@@ -532,7 +930,10 @@ npx -y @z_ai/mcp-server@0.1.4
 仓库、示例 Profile 和诊断提示统一固定为 `@z_ai/mcp-server@0.1.4`；不要改成
 `@latest`，否则上游包更新会在没有配置变更的情况下改变 OCR 行为和缓存身份。
 
-密钥不会写入输出文件。OCR/目录 Key 与翻译 Key 必须分别使用 `GLM_CODING_API_KEY` 和 `DEEPSEEK_API_KEY`；推荐只用环境变量，避免密钥出现在 shell 历史或进程列表。
+密钥不会写入输出文件。示例 Profile 的三个凭据槽分别是 OCR 的
+`GLM_CODING_API_KEY`、目录的 `GLM_TOC_API_KEY` 和翻译的
+`DEEPSEEK_API_KEY`；前两个环境变量可以配置成同一个 Coding Plan Key，但不能
+省略其中一个名称。推荐只用环境变量，避免密钥出现在 shell 历史或进程列表。
 
 DeepSeek 默认模型是 `deepseek-v4-flash`，OpenAI 兼容地址保持为 `https://api.deepseek.com`。需要 Pro 时可显式选择 `deepseek_pro` Profile，但它不再是本流水线默认值。官方已公告旧模型名 `deepseek-chat` 和 `deepseek-reasoner` 已于北京时间 2026-07-24 23:59 停止使用，因此新配置不要再使用这两个兼容别名；详见 [DeepSeek V4 更新日志](https://api-docs.deepseek.com/zh-cn/updates) 与 [模型说明](https://api-docs.deepseek.com/zh-cn/quick_start/pricing/)。
 
@@ -627,6 +1028,11 @@ batch、队列和临时目录；调整这些吞吐参数不会使已有页面失
 继续包含 DPI、最大图片边长和 JPEG 质量。调整渲染参数会准确刷新页面文字，
 但不会重启内容相同的已预热 GPU 服务。
 
+新生成的本地 OCR 检查点还会在 `ocr_metadata` 中保存经过白名单和限长处理的
+文字框 `bbox`/polygon、置信度与阅读方向，用于离线复核页脚区、栏序和边注，
+无需再次占用 GPU。该元数据不改变文字身份；已有旧缓存只有在相应页面重跑 OCR
+后才会补齐布局信息，流水线不会仅为补元数据强制重识别整本书。
+
 默认 `persistent = true` 会让服务在 OCR 阶段后继续占用两张 GPU，
 以便下本书复用已预热模型；释放 GPU 的正常停服命令见部署文档。
 
@@ -637,8 +1043,41 @@ batch、队列和临时目录；调整这些吞吐参数不会使已有页面失
 极限吞吐选项。不同版式仍应通过代表页逐步测试实例数与识别 batch；不要在
 没有字错率基线时盲目启用 TensorRT。详细安装、健康检查和调优方法见
 [`deploy/paddleocr/README.md`](deploy/paddleocr/README.md)。
+从双卡吞吐基准到脚注审定、证据封存和终态 GPU 清理的完整经验见
+[`docs/local-ocr-publication-retrospective.md`](docs/local-ocr-publication-retrospective.md)。
 仓库同时提供 `deploy/paddleocr/benchmark.py`，可在不污染正式输出目录的
 前提下记录渲染与推理的 pages/s、p50/p95 和置信度。
+
+本地双卡执行图如下。每张 A100 运行独立模型副本做页面数据并行，不做
+tensor parallel；模型常驻服务跨页面和后续任务复用：
+
+```mermaid
+flowchart LR
+    GRAPH["core.pages.ocr"] --> RENDERPOOL["CPU 渲染池<br/>私有 0700 临时目录"]
+    RENDERPOOL --> IMAGES["0600 页图有界队列"]
+    IMAGES --> CLIENT["PaddleLocalOCR client"]
+    CLIENT --> SOCKET["UID 私有 Unix socket"]
+    SOCKET --> SERVICE["paddle_service<br/>动态任务队列"]
+
+    SERVICE --> G0A["GPU 0<br/>PP-OCRv6 Medium × 8 instances"]
+    SERVICE --> G1A["GPU 1<br/>PP-OCRv6 Medium × 8 instances"]
+    G0A --> RESULTS["文字、polygon、confidence"]
+    G1A --> RESULTS
+    RESULTS --> ORDER["横排 / 竖排阅读顺序与页边栏重组"]
+    ORDER --> CLIENT
+    CLIENT --> STORE["PageStore 原子检查点"]
+
+    CONTENT["content identity<br/>模型、引擎、方向、阅读顺序版本"] --> SERVICE
+    RENDERID["checkpoint identity<br/>content + DPI + 最大边长 + JPEG 质量"] --> STORE
+    RUNTIME["runtime<br/>GPU、instances、batch、queue"] -.-> SERVICE
+```
+
+`content` 变化会改变服务与页面身份；若旧常驻 socket 仍在，客户端会明确拒绝，
+应先按部署文档停服再启动新模型。DPI 等渲染参数只改变逐页 checkpoint 身份，
+可以复用内容相同的服务。GPU 分配、实例数、batch、queue、timeout 等吞吐配置
+不改变文字缓存，但要让常驻服务采用新 runtime 仍需先停服重启。
+服务 socket、锁、日志和页图均位于当前 UID 的私有运行目录，且不会跟随预置
+symlink。完整部署与停服命令见 `deploy/paddleocr/README.md`。
 
 ### 本地 Tesseract OCR（可选后端）
 
@@ -679,17 +1118,29 @@ book-images.zip
 ## 一条命令完成
 
 ```bash
-python book_pipeline.py "input.pdf" \
+python graph_pipeline.py "input.pdf" \
   -o "outputs/my_book" \
   --phase all \
+  --config pipeline.toml \
+  --recipe recipes/full-publication.toml \
   --granularity chapter \
   --translate-non-chinese \
-  --translation-provider deepseek \
-  --ocr-concurrency 4 \
-  --translation-concurrency 16
+  --translation-source-language auto
 ```
 
-程序默认：
+先用 `--plan` 预览而不执行，只需在末尾增加 `--plan`。如果使用本地双 A100，
+把 `--config pipeline.toml` 换为 `--config pipeline.local-gpu.toml`；如果原书
+已经是中文，则删除 `--translate-non-chinese` 和语言参数。
+
+需要完全保持旧自动化脚本时，兼容入口仍可执行同一成熟阶段实现：
+
+```bash
+python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+  --phase all --config pipeline.toml \
+  --granularity chapter --translate-non-chinese
+```
+
+使用 `pipeline.example.toml` 的 Coding Plan OCR Profile 时，程序会：
 
 1. 把 PDF 每页渲染为临时 JPG，通过 Coding Plan 视觉 MCP 明确调用 GLM-4.6V，按 `--ocr-concurrency` 并行保存逐页 JSON；日文竖排的横向双页扫描会先沿书脊拆成右页、左页，超时或 1301 内容过滤时继续沿空白列/行细分，避免机械重试同一密集整页；
 2. 将前 40 页 OCR 文本交给 GLM 判断目录页并输出目录 JSON；
@@ -860,6 +1311,63 @@ python book_pipeline.py -o "outputs/my_book" --phase docx --title "书名"
 失败都会使命令返回非零状态，并把机器可读报告写到
 `audit/release-report.json`。也可独立运行：
 
+```mermaid
+flowchart TD
+    REQUEST["Graph 请求"] --> LOCK["output.lock<br/>Graph 与传统入口共用"]
+    SOURCE["源路径 + SHA-256 + source mode"] --> BIND["source.json<br/>输出目录来源绑定"]
+    LOCK --> PLAN["拓扑计划"]
+    BIND --> PLAN
+    PLAN --> NODEFP["节点指纹 + 输入 artifact 摘要"]
+    STATE["state.json"] --> CACHE{"node.cache=true、指纹一致<br/>且 artifact validator 通过？"}
+    NODEFP --> CACHE
+    CACHE -->|"是"| SKIP["node_skipped"]
+    CACHE -->|"否 / force"| RUN["执行 Handler 并校验 NodeResult"]
+    SKIP --> EVENTS["events.jsonl"]
+    RUN --> EVENTS
+
+    RUN -. "页处理节点" .-> PAGECACHE["第二层：页级 PageStore 检查点"]
+    PAGECACHE --> FRESH{"源 SHA、模型、提示词、渲染身份新鲜？"}
+    FRESH -->|"是"| REUSE["逐页复用"]
+    FRESH -->|"否"| REBUILD["只重算陈旧或缺失页"]
+    REBUILD --> CAS["原子写入 + CAS<br/>拒绝并发陈旧响应"]
+
+    RUN -. "compile 节点" .-> DRAFT["不可变 chapter_drafts"]
+    DRAFT --> SEMAUDIT["语义重建审计"]
+    SEMAUDIT --> READER["sanitize → chapters.reader"]
+    READER --> TEXTPUBS["按 profile 选择的文字出版物<br/>Word=DOCX；full=EPUB + DOCX + KB"]
+    SOURCE --> REFPUB["full profile：带书签参考 PDF"]
+    TOCSTATE["toc.mapped"] --> REFPUB
+    TEXTPUBS --> CHECKS["publication_verifier.CHECK_IDS<br/>当前 13 类确定性检查"]
+    REFPUB -. "仅 full 要求" .-> CHECKS
+    CHECKS -->|"全部硬门通过"| PASS["word_report 或 publication.report"]
+    CHECKS -->|"任一硬门失败"| FAIL["failed 审计报告仍落盘<br/>不登记成功 report artifact"]
+```
+
+Graph 缓存与页级检查点是两层机制：前者避免重跑纯节点，后者按页核对 OCR、
+校勘和翻译身份。当前检查项由 `publication_verifier.CHECK_IDS` 定义，以实际
+报告为准；它们覆盖检查点、manifest、章节文件、审定稿、语义、引注、内容
+卫生、EPUB、DOCX、DOCX 固定环境渲染、知识库、PDF 书签和运行卫生。
+为什么 pages/s 不能代表出版质量，以及 ground truth、覆盖层 CAS、证据 SHA
+和分阶段门禁的推荐做法，见
+[`本地 OCR 书籍发布复盘`](docs/local-ocr-publication-retrospective.md)。
+
+对人工 ground truth、锚点和版面报告的证据链，发布前还应运行只读契约校验：
+
+```bash
+python evidence_contract.py \
+  "outputs/my_book/audit/full-footnote-image-review.json" \
+  "outputs/my_book/audit/footnote-evidence/layout-all205-final.json" \
+  --project-root . --source "input.pdf"
+```
+
+默认会递归遍历被 SHA 绑定的 JSON 证据图；引用的当前文件必须存在且
+字节摘要相等。已不保留原始字节的历史证据必须写成 `path: null`，并显式标记
+`historical` 或 `superseded`；不得让一个可变 `/tmp` 路径伪装成当前证据。
+
+Word profile 允许 EPUB、知识库和参考 PDF 三项 skip，其余门必须通过；full
+profile 要求全部选定格式通过。warning 不自动阻断，但必须由人工解释，不能
+仅凭 `warnings=0` 或文件存在就宣布完成。
+
 ```bash
 python book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase verify --report "outputs/my_book/audit/release-report.json"
@@ -956,7 +1464,7 @@ compare-and-swap；若模型返回前 OCR 已更新，陈旧译文会被丢弃�
 完整的日语图片书工作流可以分阶段执行，便于复核和断点续传：
 
 ```bash
-# 先对已经转正的 PDF 做本地日语 OCR
+# 先对已经转正的 PDF 做 Coding Plan 视觉 OCR
 python book_pipeline.py "book_正向.pdf" -o "outputs/book" \
   --phase ocr --ocr-backend coding-plan-mcp \
   --ocr-reading-direction vertical \
@@ -994,6 +1502,37 @@ python book_pipeline.py -o "outputs/book" --phase status \
 
 ## Python 调用接口
 
+推荐的 Graph API 会先构图，可在执行前查看或替换节点：
+
+```python
+from translation_agent_api import (
+    GraphRunRequest,
+    RunRequest,
+    plan_graph,
+    run_graph,
+)
+
+request = GraphRunRequest(
+    pipeline=RunRequest(
+        input_pdf="book/input.pdf",
+        output_dir="outputs/input",
+        phase="all",
+        config="pipeline.toml",
+        translate_non_chinese=True,
+        source_language="ja",
+        require_complete_ocr=True,
+        require_translation=True,
+    ),
+    recipe="recipes/full-publication.toml",
+    source_mode="scanned-pdf",
+)
+print(plan_graph(request))
+result = run_graph(request)
+assert "publication.report" in result.values
+```
+
+兼容 API 仍可直接调用传统阶段入口：
+
 ```python
 from translation_agent_api import RunRequest, run_book
 
@@ -1014,7 +1553,7 @@ result = run_book(
 assert result.ok, result.status
 ```
 
-`RunRequest` 不提供 API Key 字段。调用进程通过 Profile 中的
+`RunRequest` 与 `GraphRunRequest` 都不提供 API Key 字段。调用进程通过 Profile 中的
 `credential_env` 解析凭据，因此可以安全地轮换账号或切换模型。
 
 ## 输出结构
@@ -1041,6 +1580,30 @@ outputs/my_book/
 ```
 
 ## 常用参数
+
+Graph 专用参数可用 `python graph_pipeline.py --graph-help` 查看；所有传统
+pipeline 参数也可直接透传：
+
+```text
+--recipe FILE                 选择严格数据型 Recipe
+--source-mode scanned-pdf|text-pdf  来源模式；默认 scanned-pdf，不自动检测
+--text-pdf-sort               文本层模式按视觉位置排序
+--text-pdf-reflow             文本层模式合并段内视觉换行
+--text-pdf-strip-leading-page-number-offset N  仅按严格偏移清理页首数字
+--target ARTIFACT             执行目标依赖闭包，可重复
+--include-proofread           在页面来源与翻译/目录之间插入校勘
+--toc-source pipeline|outline 选择目录解析或 PDF 内置书签
+--enable-node NAME            启用可选内置节点或 Recipe 声明的插件节点
+--disable-node NAME           删除节点；缺依赖时规划立即失败
+--allow-plugin ENTRY_POINT    授权一个已安装且被 Recipe 要求的插件
+--force-node NAME             只忽略指定 Graph 节点缓存，可重复
+--force-graph                 忽略全部 Graph 节点缓存，不等于重做页级检查点
+--adopt-existing-output       首次确认并绑定升级前的完整旧输出目录
+--plan                        只输出依赖图，不执行或创建产物
+--graph-help                  显示 Graph 专用参数帮助
+```
+
+传统阶段与模型参数：
 
 ```text
 --phase all|ocr|proofread|translate|toc|compile|epub|docx|verify|status

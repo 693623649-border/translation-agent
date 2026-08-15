@@ -294,7 +294,28 @@ class PaddleIntegrationTests(unittest.TestCase):
                 return (
                     PaddleOCRText(
                         "本地识别正文",
-                        {"line_count": 2, "mean_score": 0.98, "minimum_score": 0.91},
+                        {
+                            "line_count": 2,
+                            "mean_score": 0.98,
+                            "minimum_score": 0.91,
+                            "reading_direction": "horizontal",
+                            "horizontal_columns": 1,
+                            "layout_line_count": 1,
+                            "layout_lines": [
+                                {
+                                    "text": "本地识别正文",
+                                    "score": 0.98,
+                                    "bbox": [10, 20, 110, 40],
+                                    "polygon": [
+                                        [10, 20],
+                                        [110, 20],
+                                        [110, 40],
+                                        [10, 40],
+                                    ],
+                                }
+                            ],
+                            "api_key": "must-not-be-persisted",
+                        },
                     ),
                     "local-request",
                 )
@@ -331,6 +352,17 @@ class PaddleIntegrationTests(unittest.TestCase):
             record = load_page_records(output)[0]
             self.assertIn("ocr_line_count=2", record.notes)
             self.assertIn("ocr_mean_score=0.980000", record.notes)
+            self.assertEqual(record.ocr_metadata["layout_line_count"], 1)
+            self.assertEqual(record.ocr_metadata["schema_version"], 1)
+            self.assertEqual(
+                record.ocr_metadata["layout_lines"][0]["bbox"],
+                [10.0, 20.0, 110.0, 40.0],
+            )
+            checkpoint = (output / "pages" / "page_0001.json").read_text(
+                encoding="utf-8"
+            )
+            self.assertNotIn("must-not-be-persisted", checkpoint)
+            self.assertNotIn("api_key", checkpoint)
             self.assertFalse(any(spool.iterdir()))
 
     def test_temporary_rendered_page_and_directory_are_private(self) -> None:

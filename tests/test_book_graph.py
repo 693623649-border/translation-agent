@@ -181,6 +181,23 @@ class BookGraphPlanningTests(unittest.TestCase):
         self.assertIn(NODE_OCR, _plan_names(prepared))
         self.assertNotIn(NODE_TEXT_EXTRACT, _plan_names(prepared))
 
+    def test_compile_cache_version_tracks_mixed_markdown_note_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prepared = prepare_book_graph(
+                [
+                    str(Path(directory) / "book.pdf"),
+                    "--output-dir",
+                    str(Path(directory) / "output"),
+                    "--phase",
+                    "compile",
+                ]
+            )
+
+        compile_node = next(
+            node for node in prepared.graph.nodes if node.name == NODE_COMPILE
+        )
+        self.assertEqual(compile_node.version, "12")
+
     def test_text_pdf_specific_options_require_explicit_mode(self) -> None:
         with self.assertRaisesRegex(BookGraphConfigurationError, "text_pdf_.*require"):
             BookGraphOptions(text_pdf_reflow=True)

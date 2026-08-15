@@ -1027,7 +1027,7 @@ def _sanitize_fingerprint(context: GraphContext) -> dict[str, Any]:
     args = _parsed_args(context)
     return {
         "adapter": GRAPH_ADAPTER_VERSION,
-        "sanitizer": "publication-metadata-v5",
+        "sanitizer": "publication-reader-reflow-v6",
         "title": _book_title(context),
     }
 
@@ -3370,7 +3370,7 @@ def prepare_book_graph(
         _sanitize_handler,
         requires=(ART_SEMANTIC_CHAPTERS,),
         provides=(ART_READER_CHAPTERS,),
-        version="4",
+        version="5",
         fingerprint=_sanitize_fingerprint,
         # Sanitize also rebinds the semantic audit from immutable draft bytes
         # to reader bytes.  Re-enter it even when Markdown output is unchanged;
@@ -3464,7 +3464,7 @@ def prepare_book_graph(
                     _docx_handler(ART_READER_CHAPTERS),
                     requires=(ART_READER_CHAPTERS,),
                     provides=(ART_DOCX,),
-                    version="4",
+                    version="7",
                     fingerprint=_publisher_fingerprint("docx"),
                     cache_validator=_publication_file_is_current(ART_DOCX),
                     description="Build Word from chapter Markdown.",
@@ -3639,7 +3639,7 @@ def prepare_book_graph(
                         ),
                         requires=(ART_SOURCE, current_pages, ART_TOC),
                         provides=(ART_CHAPTERS,),
-                        version="7",
+                        version="12",
                         fingerprint=_reviewed_fingerprint,
                         cache_validator=_compile_inputs_are_current(current_pages),
                         description="Compile page text and mapped TOC into chapter Markdown.",
@@ -3680,7 +3680,7 @@ def prepare_book_graph(
                             _docx_handler(ART_READER_CHAPTERS),
                             requires=(ART_READER_CHAPTERS,),
                             provides=(ART_DOCX,),
-                            version="4",
+                            version="7",
                             fingerprint=_publisher_fingerprint("docx"),
                             cache_validator=_publication_file_is_current(ART_DOCX),
                             description="Publish Word from final chapter text.",

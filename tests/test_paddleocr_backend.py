@@ -565,6 +565,63 @@ class PaddleBackendTests(unittest.TestCase):
         )
         self.assertEqual(text, "第一行\n第二行")
         self.assertEqual(metadata["line_count"], 2)
+        self.assertEqual(metadata["layout_line_count"], 2)
+        self.assertFalse(metadata["layout_lines_truncated"])
+        self.assertEqual(
+            metadata["layout_lines"],
+            [
+                {
+                    "text": "第一行",
+                    "text_truncated": False,
+                    "score": 0.95,
+                    "bbox": [0.0, 0.0, 20.0, 10.0],
+                    "polygon": [
+                        [0.0, 0.0],
+                        [20.0, 0.0],
+                        [20.0, 10.0],
+                        [0.0, 10.0],
+                    ],
+                },
+                {
+                    "text": "第二行",
+                    "text_truncated": False,
+                    "score": 0.9,
+                    "bbox": [0.0, 20.0, 20.0, 30.0],
+                    "polygon": [
+                        [0.0, 20.0],
+                        [20.0, 20.0],
+                        [20.0, 30.0],
+                        [0.0, 30.0],
+                    ],
+                },
+            ],
+        )
+
+    def test_extract_page_bounds_layout_metadata_without_changing_text(self) -> None:
+        prediction = {
+            "res": {
+                "rec_texts": ["甲", "乙"],
+                "rec_scores": [0.9, 0.8],
+                "rec_polys": [
+                    [[0, 0], [20, 0], [20, 10], [0, 10]],
+                    [[0, 20], [20, 20], [20, 30], [0, 30]],
+                ],
+            }
+        }
+        with patch("local_ocr.paddle_service.MAX_LAYOUT_METADATA_LINES", 1), patch(
+            "local_ocr.paddle_service.MAX_LAYOUT_METADATA_TEXT_CHARS", 0
+        ):
+            text, metadata = _extract_page(
+                prediction,
+                reading_direction="horizontal",
+                horizontal_columns=1,
+            )
+        self.assertEqual(text, "甲\n乙")
+        self.assertEqual(metadata["line_count"], 2)
+        self.assertEqual(metadata["layout_line_count"], 2)
+        self.assertTrue(metadata["layout_lines_truncated"])
+        self.assertEqual([item["text"] for item in metadata["layout_lines"]], [""])
+        self.assertTrue(metadata["layout_lines"][0]["text_truncated"])
 
     def test_extract_page_handles_numpy_arrays_and_true_blank_page(self) -> None:
         try:
@@ -591,6 +648,8 @@ class PaddleBackendTests(unittest.TestCase):
         )
         self.assertEqual(blank, "[空白页]")
         self.assertTrue(metadata["blank_page"])
+        self.assertEqual(metadata["layout_lines"], [])
+        self.assertFalse(metadata["layout_lines_truncated"])
 
 
 class ProtocolTests(unittest.TestCase):

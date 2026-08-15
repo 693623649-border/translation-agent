@@ -30,6 +30,14 @@ from .reading_order import TextLine, order_text_lines
 from .runtime_paths import ensure_private_directory, expand_runtime_path
 
 
+# Layout metadata is an audit aid, not part of the OCR text/cache identity.
+# Keep the response bounded even if a detector produces pathological output.
+# These caps also keep the worst-case UTF-8 response comfortably below the
+# local protocol's 16 MiB message limit.
+MAX_LAYOUT_METADATA_LINES = 2048
+MAX_LAYOUT_METADATA_TEXT_CHARS = 512
+
+
 def _acquire_runtime_lock(
     path: Path,
     *,
@@ -146,6 +154,9 @@ def _extract_page(
             "reading_direction": reading_direction,
             "horizontal_columns": horizontal_columns,
             "blank_page": True,
+            "layout_line_count": 0,
+            "layout_lines_truncated": False,
+            "layout_lines": [],
         }
     lines: list[TextLine] = []
     for index, value in enumerate(texts):
@@ -173,6 +184,18 @@ def _extract_page(
         "minimum_score": min(line_scores) if line_scores else 0.0,
         "reading_direction": reading_direction,
         "horizontal_columns": horizontal_columns,
+        "layout_line_count": len(ordered),
+        "layout_lines_truncated": len(ordered) > MAX_LAYOUT_METADATA_LINES,
+        "layout_lines": [
+            {
+                "text": line.text[:MAX_LAYOUT_METADATA_TEXT_CHARS],
+                "text_truncated": len(line.text) > MAX_LAYOUT_METADATA_TEXT_CHARS,
+                "score": line.score,
+                "bbox": [line.left, line.top, line.right, line.bottom],
+                "polygon": [[x, y] for x, y in line.polygon],
+            }
+            for line in ordered[:MAX_LAYOUT_METADATA_LINES]
+        ],
     }
     return text, metadata
 

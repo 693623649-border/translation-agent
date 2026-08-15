@@ -10,6 +10,7 @@ import html
 import http.client
 import inspect
 import json
+import math
 import os
 import re
 import select
@@ -57,12 +58,15 @@ from local_ocr.runtime_paths import ensure_private_directory
 from publication_verifier import verify_publication
 from docx_footnotes import patch_docx_footnotes
 from publication_semantics import (
+    SemanticPage,
     append_markdown_footnotes,
     markdown_footnote_contract_sha256,
     markdown_footnotes_to_docx_markers,
     parse_markdown_footnotes,
+    reconstruct_adjacent_page_footnotes,
     reconstruct_page_footnotes,
     semantic_audit_summary,
+    strip_markdown_footnote_section_headings,
 )
 
 try:
@@ -83,9 +87,11 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
 TRANSLATION_PROMPT_VERSION = "book-translation-v3"
-PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v1"
+PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-zh-ja-v2"
 TOC_KINDS = {"part", "chapter", "section", "subsection", "frontmatter", "other"}
 NON_CONTENT_MARKERS = {"[无法辨认]", "[空白页]"}
+MAX_CHECKPOINT_OCR_LAYOUT_LINES = 2048
+MAX_CHECKPOINT_OCR_LAYOUT_TEXT_CHARS = 512
 
 
 def join_physical_page_texts(pages: Iterable[str]) -> str:
@@ -125,6 +131,87 @@ class PhysicalPageOCRText(str):
         return instance
 
 
+def _finite_float(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _checkpoint_ocr_metadata(value: Any) -> dict[str, Any]:
+    """Keep only bounded, non-sensitive OCR layout evidence in checkpoints.
+
+    Backend response metadata crosses a persistence boundary here.  Store the
+    geometry needed for later reading-order and footer audits, while rejecting
+    arbitrary adapter fields, non-finite values, and unbounded text/polygons.
+    """
+
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key in ("line_count", "horizontal_columns", "layout_line_count"):
+        raw = value.get(key)
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            result[key] = raw
+    for key in ("mean_score", "minimum_score"):
+        number = _finite_float(value.get(key))
+        if number is not None:
+            result[key] = number
+    direction = value.get("reading_direction")
+    if direction in {"horizontal", "vertical"}:
+        result["reading_direction"] = direction
+    for key in ("blank_page", "layout_lines_truncated"):
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            result[key] = raw
+
+    raw_lines = value.get("layout_lines")
+    if not isinstance(raw_lines, list):
+        return result
+    safe_lines: list[dict[str, Any]] = []
+    for raw_line in raw_lines[:MAX_CHECKPOINT_OCR_LAYOUT_LINES]:
+        if not isinstance(raw_line, dict):
+            continue
+        raw_text = raw_line.get("text")
+        raw_bbox = raw_line.get("bbox")
+        if not isinstance(raw_text, str) or not isinstance(raw_bbox, (list, tuple)):
+            continue
+        bbox = [_finite_float(item) for item in raw_bbox]
+        if len(bbox) != 4 or any(item is None for item in bbox):
+            continue
+        line: dict[str, Any] = {
+            "text": raw_text[:MAX_CHECKPOINT_OCR_LAYOUT_TEXT_CHARS],
+            "text_truncated": bool(raw_line.get("text_truncated"))
+            or len(raw_text) > MAX_CHECKPOINT_OCR_LAYOUT_TEXT_CHARS,
+            "bbox": [float(item) for item in bbox if item is not None],
+        }
+        score = _finite_float(raw_line.get("score"))
+        if score is not None:
+            line["score"] = score
+        raw_polygon = raw_line.get("polygon")
+        if isinstance(raw_polygon, (list, tuple)):
+            polygon: list[list[float]] = []
+            for raw_point in raw_polygon[:16]:
+                if not isinstance(raw_point, (list, tuple)) or len(raw_point) != 2:
+                    polygon = []
+                    break
+                point = [_finite_float(item) for item in raw_point]
+                if any(item is None for item in point):
+                    polygon = []
+                    break
+                polygon.append([float(item) for item in point if item is not None])
+            if len(polygon) >= 2:
+                line["polygon"] = polygon
+        safe_lines.append(line)
+    result["layout_lines"] = safe_lines
+    result["layout_lines_truncated"] = bool(
+        result.get("layout_lines_truncated")
+        or len(raw_lines) > MAX_CHECKPOINT_OCR_LAYOUT_LINES
+    )
+    result["schema_version"] = 1
+    return result
+
+
 @dataclass
 class PageRecord:
     pdf_page: int
@@ -156,6 +243,10 @@ class PageRecord:
     physical_page_texts: list[str] = field(default_factory=list)
     proofread_physical_page_texts: list[str] = field(default_factory=list)
     translated_physical_page_texts: list[str] = field(default_factory=list)
+    # Bounded detector geometry makes later layout/footnote audits possible
+    # without re-running the GPU model.  The persistence boundary strips all
+    # backend-specific or potentially sensitive fields.
+    ocr_metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def compile_text(self) -> str:
@@ -2001,7 +2092,7 @@ class ChatTranslator:
 
 
 class ChatOCRProofreader:
-    """Correct Japanese OCR without translating or replacing the raw checkpoint."""
+    """Correct Chinese or Japanese OCR without replacing the raw checkpoint."""
 
     def __init__(self, client: TextChatBackend, *, max_chars: int = 12000) -> None:
         self.client = client
@@ -2010,9 +2101,35 @@ class ChatOCRProofreader:
     def proofread(self, text: str, *, language: str) -> str:
         corrected: list[str] = []
         chunks = split_text(text, self.max_chars)
+        normalized_language = language.strip().lower().replace("_", "-")
+        chinese_source = normalized_language == "zh" or normalized_language.startswith(
+            "zh-"
+        )
         for index, chunk in enumerate(chunks, start=1):
             output_budget = min(32768, max(4096, len(chunk) * 4))
-            prompt = f"""
+            if chinese_source:
+                prompt = f"""
+请严格校勘下面的中文 OCR 原文。语言标签：{language}
+分块：{index}/{len(chunks)}
+
+要求：
+1. 逐字逐段核对，只修正能够依据中文语法、上下文和本页内部证据可靠判断的 OCR 错字、漏字、重复识别、错误空格、断行及明显的阅读顺序错误。
+2. 这是校勘，不是翻译或改写。输出必须仍是原稿中文；不得翻译外文内容，不得润色、现代化措辞、调整作者观点，也不得擅自转换简繁体或异体字。
+3. 不总结、不删减、不扩写。标题、正文、引文、列表、表格、脚注及脚注定义、书名人名、外文、数字、年代、标点等信息必须完整保留；不得因内容重复或看似页眉页脚而自行删除。
+4. 仅可删除能够确认由 OCR 重复识别造成的内容；作者有意重复、跨页衔接或无法确认性质的重复必须保留。
+5. 保留 Markdown 标题、列表、表格、脚注、引文和段落结构。纠正断行时不得合并不同段落、标题、引文或脚注；表格无法可靠复原时保持原顺序。
+6. 不以常识猜测字词或补造扫描件中没有的内容。无法可靠还原的文字保留原 OCR，并紧邻标注 [原文存疑]。
+7. 只输出校勘后的中文原文，不附加说明、修改清单、前言或质量报告。
+
+OCR 原文：
+{chunk}
+""".strip()
+                system = (
+                    "你是严谨的中文书籍 OCR 校勘员。你逐字保全原稿，只修正有充分"
+                    "上下文证据的识别错误；绝不翻译、改写、概述或创作。"
+                )
+            else:
+                prompt = f"""
 请校勘下面的日文 OCR 原文。语言标签：{language}
 分块：{index}/{len(chunks)}
 
@@ -2027,14 +2144,15 @@ class ChatOCRProofreader:
 OCR 原文：
 {chunk}
 """.strip()
+                system = (
+                    "你是严谨的日文书籍 OCR 校勘员。你只校正日文原文，"
+                    "绝不翻译、概述或创作。"
+                )
             corrected.append(
                 clean_ocr_text(
                     self.client.chat_text(
                         prompt,
-                        system=(
-                            "你是严谨的日文书籍 OCR 校勘员。你只校正日文原文，"
-                            "绝不翻译、概述或创作。"
-                        ),
+                        system=system,
                         max_tokens=output_budget,
                     )
                 )
@@ -2143,13 +2261,15 @@ def _stage_process_locked(stage: str):
 
 
 def _page_record_from_mapping(data: dict[str, Any]) -> PageRecord:
-    return PageRecord(
-        **{
-            key: data[key]
-            for key in PageRecord.__dataclass_fields__
-            if key in data
-        }
+    values = {
+        key: data[key]
+        for key in PageRecord.__dataclass_fields__
+        if key in data
+    }
+    values["ocr_metadata"] = _checkpoint_ocr_metadata(
+        values.get("ocr_metadata")
     )
+    return PageRecord(**values)
 
 
 class PageStore:
@@ -2479,6 +2599,7 @@ def import_existing_ocr(source_dir: Path, output_dir: Path) -> int:
             ]
             if isinstance(item.get("translated_physical_page_texts"), list)
             else [],
+            ocr_metadata=_checkpoint_ocr_metadata(item.get("ocr_metadata")),
             notes=str(item.get("notes") or ""),
             ocr_model=str(item.get("ocr_model") or "imported"),
         )
@@ -2677,6 +2798,7 @@ def ocr_pdf(
                 notes="; ".join(note_parts),
                 ocr_model=client.ocr_model,
                 physical_page_texts=physical_page_texts,
+                ocr_metadata=_checkpoint_ocr_metadata(ocr_metadata),
             )
             save_page_record(output_dir, record)
             return record
@@ -2905,18 +3027,31 @@ def proofread_ocr_pages(
     """Create model-attributed OCR correction overlays with page-level CAS."""
 
     store = PageStore(output_dir)
+    requested_language = language.strip().lower().replace("_", "-")
+
+    def language_matches(record: PageRecord) -> bool:
+        record_language = record.language.strip().lower().replace("_", "-")
+        requested_is_chinese = (
+            requested_language == "zh" or requested_language.startswith("zh-")
+        )
+        record_is_chinese = (
+            record_language == "zh" or record_language.startswith("zh-")
+        )
+        return (
+            record_language in {requested_language, "unknown", "other"}
+            or (requested_is_chinese and record_is_chinese)
+            or (
+                requested_language == "ja"
+                and re.search(r"[\u3040-\u30ff]", record.text) is not None
+            )
+        )
+
     candidates = [
         record
         for record in records
         if record.text.strip()
         and record.text.strip() not in NON_CONTENT_MARKERS
-        and (
-            record.language in {language, "unknown", "other"}
-            or (
-                language.lower() == "ja"
-                and re.search(r"[\u3040-\u30ff]", record.text) is not None
-            )
-        )
+        and language_matches(record)
         and (force or not record.proofread_is_fresh_for(identity))
     ]
     print(
@@ -3826,6 +3961,7 @@ def compile_chapters(
         reviewed_override = reviewed_overrides.get(entry.id)
         chapter_semantic_pages: list[dict[str, Any]] = []
         chapter_footnotes: list[Any] = []
+        chapter_existing_footnote_definitions: list[tuple[str, str]] = []
         chapter_semantic_issues: list[dict[str, Any]] = []
         if reviewed_override is not None:
             markdown = reviewed_override
@@ -3855,6 +3991,14 @@ def compile_chapters(
                 f"<!-- pdf-pages: {start}-{end} -->",
                 "",
             ]
+            # Resolve each physical page locally first, then run the narrow
+            # adjacent-page circled-note pass across the ordered chapter
+            # sequence.  A two-pass layout is required because the proven
+            # reference landing is on the already-read previous page while
+            # its definition is on the current page.
+            page_payloads: list[dict[str, Any]] = []
+            chapter_semantic_results: list[SemanticPage] = []
+            chapter_source_pages: list[str] = []
             for page in range(start, end + 1):
                 record = record_map[page]
                 physical_pages = record.compile_physical_pages_for(
@@ -3900,7 +4044,7 @@ def compile_chapters(
                             next_entry.title,
                         )
                     ]
-                semantic_page_bodies: list[str] = []
+                semantic_start = len(chapter_semantic_results)
                 for physical_index, physical_text in enumerate(
                     selected_physical_pages,
                     start=physical_start + 1,
@@ -3913,10 +4057,57 @@ def compile_chapters(
                     # model code fence or post-fence running header into a
                     # semantic footnote definition.
                     semantic_page = reconstruct_page_footnotes(
-                        clean_ocr_text(physical_text),
+                        strip_markdown_footnote_section_headings(
+                            clean_ocr_text(physical_text)
+                        ),
                         source_page=source_page,
                     )
-                    semantic_page_bodies.append(semantic_page.body)
+                    chapter_semantic_results.append(semantic_page)
+                    chapter_source_pages.append(source_page)
+                page_payloads.append(
+                    {
+                        "pdf_page": page,
+                        "physical_start": physical_start,
+                        "physical_end": physical_end,
+                        "has_exact_physical_pages": has_exact_physical_pages,
+                        "semantic_start": semantic_start,
+                        "semantic_end": len(chapter_semantic_results),
+                    }
+                )
+
+            chapter_semantic_results = list(
+                reconstruct_adjacent_page_footnotes(
+                    chapter_semantic_results,
+                    source_pages=chapter_source_pages,
+                    physical_pages_per_pdf_page=printed_pages_per_pdf_page,
+                )
+            )
+            for payload in page_payloads:
+                page = int(payload["pdf_page"])
+                physical_start = int(payload["physical_start"])
+                physical_end = int(payload["physical_end"])
+                has_exact_physical_pages = bool(
+                    payload["has_exact_physical_pages"]
+                )
+                semantic_page_bodies: list[str] = []
+                semantic_start = int(payload["semantic_start"])
+                semantic_end = int(payload["semantic_end"])
+                for semantic_index in range(semantic_start, semantic_end):
+                    semantic_page = chapter_semantic_results[semantic_index]
+                    source_page = chapter_source_pages[semantic_index]
+                    # Existing reviewed Markdown definitions may live on a
+                    # later physical page than their references.  Remove them
+                    # from the page stream before reader reflow and append
+                    # them once at chapter end with newly reconstructed notes.
+                    # Page-local missing/unused sets are intentionally not
+                    # judged here; only the complete chapter can close them.
+                    existing_inventory = parse_markdown_footnotes(
+                        semantic_page.body
+                    )
+                    chapter_existing_footnote_definitions.extend(
+                        existing_inventory.definitions
+                    )
+                    semantic_page_bodies.append(existing_inventory.body)
                     chapter_footnotes.extend(semantic_page.footnotes)
                     page_audit = {
                         "source_page": source_page,
@@ -3952,15 +4143,39 @@ def compile_chapters(
             # Chapter Markdown is a reader-facing output just like EPUB,
             # Word, and the knowledge base. Keep PDF/page coordinates only in
             # checkpoints and chapters.json; never expose them in book text.
-            semantic_markdown = append_markdown_footnotes(
+            # Remove page-bound publication furniture from the body before
+            # hoisting definitions.  Appending definitions first would make a
+            # final standalone scanned page number cease to be trailing, so
+            # the cleaner could no longer prove that it was footer furniture.
+            reader_body = strip_publication_metadata(
                 "\n".join(parts).rstrip() + "\n",
-                chapter_footnotes,
-            )
-            markdown = strip_publication_metadata(
-                semantic_markdown,
                 publication_title=publication_title,
                 chapter_title=entry.display_title,
             )
+            markdown = append_markdown_footnotes(
+                reader_body,
+                chapter_footnotes,
+                existing_definitions=chapter_existing_footnote_definitions,
+            )
+        # Count the final Markdown contract, not only definitions reconstructed
+        # from numeric OCR markers in this pass.  Source-bound reviewed
+        # definitions are equally real semantic footnotes and must agree with
+        # the graph semantic node and publication verifier.
+        markdown_inventory = parse_markdown_footnotes(markdown)
+        if reviewed_override is None and not markdown_inventory.valid:
+            raise ValueError(
+                "Compiled chapter Markdown footnotes are not a one-to-one "
+                f"closed set for {entry.display_title}: "
+                "duplicate_definitions="
+                f"{list(markdown_inventory.duplicate_definitions)}, "
+                "missing_definitions="
+                f"{list(markdown_inventory.missing_definitions)}, "
+                "unused_definitions="
+                f"{list(markdown_inventory.unused_definitions)}, "
+                "duplicate_references="
+                f"{list(markdown_inventory.duplicate_references)}"
+            )
+        markdown_footnote_count = len(markdown_inventory.definitions)
         (chapter_dir / filename).write_text(markdown, encoding="utf-8")
         manifest.append(
             {
@@ -3973,11 +4188,7 @@ def compile_chapters(
                 "boundary_mode": "closed-overlap" if overlaps_next else "non-overlap",
                 "reviewed_override": reviewed_override is not None,
                 "granularity": granularity,
-                "semantic_footnote_count": (
-                    len(chapter_footnotes)
-                    if reviewed_override is None
-                    else len(parse_markdown_footnotes(markdown).definitions)
-                ),
+                "semantic_footnote_count": markdown_footnote_count,
                 "semantic_issue_count": len(chapter_semantic_issues),
             }
         )
@@ -3986,11 +4197,7 @@ def compile_chapters(
                 "chapter_id": entry.id,
                 "filename": filename,
                 "reviewed_override": reviewed_override is not None,
-                "footnote_count": (
-                    len(chapter_footnotes)
-                    if reviewed_override is None
-                    else len(parse_markdown_footnotes(markdown).definitions)
-                ),
+                "footnote_count": markdown_footnote_count,
                 "pages": chapter_semantic_pages,
                 "issues": chapter_semantic_issues,
                 "release_blocked": any(
@@ -4045,6 +4252,296 @@ _JOINED_INDEX_ENTRY_BOUNDARY = re.compile(
 )
 
 
+_READER_FENCE_OPEN = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})")
+_READER_FOOTNOTE_DEFINITION = re.compile(r"^ {0,3}\[\^[^\]\s]+\]:")
+_READER_LIST_ITEM = re.compile(
+    r"^ {0,3}(?:[-+*]|(?:\d+|[A-Za-z])[.)]|"
+    r"[一二三四五六七八九十百零〇]+[、.)．])\s+\S"
+)
+_READER_STANDALONE_LABEL = re.compile(
+    r"^(?:[0-9０-９]{1,6}|"
+    r"[一二三四五六七八九十百零〇]{1,4}|"
+    r"注\s*[一二三四五六七八九十百零〇0-9]+|"
+    r"第[一二三四五六七八九十百零〇0-9]+[章节部篇卷])$"
+)
+_READER_BACKMATTER_TITLE = re.compile(
+    r"(?:目录|目次|索引|人名表|年表|参考(?:书目|文献)|书目|"
+    r"contents|tableofcontents|index|bibliograph|references?)",
+    flags=re.I,
+)
+
+
+def _reader_visible_line_length(line: str) -> int:
+    """Measure a visual line without counting Markdown spacing controls."""
+
+    value = re.sub(r"^\s*>\s?", "", line)
+    value = re.sub(r" {2,}$", "", value)
+    value = re.sub(r"<br\s*/?>\s*$", "", value, flags=re.I)
+    return len(re.sub(r"\s+", "", value))
+
+
+def _reader_line_has_hard_break(line: str) -> bool:
+    return bool(
+        re.search(r" {2,}$", line)
+        or re.search(r"<br\s*/?>\s*$", line, flags=re.I)
+    )
+
+
+def _reader_wrap_separator(previous: str, following: str) -> str:
+    """Return only the whitespace needed at one removed visual line break."""
+
+    left = previous.rstrip()
+    right = following.lstrip()
+    if not left or not right:
+        return ""
+    left_char = left[-1]
+    right_char = right[0]
+    cjk = lambda value: bool(
+        re.fullmatch(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]", value)
+    )
+    if cjk(left_char) or cjk(right_char):
+        return ""
+    opening_punctuation = frozenset("-‐‑‒–—/（([【《〈「『‘“\"'")
+    closing_punctuation = frozenset(
+        ",.;:!?，。；：！？、）)]】》〉」』’”\"'"
+    )
+    if left_char in opening_punctuation or right_char in closing_punctuation:
+        return ""
+    # OCR line boxes do not retain the inter-word blank at an English wrap.
+    # Restore exactly one blank for Latin/digit prose while Chinese and
+    # Japanese glyphs remain naturally adjacent.
+    if right_char.isascii() and (right_char.isalnum() or right_char in "`*_~"):
+        return " "
+    return ""
+
+
+def _join_reader_visual_lines(lines: list[str]) -> str:
+    """Collapse visual OCR wraps while retaining authored hard breaks."""
+
+    joined = ""
+    previous_hard_break = False
+    for raw_line in lines:
+        value = raw_line.strip()
+        if not value:
+            continue
+        trailing_spaces = re.search(r" {2,}$", raw_line) is not None
+        if joined:
+            if previous_hard_break:
+                joined += "\n"
+            else:
+                joined += _reader_wrap_separator(joined, value)
+        joined += value
+        if trailing_spaces and not re.search(r" {2,}$", joined):
+            # Canonicalize an explicit Markdown hard break to exactly two
+            # spaces. It is structurally significant but not reader-visible.
+            joined += "  "
+        previous_hard_break = _reader_line_has_hard_break(raw_line)
+    return joined
+
+
+def _looks_like_reader_verse(lines: list[str]) -> bool:
+    """Conservatively recognize a short, punctuated verse/epigraph block."""
+
+    if not 2 <= len(lines) <= 32:
+        return False
+    lengths = [_reader_visible_line_length(line) for line in lines]
+    if not lengths or max(lengths) > 28:
+        return False
+    median = sorted(lengths)[len(lengths) // 2]
+    attribution = re.fullmatch(
+        r"\s*(?:[-—–－]{1,2})\s*[^。！？!?]{1,24}\s*",
+        lines[-1],
+    ) is not None
+    punctuated = sum(
+        bool(re.search(r"[，。！？；：,.!?;:…》〉」』”’）)]\s*$", line))
+        for line in lines
+    )
+    return bool(
+        median <= 18
+        and (
+            attribution
+            or (
+                len(lines) >= 3
+                and punctuated >= max(2, (len(lines) + 1) // 2)
+            )
+        )
+    )
+
+
+def _render_reader_verse(lines: list[str]) -> list[str]:
+    rendered: list[str] = []
+    for index, line in enumerate(lines):
+        value = line.rstrip()
+        if index < len(lines) - 1 and not _reader_line_has_hard_break(value):
+            value += "  "
+        rendered.append(value)
+    return rendered
+
+
+def _reader_markdown_block_is_structural(lines: list[str]) -> bool:
+    """Protect Markdown constructs whose internal newlines carry semantics."""
+
+    if not lines:
+        return False
+    if all(re.match(r"^\s*>", line) for line in lines):
+        return True
+    if any(re.match(r"^ {0,3}#{1,6}(?:\s+|$)", line) for line in lines):
+        return True
+    if any(_READER_LIST_ITEM.match(line) for line in lines):
+        return True
+    if _READER_FOOTNOTE_DEFINITION.match(lines[0]):
+        return True
+    if re.match(r"^ {0,3}\[[^\]^]+\]:\s*\S", lines[0]):
+        return True
+    if any(re.match(r"^(?: {4}|\t)\S", line) for line in lines):
+        return True
+    if any(re.fullmatch(r" {0,3}(?:[*_-]\s*){3,}", line) for line in lines):
+        return True
+    if len(lines) >= 2 and (
+        re.fullmatch(r" {0,3}=+\s*", lines[1])
+        or re.fullmatch(r" {0,3}-+\s*", lines[1])
+    ):
+        return True
+    pipe_rows = sum("|" in line for line in lines)
+    if pipe_rows >= 2 or any(
+        re.fullmatch(r"\s*\|?\s*:?-{3,}:?(?:\s*\|\s*:?-{3,}:?)+\s*\|?\s*", line)
+        for line in lines
+    ):
+        return True
+    if any(
+        re.match(r"^\s*</?(?!br\b)[A-Za-z][^>]*>", line, flags=re.I)
+        for line in lines
+    ):
+        return True
+    return False
+
+
+def _reflow_reader_markdown_block(lines: list[str]) -> list[str]:
+    if not lines or _reader_markdown_block_is_structural(lines):
+        return [line.rstrip() for line in lines]
+
+    # A high-confidence leading epigraph is commonly followed immediately by
+    # a compact note label because PaddleOCR has no vertical-gap token. Keep
+    # the attribution on its own line, then resume ordinary prose reflow.
+    if len(lines) >= 3:
+        signed_attribution = re.fullmatch(
+            r"\s*(?:[-—–－]{1,2})\s*[^。！？!?]{1,24}\s*",
+            lines[1],
+        ) is not None
+        bibliographic_attribution = bool(
+            _reader_visible_line_length(lines[1]) <= 42
+            and re.match(
+                r"\s*[A-Za-z\u3400-\u9fff][A-Za-z\u3400-\u9fff\s·.．]{1,24}"
+                r"[：:].{1,30}\s*$",
+                lines[1],
+            )
+        )
+        attribution = signed_attribution or bibliographic_attribution or (
+            _READER_STANDALONE_LABEL.fullmatch(lines[2].strip()) is not None
+            and re.fullmatch(r"一[\u3400-\u9fff·]{2,10}", lines[1].strip())
+            is not None
+        )
+        if (
+            attribution
+            and _reader_visible_line_length(lines[0]) <= 28
+            and _reader_visible_line_length(lines[1]) <= 24
+        ):
+            epigraph_size = 2
+            if (
+                bibliographic_attribution
+                and len(lines) >= 4
+                and _reader_visible_line_length(lines[2]) <= 42
+                and re.fullmatch(r"\s*[（(].{1,40}[）)]\s*", lines[2])
+            ):
+                epigraph_size = 3
+            return [
+                *_render_reader_verse(lines[:epigraph_size]),
+                "",
+                *_reflow_reader_markdown_block(lines[epigraph_size:]),
+            ]
+
+    if not any(
+        _READER_STANDALONE_LABEL.fullmatch(line.strip()) for line in lines
+    ) and _looks_like_reader_verse(lines):
+        return _render_reader_verse(lines)
+
+    rendered: list[str] = []
+    prose: list[str] = []
+
+    def flush_prose() -> None:
+        if not prose:
+            return
+        value = _join_reader_visual_lines(prose)
+        if value:
+            rendered.extend(value.splitlines())
+        prose.clear()
+
+    for line in lines:
+        if _READER_STANDALONE_LABEL.fullmatch(line.strip()):
+            flush_prose()
+            if rendered and rendered[-1].strip():
+                rendered.append("")
+            rendered.append(line.strip())
+            rendered.append("")
+        else:
+            prose.append(line)
+    flush_prose()
+    while rendered and not rendered[-1].strip():
+        rendered.pop()
+    return rendered
+
+
+def reflow_reader_markdown_soft_wraps(markdown_text: str) -> str:
+    """Remove OCR visual wraps from reader Markdown without touching source pages.
+
+    Blank-line paragraphs and Markdown structures remain intact.  Fenced code,
+    headings, lists, tables, link/footnote definitions, explicit ``<br>`` or
+    two-space breaks, and conservatively detected verse retain their authored
+    line semantics.  The transform is deliberately idempotent because legacy
+    compilation and the graph sanitizer may both apply it.
+    """
+
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    output: list[str] = []
+    block: list[str] = []
+    fence_character: str | None = None
+    fence_size = 0
+
+    def flush_block() -> None:
+        if block:
+            output.extend(_reflow_reader_markdown_block(block))
+            block.clear()
+
+    for line in normalized.splitlines():
+        if fence_character is not None:
+            output.append(line.rstrip())
+            if re.match(
+                rf"^ {{0,3}}{re.escape(fence_character)}{{{fence_size},}}\s*$",
+                line,
+            ):
+                fence_character = None
+                fence_size = 0
+            continue
+        fence = _READER_FENCE_OPEN.match(line)
+        if fence is not None:
+            flush_block()
+            token = fence.group("fence")
+            fence_character = token[0]
+            fence_size = len(token)
+            output.append(line.rstrip())
+            continue
+        if not line.strip():
+            flush_block()
+            if output and output[-1].strip():
+                output.append("")
+            continue
+        block.append(line)
+    flush_block()
+    while output and not output[-1].strip():
+        output.pop()
+    return "\n".join(output).strip() + "\n"
+
+
 def _split_joined_index_entries(markdown_text: str) -> str:
     """Separate an OCR-joined Chinese index entry without rewriting text.
 
@@ -4078,6 +4575,7 @@ def strip_publication_metadata(
     }
     normalized_titles: list[str] = []
     structural_chapter_prefixes: list[str] = []
+    leading_subdivision_ordinal: str | None = None
     if chapter_title:
         compact_chapter_title = re.sub(r"\s+", "", chapter_title)
         structural_match = re.match(
@@ -4086,6 +4584,13 @@ def strip_publication_metadata(
         )
         if structural_match:
             structural_chapter_prefixes.append(structural_match.group(1))
+        subdivision_match = re.search(
+            r"[·•・]\s*([一二三四五六七八九十百零〇0-9]{1,4})"
+            r"(?=\s|[：:]|$)",
+            chapter_title,
+        )
+        if subdivision_match:
+            leading_subdivision_ordinal = subdivision_match.group(1)
     for title in (publication_title, chapter_title):
         if not title:
             continue
@@ -4208,6 +4713,8 @@ def strip_publication_metadata(
             return False
         if following.startswith(("#", "- ", "* ", "> ", "|")):
             return False
+        if _READER_STANDALONE_LABEL.fullmatch(following.strip()):
+            return False
         if re.fullmatch(r"\d{4}", previous.strip()):
             return False
         if re.fullmatch(r"\d{4}", following.strip()):
@@ -4246,6 +4753,15 @@ def strip_publication_metadata(
             continue
         if stripped.startswith("<!--") and stripped.endswith("-->"):
             continue
+        # PaddleOCR uses these exact sentinel lines for pages without
+        # reader-facing text.  They remain useful in page checkpoints, but
+        # must not become paragraphs in compiled Markdown/EPUB/Word output.
+        # Match the complete stripped line only so prose that discusses a
+        # marker (for example ``原稿标为[空白页]``) is preserved.  Reviewed
+        # overrides deliberately use the narrower cleaner below and are not
+        # affected by this raw-OCR publication rule.
+        if stripped in NON_CONTENT_MARKERS:
+            continue
         # A body copy of the scanned contents page can contain page numbers
         # throughout the page rather than only at the physical-page boundary.
         # Keep standalone numbers in normal chapters as real content, but omit
@@ -4258,6 +4774,21 @@ def strip_publication_metadata(
             continue
         if is_running_title(line):
             continue
+        if (
+            leading_subdivision_ordinal is not None
+            and stripped == leading_subdivision_ordinal
+        ):
+            nonempty_output = [item.strip() for item in output if item.strip()]
+            if (
+                len(nonempty_output) == 1
+                and re.fullmatch(r"#\s+.+", nonempty_output[0])
+            ):
+                # Some section title pages repeat only their ordinal after the
+                # generated H1 (for example H1 ``第三部·二 …`` followed by an
+                # isolated OCR line ``二``).  Remove only the exact ordinal
+                # encoded in the configured chapter title; ordinary standalone
+                # numbers and labels elsewhere remain reader-visible.
+                continue
         if output and re.match(r"^#\s+", line):
             # The generated chapter title is the only reader-facing H1.
             # OCR/model-created headings inside its body remain navigable but
@@ -4305,6 +4836,8 @@ def strip_publication_metadata(
     cleaned = "\n".join(compact).strip() + "\n"
     if normalized_chapter_title == "索引":
         cleaned = _split_joined_index_entries(cleaned)
+    if not _READER_BACKMATTER_TITLE.search(normalized_chapter_title):
+        cleaned = reflow_reader_markdown_soft_wraps(cleaned)
     return cleaned
 
 
@@ -4457,7 +4990,15 @@ def markdown_inline_to_plain_text(value: str) -> str:
     """Convert the small inline-Markdown/HTML subset used by page translations."""
     cleaned = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", value)
     cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.I)
-    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    # CommonMark raw HTML tag names begin with an ASCII letter.  Requiring a
+    # syntactically complete tag name keeps authored Chinese angle-bracket
+    # titles such as ``<打开我的图书馆>`` as visible text while still removing
+    # inline markup such as ``<sup>``/``</sup>``.
+    cleaned = re.sub(
+        r"</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>",
+        "",
+        cleaned,
+    )
     cleaned = html.unescape(cleaned)
     return re.sub(r"[`*_]{1,3}", "", cleaned).strip()
 
@@ -4965,33 +5506,6 @@ def _configure_docx_footnote_numbering(section: Any) -> None:
     footnote_properties.append(restart)
 
 
-def _add_docx_page_number_footer(document: Any) -> None:
-    """Add only a centered PAGE field; the title page intentionally stays blank."""
-
-    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
-    from docx.oxml import OxmlElement  # type: ignore[import-not-found]
-    from docx.oxml.ns import qn  # type: ignore[import-not-found]
-    from docx.shared import Pt, RGBColor  # type: ignore[import-not-found]
-
-    section = document.sections[0]
-    section.different_first_page_header_footer = True
-    paragraph = section.footer.paragraphs[0]
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    paragraph.paragraph_format.first_line_indent = Pt(0)
-    run = paragraph.add_run()
-    run.font.name = "Times New Roman"
-    run.font.size = Pt(9)
-    run.font.color.rgb = RGBColor(96, 96, 96)
-    field = OxmlElement("w:fldSimple")
-    field.set(qn("w:instr"), "PAGE")
-    cached_run = OxmlElement("w:r")
-    cached_text = OxmlElement("w:t")
-    cached_text.text = "1"
-    cached_run.append(cached_text)
-    field.append(cached_run)
-    paragraph._p.append(field)
-
-
 def _style_docx_tables(document: Any) -> None:
     """Apply fixed, internally consistent DXA geometry to every book table."""
 
@@ -5119,7 +5633,6 @@ def build_docx(
     section.footer_distance = Cm(1.25)
     title_style_name = _configure_book_docx_styles(document)
     _configure_docx_footnote_numbering(section)
-    _add_docx_page_number_footer(document)
 
     title = document.add_paragraph(style=title_style_name)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
