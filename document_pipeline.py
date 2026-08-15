@@ -207,45 +207,182 @@ def publish_spec(spec: RunSpec, formats: tuple[str, ...]) -> dict[str, Any]:
         "release_ready": False,
         "publication_status": "draft",
         "reason": (
-            "EPUB and standalone semantic adapters do not yet have a compatible "
-            "native release verifier; artifacts remain drafts until they pass a "
-            "Graph publication verification profile"
+            "the standalone publish command does not execute a release verifier; "
+            "use the unified run command with publication.epub_report (or another "
+            "Graph publication report target) for a release-ready artifact"
         ),
         "formats": results,
     }
 
 
-def review_status(output_dir: Path) -> dict[str, Any]:
-    audit_dir = output_dir.expanduser().resolve() / "audit"
-    audits: list[dict[str, Any]] = []
-    blocked = False
-    if audit_dir.is_dir():
-        for path in sorted(audit_dir.glob("*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, Mapping):
-                continue
-            is_blocked = bool(
-                payload.get("release_blocked") is True
-                or payload.get("status") in {"blocked", "failed"}
-            )
-            blocked = blocked or is_blocked
-            audits.append(
-                {
-                    "path": str(path),
-                    "status": payload.get("status"),
-                    "release_blocked": is_blocked,
-                }
-            )
+def _review_error_report(
+    output_dir: Path,
+    *,
+    mode: str,
+    error: Exception,
+) -> dict[str, Any]:
     return {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "app_version": APP_VERSION,
-        "status": "blocked" if blocked else "passed",
-        "release_blocked": blocked,
-        "audits": audits,
+        "mode": mode,
+        "output_dir": str(output_dir.expanduser().resolve()),
+        "status": "blocked",
+        "release_blocked": True,
+        "reconstruction": None,
+        "review_policy": None,
+        "issue_set": None,
+        "decision_log": None,
+        "summary": None,
+        "error": {
+            "code": "semantic_review_unavailable",
+            "type": type(error).__name__,
+            "message": str(error),
+        },
     }
+
+
+def _review_report_from_resolution(
+    context: Any,
+    resolution: Any,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    resolved = resolution.to_dict()
+    report: dict[str, Any] = {
+        "schema_version": CONTRACT_SCHEMA_VERSION,
+        "app_version": APP_VERSION,
+        "mode": mode,
+        "output_dir": str(context.output_dir),
+        "status": resolution.status,
+        "release_blocked": resolution.release_blocked,
+        "reconstruction": {
+            "path": str(context.reconstruction_path),
+            "sha256": context.reconstruction_sha256,
+        },
+        "review_policy": resolved["review_policy"],
+        "issue_set": resolved["issue_set"],
+        "decision_log": resolved["decision_log"],
+        "summary": resolved["summary"],
+        "error": None,
+    }
+    if mode == "review":
+        report["issues"] = resolved["issues"]
+        report["resolution"] = resolved
+    return report
+
+
+def review_status(
+    output_dir: Path,
+    *,
+    include_issues: bool = False,
+) -> dict[str, Any]:
+    """Return current semantic review status without changing product state."""
+
+    if type(include_issues) is not bool:
+        raise ValueError("include_issues must be a boolean")
+    output = output_dir.expanduser().resolve()
+    try:
+        import semantic_review_policy
+
+        context = semantic_review_policy.collect_reconstruction_review(output)
+        if not (
+            context.decision_log_path.exists()
+            or context.decision_log_path.is_symlink()
+        ):
+            raise FileNotFoundError(
+                f"semantic review decision log is missing: "
+                f"{context.decision_log_path}; run review first"
+            )
+        decision_lock = context.decision_log_path.with_name(
+            context.decision_log_path.name + ".lock"
+        )
+        if not (decision_lock.exists() or decision_lock.is_symlink()):
+            raise FileNotFoundError(
+                f"semantic review decision lock is missing: {decision_lock}; "
+                "run review first"
+            )
+        current, resolution = semantic_review_policy.resolve_semantic_review(
+            output,
+            expected_reconstruction_sha256=context.reconstruction_sha256,
+        )
+        report = _review_report_from_resolution(
+            current,
+            resolution,
+            mode="status",
+        )
+        if include_issues:
+            report["issues"] = resolution.to_dict()["issues"]
+        return report
+    except (OSError, ValueError) as exc:
+        return _review_error_report(output, mode="status", error=exc)
+
+
+def review_report(
+    output_dir: Path,
+    *,
+    issue_id: str | None = None,
+    reviewer: str | None = None,
+    decision: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """View the complete review or append one policy-authorized decision."""
+
+    fields = (issue_id, reviewer, decision, reason)
+    if any(value is not None for value in fields) and not all(
+        value is not None for value in fields
+    ):
+        raise ValueError(
+            "recording a review decision requires --issue-id, --reviewer, "
+            "--decision, and --reason together"
+        )
+    output = output_dir.expanduser().resolve()
+    try:
+        import semantic_review_policy
+
+        if all(value is not None for value in fields):
+            artifact = semantic_review_policy.record_semantic_review_decision(
+                output,
+                issue_id=str(issue_id),
+                reviewer=str(reviewer),
+                decision=str(decision),
+                reason=str(reason),
+            )
+            action = "decision-recorded"
+        else:
+            artifact = semantic_review_policy.refresh_semantic_review(
+                output,
+                create_decision_log=True,
+            )
+            action = "viewed"
+        context = semantic_review_policy.collect_reconstruction_review(
+            output,
+            expected_reconstruction_sha256=(
+                artifact.resolution.reconstruction_sha256
+            ),
+        )
+        report = _review_report_from_resolution(
+            context,
+            artifact.resolution,
+            mode="review",
+        )
+        report["action"] = action
+        report["review_audit"] = {
+            "path": str(artifact.audit_path),
+            "sha256": artifact.audit_sha256,
+            "snapshot_path": (
+                str(artifact.snapshot_path)
+                if artifact.snapshot_path is not None
+                else None
+            ),
+        }
+        return report
+    except (OSError, ValueError) as exc:
+        report = _review_error_report(output, mode="review", error=exc)
+        report["action"] = "blocked"
+        report["issues"] = []
+        report["resolution"] = None
+        report["review_audit"] = None
+        return report
 
 
 def _add_spec_arguments(parser: argparse.ArgumentParser, *, source: bool = True) -> None:
@@ -293,9 +430,17 @@ def build_parser() -> argparse.ArgumentParser:
     publish = subparsers.add_parser("publish")
     _add_spec_arguments(publish, source=False)
     publish.add_argument("--format", action="append", default=[])
-    for name in ("review", "status"):
-        child = subparsers.add_parser(name)
-        child.add_argument("-o", "--output-dir", default="outputs/book")
+    status = subparsers.add_parser("status")
+    status.add_argument("-o", "--output-dir", default="outputs/book")
+    review = subparsers.add_parser("review")
+    review.add_argument("-o", "--output-dir", default="outputs/book")
+    review.add_argument("--issue-id")
+    review.add_argument("--reviewer")
+    review.add_argument(
+        "--decision",
+        choices=("accepted", "rejected", "replaced"),
+    )
+    review.add_argument("--reason")
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("doctor_args", nargs=argparse.REMAINDER)
     return parser
@@ -311,8 +456,18 @@ def main(argv: list[str] | None = None) -> int:
 
         return doctor_main(raw_argv[1:])
     args = build_parser().parse_args(raw_argv)
-    if args.command in {"review", "status"}:
+    if args.command == "status":
         report = review_status(Path(args.output_dir))
+        _json(report)
+        return 1 if report["release_blocked"] else 0
+    if args.command == "review":
+        report = review_report(
+            Path(args.output_dir),
+            issue_id=args.issue_id,
+            reviewer=args.reviewer,
+            decision=args.decision,
+            reason=args.reason,
+        )
         _json(report)
         return 1 if report["release_blocked"] else 0
 

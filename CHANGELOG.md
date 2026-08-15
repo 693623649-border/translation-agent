@@ -20,6 +20,9 @@
 - Web 取消改为租约保护的两阶段状态，实际 targets/profile 持久化用于产物判定。
 - Web 计划与 worker 显式禁用仓库 `.env` 自动加载，保留可信 CLI 的兼容默认行为。
 - semantic apply 在事务提交前拒绝输出树中的 symlink 和非 regular 目标。
+- 增加 hash-bound 人工复核闭环：raw reconstruction audit 保持不可变，append-only
+  决议、中央 policy、内容寻址 review audit、effective semantic bundle、Graph 节点、
+  EPUB/Word/full verifier 与 Web 正式产物目录共同验证同一 provenance 链。
 
 ## 0.1.0 — 2026-08-14
 

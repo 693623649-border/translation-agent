@@ -28,14 +28,34 @@ from publication_semantics import (
 )
 from semantic_apply import SemanticApplyError, apply_translation_transaction
 from semantic_ir import SourceLocator, TranslationUnit
+from semantic_review import SemanticReviewError
+from semantic_review_policy import refresh_semantic_review
 
 
 SCHEMA_VERSION = 1
-IMPORTER_VERSION = "born-digital-pdf-semantic-v2"
+IMPORTER_VERSION = "born-digital-pdf-semantic-v3"
 
 
 class BornDigitalPdfError(ValueError):
     """Raised for an invalid source or an unsafe semantic reconstruction."""
+
+
+def _refresh_review_audit(output_dir: Path):
+    """Initialize the append-only log and refresh its derived review audit."""
+
+    try:
+        reconstruction_sha256 = _sha256_bytes(
+            (output_dir / "audit" / "semantic-reconstruction.json").read_bytes()
+        )
+        return refresh_semantic_review(
+            output_dir,
+            create_decision_log=True,
+            expected_reconstruction_sha256=reconstruction_sha256,
+        )
+    except (OSError, SemanticReviewError) as exc:
+        raise BornDigitalPdfError(
+            f"cannot initialize semantic reconstruction review: {exc}"
+        ) from exc
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -484,7 +504,15 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
             }
             audit_path = output_dir / "audit" / "semantic-reconstruction.json"
             _atomic_json(audit_path, audit)
-            return {"status": "blocked", "release_blocked": True, "chapter_count": 0, "audit": str(audit_path)}
+            review = _refresh_review_audit(output_dir)
+            return {
+                "status": "blocked",
+                "release_blocked": True,
+                "chapter_count": 0,
+                "audit": str(audit_path),
+                "review_audit": str(review.audit_path),
+                "review_status": review.resolution.status,
+            }
 
         boundaries, outline_issues = _chapter_boundaries(document, book_title)
         issues.extend(outline_issues)
@@ -660,6 +688,7 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
         },
     )
     _atomic_json(output_dir / "audit" / "semantic-reconstruction.json", audit)
+    review = _refresh_review_audit(output_dir)
     _atomic_text(output_dir / "semantic" / "translation-units.jsonl", "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units))
     return {
         "status": audit["status"],
@@ -673,6 +702,8 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
         "chapters": str(chapter_dir.resolve()),
         "translation_units": str((output_dir / "semantic" / "translation-units.jsonl").resolve()),
         "audit": str((output_dir / "audit" / "semantic-reconstruction.json").resolve()),
+        "review_audit": str(review.audit_path),
+        "review_status": review.resolution.status,
     }
 
 

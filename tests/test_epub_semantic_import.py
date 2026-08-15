@@ -146,6 +146,11 @@ class EpubSemanticImportTests(unittest.TestCase):
             manifest = json.loads((output / "chapters.json").read_text(encoding="utf-8"))
             markdown = (output / "chapters" / manifest[0]["filename"]).read_text(encoding="utf-8")
             audit = json.loads((output / "audit" / "semantic-reconstruction.json").read_text(encoding="utf-8"))
+            review = json.loads(
+                (output / "audit" / "semantic-review.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
             self.assertEqual(result["status"], "passed")
             self.assertEqual(result["chapter_count"], 1)
@@ -161,6 +166,14 @@ class EpubSemanticImportTests(unittest.TestCase):
             self.assertEqual(audit["generated_by"], "core.source.epub+core.reconstruct.semantic")
             self.assertEqual(audit["summary"]["continuation_merged_count"], 1)
             self.assertFalse(audit["release_blocked"])
+            self.assertEqual(review["status"], "passed")
+            self.assertEqual(
+                review["upstream_reconstruction"]["sha256"],
+                hashlib.sha256(
+                    (output / "audit" / "semantic-reconstruction.json").read_bytes()
+                ).hexdigest(),
+            )
+            self.assertTrue((output / "audit" / "review-decisions.jsonl").is_file())
             units = [
                 json.loads(line)
                 for line in (output / "semantic" / "translation-units.jsonl")
@@ -246,9 +259,26 @@ class EpubSemanticImportTests(unittest.TestCase):
                 hashlib.sha256(reconstruction_before).hexdigest(),
             )
             self.assertEqual(translation_audit["schema_version"], 1)
+            review_resolution = translation_audit["review_resolution"]
+            self.assertEqual(review_resolution["schema_version"], 1)
+            self.assertEqual(review_resolution["status"], "passed")
+            self.assertFalse(review_resolution["release_blocked"])
             self.assertEqual(
-                translation_audit["review_resolution"],
-                {"schema_version": 1, "decisions": []},
+                review_resolution["upstream_reconstruction"]["sha256"],
+                hashlib.sha256(reconstruction_before).hexdigest(),
+            )
+            self.assertEqual(review_resolution["issue_set"]["count"], 0)
+            self.assertEqual(review_resolution["decision_log"]["record_count"], 0)
+            self.assertEqual(
+                review_resolution["audit"]["path"],
+                "audit/semantic-review.json",
+            )
+            effective = translation_audit["effective_semantic_bundle"]
+            self.assertEqual(effective["status"], "passed")
+            self.assertEqual(len(effective["sha256"]), 64)
+            self.assertEqual(
+                effective["review_audit_sha256"],
+                review_resolution["audit"]["sha256"],
             )
 
             units[1]["translated_markdown"] = units[1]["translated_markdown"].replace("[^epub-", "[^changed-")

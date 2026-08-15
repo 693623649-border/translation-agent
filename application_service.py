@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
-from typing import BinaryIO, Mapping
+from typing import Any, BinaryIO, Mapping
 
 from frontend_runtime import (
     FrontendSettings,
@@ -26,6 +26,7 @@ from frontend_runtime import (
 from product_contracts import ArtifactRecord, RunSpec
 from product_paths import resource_root
 from run_execution_service import RunExecutionService
+from semantic_review_policy import ACCEPT_AS_TEXT_REASON as REVIEW_ACCEPT_REASON
 
 
 class ApplicationService:
@@ -386,5 +387,50 @@ class ApplicationService:
     def log(self, job_id: str, *, max_bytes: int = 128 * 1024) -> str:
         return tail_log(self.registry.get(job_id), max_bytes=max_bytes)
 
+    def _review_output(self, job_id: str) -> Path:
+        """Return the canonical output owned by a registered Web task."""
 
-__all__ = ["ApplicationService"]
+        job = self.registry.get(job_id)
+        workspace, _input_dir, expected_output = self._job_paths(job.id)
+        if job.workspace.resolve() != workspace:
+            raise ValueError("task workspace does not match its registered identity")
+        output = Path(job.spec.output_dir).expanduser().resolve()
+        if output != expected_output.resolve():
+            raise ValueError("task review output does not match its UUID workspace")
+        return output
+
+    def review_status(self, job_id: str) -> dict[str, Any]:
+        """Read current review state through the shared product contract."""
+
+        from document_pipeline import review_status
+
+        return review_status(self._review_output(job_id), include_issues=True)
+
+    def review_report(self, job_id: str) -> dict[str, Any]:
+        """Initialize/refresh and return the complete shared review report."""
+
+        from document_pipeline import review_report
+
+        return review_report(self._review_output(job_id))
+
+    def accept_review_issue_as_text(
+        self,
+        job_id: str,
+        *,
+        issue_id: str,
+        reviewer: str,
+    ) -> dict[str, Any]:
+        """Record the sole non-structural decision exposed by Web UI v1."""
+
+        from document_pipeline import review_report
+
+        return review_report(
+            self._review_output(job_id),
+            issue_id=issue_id,
+            reviewer=reviewer,
+            decision="accepted",
+            reason=REVIEW_ACCEPT_REASON,
+        )
+
+
+__all__ = ["ApplicationService", "REVIEW_ACCEPT_REASON"]

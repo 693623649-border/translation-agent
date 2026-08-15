@@ -9,6 +9,10 @@ import unittest
 import fitz
 
 from born_digital_pdf_import import apply_translations, import_born_digital_pdf
+from semantic_review_policy import (
+    collect_reconstruction_review,
+    record_semantic_review_decision,
+)
 
 
 def _text_pdf(path: Path, pages: list[str], *, outline: list[list[object]] | None = None) -> None:
@@ -42,6 +46,11 @@ class BornDigitalPdfImportTests(unittest.TestCase):
             manifest = json.loads((output / "chapters.json").read_text(encoding="utf-8"))
             toc = json.loads((output / "toc.json").read_text(encoding="utf-8"))
             audit = json.loads((output / "audit" / "semantic-reconstruction.json").read_text(encoding="utf-8"))
+            review = json.loads(
+                (output / "audit" / "semantic-review.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
             self.assertEqual(result["status"], "passed")
             self.assertEqual([item["display_title"] for item in manifest], ["Chapter One", "Chapter Two"])
@@ -57,6 +66,8 @@ class BornDigitalPdfImportTests(unittest.TestCase):
             self.assertTrue((output / "semantic" / "source_chapters" / manifest[0]["filename"]).is_file())
             self.assertGreater(result["translation_unit_count"], 2)
             self.assertEqual(audit["source"]["metadata"]["author"], "A. Author")
+            self.assertEqual(review["status"], "passed")
+            self.assertTrue((output / "audit" / "review-decisions.jsonl").is_file())
 
     def test_no_outline_becomes_one_chapter_without_heading_guess(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -90,10 +101,23 @@ class BornDigitalPdfImportTests(unittest.TestCase):
 
             result = import_born_digital_pdf(pdf, output)
             audit = json.loads((output / "audit" / "semantic-reconstruction.json").read_text(encoding="utf-8"))
+            review = json.loads(
+                (output / "audit" / "semantic-review.json").read_text(
+                    encoding="utf-8"
+                )
+            )
 
             self.assertTrue(result["release_blocked"])
             self.assertIn("pdf_text_layer_too_sparse", {issue["code"] for issue in audit["issues"]})
             self.assertFalse((output / "chapters.json").exists())
+            self.assertEqual(review["status"], "blocked")
+            self.assertEqual(
+                review["upstream_reconstruction"]["sha256"],
+                hashlib.sha256(
+                    (output / "audit" / "semantic-reconstruction.json").read_bytes()
+                ).hexdigest(),
+            )
+            self.assertTrue((output / "audit" / "review-decisions.jsonl").is_file())
 
     def test_blank_front_and_back_pages_are_warned_not_treated_as_scans(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -213,6 +237,113 @@ class BornDigitalPdfImportTests(unittest.TestCase):
                     for chapter in audit["chapters"]
                     for issue in chapter["issues"]
                 },
+            )
+
+    def test_complete_review_resolution_allows_apply_without_rewriting_raw_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            pdf = root / "superscript.pdf"
+            output = root / "output"
+            document = fitz.open()
+            page = document.new_page()
+            page.insert_text(
+                (72, 72),
+                "A complete embedded-text paragraph has an unresolved note marker",
+                fontsize=11,
+            )
+            page.insert_text((411, 68), "1", fontsize=7)
+            page.insert_text(
+                (72, 105),
+                "Additional ordinary text keeps the source-quality gate reliable.",
+                fontsize=11,
+            )
+            document.set_metadata({"title": "Superscript Book"})
+            document.save(pdf)
+            document.close()
+
+            imported = import_born_digital_pdf(pdf, output)
+            self.assertTrue(imported["release_blocked"])
+            reconstruction = output / "audit" / "semantic-reconstruction.json"
+            reconstruction_before = reconstruction.read_bytes()
+            context = collect_reconstruction_review(output)
+            self.assertEqual(len(context.issues), 1)
+            self.assertTrue(context.issues[0].reviewable)
+            record_semantic_review_decision(
+                output,
+                issue_id=context.issues[0].issue_id,
+                reviewer="reviewer@example.test",
+                decision="accepted",
+                reason="accept_as_text",
+                timestamp="2026-08-15T12:00:00Z",
+            )
+            decision_log = output / "audit" / "review-decisions.jsonl"
+            decision_bytes = decision_log.read_bytes()
+
+            # Re-import refreshes the derived audit without truncating the
+            # append-only decision history for identical raw evidence.
+            import_born_digital_pdf(pdf, output)
+            self.assertEqual(decision_log.read_bytes(), decision_bytes)
+            self.assertEqual(
+                json.loads(
+                    (output / "audit" / "semantic-review.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["status"],
+                "passed",
+            )
+
+            units = [
+                json.loads(line)
+                for line in (output / "semantic" / "translation-units.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            replacements = {
+                "Superscript Book": "上标图书",
+                "A complete embedded-text paragraph has an unresolved note marker":
+                    "一段完整的内嵌文字含有尚未解析的注释标记",
+                "Additional ordinary text keeps the source-quality gate reliable.":
+                    "补充的普通文字使来源质量门保持可靠。",
+            }
+            for unit in units:
+                translated = unit["source_markdown"]
+                for source_text, target_text in replacements.items():
+                    translated = translated.replace(source_text, target_text)
+                unit["translated_markdown"] = translated
+            translations = root / "translations.jsonl"
+            translations.write_text(
+                "".join(
+                    json.dumps(unit, ensure_ascii=False) + "\n" for unit in units
+                ),
+                encoding="utf-8",
+            )
+
+            result = apply_translations(output, translations)
+            translation_audit = json.loads(
+                (output / "audit" / "semantic-translation.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(reconstruction.read_bytes(), reconstruction_before)
+            self.assertEqual(
+                translation_audit["upstream_reconstruction"]["status"],
+                "blocked",
+            )
+            self.assertEqual(
+                translation_audit["review_resolution"]["status"],
+                "passed",
+            )
+            self.assertEqual(
+                translation_audit["review_resolution"]["decision_log"][
+                    "record_count"
+                ],
+                1,
+            )
+            self.assertEqual(
+                translation_audit["effective_semantic_bundle"]["status"],
+                "passed",
             )
 
     def test_shared_translation_contract_applies_hash_bound_units(self) -> None:

@@ -25,10 +25,12 @@ from publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
 )
+from semantic_review import SemanticReviewError
+from semantic_review_policy import validate_semantic_review
 
 
 SCHEMA_VERSION = 1
-VERIFIER_VERSION = "epub-publication-verifier-v2"
+VERIFIER_VERSION = "epub-publication-verifier-v3"
 PUBLICATION_PROFILE = "epub"
 VERIFIER_NODE = "core.publication.verify.epub"
 DEFAULT_REPORT_NAME = "epub-release-report.json"
@@ -468,7 +470,23 @@ class _Verifier:
         payload = self.context.get("reconstruction")
         if not isinstance(payload, Mapping):
             raise _CheckFailure("prerequisite_failed", "source identity check did not load reconstruction audit")
-        _check_audit_status(payload, label="semantic reconstruction audit")
+        try:
+            review = validate_semantic_review(
+                self.output_dir,
+                expected_reconstruction_sha256=str(
+                    self.context["reconstruction_sha256"]
+                ),
+            )
+        except (SemanticReviewError, KeyError, ValueError) as exc:
+            raise _CheckFailure(
+                "semantic_review_invalid",
+                f"semantic review evidence is missing, stale, or invalid: {exc}",
+            ) from exc
+        if review.resolution.release_blocked or review.resolution.status != "passed":
+            raise _CheckFailure(
+                "semantic_review_blocked",
+                "semantic reconstruction has unresolved review blockers",
+            )
         audit = _audit_by_filename(payload, label="semantic reconstruction audit")
         source_dir = self.output_dir / "semantic" / "source_chapters"
         for filename, item in audit.items():
@@ -489,7 +507,23 @@ class _Verifier:
         if summary.get("chapter_count") != len(audit):
             raise _CheckFailure("reconstruction_summary_stale", "reconstruction chapter count is stale")
         self.context["reconstruction_audit"] = audit
-        return {"chapter_count": len(audit), "sha256": self.context["reconstruction_sha256"]}
+        self.context["review"] = review
+        self.context["review_sha256"] = review.audit_sha256
+        self.context["decision_log_sha256"] = (
+            review.resolution.decision_log_sha256
+        )
+        self.context["review_policy_fingerprint"] = (
+            review.resolution.review_policy_fingerprint
+        )
+        self.context["review_issue_set_sha256"] = (
+            review.resolution.issue_set_sha256
+        )
+        return {
+            "chapter_count": len(audit),
+            "sha256": self.context["reconstruction_sha256"],
+            "review_sha256": review.audit_sha256,
+            "review_issue_count": len(review.resolution.issues),
+        }
 
     def translation(self) -> Mapping[str, Any]:
         path = self.output_dir / "audit" / "semantic-translation.json"
@@ -502,8 +536,98 @@ class _Verifier:
         upstream = payload.get("upstream_reconstruction")
         if not isinstance(upstream, Mapping) or upstream.get("sha256") != self.context.get("reconstruction_sha256"):
             raise _CheckFailure("translation_upstream_mismatch", "translation audit is not bound to reconstruction bytes")
-        if upstream.get("status") != "passed" or upstream.get("schema_version") != SCHEMA_VERSION:
+        reconstruction = self.context.get("reconstruction")
+        if not isinstance(reconstruction, Mapping):
+            raise _CheckFailure(
+                "prerequisite_failed",
+                "semantic reconstruction was not loaded before translation audit",
+            )
+        if (
+            upstream.get("schema_version") != SCHEMA_VERSION
+            or upstream.get("status") != reconstruction.get("status")
+            or upstream.get("release_blocked")
+            is not reconstruction.get("release_blocked")
+        ):
             raise _CheckFailure("translation_upstream_invalid", "translation audit records an invalid reconstruction state")
+        review_artifact = self.context.get("review")
+        if review_artifact is None:
+            raise _CheckFailure(
+                "prerequisite_failed",
+                "semantic review was not validated before translation audit",
+            )
+        expected_review = review_artifact.resolution.to_dict()
+        reviewed = payload.get("review_resolution")
+        if not isinstance(reviewed, Mapping):
+            raise _CheckFailure(
+                "translation_review_missing",
+                "translation audit has no semantic review provenance",
+            )
+        for key, expected_value in expected_review.items():
+            if reviewed.get(key) != expected_value:
+                raise _CheckFailure(
+                    "translation_review_mismatch",
+                    "translation audit is not bound to the current review resolution",
+                )
+        review_audit = reviewed.get("audit")
+        if (
+            not isinstance(review_audit, Mapping)
+            or review_audit.get("path") != "audit/semantic-review.json"
+            or review_audit.get("sha256") != review_artifact.audit_sha256
+            or not isinstance(review_audit.get("snapshot_path"), str)
+        ):
+            raise _CheckFailure(
+                "translation_review_mismatch",
+                "translation audit has an invalid semantic review audit identity",
+            )
+        effective_bundle = payload.get("effective_semantic_bundle")
+        if not isinstance(effective_bundle, Mapping):
+            raise _CheckFailure(
+                "effective_semantic_bundle_missing",
+                "translation audit has no effective semantic bundle identity",
+            )
+        required_effective = {
+            "raw_reconstruction_sha256": self.context.get(
+                "reconstruction_sha256"
+            ),
+            "review_audit_sha256": review_artifact.audit_sha256,
+            "decision_log_sha256": review_artifact.resolution.decision_log_sha256,
+            "review_policy_fingerprint": (
+                review_artifact.resolution.review_policy_fingerprint
+            ),
+            "issue_set_sha256": review_artifact.resolution.issue_set_sha256,
+        }
+        if any(
+            effective_bundle.get(key) != expected
+            for key, expected in required_effective.items()
+        ):
+            raise _CheckFailure(
+                "effective_semantic_bundle_mismatch",
+                "translation audit effective bundle is bound to stale review evidence",
+            )
+        effective_identity = {
+            key: value
+            for key, value in effective_bundle.items()
+            if key not in {"status", "sha256"}
+        }
+        expected_effective_sha256 = _sha256_bytes(
+            b"semantic-effective-bundle-v1\0"
+            + json.dumps(
+                effective_identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        if (
+            effective_bundle.get("schema_version") != SCHEMA_VERSION
+            or effective_bundle.get("status") != "passed"
+            or effective_bundle.get("sha256") != expected_effective_sha256
+        ):
+            raise _CheckFailure(
+                "effective_semantic_bundle_invalid",
+                "translation audit effective bundle identity is invalid",
+            )
         audit = _audit_by_filename(payload, label="semantic translation audit")
         reconstruction_audit = self.context.get("reconstruction_audit")
         if not isinstance(reconstruction_audit, Mapping) or tuple(audit) != tuple(reconstruction_audit):
@@ -547,6 +671,9 @@ class _Verifier:
         self.context["translation"] = payload
         self.context["translation_sha256"] = digest
         self.context["translation_input_sha256"] = translation_input_sha256
+        self.context["effective_semantic_bundle_sha256"] = (
+            expected_effective_sha256
+        )
         self.context["active_audit"] = audit
         self.context["translation_applied"] = True
         return {"required": self.require_translation, "present": True, "chapter_count": len(audit), "sha256": digest}
@@ -1132,9 +1259,22 @@ def verify_epub_publication(
         },
         "semantic": {
             "reconstruction_sha256": verifier.context.get("reconstruction_sha256"),
+            "review_sha256": verifier.context.get("review_sha256"),
+            "review_decision_log_sha256": verifier.context.get(
+                "decision_log_sha256"
+            ),
+            "review_policy_fingerprint": verifier.context.get(
+                "review_policy_fingerprint"
+            ),
+            "review_issue_set_sha256": verifier.context.get(
+                "review_issue_set_sha256"
+            ),
             "translation_sha256": verifier.context.get("translation_sha256"),
             "translation_input_sha256": verifier.context.get(
                 "translation_input_sha256"
+            ),
+            "effective_semantic_bundle_sha256": verifier.context.get(
+                "effective_semantic_bundle_sha256"
             ),
             "canonical_manifest_sha256": verifier.context.get(
                 "canonical_manifest_sha256"

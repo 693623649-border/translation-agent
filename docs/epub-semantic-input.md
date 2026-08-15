@@ -61,6 +61,7 @@ translation-agent run "book.epub" -o "outputs/book" \
 ```text
 core.source.epub.inspect
   → core.reconstruct.epub_semantic
+  → core.semantic.review
   → core.semantic.translate
   → core.semantic.apply
   → core.publish.epub
@@ -80,6 +81,7 @@ EPUB Graph 支持以下 target artifacts：
 | `chapters.semantic` | 不可变 source chapters 与 reconstruction audit |
 | `semantic.translation_units` | canonical 翻译单元 JSONL |
 | `semantic.translations` | 在线生成或外部绑定的完整翻译集合 |
+| `semantic.review` | 与 raw audit、决策日志及中央 policy 绑定的复核结果 |
 | `chapters.reader` | 通过结构/语言/术语复验的唯一 reader bundle |
 | `publication.epub` | 未单独验收的 EPUB 文件 |
 | `publication.docx` | 未单独验收的 Word 文件 |

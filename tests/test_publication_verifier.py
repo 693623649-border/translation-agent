@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 import zipfile
@@ -25,6 +26,12 @@ from publication_verifier import (
     _docx_positive_footnote_texts,
     _markdown_visible_text,
     verify_publication,
+)
+from semantic_review_policy import (
+    ACCEPT_AS_TEXT_REASON,
+    collect_reconstruction_review,
+    record_semantic_review_decision,
+    refresh_semantic_review,
 )
 
 
@@ -227,6 +234,63 @@ class PublicationVerifierTests(unittest.TestCase):
             json.dumps(audit, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+
+    def _install_semantic_review_contract(
+        self,
+        *,
+        blocker: bool = False,
+        accept: bool = False,
+    ):
+        audit_path = self.output / "audit" / "semantic-reconstruction.json"
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+        audit["contract_mode"] = "born-digital-pdf-text-layer"
+        audit["source"] = {
+            "path": str(self.source_pdf.resolve()),
+            "sha256": hashlib.sha256(self.source_pdf.read_bytes()).hexdigest(),
+        }
+        audit["issues"] = []
+        audit["release_blocked"] = blocker
+        chapter = audit["chapters"][0]
+        chapter["issues"] = (
+            [
+                {
+                    "code": "pdf_visible_superscript_unresolved",
+                    "message": "Visible superscript needs human review.",
+                    "blocking": True,
+                    "source_page": "pdf-0002-0001",
+                    "evidence": {"marker": "1"},
+                }
+            ]
+            if blocker
+            else []
+        )
+        chapter["release_blocked"] = blocker
+        audit["status"] = "blocked" if blocker else "passed"
+        audit["summary"].update(
+            {
+                "issue_count": 1 if blocker else 0,
+                "blocking_issue_count": 1 if blocker else 0,
+                "release_blocked": blocker,
+            }
+        )
+        audit_path.write_text(
+            json.dumps(audit, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        artifact = refresh_semantic_review(
+            self.output.resolve(),
+            create_decision_log=True,
+        )
+        if accept:
+            issue = collect_reconstruction_review(self.output.resolve()).issues[0]
+            artifact = record_semantic_review_decision(
+                self.output.resolve(),
+                issue_id=issue.issue_id,
+                reviewer="editor@example.test",
+                decision="accepted",
+                reason=ACCEPT_AS_TEXT_REASON,
+            )
+        return artifact
 
     @staticmethod
     def _rewrite_zip_member(path: Path, member: str, transform) -> None:
@@ -476,6 +540,97 @@ class PublicationVerifierTests(unittest.TestCase):
                 self.assertEqual(len(matching), 1)
                 self.assertIn(name, matching[0]["evidence"]["signals"])
 
+    def test_semantic_review_acceptance_is_hash_bound_in_release_report(self) -> None:
+        artifact = self._install_semantic_review_contract(
+            blocker=True,
+            accept=True,
+        )
+
+        report = self._verify(report_name="review-accepted.json")
+
+        self.assertTrue(report["release_ready"], report["errors"])
+        semantic = report["semantic"]
+        self.assertTrue(semantic["review_required"])
+        self.assertEqual(semantic["review_sha256"], artifact.audit_sha256)
+        self.assertEqual(
+            semantic["review_decision_log_sha256"],
+            artifact.resolution.decision_log_sha256,
+        )
+        self.assertEqual(
+            semantic["review_policy_fingerprint"],
+            artifact.resolution.review_policy_fingerprint,
+        )
+        self.assertEqual(
+            semantic["review_issue_set_sha256"],
+            artifact.resolution.issue_set_sha256,
+        )
+
+    def test_legacy_semantic_audit_report_explicitly_declares_no_review(self) -> None:
+        report = self._verify(report_name="legacy-no-review.json")
+
+        self.assertTrue(report["release_ready"], report["errors"])
+        self.assertEqual(
+            report["semantic"]["reconstruction_sha256"],
+            hashlib.sha256(
+                (
+                    self.output
+                    / "audit"
+                    / "semantic-reconstruction.json"
+                ).read_bytes()
+            ).hexdigest(),
+        )
+        self.assertIs(report["semantic"]["review_required"], False)
+        for field in (
+            "review_sha256",
+            "review_decision_log_sha256",
+            "review_policy_fingerprint",
+            "review_issue_set_sha256",
+        ):
+            self.assertIsNone(report["semantic"][field])
+
+    def test_unresolved_semantic_review_remains_a_release_blocker(self) -> None:
+        self._install_semantic_review_contract(blocker=True)
+
+        report = self._verify(report_name="review-blocked.json")
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["release_ready"])
+        self.assertIn(
+            "semantic_review_blocked",
+            {issue["code"] for issue in check["issues"]},
+        )
+
+    def test_backdated_semantic_review_tamper_fails_closed(self) -> None:
+        artifact = self._install_semantic_review_contract()
+        valid = self._verify(report_name="review-before-tamper.json")
+        self.assertTrue(valid["release_ready"], valid["errors"])
+        review_path = artifact.audit_path
+        review_path.write_bytes(review_path.read_bytes() + b"\n")
+        report_mtime = Path(valid["report_path"]).stat().st_mtime_ns
+        older = max(1, report_mtime - 1_000_000_000)
+        os.utime(review_path, ns=(older, older))
+
+        report = self._verify(report_name="review-after-tamper.json")
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["release_ready"])
+        self.assertIn(
+            "semantic_review_invalid",
+            {issue["code"] for issue in check["issues"]},
+        )
+
+    def test_deleted_semantic_review_decision_log_fails_closed(self) -> None:
+        self._install_semantic_review_contract()
+        (self.output / "audit" / "review-decisions.jsonl").unlink()
+
+        report = self._verify(report_name="review-log-deleted.json")
+        check = self._checks(report)["semantics.integrity"]
+
+        self.assertFalse(report["release_ready"])
+        self.assertIn(
+            "semantic_review_invalid",
+            {issue["code"] for issue in check["issues"]},
+        )
     def test_reviewed_source_bom_is_normalized_but_generated_bytes_are_strict(self) -> None:
         manifest = json.loads(
             (self.output / "chapters.json").read_text(encoding="utf-8")

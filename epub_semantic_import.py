@@ -36,6 +36,8 @@ from publication_semantics import (
 )
 from semantic_apply import SemanticApplyError, apply_translation_transaction
 from semantic_ir import SourceLocator, TranslationUnit
+from semantic_review import SemanticReviewError
+from semantic_review_policy import refresh_semantic_review
 
 
 EPUB_NS = "http://www.idpf.org/2007/ops"
@@ -43,11 +45,29 @@ CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 OPF_NS = "http://www.idpf.org/2007/opf"
 DC_NS = "http://purl.org/dc/elements/1.1/"
 SCHEMA_VERSION = 1
-IMPORTER_VERSION = "epub-semantic-v3"
+IMPORTER_VERSION = "epub-semantic-v4"
 
 
 class EpubSemanticError(ValueError):
     """Raised when an EPUB cannot prove a safe semantic reconstruction."""
+
+
+def _refresh_review_audit(output_dir: Path):
+    """Initialize the append-only log and refresh its derived review audit."""
+
+    try:
+        reconstruction_sha256 = _sha256_bytes(
+            (output_dir / "audit" / "semantic-reconstruction.json").read_bytes()
+        )
+        return refresh_semantic_review(
+            output_dir,
+            create_decision_log=True,
+            expected_reconstruction_sha256=reconstruction_sha256,
+        )
+    except (OSError, SemanticReviewError) as exc:
+        raise EpubSemanticError(
+            f"cannot initialize semantic reconstruction review: {exc}"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -886,6 +906,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     }
     _atomic_write_json(output_dir / "chapters.json", manifest)
     _atomic_write_json(output_dir / "audit" / "semantic-reconstruction.json", audit)
+    review = _refresh_review_audit(output_dir)
     units_path = output_dir / "semantic" / "translation-units.jsonl"
     _atomic_write_text(
         units_path,
@@ -904,6 +925,8 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         "chapters": str(chapter_dir.resolve()),
         "translation_units": str(units_path.resolve()),
         "audit": str((output_dir / "audit" / "semantic-reconstruction.json").resolve()),
+        "review_audit": str(review.audit_path),
+        "review_status": review.resolution.status,
     }
 
 

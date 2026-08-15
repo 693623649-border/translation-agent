@@ -24,6 +24,72 @@ from run_execution_service import (
 from tests.test_epub_semantic_import import _write_epub
 
 
+def _write_reconstruction_audit(
+    output_dir: Path,
+    *,
+    issue_code: str | None = None,
+    root_issue: bool = False,
+) -> Path:
+    selected_issues = (
+        []
+        if issue_code is None
+        else [
+            {
+                "code": issue_code,
+                "message": f"Review required for {issue_code}",
+                "blocking": True,
+                "source_page": 7,
+                "evidence": {"text": "ambiguous note marker"},
+            }
+        ]
+    )
+    root_issues = selected_issues if root_issue else []
+    chapter_issues = [] if root_issue else selected_issues
+    blocked = bool(selected_issues)
+    payload = {
+        "schema_version": 1,
+        "status": "blocked" if blocked else "passed",
+        "release_blocked": blocked,
+        "generated_by": "test",
+        "contract_mode": "born-digital-pdf-text-layer",
+        "importer_version": "test-v1",
+        "source": {"path": "/source/book.pdf", "sha256": "1" * 64},
+        "issues": root_issues,
+        "chapters": [
+            {
+                "chapter_id": "chapter-1",
+                "filename": "chapter-1.md",
+                "markdown_sha256": "2" * 64,
+                "footnote_count": 0,
+                "issues": chapter_issues,
+                "release_blocked": bool(chapter_issues),
+            }
+        ],
+        "summary": {
+            "chapter_count": 1,
+            "footnote_count": 0,
+            "issue_count": len(selected_issues),
+            "blocking_issue_count": len(selected_issues),
+            "release_blocked": blocked,
+        },
+    }
+    path = output_dir / "audit" / "semantic-reconstruction.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _file_snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        path.relative_to(root).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 class DocumentPipelineTests(unittest.TestCase):
     def test_execution_service_propagates_isolated_dotenv_policy(self) -> None:
         spec = RunSpec(
@@ -100,6 +166,7 @@ class DocumentPipelineTests(unittest.TestCase):
             (
                 "core.source.epub.inspect",
                 "core.reconstruct.epub_semantic",
+                "core.semantic.review",
                 "core.semantic.materialize_reader",
                 "core.publish.epub",
                 "core.publish.docx",
@@ -131,20 +198,236 @@ class DocumentPipelineTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(stdout.getvalue())["source_mode"], "epub")
 
-    def test_review_is_blocked_by_any_failed_audit(self) -> None:
+    def test_status_fails_closed_for_an_empty_output_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            audit = output / "audit"
-            audit.mkdir()
-            (audit / "semantic-reconstruction.json").write_text(
-                json.dumps({"status": "blocked", "release_blocked": True}),
-                encoding="utf-8",
-            )
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = document_pipeline.main(
+                    ["status", "--output-dir", str(output)]
+                )
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "blocked")
+        self.assertTrue(report["release_blocked"])
+        self.assertEqual(report["error"]["code"], "semantic_review_unavailable")
+
+    def test_status_fails_closed_for_invalid_reconstruction_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            path = output / "audit" / "semantic-reconstruction.json"
+            path.parent.mkdir()
+            path.write_text("{not-json", encoding="utf-8")
 
             report = document_pipeline.review_status(output)
 
         self.assertEqual(report["status"], "blocked")
         self.assertTrue(report["release_blocked"])
+        self.assertIn("invalid JSON", report["error"]["message"])
+
+    def test_status_fails_closed_when_reconstruction_audit_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            (output / "audit").mkdir()
+
+            report = document_pipeline.review_status(output)
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertTrue(report["release_blocked"])
+        self.assertIn("reconstruction audit is missing", report["error"]["message"])
+
+    def test_status_does_not_initialize_a_missing_review_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(output)
+            before = _file_snapshot(output)
+
+            report = document_pipeline.review_status(output)
+
+            after = _file_snapshot(output)
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("run review first", report["error"]["message"])
+        self.assertEqual(before, after)
+
+    def test_status_is_read_only_and_uses_the_central_review_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(
+                output,
+                issue_code="pdf_visible_superscript_unresolved",
+            )
+            document_pipeline.review_report(output)
+            before = _file_snapshot(output)
+
+            report = document_pipeline.review_status(output)
+
+            after = _file_snapshot(output)
+
+        self.assertEqual(before, after)
+        self.assertEqual(report["mode"], "status")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(report["summary"]["blocking_issue_count"], 1)
+        self.assertNotIn("issues", report)
+
+    def test_status_passes_a_valid_reconstruction_without_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(output)
+            document_pipeline.review_report(output)
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = document_pipeline.main(
+                    ["status", "--output-dir", str(output)]
+                )
+            report = json.loads(stdout.getvalue())
+
+        self.assertEqual(code, 0)
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["release_blocked"])
+        self.assertEqual(report["issue_set"]["count"], 0)
+
+    def test_status_ignores_unrelated_audits_instead_of_guessing_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(output)
+            document_pipeline.review_report(output)
+            (output / "audit" / "unrelated.json").write_text(
+                json.dumps({"status": "failed", "release_blocked": True}),
+                encoding="utf-8",
+            )
+
+            report = document_pipeline.review_status(output)
+
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["release_blocked"])
+
+    def test_review_view_exposes_complete_issue_and_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(
+                output,
+                issue_code="pdf_visible_superscript_unresolved",
+            )
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                code = document_pipeline.main(
+                    ["review", "--output-dir", str(output)]
+                )
+            report = json.loads(stdout.getvalue())
+            review_audit_exists = Path(report["review_audit"]["path"]).is_file()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(report["mode"], "review")
+        self.assertEqual(report["action"], "viewed")
+        self.assertEqual(report["status"], "blocked")
+        self.assertEqual(len(report["issues"]), 1)
+        issue = report["issues"][0]
+        self.assertEqual(issue["code"], "pdf_visible_superscript_unresolved")
+        self.assertTrue(issue["reviewable"])
+        self.assertEqual(issue["allowed_decisions"], ["accepted"])
+        self.assertEqual(issue["resolution"], "unresolved")
+        self.assertTrue(review_audit_exists)
+
+    def test_review_records_one_bound_decision_and_status_observes_it_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(
+                output,
+                issue_code="pdf_visible_superscript_unresolved",
+            )
+            issue_id = document_pipeline.review_report(output)["issues"][0]["issue_id"]
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = document_pipeline.main(
+                    [
+                        "review",
+                        "--output-dir",
+                        str(output),
+                        "--issue-id",
+                        issue_id,
+                        "--reviewer",
+                        "editor@example.test",
+                        "--decision",
+                        "accepted",
+                        "--reason",
+                        "accept_as_text",
+                    ]
+                )
+            recorded = json.loads(stdout.getvalue())
+            before_status = _file_snapshot(output)
+
+            status = document_pipeline.review_status(output)
+
+            after_status = _file_snapshot(output)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(recorded["action"], "decision-recorded")
+        self.assertEqual(recorded["issues"][0]["resolution"], "accepted")
+        self.assertEqual(
+            recorded["issues"][0]["effective_decision"]["reason"],
+            "accept_as_text",
+        )
+        self.assertEqual(status["status"], "passed")
+        self.assertFalse(status["release_blocked"])
+        self.assertEqual(before_status, after_status)
+
+    def test_review_rejects_partial_decision_arguments_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(
+                output,
+                issue_code="pdf_visible_superscript_unresolved",
+            )
+            before = _file_snapshot(output)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = document_pipeline.cli(
+                    [
+                        "review",
+                        "--output-dir",
+                        str(output),
+                        "--issue-id",
+                        "issue-" + "1" * 64,
+                    ]
+                )
+            after = _file_snapshot(output)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(before, after)
+        self.assertIn("requires --issue-id", stderr.getvalue())
+
+    def test_review_cannot_accept_a_non_reviewable_root_issue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            _write_reconstruction_audit(
+                output,
+                issue_code="semantic_structure_invalid",
+                root_issue=True,
+            )
+            viewed = document_pipeline.review_report(output)
+            issue = viewed["issues"][0]
+            decision_log = output / "audit" / "review-decisions.jsonl"
+            before = decision_log.read_bytes()
+
+            report = document_pipeline.review_report(
+                output,
+                issue_id=issue["issue_id"],
+                reviewer="editor@example.test",
+                decision="accepted",
+                reason="Attempted override",
+            )
+            after = decision_log.read_bytes()
+
+        self.assertFalse(issue["reviewable"])
+        self.assertEqual(issue["allowed_decisions"], [])
+        self.assertEqual(report["status"], "blocked")
+        self.assertTrue(report["release_blocked"])
+        self.assertIn("is not allowed", report["error"]["message"])
+        self.assertEqual(before, after)
 
     def test_publish_plan_is_explicitly_draft_without_release_report(self) -> None:
         class FakeRun:

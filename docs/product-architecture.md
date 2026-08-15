@@ -19,8 +19,10 @@ flowchart TB
     TEXT --> DAG
     EPUB --> DAG
     DAG --> SOURCE["document semantic source / canonical TranslationUnit"]
+    SOURCE --> REVIEW["hash-bound semantic review"]
     SOURCE --> TRANSLATE["Provider + semantic translation QA"]
-    TRANSLATE --> APPLY["transactional semantic apply"]
+    REVIEW --> APPLY["transactional semantic apply"]
+    TRANSLATE --> APPLY
     APPLY --> SANITIZE["reader sanitize"]
     SANITIZE --> PUBLISH["EPUB / DOCX / KB / reference PDF"]
     PUBLISH --> VERIFY{"release profile"}
@@ -51,7 +53,7 @@ profile，因此返回草稿，不得与完整 `run` 的正式目标混用。
 | `RunSpec` | v1 | 统一 CLI、服务与 UI 的输入；严格类型、来源/目标能力，不保存密钥 |
 | `DocumentSemantic` | v1 | 文档、章节、语义块、来源定位与资产清单 |
 | `TranslationUnit` | v1 | 8 个固定字段、稳定顺序、源文本 SHA-256 与一个或多个 `SourceLocator` |
-| `ReviewDecision` | v1 | append-only 人工决定；绑定 issue、unit 与 source hash |
+| `ReviewDecision` | v1 | append-only 人工决定；绑定 reconstruction、subject、source hash 与审计理由 |
 | `ArtifactRecord` | v1 | 文件身份、SHA-256、草稿/阻断/正式状态 |
 | `RunEvent` | v1 | 可序列化任务事件与错误摘要 |
 | Graph state/event | v1 | 节点缓存、产物指纹和恢复记录 |
@@ -72,8 +74,8 @@ Provider、Source Adapter 和 publisher 可以迭代，但不能绕过这些契�
 6. EPUB 的 source、semantic source、translation、reader 与 publication 各是独立
    artifact；翻译开关变化不得让译文 reader 污染源语言 reader 的缓存。
 7. `publication.epub_report` 必须依赖同次 Graph 记录的 `source.epub`、
-   `chapters.reader` 与 `publication.epub`；验收报告节点不缓存，以便每次重新绑定
-   当前文件身份。
+   `semantic.review`、`chapters.reader` 与 `publication.epub`；验收报告节点不缓存，
+   以便每次重新绑定当前文件身份。
 
 ## EPUB Graph 与发布契约
 
@@ -82,6 +84,7 @@ EPUB 的正常节点链为：
 ```text
 core.source.epub.inspect
   → core.reconstruct.epub_semantic
+  → core.semantic.review
   → [core.semantic.translate → core.semantic.apply]
     或 core.semantic.materialize_reader（不翻译）
   → core.publish.epub
@@ -96,7 +99,7 @@ core.source.epub.inspect
 `publication.word_report` 也不属于 EPUB target 集合。
 
 EPUB native verifier 是确定性的包/语义门，不调用模型，也不是视觉渲染门。它核对
-源文件和 reconstruction/translation audit 的哈希绑定、canonical 章节顺序与正文、
+源文件和 reconstruction/review/translation audit 的哈希绑定、canonical 章节顺序与正文、
 脚注闭环、EPUB3 container/OPF/manifest/spine/nav、语言、资源清单、内部链接/fragment
 和成品 SHA-256。外部 `http`/`https`/`mailto` 超链接可以保留，但外部图片/媒体不
 允许；所有 `src` 必须指向包内资源。
@@ -128,10 +131,14 @@ runner/apply 边界使用 normalizer，对既有 schema-v1 行兼容读取 `sour
 `source_pages` 以及旧 `kind=list`，但拒绝新旧 locator 混写。所有当前 writer
 只写 canonical 形状，避免兼容字段继续扩散。
 
-人工复核的目标契约是 append-only `review-decisions.jsonl`，决定绑定
-issue/unit/source hash；当前数据模型和安全追加写已经存在，但 resolution → apply
-→ verifier 尚未接通，不能把手工改写 audit 当作正式复核。该链闭合前，原审计的
-blocking 状态仍必须 fail closed。
+人工复核使用 append-only `audit/review-decisions.jsonl`。中央 policy 从不可变的
+`semantic-reconstruction.json` 完整重算 blocker 集合，决定绑定 reconstruction、
+subject 与 source hash；派生 `semantic-review.json` 和内容寻址快照。当前 v1 只允许
+将文字 PDF 章节中的 `pdf_visible_superscript_unresolved` 明确记录为
+`accepted + reason=accept_as_text`；未知、根级、结构替换及所有来源/哈希/包完整性
+问题均不可豁免。apply、EPUB Graph、EPUB 与 Word/full verifier、Web artifact catalog
+都复验同一 raw → review → effective bundle 哈希链；旧 PDF 审计会在报告中明确标为
+`review_required=false`，且只在复核证据从未出现时维持原始阻断契约。
 
 ## WebUI 安全模型
 

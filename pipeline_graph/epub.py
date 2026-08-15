@@ -37,6 +37,8 @@ from epub_publication_verifier import (
 )
 from epub_semantic_import import IMPORTER_VERSION, apply_translations, import_epub
 from semantic_ir import SemanticContractError, TranslationUnit
+from semantic_review import REVIEW_POLICY_VERSION, SemanticReviewError
+from semantic_review_policy import validate_semantic_review
 from semantic_translation_runner import (
     PROMPT_CONTRACT_SHA256,
     RUNNER_VERSION,
@@ -64,6 +66,7 @@ NODE_SOURCE = "core.source.epub.inspect"
 NODE_IMPORT = "core.reconstruct.epub_semantic"
 NODE_TRANSLATIONS_IMPORT = "core.semantic.translations.inspect"
 NODE_TRANSLATE = "core.semantic.translate"
+NODE_REVIEW = "core.semantic.review"
 NODE_APPLY = "core.semantic.apply"
 NODE_READER = "core.semantic.materialize_reader"
 NODE_EPUB = "core.publish.epub"
@@ -74,6 +77,7 @@ ART_SOURCE = "source.epub"
 ART_SEMANTIC_CHAPTERS = "chapters.semantic"
 ART_TRANSLATION_UNITS = "semantic.translation_units"
 ART_TRANSLATIONS = "semantic.translations"
+ART_REVIEW = "semantic.review"
 ART_READER_CHAPTERS = "chapters.reader"
 ART_EPUB = "publication.epub"
 ART_DOCX = "publication.docx"
@@ -85,6 +89,7 @@ KNOWN_TARGET_ARTIFACTS = frozenset(
         ART_SEMANTIC_CHAPTERS,
         ART_TRANSLATION_UNITS,
         ART_TRANSLATIONS,
+        ART_REVIEW,
         ART_READER_CHAPTERS,
         ART_EPUB,
         ART_DOCX,
@@ -574,6 +579,44 @@ def _file_artifact(path: Path) -> dict[str, Any]:
     }
 
 
+def _semantic_review_artifact(output_dir: Path) -> dict[str, Any]:
+    try:
+        artifact = validate_semantic_review(output_dir)
+    except SemanticReviewError as exc:
+        raise EpubSemanticBlockedError(
+            f"semantic review evidence is missing, stale, or invalid: {exc}"
+        ) from exc
+    resolution = artifact.resolution
+    file_artifact = _file_artifact(artifact.audit_path)
+    if file_artifact["sha256"] != artifact.audit_sha256:
+        raise EpubSemanticBlockedError(
+            "semantic review audit changed while its graph artifact was built"
+        )
+    return {
+        **file_artifact,
+        "status": resolution.status,
+        "release_blocked": resolution.release_blocked,
+        "reconstruction_sha256": resolution.reconstruction_sha256,
+        "decision_log_sha256": resolution.decision_log_sha256,
+        "issue_set_sha256": resolution.issue_set_sha256,
+        "policy_version": resolution.review_policy_version,
+        "policy_fingerprint": resolution.review_policy_fingerprint,
+    }
+
+
+def _semantic_review_artifact_is_current(
+    context: GraphContext,
+    value: Mapping[str, Any],
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    try:
+        current = _semantic_review_artifact(context.output_dir)
+    except (OSError, ValueError, SemanticReviewError, EpubSemanticBlockedError):
+        return False
+    return all(value.get(key) == current.get(key) for key in current)
+
+
 def _translation_units_artifact(path: Path) -> dict[str, Any]:
     artifact = _file_artifact(path)
     records = _read_canonical_translation_units(path)
@@ -825,6 +868,7 @@ def _bundle_artifact(
     manifest_path: Path,
     chapter_dir: Path,
     semantic_audit: Path,
+    review_audit: Path | None,
     translation_audit: Path | None,
     title: str,
     author: str,
@@ -834,6 +878,8 @@ def _bundle_artifact(
     translation_input_sha256: str | None = None,
 ) -> dict[str, Any]:
     audits = [semantic_audit]
+    if review_audit is not None:
+        audits.append(review_audit)
     if translation_audit is not None:
         audits.append(translation_audit)
     content_sha256 = _bundle_digest(manifest_path, chapter_dir, audits)
@@ -848,6 +894,9 @@ def _bundle_artifact(
         "manifest": str(manifest_path.resolve()),
         "chapter_dir": str(chapter_dir.resolve()),
         "semantic_audit": str(semantic_audit.resolve()),
+        "review_audit": (
+            str(review_audit.resolve()) if review_audit is not None else None
+        ),
         "translation_audit": (
             str(translation_audit.resolve()) if translation_audit is not None else None
         ),
@@ -872,8 +921,11 @@ def _bundle_is_current(
         manifest = Path(str(value["manifest"])).expanduser()
         chapters = Path(str(value["chapter_dir"])).expanduser()
         semantic_audit = Path(str(value["semantic_audit"])).expanduser()
+        review_value = value.get("review_audit")
         translation_value = value.get("translation_audit")
         audits = [semantic_audit]
+        if review_value:
+            audits.append(Path(str(review_value)).expanduser())
         if translation_value:
             audits.append(Path(str(translation_value)).expanduser())
         content_sha256 = _bundle_digest(manifest, chapters, audits)
@@ -970,6 +1022,7 @@ def _import_handler(context: GraphContext) -> NodeResult:
         manifest_path=source_manifest,
         chapter_dir=context.output_dir / "semantic" / "source_chapters",
         semantic_audit=semantic_audit,
+        review_audit=None,
         translation_audit=None,
         title=str(result.get("title") or source.stem),
         author=str(result.get("author") or ""),
@@ -998,6 +1051,35 @@ def _import_handler(context: GraphContext) -> NodeResult:
             "chapter_count": int(result.get("chapter_count") or 0),
             "translation_unit_count": int(result.get("translation_unit_count") or 0),
             "release_blocked": bool(result.get("release_blocked")),
+        },
+    )
+
+
+def _review_handler(context: GraphContext) -> NodeResult:
+    semantic = context.require(ART_SEMANTIC_CHAPTERS)
+    if not _bundle_is_current(context, semantic):
+        raise EpubSourceChangedError(
+            "chapters.semantic no longer matches its artifact"
+        )
+    semantic_audit = Path(str(semantic["semantic_audit"])).resolve()
+    reconstruction_sha256 = _sha256_file(semantic_audit)
+    try:
+        resolved = validate_semantic_review(
+            context.output_dir,
+            expected_reconstruction_sha256=reconstruction_sha256,
+        )
+    except SemanticReviewError as exc:
+        raise EpubSemanticBlockedError(
+            f"semantic review evidence is missing, stale, or invalid: {exc}"
+        ) from exc
+    artifact = _semantic_review_artifact(context.output_dir)
+    return NodeResult(
+        outputs={ART_REVIEW: artifact},
+        fingerprints={ART_REVIEW: str(artifact["sha256"])},
+        metadata={
+            "status": resolved.resolution.status,
+            "release_blocked": resolved.resolution.release_blocked,
+            "issue_count": len(resolved.resolution.issues),
         },
     )
 
@@ -1087,7 +1169,24 @@ def _translate_handler(
     return handler
 
 
-def _assert_publishable(bundle: Mapping[str, Any]) -> None:
+def _assert_publishable(
+    bundle: Mapping[str, Any],
+    review: Mapping[str, Any] | None = None,
+) -> None:
+    if review is not None:
+        if (
+            review.get("status") != "passed"
+            or review.get("release_blocked") is not False
+        ):
+            raise EpubSemanticBlockedError(
+                "EPUB semantic review is unresolved or blocked"
+            )
+        semantic_audit = Path(str(bundle["semantic_audit"])).resolve()
+        if review.get("reconstruction_sha256") != _sha256_file(semantic_audit):
+            raise EpubSemanticBlockedError(
+                "EPUB semantic review is bound to different reconstruction bytes"
+            )
+        return
     if bundle.get("release_blocked") is not False:
         raise EpubSemanticBlockedError(
             "EPUB semantic reconstruction is blocked; review its audit"
@@ -1139,7 +1238,8 @@ def _materialize_bundle(
 
 def _source_reader_handler(context: GraphContext) -> NodeResult:
     semantic = context.require(ART_SEMANTIC_CHAPTERS)
-    _assert_publishable(semantic)
+    review = context.require(ART_REVIEW)
+    _assert_publishable(semantic, review)
     _materialize_bundle(
         context.output_dir,
         semantic,
@@ -1149,6 +1249,7 @@ def _source_reader_handler(context: GraphContext) -> NodeResult:
         manifest_path=context.output_dir / "chapters.json",
         chapter_dir=context.output_dir / "chapters",
         semantic_audit=Path(str(semantic["semantic_audit"])).resolve(),
+        review_audit=Path(str(review["path"])).resolve(),
         translation_audit=None,
         title=str(semantic["title"]),
         author=str(semantic["author"]),
@@ -1169,7 +1270,8 @@ def _apply_handler(
     def handler(context: GraphContext) -> NodeResult:
         semantic = context.require(ART_SEMANTIC_CHAPTERS)
         translations = context.require(ART_TRANSLATIONS)
-        _assert_publishable(semantic)
+        review = context.require(ART_REVIEW)
+        _assert_publishable(semantic, review)
         if not _file_artifact_is_current(context, translations):
             raise EpubSourceChangedError(
                 "semantic.translations no longer matches its artifact"
@@ -1208,18 +1310,58 @@ def _apply_handler(
             audited_translation_sha256 = str(
                 translation_audit_payload["translation_input"]["sha256"]
             )
+            reviewed = translation_audit_payload["review_resolution"]
+            effective_bundle = translation_audit_payload[
+                "effective_semantic_bundle"
+            ]
         except (KeyError, OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             raise EpubSourceChangedError(
-                "semantic translation audit has no translation input binding"
+                "semantic translation audit has incomplete provenance"
             ) from exc
         if audited_translation_sha256 != translation_input_sha256:
             raise EpubSourceChangedError(
                 "semantic translation audit binds different translation bytes"
             )
+        review_audit_identity = reviewed.get("audit") if isinstance(reviewed, Mapping) else None
+        review_upstream = reviewed.get("upstream_reconstruction") if isinstance(reviewed, Mapping) else None
+        review_log = reviewed.get("decision_log") if isinstance(reviewed, Mapping) else None
+        review_policy = reviewed.get("review_policy") if isinstance(reviewed, Mapping) else None
+        review_issue_set = reviewed.get("issue_set") if isinstance(reviewed, Mapping) else None
+        if (
+            not isinstance(review_audit_identity, Mapping)
+            or review_audit_identity.get("sha256") != review.get("sha256")
+            or not isinstance(review_upstream, Mapping)
+            or review_upstream.get("sha256") != review.get("reconstruction_sha256")
+            or not isinstance(review_log, Mapping)
+            or review_log.get("sha256") != review.get("decision_log_sha256")
+            or not isinstance(review_policy, Mapping)
+            or review_policy.get("fingerprint") != review.get("policy_fingerprint")
+            or not isinstance(review_issue_set, Mapping)
+            or review_issue_set.get("sha256") != review.get("issue_set_sha256")
+        ):
+            raise EpubSourceChangedError(
+                "semantic translation audit binds different review evidence"
+            )
+        if (
+            not isinstance(effective_bundle, Mapping)
+            or effective_bundle.get("status") != "passed"
+            or effective_bundle.get("review_audit_sha256")
+            != review.get("sha256")
+            or effective_bundle.get("decision_log_sha256")
+            != review.get("decision_log_sha256")
+            or effective_bundle.get("review_policy_fingerprint")
+            != review.get("policy_fingerprint")
+            or effective_bundle.get("issue_set_sha256")
+            != review.get("issue_set_sha256")
+        ):
+            raise EpubSourceChangedError(
+                "semantic translation audit has a stale effective semantic bundle"
+            )
         reader = _bundle_artifact(
             manifest_path=context.output_dir / "chapters.json",
             chapter_dir=context.output_dir / "chapters",
             semantic_audit=Path(str(semantic["semantic_audit"])).resolve(),
+            review_audit=Path(str(review["path"])).resolve(),
             translation_audit=translation_audit,
             title=str(semantic["title"]),
             author=str(semantic["author"]),
@@ -1323,7 +1465,7 @@ def register_epub_verifier(graph: PipelineGraph, node: NodeSpec) -> PipelineGrap
     validating an arbitrary file discovered by glob.
     """
 
-    required = {ART_SOURCE, ART_READER_CHAPTERS, ART_EPUB}
+    required = {ART_SOURCE, ART_REVIEW, ART_READER_CHAPTERS, ART_EPUB}
     if node.name != NODE_VERIFY_EPUB:
         raise EpubGraphConfigurationError(
             f"EPUB verifier node must be named {NODE_VERIFY_EPUB!r}"
@@ -1334,7 +1476,8 @@ def register_epub_verifier(graph: PipelineGraph, node: NodeSpec) -> PipelineGrap
         )
     if not required.issubset(node.requires):
         raise EpubGraphConfigurationError(
-            "EPUB verifier must require source.epub, chapters.reader, and publication.epub"
+            "EPUB verifier must require source.epub, semantic.review, "
+            "chapters.reader, and publication.epub"
         )
     graph.add(node)
     return graph
@@ -1345,6 +1488,7 @@ def _epub_verify_handler(
 ) -> Callable[[GraphContext], NodeResult]:
     def handler(context: GraphContext) -> NodeResult:
         source = context.require(ART_SOURCE)
+        review = context.require(ART_REVIEW)
         reader = context.require(ART_READER_CHAPTERS)
         publication = context.require(ART_EPUB)
         translations = (
@@ -1354,6 +1498,14 @@ def _epub_verify_handler(
         )
         if not _epub_source_artifact_is_current(context, source):
             raise EpubSourceChangedError("source.epub no longer matches its artifact")
+        if not _semantic_review_artifact_is_current(context, review):
+            raise EpubSourceChangedError(
+                "semantic.review no longer matches its artifact"
+            )
+        if review.get("status") != "passed" or review.get("release_blocked") is not False:
+            raise EpubSemanticBlockedError(
+                "semantic review is not release-ready"
+            )
         if not _bundle_is_current(context, reader):
             raise EpubSourceChangedError(
                 "chapters.reader no longer matches its artifact"
@@ -1408,7 +1560,7 @@ def _epub_verify_handler(
 def epub_verifier_node(options: EpubGraphOptions) -> NodeSpec:
     """Build the deterministic, non-cacheable native EPUB release gate."""
 
-    requirements = {ART_SOURCE, ART_READER_CHAPTERS, ART_EPUB}
+    requirements = {ART_SOURCE, ART_REVIEW, ART_READER_CHAPTERS, ART_EPUB}
     if options.translation_mode != "none":
         requirements.add(ART_TRANSLATIONS)
     return NodeSpec(
@@ -1508,6 +1660,28 @@ def prepare_epub_graph(
             description="Import the EPUB spine into immutable semantic chapters and units.",
         )
     )
+    graph.add(
+        NodeSpec(
+            name=NODE_REVIEW,
+            handler=_review_handler,
+            requires=frozenset({ART_SEMANTIC_CHAPTERS}),
+            provides=frozenset({ART_REVIEW}),
+            version="1",
+            fingerprint=stable_fingerprint(
+                {
+                    "policy": REVIEW_POLICY_VERSION,
+                    "contract": "raw-reconstruction+append-only-decisions",
+                }
+            ),
+            cache_validator=_single_output_is_current(
+                ART_REVIEW, _semantic_review_artifact_is_current
+            ),
+            description=(
+                "Resolve the complete reconstruction issue set through the "
+                "hash-bound append-only review policy."
+            ),
+        )
+    )
 
     if options.translation_mode == "run":
         graph.add(
@@ -1552,9 +1726,9 @@ def prepare_epub_graph(
             NodeSpec(
                 name=NODE_READER,
                 handler=_source_reader_handler,
-                requires=frozenset({ART_SEMANTIC_CHAPTERS}),
+                requires=frozenset({ART_SEMANTIC_CHAPTERS, ART_REVIEW}),
                 provides=frozenset({ART_READER_CHAPTERS}),
-                version="1",
+                version="2",
                 fingerprint=stable_fingerprint(
                     {"mode": "source", "adapter": EPUB_GRAPH_ADAPTER_VERSION}
                 ),
@@ -1570,10 +1744,10 @@ def prepare_epub_graph(
                 name=NODE_APPLY,
                 handler=_apply_handler(options),
                 requires=frozenset(
-                    {ART_SEMANTIC_CHAPTERS, ART_TRANSLATIONS}
+                    {ART_SEMANTIC_CHAPTERS, ART_TRANSLATIONS, ART_REVIEW}
                 ),
                 provides=frozenset({ART_READER_CHAPTERS}),
-                version="1",
+                version="2",
                 fingerprint=stable_fingerprint({
                     "target_language": options.target_language,
                     "glossary": dict(options.glossary),
@@ -1657,6 +1831,7 @@ def prepare_epub_graph(
             ART_SEMANTIC_CHAPTERS: _bundle_is_current,
             ART_TRANSLATION_UNITS: _translation_units_artifact_is_current,
             ART_TRANSLATIONS: _file_artifact_is_current,
+            ART_REVIEW: _semantic_review_artifact_is_current,
             ART_READER_CHAPTERS: _bundle_is_current,
             ART_EPUB: _file_artifact_is_current,
             ART_DOCX: _file_artifact_is_current,

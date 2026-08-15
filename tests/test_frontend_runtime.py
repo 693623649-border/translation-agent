@@ -30,7 +30,208 @@ from frontend_runtime import (
     validate_upload_size,
 )
 from product_contracts import RunSpec
+from semantic_review_policy import refresh_semantic_review
 from tests.test_epub_semantic_import import _write_epub
+
+
+def _write_pdf_reconstruction(
+    output: Path,
+    *,
+    blocked: bool = False,
+) -> Path:
+    output = output.resolve()
+    issue = {
+        "code": "semantic_structure_invalid",
+        "message": "Structural evidence is incomplete",
+        "blocking": True,
+        "source_page": "pdf-0001-0001",
+        "note_label": None,
+        "evidence": {"page": 1},
+    }
+    chapter_issues = [issue] if blocked else []
+    reconstruction = {
+        "schema_version": 1,
+        "status": "blocked" if blocked else "passed",
+        "release_blocked": blocked,
+        "generated_by": "test",
+        "contract_mode": "born-digital-pdf-text-layer",
+        "importer_version": "test-v1",
+        "source": {
+            "path": "/source/book.pdf",
+            "sha256": hashlib.sha256(b"source").hexdigest(),
+        },
+        "issues": [],
+        "chapters": [
+            {
+                "chapter_id": "chapter-1",
+                "filename": "chapter-1.md",
+                "markdown_sha256": hashlib.sha256(b"chapter").hexdigest(),
+                "footnote_count": 0,
+                "issues": chapter_issues,
+                "release_blocked": blocked,
+            }
+        ],
+        "summary": {
+            "chapter_count": 1,
+            "footnote_count": 0,
+            "issue_count": len(chapter_issues),
+            "blocking_issue_count": len(chapter_issues),
+            "release_blocked": blocked,
+        },
+    }
+    reconstruction_path = output / "audit" / "semantic-reconstruction.json"
+    reconstruction_path.parent.mkdir(parents=True, exist_ok=True)
+    reconstruction_path.write_text(
+        json.dumps(reconstruction, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return reconstruction_path
+
+
+def _write_pdf_semantic_review(
+    output: Path,
+    *,
+    blocked: bool = False,
+) -> tuple[dict[str, object], Path, Path]:
+    output = output.resolve()
+    _write_pdf_reconstruction(output, blocked=blocked)
+    artifact = refresh_semantic_review(output, create_decision_log=True)
+    semantic = {
+        "reconstruction_sha256": artifact.resolution.reconstruction_sha256,
+        "review_required": True,
+        "review_sha256": artifact.audit_sha256,
+        "review_decision_log_sha256": (
+            artifact.resolution.decision_log_sha256
+        ),
+        "review_policy_fingerprint": (
+            artifact.resolution.review_policy_fingerprint
+        ),
+        "review_issue_set_sha256": artifact.resolution.issue_set_sha256,
+    }
+    return (
+        semantic,
+        artifact.audit_path,
+        output / "audit" / "review-decisions.jsonl",
+    )
+
+
+def _pdf_catalog_fixture(
+    root: Path,
+    *,
+    profile: str,
+    blocked_review: bool = False,
+    include_binding: bool = True,
+    review_required: bool = True,
+) -> SimpleNamespace:
+    root = root.resolve()
+    workspace = root / "job"
+    output = workspace / "output"
+    output.mkdir(parents=True)
+    source = workspace / "book.pdf"
+    source.write_bytes(b"pdf")
+    report_artifact = (
+        "publication.word_report" if profile == "word" else "publication.report"
+    )
+    report_name = (
+        "word-release-report.json" if profile == "word" else "release-report.json"
+    )
+    registry = JobRegistry(root / "jobs.sqlite3")
+    job = registry.create(
+        "b" * 32,
+        workspace,
+        RunSpec(
+            source=source,
+            source_mode="text-pdf",
+            output_dir=output,
+            targets=(report_artifact,),
+        ),
+        resolved_targets=(report_artifact,),
+        release_profile=profile,
+    )
+    publication = output / "book.docx"
+    publication.write_bytes(b"docx")
+    publication_sha256 = hashlib.sha256(publication.read_bytes()).hexdigest()
+    if review_required:
+        semantic, review_audit, decision_log = _write_pdf_semantic_review(
+            output,
+            blocked=blocked_review,
+        )
+    else:
+        reconstruction = _write_pdf_reconstruction(
+            output,
+            blocked=blocked_review,
+        )
+        legacy_payload = json.loads(reconstruction.read_text(encoding="utf-8"))
+        for key in ("contract_mode", "importer_version", "source"):
+            legacy_payload.pop(key, None)
+        reconstruction.write_text(
+            json.dumps(legacy_payload, ensure_ascii=False, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        semantic = {
+            "reconstruction_sha256": hashlib.sha256(
+                reconstruction.read_bytes()
+            ).hexdigest(),
+            "review_required": False,
+            "review_sha256": None,
+            "review_decision_log_sha256": None,
+            "review_policy_fingerprint": None,
+            "review_issue_set_sha256": None,
+        }
+        review_audit = output / "audit" / "semantic-review.json"
+        decision_log = output / "audit" / "review-decisions.jsonl"
+    report = output / "audit" / report_name
+    payload: dict[str, object] = {
+        "release_ready": True,
+        "mode": "full",
+        "publication_profile": profile,
+    }
+    if include_binding:
+        payload["semantic"] = semantic
+    report.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    metadata = output / ".pipeline_graph"
+    metadata.mkdir()
+    state_path = metadata / "state.json"
+
+    def write_state() -> None:
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "nodes": {
+                        "core.publish.docx": {
+                            "outputs": {
+                                "publication.docx": {
+                                    "path": str(publication),
+                                    "sha256": publication_sha256,
+                                }
+                            }
+                        },
+                        f"core.publication.verify.{profile}": {
+                            "outputs": {
+                                report_artifact: {
+                                    "path": str(report),
+                                    "sha256": hashlib.sha256(
+                                        report.read_bytes()
+                                    ).hexdigest(),
+                                }
+                            }
+                        },
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_state()
+    return SimpleNamespace(
+        job=job,
+        report=report,
+        publication=publication,
+        review_audit=review_audit,
+        decision_log=decision_log,
+        write_state=write_state,
+    )
 
 
 class FrontendRuntimeTests(unittest.TestCase):
@@ -512,11 +713,20 @@ class FrontendRuntimeTests(unittest.TestCase):
             docx.write_bytes(b"docx")
             sha256 = hashlib.sha256(b"docx").hexdigest()
             audit = output / "audit"
-            audit.mkdir()
+            semantic, _review_audit, _decision_log = _write_pdf_semantic_review(
+                output
+            )
             report = audit / "word-release-report.json"
             report.write_text(
-                '{"release_ready": true, "mode": "full", '
-                '"publication_profile": "word"}\n',
+                json.dumps(
+                    {
+                        "release_ready": True,
+                        "mode": "full",
+                        "publication_profile": "word",
+                        "semantic": semantic,
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             metadata = output / ".pipeline_graph"
@@ -605,8 +815,15 @@ class FrontendRuntimeTests(unittest.TestCase):
             self.assertEqual(docx_after_epub.status, "released")
 
             report.write_text(
-                '{"release_ready": false, "mode": "full", '
-                '"publication_profile": "word"}\n',
+                json.dumps(
+                    {
+                        "release_ready": False,
+                        "mode": "full",
+                        "publication_profile": "word",
+                        "semantic": semantic,
+                    }
+                )
+                + "\n",
                 encoding="utf-8",
             )
             write_state()
@@ -635,6 +852,156 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(draft_publication.status, "draft")
             self.assertIsNone(draft_publication.report_path)
+
+    def test_pdf_release_catalog_requires_report_bound_central_review(self) -> None:
+        for profile in ("word", "full"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as directory:
+                fixture = _pdf_catalog_fixture(Path(directory), profile=profile)
+                publication = next(
+                    record
+                    for record in artifact_catalog(fixture.job)
+                    if record.kind == "docx"
+                )
+                self.assertEqual(publication.status, "released")
+
+            with (
+                self.subTest(profile=profile, evidence="legacy-without-review"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = _pdf_catalog_fixture(
+                    Path(directory),
+                    profile=profile,
+                    review_required=False,
+                )
+                publication = next(
+                    record
+                    for record in artifact_catalog(fixture.job)
+                    if record.kind == "docx"
+                )
+                self.assertEqual(publication.status, "released")
+
+            with (
+                self.subTest(profile=profile, evidence="report-binding-missing"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = _pdf_catalog_fixture(
+                    Path(directory),
+                    profile=profile,
+                    include_binding=False,
+                )
+                publication = next(
+                    record
+                    for record in artifact_catalog(fixture.job)
+                    if record.kind == "docx"
+                )
+                self.assertEqual(publication.status, "blocked")
+
+    def test_pdf_release_catalog_rejects_stale_or_blocked_review_evidence(self) -> None:
+        scenarios = (
+            "backdated-review-audit",
+            "backdated-decision-log",
+            "missing-review-audit",
+            "missing-decision-log",
+            "report-binding-mismatch",
+            "blocked-resolution",
+        )
+        for profile in ("word", "full"):
+            for scenario in scenarios:
+                with (
+                    self.subTest(profile=profile, scenario=scenario),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    fixture = _pdf_catalog_fixture(
+                        Path(directory),
+                        profile=profile,
+                        blocked_review=scenario == "blocked-resolution",
+                    )
+                    older = max(
+                        1,
+                        fixture.report.stat().st_mtime_ns - 1_000_000_000,
+                    )
+                    if scenario == "backdated-review-audit":
+                        payload = json.loads(
+                            fixture.review_audit.read_text(encoding="utf-8")
+                        )
+                        payload["summary"]["resolved_issue_count"] = 99
+                        fixture.review_audit.write_text(
+                            json.dumps(payload),
+                            encoding="utf-8",
+                        )
+                        os.utime(fixture.review_audit, ns=(older, older))
+                    elif scenario == "backdated-decision-log":
+                        fixture.decision_log.write_text("{}\n", encoding="utf-8")
+                        os.utime(fixture.decision_log, ns=(older, older))
+                    elif scenario == "missing-review-audit":
+                        fixture.review_audit.unlink()
+                    elif scenario == "missing-decision-log":
+                        fixture.decision_log.unlink()
+                    elif scenario == "report-binding-mismatch":
+                        payload = json.loads(fixture.report.read_text(encoding="utf-8"))
+                        payload["semantic"]["review_sha256"] = "0" * 64
+                        fixture.report.write_text(
+                            json.dumps(payload) + "\n",
+                            encoding="utf-8",
+                        )
+                        fixture.write_state()
+
+                    publication = next(
+                        record
+                        for record in artifact_catalog(fixture.job)
+                        if record.kind == "docx"
+                    )
+                    self.assertEqual(publication.status, "blocked")
+
+    def test_legacy_pdf_release_is_invalidated_by_any_review_evidence(self) -> None:
+        evidence_names = (
+            "semantic-review.json",
+            f"semantic-review.{'1' * 64}.json",
+            "review-decisions.jsonl",
+            "review-decisions.jsonl.lock",
+        )
+        for profile in ("word", "full"):
+            for evidence_name in evidence_names:
+                with (
+                    self.subTest(profile=profile, evidence=evidence_name),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    fixture = _pdf_catalog_fixture(
+                        Path(directory),
+                        profile=profile,
+                        review_required=False,
+                    )
+                    evidence = fixture.report.parent / evidence_name
+                    evidence.write_text("{}\n", encoding="utf-8")
+                    older = max(
+                        1,
+                        fixture.report.stat().st_mtime_ns - 1_000_000_000,
+                    )
+                    os.utime(evidence, ns=(older, older))
+                    publication = next(
+                        record
+                        for record in artifact_catalog(fixture.job)
+                        if record.kind == "docx"
+                    )
+                    self.assertEqual(publication.status, "blocked")
+
+            with (
+                self.subTest(profile=profile, evidence="broken-snapshot-symlink"),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                fixture = _pdf_catalog_fixture(
+                    Path(directory),
+                    profile=profile,
+                    review_required=False,
+                )
+                snapshot = fixture.report.parent / "semantic-review.broken.json"
+                snapshot.symlink_to(fixture.report.parent / "missing-review-target")
+                publication = next(
+                    record
+                    for record in artifact_catalog(fixture.job)
+                    if record.kind == "docx"
+                )
+                self.assertEqual(publication.status, "blocked")
 
     def test_upload_name_has_mode_specific_extension(self) -> None:
         self.assertEqual(
@@ -872,12 +1239,28 @@ class FrontendRuntimeTests(unittest.TestCase):
             self.assertEqual(restored.status, "released")
 
             report_mtime = publication.report_path.stat().st_mtime_ns
+            review_audit = (
+                Path(job.spec.output_dir) / "audit" / "semantic-review.json"
+            )
+            review_bytes = review_audit.read_bytes()
+            review_payload = json.loads(review_bytes)
+            review_payload["summary"]["resolved_issue_count"] = 99
+            review_audit.write_text(json.dumps(review_payload), encoding="utf-8")
+            older = max(1, report_mtime - 1_000_000_000)
+            os.utime(review_audit, ns=(older, older))
+            review_tampered = next(
+                record
+                for record in service.artifacts(job.id)
+                if record.kind == "epub"
+            )
+            self.assertEqual(review_tampered.status, "blocked")
+            review_audit.write_bytes(review_bytes)
+
             chapter = next((Path(job.spec.output_dir) / "chapters").glob("*.md"))
             chapter.write_text(
                 chapter.read_text(encoding="utf-8") + "\nchanged after release\n",
                 encoding="utf-8",
             )
-            older = max(1, report_mtime - 1_000_000_000)
             os.utime(chapter, ns=(older, older))
             tampered = next(
                 record

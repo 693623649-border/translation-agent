@@ -30,6 +30,11 @@ pages = [
         icon=":material/pending_actions:",
     ),
     st.Page(
+        "app_pages/review.py",
+        title="人工复核",
+        icon=":material/fact_check:",
+    ),
+    st.Page(
         "app_pages/artifacts.py",
         title="产物",
         icon=":material/folder_open:",

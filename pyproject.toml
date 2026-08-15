@@ -63,6 +63,8 @@ py-modules = [
   "semantic_translation_runner",
   "semantic_apply",
   "semantic_ir",
+  "semantic_review",
+  "semantic_review_policy",
   "application_service",
   "streamlit_app",
   "translation_agent_api",

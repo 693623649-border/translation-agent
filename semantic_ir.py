@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
@@ -28,6 +29,9 @@ BLOCK_KINDS = frozenset(
 )
 REVIEW_DECISIONS = frozenset({"accepted", "rejected", "replaced"})
 _SHA256 = frozenset("0123456789abcdef")
+_UTC_TIMESTAMP = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z"
+)
 
 
 class SemanticContractError(ValueError):
@@ -44,6 +48,20 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in _SHA256 for character in value)
     )
+
+
+def _review_timestamp(value: object) -> str:
+    """Return one unambiguous, calendar-valid UTC review timestamp."""
+
+    if not isinstance(value, str) or _UTC_TIMESTAMP.fullmatch(value) is None:
+        raise SemanticContractError(
+            "review decision timestamp must be an ISO-8601 UTC timestamp ending in Z"
+        )
+    try:
+        datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as exc:
+        raise SemanticContractError("review decision timestamp is invalid") from exc
+    return value
 
 
 def _required_string(value: object, field_name: str) -> str:
@@ -476,26 +494,54 @@ class ReviewDecision:
     decision: str
     timestamp: str
     replacement_markdown: str | None = None
+    # Added after the original v1 object shipped.  Keeping this field optional
+    # preserves construction/serialization compatibility for callers that only
+    # use the legacy source-bound model.  The semantic_review resolver requires
+    # it and therefore never treats an unbound legacy row as effective.
+    reconstruction_sha256: str | None = None
+    # Executable review records also identify the exact chapter/unit subject
+    # and explain the human judgment.  They remain optional on the constructor
+    # solely for compatibility with the original, non-executable v1 model.
+    subject_id: str | None = None
+    reason: str | None = None
 
     def __post_init__(self) -> None:
-        if self.schema_version != SEMANTIC_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != SEMANTIC_SCHEMA_VERSION:
             raise SemanticContractError("unsupported ReviewDecision schema")
-        if (
-            not self.issue_id
-            or len(self.source_sha256) != 64
-            or not self.reviewer
-            or not self.timestamp
-            or self.decision not in REVIEW_DECISIONS
-        ):
+        _required_string(self.issue_id, "review decision issue_id")
+        if self.unit_id is not None:
+            _required_string(self.unit_id, "review decision unit_id")
+        if not _is_sha256(self.source_sha256):
+            raise SemanticContractError("review decision source_sha256 is invalid")
+        _required_string(self.reviewer, "review decision reviewer")
+        _review_timestamp(self.timestamp)
+        if self.decision not in REVIEW_DECISIONS:
             raise SemanticContractError("invalid review decision")
-        if self.decision == "replaced" and not self.replacement_markdown:
-            raise SemanticContractError("replaced review decision requires replacement_markdown")
+        if self.reconstruction_sha256 is not None and not _is_sha256(
+            self.reconstruction_sha256
+        ):
+            raise SemanticContractError(
+                "review decision reconstruction_sha256 is invalid"
+            )
+        if self.subject_id is not None:
+            _required_string(self.subject_id, "review decision subject_id")
+        if self.reason is not None:
+            _required_string(self.reason, "review decision reason")
+        if self.decision == "replaced":
+            _required_string(
+                self.replacement_markdown,
+                "review decision replacement_markdown",
+            )
+        elif self.replacement_markdown is not None:
+            raise SemanticContractError(
+                "only a replaced review decision may include replacement_markdown"
+            )
 
     def matches_source(self, source_markdown: str) -> bool:
         return sha256_text(source_markdown) == self.source_sha256
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": self.schema_version,
             "issue_id": self.issue_id,
             "unit_id": self.unit_id,
@@ -505,6 +551,107 @@ class ReviewDecision:
             "timestamp": self.timestamp,
             "replacement_markdown": self.replacement_markdown,
         }
+        if self.reconstruction_sha256 is not None:
+            result["reconstruction_sha256"] = self.reconstruction_sha256
+        if self.subject_id is not None:
+            result["subject_id"] = self.subject_id
+        if self.reason is not None:
+            result["reason"] = self.reason
+        return result
+
+    @classmethod
+    def from_dict(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        require_reconstruction: bool = False,
+    ) -> "ReviewDecision":
+        """Parse a decision without coercing fields or accepting extensions.
+
+        ``require_reconstruction`` is used by the executable review contract.
+        The default remains capable of reading the original source-bound v1
+        shape so existing integrations can migrate deliberately.
+        """
+
+        if not isinstance(value, Mapping):
+            raise SemanticContractError("review decision must be an object")
+        legacy_fields = {
+            "schema_version",
+            "issue_id",
+            "unit_id",
+            "source_sha256",
+            "reviewer",
+            "decision",
+            "timestamp",
+            "replacement_markdown",
+        }
+        executable_fields = {"reconstruction_sha256", "subject_id", "reason"}
+        allowed = legacy_fields | executable_fields
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise SemanticContractError(
+                f"review decision has unknown fields: {unknown}"
+            )
+        missing = sorted(legacy_fields - set(value))
+        if missing:
+            raise SemanticContractError(
+                f"review decision is missing fields: {missing}"
+            )
+        missing_executable = sorted(executable_fields - set(value))
+        if require_reconstruction and missing_executable:
+            raise SemanticContractError(
+                f"review decision is missing fields: {missing_executable}"
+            )
+        unit_id = value.get("unit_id")
+        replacement = value.get("replacement_markdown")
+        reconstruction = value.get("reconstruction_sha256")
+        subject_id = value.get("subject_id")
+        reason = value.get("reason")
+        if unit_id is not None and not isinstance(unit_id, str):
+            raise SemanticContractError("review decision unit_id must be null or a string")
+        if replacement is not None and not isinstance(replacement, str):
+            raise SemanticContractError(
+                "review decision replacement_markdown must be null or a string"
+            )
+        if reconstruction is not None and not isinstance(reconstruction, str):
+            raise SemanticContractError(
+                "review decision reconstruction_sha256 must be null or a string"
+            )
+        if require_reconstruction and not _is_sha256(reconstruction):
+            raise SemanticContractError(
+                "review decision reconstruction_sha256 is invalid"
+            )
+        if subject_id is not None and not isinstance(subject_id, str):
+            raise SemanticContractError(
+                "review decision subject_id must be null or a string"
+            )
+        if reason is not None and not isinstance(reason, str):
+            raise SemanticContractError(
+                "review decision reason must be null or a string"
+            )
+        if require_reconstruction:
+            _required_string(subject_id, "review decision subject_id")
+            _required_string(reason, "review decision reason")
+        return cls(
+            schema_version=_integer(
+                value.get("schema_version"),
+                "review decision schema_version",
+                minimum=1,
+            ),
+            issue_id=_required_string(value.get("issue_id"), "review decision issue_id"),
+            unit_id=unit_id,
+            source_sha256=_required_string(
+                value.get("source_sha256"),
+                "review decision source_sha256",
+            ),
+            reviewer=_required_string(value.get("reviewer"), "review decision reviewer"),
+            decision=_required_string(value.get("decision"), "review decision decision"),
+            timestamp=_review_timestamp(value.get("timestamp")),
+            replacement_markdown=replacement,
+            reconstruction_sha256=reconstruction,
+            subject_id=subject_id,
+            reason=reason,
+        )
 
 
 def append_review_decision(path: Path, decision: ReviewDecision) -> None:

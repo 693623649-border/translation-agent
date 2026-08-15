@@ -22,6 +22,19 @@ translation-agent plan book/input.pdf -o outputs/input \
   --source-mode text-pdf --config pipeline.toml
 ```
 
+语义重建被阻断时，先只读查看复核状态，再按中央 policy 记录决定：
+
+```bash
+translation-agent status -o outputs/input
+translation-agent review -o outputs/input
+translation-agent review -o outputs/input \
+  --issue-id issue-... --reviewer "name" \
+  --decision accepted --reason accept_as_text
+```
+
+当前 v1 不支持用人工决定豁免来源、哈希、包结构或脚注结构错误；不在 allowlist
+内的问题会继续阻断 apply 和正式发布。
+
 本地启动任务工作台：
 
 ```bash
@@ -133,6 +146,8 @@ translation-agent/
 │   └── outline-word.toml         # PDF 内置目录 → Word
 ├── product_contracts.py          # RunSpec / ArtifactRecord / Event 公共契约
 ├── semantic_ir.py                # 版本化文档语义 IR 与人工复核决定
+├── semantic_review.py            # append-only 决议日志与可复现 resolution
+├── semantic_review_policy.py     # blocker 全量提取、权限策略与只读复验
 ├── semantic_apply.py             # 翻译集合验证与事务回填
 ├── translation_agent_api.py      # 传统与 Graph 程序化调用接口
 ├── application_service.py        # WebUI 的持久任务与安全工作区 facade
@@ -261,6 +276,7 @@ EPUB Graph 的节点和产物为：
 | `core.reconstruct.epub_semantic` | 按 spine 重建不可变章节和 canonical 单元（`chapters.semantic`、`semantic.translation_units`） |
 | `core.semantic.translate` | 通过显式请求回调翻译哈希绑定单元（`semantic.translations`） |
 | `core.semantic.translations.inspect` | `apply` 模式下绑定外部翻译 JSONL；与在线翻译节点二选一 |
+| `core.semantic.review` | 全量重算 blocker 与 append-only 决议，产出 `semantic.review` |
 | `core.semantic.apply` | 完整复验并物化译文 reader bundle（`chapters.reader`） |
 | `core.semantic.materialize_reader` | 不翻译时物化并验证源语言 reader bundle（`chapters.reader`） |
 | `core.publish.epub` | 从唯一 reader bundle 发布 EPUB（`publication.epub`） |

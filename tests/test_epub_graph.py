@@ -11,10 +11,14 @@ import zipfile
 
 import pipeline_graph.epub as epub_graph_module
 from pipeline_graph.core import NodeExecutionError
+from semantic_ir import ReviewDecision
+from semantic_review import append_semantic_review_decision
+from semantic_review_policy import refresh_semantic_review
 from pipeline_graph.epub import (
     ART_EPUB,
     ART_EPUB_REPORT,
     ART_READER_CHAPTERS,
+    ART_REVIEW,
     ART_SEMANTIC_CHAPTERS,
     ART_SOURCE,
     ART_TRANSLATIONS,
@@ -27,6 +31,7 @@ from pipeline_graph.epub import (
     NODE_EPUB,
     NODE_IMPORT,
     NODE_READER,
+    NODE_REVIEW,
     NODE_SOURCE,
     NODE_TRANSLATIONS_IMPORT,
     NODE_VERIFY_EPUB,
@@ -255,6 +260,70 @@ class EpubGraphTests(unittest.TestCase):
             self.assertGreater(source_artifact["entry_count"], 0)
             self.assertGreater(source_artifact["uncompressed_size"], 0)
 
+    def test_review_target_is_a_first_class_hash_bound_closure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_epub(source)
+
+            prepared = prepare_epub_graph(
+                source,
+                output,
+                options=EpubGraphOptions(
+                    target_artifacts=frozenset({ART_REVIEW})
+                ),
+            )
+
+            expected = (NODE_SOURCE, NODE_IMPORT, NODE_REVIEW)
+            self.assertEqual(tuple(node.name for node in prepared.plan()), expected)
+            result = prepared.execute()
+            review = result.values[ART_REVIEW]
+            self.assertEqual(result.plan, expected)
+            self.assertEqual(review["status"], "passed")
+            self.assertFalse(review["release_blocked"])
+            self.assertTrue(Path(review["path"]).is_file())
+
+    def test_review_log_change_invalidates_only_review_and_downstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_epub(source)
+            prepared = prepare_epub_graph(
+                source,
+                output,
+                options=EpubGraphOptions(
+                    target_artifacts=frozenset({ART_EPUB})
+                ),
+            )
+            first = prepared.execute()
+            self.assertIn(NODE_IMPORT, first.executed)
+            append_semantic_review_decision(
+                output.resolve() / "audit" / "review-decisions.jsonl",
+                ReviewDecision(
+                    schema_version=1,
+                    issue_id="issue-" + "1" * 64,
+                    subject_id="historical-chapter",
+                    unit_id=None,
+                    source_sha256="2" * 64,
+                    reconstruction_sha256="3" * 64,
+                    reviewer="reviewer@example.test",
+                    decision="accepted",
+                    timestamp="2026-08-15T00:00:00Z",
+                    reason="historical decision",
+                ),
+            )
+            refresh_semantic_review(output.resolve())
+
+            second = prepared.execute()
+
+            self.assertNotIn(NODE_SOURCE, second.executed)
+            self.assertNotIn(NODE_IMPORT, second.executed)
+            self.assertIn(NODE_REVIEW, second.executed)
+            self.assertIn(NODE_READER, second.executed)
+            self.assertIn(NODE_EPUB, second.executed)
+
     def test_one_publication_target_closes_without_docx_and_resumes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -267,7 +336,13 @@ class EpubGraphTests(unittest.TestCase):
                 options=EpubGraphOptions(target_artifacts=frozenset({ART_EPUB})),
             )
 
-            expected = (NODE_SOURCE, NODE_IMPORT, NODE_READER, NODE_EPUB)
+            expected = (
+                NODE_SOURCE,
+                NODE_IMPORT,
+                NODE_REVIEW,
+                NODE_READER,
+                NODE_EPUB,
+            )
             self.assertEqual(tuple(node.name for node in prepared.plan()), expected)
             first = prepared.execute()
             self.assertEqual(first.executed, expected)
@@ -365,6 +440,7 @@ class EpubGraphTests(unittest.TestCase):
                 (
                     NODE_SOURCE,
                     NODE_IMPORT,
+                    NODE_REVIEW,
                     NODE_TRANSLATIONS_IMPORT,
                     NODE_APPLY,
                 ),
@@ -388,7 +464,14 @@ class EpubGraphTests(unittest.TestCase):
             )
             self.assertEqual(
                 tuple(node.name for node in prepared.plan()),
-                (NODE_SOURCE, NODE_IMPORT, NODE_READER, NODE_EPUB, NODE_VERIFY_EPUB),
+                (
+                    NODE_SOURCE,
+                    NODE_IMPORT,
+                    NODE_REVIEW,
+                    NODE_READER,
+                    NODE_EPUB,
+                    NODE_VERIFY_EPUB,
+                ),
             )
             result = prepared.execute()
             report_path = Path(result.values[ART_EPUB_REPORT]["path"])

@@ -35,6 +35,12 @@ from semantic_ir import (
     SemanticContractError,
     normalize_translation_unit_record,
 )
+from semantic_review import SemanticReviewArtifact, SemanticReviewError
+from semantic_review_policy import (
+    ReconstructionReviewContext,
+    collect_reconstruction_review,
+    refresh_semantic_review,
+)
 
 
 TRANSLATION_SET_SCHEMA_VERSION = SEMANTIC_SCHEMA_VERSION
@@ -76,6 +82,12 @@ class ValidatedTranslationSet:
         return {key: tuple(value) for key, value in result.items()}
 
 
+@dataclass(frozen=True)
+class _ReviewAuthorization:
+    context: ReconstructionReviewContext
+    artifact: SemanticReviewArtifact
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -106,7 +118,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return _read_jsonl_with_sha256(path)[0]
 
 
-def load_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
+def _read_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
     try:
         raw = path.read_bytes()
         value = json.loads(raw.decode("utf-8"))
@@ -114,8 +126,13 @@ def load_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
         raise SemanticApplyError("semantic reconstruction audit is missing or invalid") from exc
     if not isinstance(value, dict):
         raise SemanticApplyError("semantic reconstruction audit root must be an object")
-    assert_reconstruction_allows_apply(value)
     return value, _sha256_bytes(raw)
+
+
+def load_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
+    value, digest = _read_reconstruction_audit(path)
+    assert_reconstruction_allows_apply(value)
+    return value, digest
 
 
 def _blocking_issues(value: object) -> bool:
@@ -160,6 +177,182 @@ def assert_reconstruction_allows_apply(audit: Mapping[str, Any]) -> None:
             raise SemanticApplyError(
                 f"semantic reconstruction chapter is blocked: {chapter.get('chapter_id')!r}"
             )
+
+
+def _regular_file_sha256(path: Path, *, label: str) -> str:
+    try:
+        entry = path.lstat()
+    except OSError as exc:
+        raise SemanticApplyError(f"{label} is missing: {path}") from exc
+    if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
+        raise SemanticApplyError(f"{label} is not a non-symlink regular file: {path}")
+    try:
+        return _sha256_bytes(path.read_bytes())
+    except OSError as exc:
+        raise SemanticApplyError(f"{label} is unreadable: {path}") from exc
+
+
+def _authorize_reconstruction_review(
+    output_dir: Path,
+    reconstruction: Mapping[str, Any],
+    reconstruction_sha256: str,
+) -> _ReviewAuthorization:
+    """Resolve the exact raw audit through the central append-only policy."""
+
+    status = reconstruction.get("status")
+    if status == "passed" and reconstruction.get("release_blocked") is False:
+        # Preserve the stricter legacy diagnostics for malformed audits that
+        # claim to be passed while retaining blocked summary/chapter state.
+        assert_reconstruction_allows_apply(reconstruction)
+    elif status != "blocked" or reconstruction.get("release_blocked") is not True:
+        assert_reconstruction_allows_apply(reconstruction)
+
+    try:
+        context = collect_reconstruction_review(
+            output_dir,
+            expected_reconstruction_sha256=reconstruction_sha256,
+        )
+        artifact = refresh_semantic_review(
+            output_dir,
+            create_decision_log=True,
+            expected_reconstruction_sha256=reconstruction_sha256,
+        )
+    except SemanticReviewError as exc:
+        raise SemanticApplyError(
+            f"semantic reconstruction review is invalid: {exc}"
+        ) from exc
+    resolution = artifact.resolution
+    if (
+        context.reconstruction_sha256 != reconstruction_sha256
+        or resolution.reconstruction_sha256 != reconstruction_sha256
+    ):
+        raise SemanticApplyError(
+            "semantic reconstruction review is bound to different raw audit bytes"
+        )
+    if (
+        resolution.issue_set_sha256 != context.issue_set_sha256
+        or resolution.review_policy_fingerprint != context.policy_fingerprint
+    ):
+        raise SemanticApplyError(
+            "semantic reconstruction review policy or issue set changed during resolution"
+        )
+    if resolution.status != "passed" or resolution.release_blocked:
+        raise SemanticApplyError(
+            "semantic reconstruction review is blocked; translations cannot be applied"
+        )
+    if _regular_file_sha256(
+        artifact.audit_path,
+        label="semantic review audit",
+    ) != artifact.audit_sha256:
+        raise SemanticApplyError("semantic review audit changed during resolution")
+    if _regular_file_sha256(
+        context.decision_log_path,
+        label="semantic review decision log",
+    ) != resolution.decision_log_sha256:
+        raise SemanticApplyError("semantic review decision log changed during resolution")
+    if artifact.snapshot_path is None or _regular_file_sha256(
+        artifact.snapshot_path,
+        label="semantic review snapshot",
+    ) != artifact.audit_sha256:
+        raise SemanticApplyError("semantic review snapshot is missing or stale")
+    return _ReviewAuthorization(context=context, artifact=artifact)
+
+
+def _relative_output_path(output_dir: Path, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(output_dir).as_posix()
+    except ValueError as exc:
+        raise SemanticApplyError(
+            f"semantic provenance path escapes output directory: {path}"
+        ) from exc
+
+
+def _review_provenance(
+    output_dir: Path,
+    authorization: _ReviewAuthorization,
+    *,
+    source_units_sha256: str,
+    source_manifest_sha256: str,
+    source_chapters: Sequence[Mapping[str, str]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    resolution = authorization.artifact.resolution
+    review_resolution = resolution.to_dict()
+    review_resolution["audit"] = {
+        "path": _relative_output_path(
+            output_dir,
+            authorization.artifact.audit_path,
+        ),
+        "sha256": authorization.artifact.audit_sha256,
+        "snapshot_path": _relative_output_path(
+            output_dir,
+            authorization.artifact.snapshot_path,
+        )
+        if authorization.artifact.snapshot_path is not None
+        else None,
+    }
+    identity = {
+        "schema_version": SEMANTIC_SCHEMA_VERSION,
+        "raw_reconstruction_sha256": resolution.reconstruction_sha256,
+        "review_audit_sha256": authorization.artifact.audit_sha256,
+        "decision_log_sha256": resolution.decision_log_sha256,
+        "review_policy_fingerprint": resolution.review_policy_fingerprint,
+        "issue_set_sha256": resolution.issue_set_sha256,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_translation_units_sha256": source_units_sha256,
+        "source_chapters": [dict(chapter) for chapter in source_chapters],
+    }
+    effective_bundle = {
+        **identity,
+        "status": "passed",
+        "sha256": _sha256_bytes(
+            b"semantic-effective-bundle-v1\0"
+            + json.dumps(
+                identity,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ),
+    }
+    return review_resolution, effective_bundle
+
+
+def _assert_review_authorization_current(
+    output_dir: Path,
+    authorization: _ReviewAuthorization,
+) -> None:
+    artifact = authorization.artifact
+    resolution = artifact.resolution
+    try:
+        current = collect_reconstruction_review(
+            output_dir,
+            expected_reconstruction_sha256=resolution.reconstruction_sha256,
+        )
+    except SemanticReviewError as exc:
+        raise SemanticApplyError(
+            f"semantic reconstruction review changed during translation apply: {exc}"
+        ) from exc
+    if (
+        current.reconstruction_sha256 != resolution.reconstruction_sha256
+        or current.issue_set_sha256 != resolution.issue_set_sha256
+        or current.policy_fingerprint != resolution.review_policy_fingerprint
+    ):
+        raise SemanticApplyError(
+            "semantic reconstruction review inputs changed during translation apply"
+        )
+    checks = (
+        (artifact.audit_path, artifact.audit_sha256, "semantic review audit"),
+        (
+            authorization.context.decision_log_path,
+            resolution.decision_log_sha256,
+            "semantic review decision log",
+        ),
+        (artifact.snapshot_path, artifact.audit_sha256, "semantic review snapshot"),
+    )
+    for path, expected, label in checks:
+        if path is None or _regular_file_sha256(path, label=label) != expected:
+            raise SemanticApplyError(f"{label} changed during translation apply")
 
 
 def _heading_signature(markdown: str) -> tuple[int, ...]:
@@ -608,7 +801,14 @@ def apply_translation_transaction(
     _assert_safe_output_root(output_dir)
     translations_path = translations_path.expanduser().resolve()
     reconstruction_path = output_dir / "audit" / "semantic-reconstruction.json"
-    reconstruction, reconstruction_sha256 = load_reconstruction_audit(reconstruction_path)
+    reconstruction, reconstruction_sha256 = _read_reconstruction_audit(
+        reconstruction_path
+    )
+    review_authorization = _authorize_reconstruction_review(
+        output_dir,
+        reconstruction,
+        reconstruction_sha256,
+    )
     source_units_path = output_dir / "semantic" / "translation-units.jsonl"
     source_units, source_units_sha256 = _read_jsonl_with_sha256(source_units_path)
     translated_units, translation_input_sha256 = _read_jsonl_with_sha256(
@@ -703,6 +903,21 @@ def apply_translation_transaction(
                 }
             )
 
+        source_manifest_sha256 = _sha256_bytes(raw_manifest_bytes)
+        review_resolution, effective_bundle = _review_provenance(
+            output_dir,
+            review_authorization,
+            source_units_sha256=source_units_sha256,
+            source_manifest_sha256=source_manifest_sha256,
+            source_chapters=tuple(
+                {
+                    "chapter_id": str(item["chapter_id"]),
+                    "filename": str(item["filename"]),
+                    "sha256": str(item["source_markdown_sha256"]),
+                }
+                for item in audit_chapters
+            ),
+        )
         report = {
             "schema_version": TRANSLATION_SET_SCHEMA_VERSION,
             "status": "passed",
@@ -714,15 +929,14 @@ def apply_translation_transaction(
                 "sha256": reconstruction_sha256,
                 "schema_version": reconstruction.get("schema_version"),
                 "status": reconstruction.get("status"),
+                "release_blocked": reconstruction.get("release_blocked"),
             },
             "translation_input": {
                 "sha256": translation_input_sha256,
                 "unit_count": len(translated_units),
             },
-            "review_resolution": {
-                "schema_version": SEMANTIC_SCHEMA_VERSION,
-                "decisions": [],
-            },
+            "review_resolution": review_resolution,
+            "effective_semantic_bundle": effective_bundle,
             "summary": {
                 "chapter_count": len(audit_chapters),
                 "footnote_count": sum(item["footnote_count"] for item in audit_chapters),
@@ -749,6 +963,10 @@ def apply_translation_transaction(
         # Refuse to commit against an audit changed while staging.
         if _sha256_bytes(reconstruction_path.read_bytes()) != reconstruction_sha256:
             raise SemanticApplyError("semantic reconstruction audit changed during translation apply")
+        _assert_review_authorization_current(
+            output_dir,
+            review_authorization,
+        )
         if _sha256_bytes(source_units_path.read_bytes()) != source_units_sha256:
             raise SemanticApplyError("semantic translation units changed during translation apply")
         if _sha256_bytes(translations_path.read_bytes()) != translation_input_sha256:

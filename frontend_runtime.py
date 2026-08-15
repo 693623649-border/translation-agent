@@ -1259,6 +1259,8 @@ def _report_is_fresh(
     watched = [
         output_dir / "toc.json",
         output_dir / "chapters.json",
+        output_dir / "audit" / "semantic-review.json",
+        output_dir / "audit" / "review-decisions.jsonl",
         *output_dir.glob("*.docx"),
         *(output_dir / "chapters").glob("*.md"),
         *(output_dir / "reviewed_chapters").glob("*.md"),
@@ -1288,6 +1290,109 @@ def _report_is_fresh(
         path.is_file() and path.stat().st_mtime_ns > report_mtime
         for path in watched
     )
+
+
+def _semantic_review_report_binding_is_current(
+    output_dir: Path,
+    semantic: Mapping[str, Any],
+    *,
+    reconstruction_audit: Path,
+) -> bool:
+    """Validate the central review and its exact identities signed by a report."""
+
+    expected_reconstruction = semantic.get("reconstruction_sha256")
+    if not isinstance(expected_reconstruction, str):
+        return False
+    try:
+        if (
+            not reconstruction_audit.is_file()
+            or reconstruction_audit.is_symlink()
+            or _sha256_file(reconstruction_audit) != expected_reconstruction
+        ):
+            return False
+        from semantic_review_policy import validate_semantic_review
+
+        review_artifact = validate_semantic_review(
+            output_dir,
+            expected_reconstruction_sha256=expected_reconstruction,
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+    return bool(
+        review_artifact.resolution.release_blocked is False
+        and review_artifact.resolution.status == "passed"
+        and semantic.get("review_sha256") == review_artifact.audit_sha256
+        and semantic.get("review_decision_log_sha256")
+        == review_artifact.resolution.decision_log_sha256
+        and semantic.get("review_policy_fingerprint")
+        == review_artifact.resolution.review_policy_fingerprint
+        and semantic.get("review_issue_set_sha256")
+        == review_artifact.resolution.issue_set_sha256
+    )
+
+
+def _semantic_review_evidence_exists(output_dir: Path) -> bool:
+    audit_dir = output_dir / "audit"
+    explicit = (
+        audit_dir / "semantic-review.json",
+        audit_dir / "review-decisions.jsonl",
+        audit_dir / "review-decisions.jsonl.lock",
+    )
+    try:
+        snapshots = tuple(audit_dir.glob("semantic-review.*.json"))
+        return any(
+            path.exists() or path.is_symlink()
+            for path in (*explicit, *snapshots)
+        )
+    except OSError:
+        return True
+
+
+def _pdf_report_semantics_are_current(
+    output_dir: Path,
+    report: Mapping[str, Any],
+) -> bool:
+    """Require Word/full reports to sign the shared semantic-review schema."""
+
+    semantic = report.get("semantic")
+    if not isinstance(semantic, Mapping):
+        return False
+    review_required = semantic.get("review_required")
+    if type(review_required) is not bool:
+        return False
+    reconstruction_audit = output_dir / "audit" / "semantic-reconstruction.json"
+    if review_required:
+        return _semantic_review_report_binding_is_current(
+            output_dir,
+            semantic,
+            reconstruction_audit=reconstruction_audit,
+        )
+
+    # Legacy book-pipeline audits predate central review.  The verifier marks
+    # them explicitly and still applies its raw blocker gate.  The catalog may
+    # preserve that result only while no central-review evidence has appeared;
+    # otherwise the legacy report is stale and must be regenerated.
+    expected_reconstruction = semantic.get("reconstruction_sha256")
+    review_identity_keys = (
+        "review_sha256",
+        "review_decision_log_sha256",
+        "review_policy_fingerprint",
+        "review_issue_set_sha256",
+    )
+    try:
+        return bool(
+            isinstance(expected_reconstruction, str)
+            and reconstruction_audit.is_file()
+            and not reconstruction_audit.is_symlink()
+            and _sha256_file(reconstruction_audit) == expected_reconstruction
+            and all(
+                key in semantic and semantic.get(key) is None
+                for key in review_identity_keys
+            )
+            and not _semantic_review_evidence_exists(output_dir)
+        )
+    except OSError:
+        return False
 
 
 def _epub_report_semantics_are_current(
@@ -1354,19 +1459,16 @@ def _epub_report_semantics_are_current(
         or _sha256_file(resolved_source) != expected_source_hash
     ):
         return False
-    expected_reconstruction = semantic.get("reconstruction_sha256")
-    if not isinstance(expected_reconstruction, str):
-        return False
     draft_audit = output_dir / ".pipeline_graph" / "draft-semantic-audit.json"
     reconstruction_audit = (
         draft_audit
         if draft_audit.is_file() and not draft_audit.is_symlink()
         else output_dir / "audit" / "semantic-reconstruction.json"
     )
-    if (
-        not reconstruction_audit.is_file()
-        or reconstruction_audit.is_symlink()
-        or _sha256_file(reconstruction_audit) != expected_reconstruction
+    if not _semantic_review_report_binding_is_current(
+        output_dir,
+        semantic,
+        reconstruction_audit=reconstruction_audit,
     ):
         return False
     translation_audit = output_dir / "audit" / "semantic-translation.json"
@@ -1404,9 +1506,16 @@ def _epub_report_semantics_are_current(
                 translation_audit.read_text(encoding="utf-8")
             )
             audited_input = translation_payload["translation_input"]["sha256"]
+            audited_effective_bundle = translation_payload[
+                "effective_semantic_bundle"
+            ]["sha256"]
         except (KeyError, OSError, TypeError, json.JSONDecodeError):
             return False
-        if audited_input != expected_translation_input:
+        if (
+            audited_input != expected_translation_input
+            or audited_effective_bundle
+            != semantic.get("effective_semantic_bundle_sha256")
+        ):
             return False
     elif (
         expected_translation is not None
@@ -1498,14 +1607,17 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
         and report.get("publication_profile") == expected_profile
         and report_path is not None
         and (
-            expected_profile != "epub"
-            or _epub_report_semantics_are_current(
+            _epub_report_semantics_are_current(
                 output,
                 report,
                 source_path=Path(job.spec.source or ""),
                 publication_identity=identities.get("publication.epub"),
                 translation_identity=identities.get("semantic.translations"),
             )
+            if expected_profile == "epub"
+            else _pdf_report_semantics_are_current(output, report)
+            if expected_profile in {"word", "full"}
+            else False
         )
         and _report_is_fresh(
             output,

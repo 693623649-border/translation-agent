@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,21 @@ from streamlit.testing.v1 import AppTest
 
 
 class FrontendAppTests(unittest.TestCase):
+    def setUp(self) -> None:
+        main_module = sys.modules["__main__"]
+        self._main_metadata = {
+            name: getattr(main_module, name, None)
+            for name in ("__file__", "__spec__", "__package__", "__loader__", "__cached__")
+        }
+
+    def tearDown(self) -> None:
+        main_module = sys.modules["__main__"]
+        for name, value in self._main_metadata.items():
+            if value is None:
+                main_module.__dict__.pop(name, None)
+            else:
+                setattr(main_module, name, value)
+
     def test_default_page_renders_without_exception(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory, patch.dict(
@@ -27,8 +43,14 @@ class FrontendAppTests(unittest.TestCase):
         self.assertNotIn("use_container_width", combined)
         self.assertNotIn("unsafe_allow_html", combined)
         self.assertIn("st.navigation", combined)
+        self.assertIn('"app_pages/review.py"', combined)
         self.assertIn('"cancel_requested"', combined)
         self.assertIn("正在取消…", combined)
+        review_source = (root / "app_pages" / "review.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("semantic_review_policy", review_source)
+        self.assertNotIn("semantic-reconstruction.json", review_source)
 
 
 if __name__ == "__main__":

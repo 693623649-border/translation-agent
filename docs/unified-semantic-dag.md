@@ -22,9 +22,11 @@ flowchart LR
 
     subgraph E["入口二：EPUB first-class Graph"]
         E1["core.source.epub.inspect"] --> E2["core.reconstruct.epub_semantic"]
+        E2 --> ER["core.semantic.review"]
         E2 --> E3["可选 core.semantic.translate"]
         E3 --> E4["core.semantic.apply"]
-        E2 --> EN["不翻译：core.semantic.materialize_reader"]
+        ER --> E4
+        ER --> EN["不翻译：core.semantic.materialize_reader"]
     end
 
     subgraph P["入口三：带文本层 PDF"]
@@ -80,6 +82,7 @@ flowchart LR
     P3 --> R
     E3 --> R
     R --> DS["document.semantic.source\n块、标题、表格、引用、定义、来源审计"]
+    DS --> HR["core.semantic.review\nappend-only 决定 + policy"]
     DS --> T1["core.semantic.translate.prepare"]
     T1 --> T2["core.semantic.translate.run"]
     T2 --> T3["core.semantic.verify"]
@@ -87,6 +90,7 @@ flowchart LR
     C -->|"否"| Q["audit/review queue\n阻断发布"]
     C -->|"是"| DT["document.semantic.translated"]
     DT --> A["core.semantic.apply\n源 SHA 与单元集合复验"]
+    HR --> A
     A --> Z["core.publication.sanitize"]
     Z --> PUB["知识库 / EPUB / DOCX 发布器"]
     PUB --> PKG["包结构门"]

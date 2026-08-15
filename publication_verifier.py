@@ -27,6 +27,8 @@ from publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
 )
+from semantic_review import SemanticReviewError
+from semantic_review_policy import validate_semantic_review
 
 try:
     import fcntl
@@ -861,6 +863,7 @@ class _VerificationContext:
         self.manifest: list[dict[str, Any]] = []
         self.selected: list[dict[str, Any]] = []
         self.chapter_texts: dict[str, str] = {}
+        self.semantic_provenance: dict[str, Any] = {}
 
     @property
     def chapter_dir(self) -> Path:
@@ -1679,6 +1682,79 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
             )
         )
 
+    reconstruction_sha256 = (
+        _sha256_file(audit_path) if audit_path.is_file() else None
+    )
+    review_paths = (
+        context.output_dir / "audit" / "semantic-review.json",
+        context.output_dir / "audit" / "review-decisions.jsonl",
+        context.output_dir / "audit" / "review-decisions.jsonl.lock",
+    )
+    review_required = bool(
+        audit_payload.get("contract_mode")
+        or isinstance(audit_payload.get("source"), dict)
+        or any(path.exists() or path.is_symlink() for path in review_paths)
+        or any(
+            (context.output_dir / "audit").glob("semantic-review.*.json")
+        )
+    )
+    review_clears_raw_blockers = False
+    review_artifact = None
+    if review_required and reconstruction_sha256 is not None:
+        try:
+            review_artifact = validate_semantic_review(
+                context.output_dir,
+                expected_reconstruction_sha256=reconstruction_sha256,
+            )
+        except (OSError, SemanticReviewError, ValueError) as exc:
+            issues.append(
+                _issue(
+                    "semantic_review_invalid",
+                    "语义复核证据缺失、过期或与当前重建审计不一致。",
+                    path=context.output_dir / "audit" / "semantic-review.json",
+                    error=str(exc),
+                )
+            )
+        else:
+            resolution = review_artifact.resolution
+            review_clears_raw_blockers = bool(
+                resolution.status == "passed"
+                and resolution.release_blocked is False
+            )
+            if not review_clears_raw_blockers:
+                issues.append(
+                    _issue(
+                        "semantic_review_blocked",
+                        "语义重建仍有未解决或不可豁免的复核阻断项。",
+                        path=review_artifact.audit_path,
+                        blocking_issue_count=sum(
+                            item.release_blocked for item in resolution.issues
+                        ),
+                    )
+                )
+    context.semantic_provenance = {
+        "reconstruction_sha256": reconstruction_sha256,
+        "review_required": review_required,
+        "review_sha256": (
+            review_artifact.audit_sha256 if review_artifact is not None else None
+        ),
+        "review_decision_log_sha256": (
+            review_artifact.resolution.decision_log_sha256
+            if review_artifact is not None
+            else None
+        ),
+        "review_policy_fingerprint": (
+            review_artifact.resolution.review_policy_fingerprint
+            if review_artifact is not None
+            else None
+        ),
+        "review_issue_set_sha256": (
+            review_artifact.resolution.issue_set_sha256
+            if review_artifact is not None
+            else None
+        ),
+    }
+
     summary_payload = audit_payload.get("summary")
     summary_release_blocked = bool(
         isinstance(summary_payload, dict)
@@ -1691,7 +1767,7 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
         release_block_signals.append("release_blocked")
     if summary_release_blocked:
         release_block_signals.append("summary.release_blocked")
-    if release_block_signals:
+    if release_block_signals and not review_clears_raw_blockers:
         issues.append(
             _issue(
                 "semantic_audit_release_blocked",
@@ -1852,20 +1928,21 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
                 }
             ]
         blocking_audit_issue_count += len(blocking)
-        for value in blocking:
-            issues.append(
-                _issue(
-                    "semantic_audit_blocking_issue",
-                    "脚注引用落点仍有未解决的不确定性。",
-                    path=audit_path,
-                    chapter_id=chapter_id,
-                    semantic_code=str(value.get("code") or "unknown"),
-                    semantic_message=str(value.get("message") or ""),
-                    source_page=value.get("source_page"),
-                    note_label=value.get("note_label"),
-                    semantic_evidence=value.get("evidence") or {},
+        if not review_clears_raw_blockers:
+            for value in blocking:
+                issues.append(
+                    _issue(
+                        "semantic_audit_blocking_issue",
+                        "脚注引用落点仍有未解决的不确定性。",
+                        path=audit_path,
+                        chapter_id=chapter_id,
+                        semantic_code=str(value.get("code") or "unknown"),
+                        semantic_message=str(value.get("message") or ""),
+                        source_page=value.get("source_page"),
+                        note_label=value.get("note_label"),
+                        semantic_evidence=value.get("evidence") or {},
+                    )
                 )
-            )
 
     return _result(
         "语义脚注闭环且无待复核引用落点。"
@@ -4425,6 +4502,7 @@ def verify_publication(
             or context.artifact_titles.get("docx")
         ),
         "publication_profile": publication_profile,
+        "semantic": dict(context.semantic_provenance),
         "expected_language": expected_language,
         "translation_required": require_translation,
         "docx_render_required": bool(require_docx and require_docx_render),

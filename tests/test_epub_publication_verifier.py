@@ -281,6 +281,42 @@ class EpubPublicationVerifierTests(unittest.TestCase):
         self.assertFalse(missing["release_ready"])
         self.assertIn("translation_input_missing", self._issue_codes(missing))
 
+    def test_review_and_effective_bundle_provenance_cannot_be_tampered(self) -> None:
+        mutations = ("review-audit", "decision-log", "translation-review", "effective-bundle")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                source, output, artifact = self._fixture(root)
+                if mutation == "review-audit":
+                    path = output / "audit" / "semantic-review.json"
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    payload["summary"]["resolved_issue_count"] = 99
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+                    expected_code = "semantic_review_invalid"
+                elif mutation == "decision-log":
+                    path = output / "audit" / "review-decisions.jsonl"
+                    path.write_text("{}\n", encoding="utf-8")
+                    expected_code = "semantic_review_invalid"
+                else:
+                    path = output / "audit" / "semantic-translation.json"
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    if mutation == "translation-review":
+                        payload["review_resolution"]["audit"]["sha256"] = "0" * 64
+                        expected_code = "translation_review_mismatch"
+                    else:
+                        payload["effective_semantic_bundle"]["sha256"] = "0" * 64
+                        expected_code = "effective_semantic_bundle_invalid"
+                    path.write_text(json.dumps(payload), encoding="utf-8")
+
+                report = verify_epub_publication(
+                    output,
+                    source_epub=source,
+                    artifact_path=artifact,
+                )
+
+                self.assertFalse(report["release_ready"])
+                self.assertIn(expected_code, self._issue_codes(report))
+
     def test_graph_reader_audit_is_bound_to_translation_and_canonical_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

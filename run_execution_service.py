@@ -64,6 +64,7 @@ EPUB_TARGETS = frozenset(
         "chapters.semantic",
         "semantic.translation_units",
         "semantic.translations",
+        "semantic.review",
         "chapters.reader",
         "publication.epub",
         "publication.docx",
