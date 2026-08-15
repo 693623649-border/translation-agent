@@ -21,7 +21,7 @@ from typing import Any
 import zipfile
 import xml.etree.ElementTree as ET
 
-import fitz
+import pymupdf as fitz
 from PIL import Image, ImageChops
 
 

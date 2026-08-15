@@ -7,6 +7,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Mapping, Sequence
 
 
@@ -26,6 +27,7 @@ BLOCK_KINDS = frozenset(
     }
 )
 REVIEW_DECISIONS = frozenset({"accepted", "rejected", "replaced"})
+_SHA256 = frozenset("0123456789abcdef")
 
 
 class SemanticContractError(ValueError):
@@ -34,6 +36,36 @@ class SemanticContractError(ValueError):
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in _SHA256 for character in value)
+    )
+
+
+def _required_string(value: object, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SemanticContractError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _optional_string(value: object, field_name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise SemanticContractError(f"{field_name} must be null or a non-empty string")
+    return value
+
+
+def _integer(value: object, field_name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise SemanticContractError(
+            f"{field_name} must be an integer greater than or equal to {minimum}"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -46,12 +78,14 @@ class SourceLocator:
     block_index: int | None = None
 
     def __post_init__(self) -> None:
-        if not self.adapter or not self.source:
-            raise SemanticContractError("locator adapter and source are required")
-        if self.page is not None and self.page < 1:
-            raise SemanticContractError("locator page must be positive")
-        if self.block_index is not None and self.block_index < 0:
-            raise SemanticContractError("locator block_index must not be negative")
+        _required_string(self.adapter, "locator adapter")
+        _required_string(self.source, "locator source")
+        _optional_string(self.href, "locator href")
+        _optional_string(self.anchor, "locator anchor")
+        if self.page is not None:
+            _integer(self.page, "locator page", minimum=1)
+        if self.block_index is not None:
+            _integer(self.block_index, "locator block_index", minimum=0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,20 +99,28 @@ class SourceLocator:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "SourceLocator":
+        if not isinstance(value, Mapping):
+            raise SemanticContractError("locator must be an object")
         allowed = {"adapter", "source", "page", "href", "anchor", "block_index"}
         unknown = sorted(set(value) - allowed)
         if unknown:
             raise SemanticContractError(f"locator has unknown fields: {unknown}")
         return cls(
-            adapter=str(value.get("adapter") or ""),
-            source=str(value.get("source") or ""),
-            page=int(value["page"]) if value.get("page") is not None else None,
-            href=str(value["href"]) if value.get("href") is not None else None,
-            anchor=(
-                str(value["anchor"]) if value.get("anchor") is not None else None
+            adapter=_required_string(value.get("adapter"), "locator adapter"),
+            source=_required_string(value.get("source"), "locator source"),
+            page=(
+                _integer(value["page"], "locator page", minimum=1)
+                if value.get("page") is not None
+                else None
             ),
+            href=_optional_string(value.get("href"), "locator href"),
+            anchor=_optional_string(value.get("anchor"), "locator anchor"),
             block_index=(
-                int(value["block_index"])
+                _integer(
+                    value["block_index"],
+                    "locator block_index",
+                    minimum=0,
+                )
                 if value.get("block_index") is not None
                 else None
             ),
@@ -250,16 +292,178 @@ class TranslationUnit:
     locators: tuple[SourceLocator, ...]
 
     def __post_init__(self) -> None:
-        if self.schema_version != SEMANTIC_SCHEMA_VERSION:
+        if type(self.schema_version) is not int or self.schema_version != SEMANTIC_SCHEMA_VERSION:
             raise SemanticContractError("unsupported TranslationUnit schema")
-        if not self.id or not self.chapter_id or self.sequence < 1:
-            raise SemanticContractError("translation unit identity is invalid")
+        _required_string(self.id, "translation unit id")
+        _required_string(self.chapter_id, "translation unit chapter_id")
+        _integer(self.sequence, "translation unit sequence", minimum=1)
         if self.kind not in BLOCK_KINDS:
             raise SemanticContractError(f"unsupported translation unit kind: {self.kind}")
+        _required_string(self.source_markdown, "translation unit source_markdown")
+        if not _is_sha256(self.source_sha256):
+            raise SemanticContractError(
+                f"translation unit source_sha256 is invalid: {self.id}"
+            )
         if sha256_text(self.source_markdown) != self.source_sha256:
             raise SemanticContractError(f"translation unit source hash is stale: {self.id}")
-        if not self.locators:
+        if not self.locators or not all(
+            isinstance(locator, SourceLocator) for locator in self.locators
+        ):
             raise SemanticContractError(f"translation unit has no source locator: {self.id}")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the strict canonical source-unit record."""
+
+        return {
+            "schema_version": self.schema_version,
+            "id": self.id,
+            "chapter_id": self.chapter_id,
+            "sequence": self.sequence,
+            "kind": self.kind,
+            "source_markdown": self.source_markdown,
+            "source_sha256": self.source_sha256,
+            "locators": [locator.to_dict() for locator in self.locators],
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TranslationUnit":
+        """Read only the canonical record shape; use the normalizer for v1 legacy rows."""
+
+        if not isinstance(value, Mapping):
+            raise SemanticContractError("translation unit must be an object")
+        allowed = {
+            "schema_version",
+            "id",
+            "chapter_id",
+            "sequence",
+            "kind",
+            "source_markdown",
+            "source_sha256",
+            "locators",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise SemanticContractError(
+                f"translation unit has unknown fields: {unknown}"
+            )
+        raw_locators = value.get("locators")
+        if not isinstance(raw_locators, Sequence) or isinstance(
+            raw_locators, (str, bytes)
+        ):
+            raise SemanticContractError("translation unit locators must be an array")
+        return cls(
+            schema_version=_integer(
+                value.get("schema_version"),
+                "translation unit schema_version",
+                minimum=1,
+            ),
+            id=_required_string(value.get("id"), "translation unit id"),
+            chapter_id=_required_string(
+                value.get("chapter_id"),
+                "translation unit chapter_id",
+            ),
+            sequence=_integer(
+                value.get("sequence"),
+                "translation unit sequence",
+                minimum=1,
+            ),
+            kind=_required_string(value.get("kind"), "translation unit kind"),
+            source_markdown=_required_string(
+                value.get("source_markdown"),
+                "translation unit source_markdown",
+            ),
+            source_sha256=_required_string(
+                value.get("source_sha256"),
+                "translation unit source_sha256",
+            ),
+            locators=tuple(
+                locator
+                if isinstance(locator, SourceLocator)
+                else SourceLocator.from_dict(locator)
+                for locator in raw_locators
+            ),
+        )
+
+
+def normalize_translation_unit_record(
+    value: Mapping[str, Any],
+) -> TranslationUnit:
+    """Normalize canonical or legacy adapter rows into one strict unit.
+
+    Historical EPUB rows used ``source_href`` and the non-canonical ``list``
+    kind. Historical text-PDF rows used ``source_pages``.  Readers keep
+    accepting those schema-v1 rows, while all current writers emit locators
+    and canonical kinds.
+    """
+
+    if not isinstance(value, Mapping):
+        raise SemanticContractError("translation unit must be an object")
+    canonical_keys = {
+        "schema_version",
+        "id",
+        "chapter_id",
+        "sequence",
+        "kind",
+        "source_markdown",
+        "source_sha256",
+        "locators",
+    }
+    legacy_keys = {"source_href", "source_pages"}
+    unknown = sorted(set(value) - canonical_keys - legacy_keys)
+    if unknown:
+        raise SemanticContractError(
+            f"translation unit has unknown fields: {unknown}"
+        )
+
+    normalized = {key: value[key] for key in canonical_keys if key in value}
+    if normalized.get("kind") == "list":
+        normalized["kind"] = "list_item"
+
+    raw_locators = normalized.get("locators")
+    legacy_locator_fields = legacy_keys & set(value)
+    if raw_locators is not None and legacy_locator_fields:
+        raise SemanticContractError(
+            "translation unit must not mix canonical and legacy locator fields"
+        )
+    if raw_locators is None:
+        has_source_href = "source_href" in value
+        has_source_pages = "source_pages" in value
+        if has_source_href == has_source_pages:
+            raise SemanticContractError(
+                "legacy translation unit requires exactly one source_href or source_pages"
+            )
+        sequence = _integer(
+            normalized.get("sequence"),
+            "translation unit sequence",
+            minimum=1,
+        )
+        if has_source_href:
+            href = _required_string(value.get("source_href"), "legacy source_href")
+            locator = SourceLocator(
+                adapter="epub",
+                source=href,
+                href=href,
+                block_index=sequence - 1,
+            )
+        else:
+            pages = _required_string(value.get("source_pages"), "legacy source_pages")
+            if not re.fullmatch(r"[1-9]\d*(?:-[1-9]\d*)?", pages):
+                raise SemanticContractError("legacy source_pages is invalid")
+            start_text, _, end_text = pages.partition("-")
+            if end_text and int(end_text) < int(start_text):
+                raise SemanticContractError("legacy source_pages range is invalid")
+            locator = SourceLocator(
+                adapter="text-pdf",
+                source=f"pages:{pages}",
+                page=(
+                    int(start_text)
+                    if not end_text or end_text == start_text
+                    else None
+                ),
+                block_index=sequence - 1,
+            )
+        normalized["locators"] = [locator.to_dict()]
+    return TranslationUnit.from_dict(normalized)
 
 
 @dataclass(frozen=True)

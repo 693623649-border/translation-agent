@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import fitz
+import pymupdf as fitz
 from docx import Document
 from docx.oxml.ns import qn
 from openai import AuthenticationError, OpenAI

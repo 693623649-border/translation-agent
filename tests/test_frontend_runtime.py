@@ -30,6 +30,7 @@ from frontend_runtime import (
     validate_upload_size,
 )
 from product_contracts import RunSpec
+from tests.test_epub_semantic_import import _write_epub
 
 
 class FrontendRuntimeTests(unittest.TestCase):
@@ -648,7 +649,7 @@ class FrontendRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "upload exceeds"):
             validate_upload_size(9, limit=8)
 
-    def test_epub_adapter_is_explicitly_draft_until_native_gate_exists(self) -> None:
+    def test_epub_native_release_plan_is_persisted_for_web_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = FrontendSettings(
@@ -658,23 +659,238 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             service = ApplicationService(settings)
             source = root / "book.epub"
-            source.write_bytes(b"epub")
+            _write_epub(source)
             spec = RunSpec(
                 source=source,
                 source_mode="epub",
                 output_dir="ignored",
-                targets=("publication.epub",),
+                targets=("publication.epub_report",),
                 translate=False,
                 verify=True,
             )
-            with self.assertRaisesRegex(ValueError, "verification is not available"):
-                service.submit_path(spec, start=False)
+            job = service.submit_path(spec, start=False)
+
+            self.assertEqual(job.release_profile, "epub")
+            self.assertEqual(job.resolved_targets, ("publication.epub_report",))
+
+    def test_server_path_job_snapshots_source_and_control_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "book.epub"
+            _write_epub(source)
+            config = root / "pipeline.toml"
+            config.write_text("[pipeline]\nname = 'original'\n", encoding="utf-8")
+            recipe = root / "recipe.toml"
+            recipe.write_text("targets = ['publication.epub']\n", encoding="utf-8")
+            glossary = root / "glossary.json"
+            glossary.write_text(
+                json.dumps({"injury": "伤害"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            original_source = source.read_bytes()
+            service = ApplicationService(
+                FrontendSettings(
+                    database=root / "jobs.sqlite3",
+                    jobs_root=root / "jobs",
+                    source_roots=(root,),
+                )
+            )
+            plan = SimpleNamespace(
+                targets=("semantic.translation_units",),
+                release_profile="draft",
+            )
+            with patch.object(service.execution, "plan", return_value=plan):
+                job = service.submit_path(
+                    RunSpec(
+                        source=source,
+                        source_mode="epub",
+                        output_dir="ignored",
+                        config=config,
+                        recipe=recipe,
+                        targets=("semantic.translation_units",),
+                        translate=False,
+                        verify=False,
+                        options={"glossary": str(glossary)},
+                    ),
+                    start=False,
+                )
+
+            self.assertTrue(job.source_path.is_relative_to(job.workspace / "input"))
+            self.assertEqual(job.source_path.read_bytes(), original_source)
+            self.assertEqual(
+                Path(job.spec.config or "").read_text(encoding="utf-8"),
+                "[pipeline]\nname = 'original'\n",
+            )
+            self.assertEqual(
+                Path(job.spec.recipe or "").read_text(encoding="utf-8"),
+                "targets = ['publication.epub']\n",
+            )
+            snapshot_glossary = Path(str(job.spec.options["glossary"]))
+            self.assertTrue(snapshot_glossary.is_relative_to(job.workspace / "control"))
+            self.assertEqual(
+                json.loads(snapshot_glossary.read_text(encoding="utf-8")),
+                {"injury": "伤害"},
+            )
+
+            source.write_bytes(b"changed source")
+            config.write_text("changed config", encoding="utf-8")
+            recipe.write_text("changed recipe", encoding="utf-8")
+            glossary.write_text("{}", encoding="utf-8")
+            self.assertEqual(job.source_path.read_bytes(), original_source)
+            self.assertIn("name = 'original'", Path(job.spec.config or "").read_text())
+            self.assertIn("publication.epub", Path(job.spec.recipe or "").read_text())
+            self.assertEqual(
+                json.loads(snapshot_glossary.read_text(encoding="utf-8")),
+                {"injury": "伤害"},
+            )
+
+    def test_epub_upload_is_written_before_native_graph_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.epub"
+            _write_epub(source)
+            service = ApplicationService(
+                FrontendSettings(
+                    database=root / "jobs.sqlite3",
+                    jobs_root=root / "jobs",
+                    source_roots=(root,),
+                )
+            )
+            job = service.submit_upload(
+                RunSpec(
+                    source_mode="epub",
+                    output_dir="ignored",
+                    targets=("semantic.translation_units",),
+                    translate=False,
+                    verify=False,
+                ),
+                filename="book.epub",
+                content=source.read_bytes(),
+                start=False,
+            )
+
+            self.assertTrue(job.source_path.is_file())
+            self.assertEqual(job.resolved_targets, ("semantic.translation_units",))
+
+    def test_epub_native_report_releases_only_the_graph_epub_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "book.epub"
+            _write_epub(source)
+            service = ApplicationService(
+                FrontendSettings(
+                    database=root / "jobs.sqlite3",
+                    jobs_root=root / "jobs",
+                    source_roots=(root,),
+                )
+            )
+            job = service.submit_path(
+                RunSpec(
+                    source=source,
+                    source_mode="epub",
+                    output_dir="ignored",
+                    targets=("publication.epub_report",),
+                    target_language="en",
+                    translate=False,
+                    verify=True,
+                ),
+                start=False,
+            )
+            result = service.execution.execute(job.spec)
+
+            self.assertTrue(result.release_ready)
+            records = service.artifacts(job.id)
+            publication = next(record for record in records if record.kind == "epub")
+            self.assertEqual(publication.status, "released")
+            self.assertEqual(
+                publication.report_path,
+                Path(job.spec.output_dir) / "audit" / "epub-release-report.json",
+            )
+
+            state_path = Path(job.spec.output_dir) / ".pipeline_graph" / "state.json"
+            state_bytes = state_path.read_bytes()
+            state = json.loads(state_bytes)
+            replacement = Path(job.spec.output_dir) / "replacement.epub"
+            replacement.write_bytes(Path(publication.path).read_bytes() + b"\n")
+            replacement_sha256 = hashlib.sha256(replacement.read_bytes()).hexdigest()
+            replaced = False
+            for node in state["nodes"].values():
+                outputs = node.get("outputs", {})
+                if "publication.epub" in outputs:
+                    outputs["publication.epub"]["path"] = str(replacement)
+                    outputs["publication.epub"]["sha256"] = replacement_sha256
+                    replaced = True
+            self.assertTrue(replaced)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            stale_report = next(
+                record
+                for record in service.artifacts(job.id)
+                if record.kind == "epub"
+            )
+            self.assertEqual(stale_report.path, replacement.resolve())
+            self.assertEqual(stale_report.status, "blocked")
+            state_path.write_bytes(state_bytes)
+            replacement.unlink()
+            restored_identity = next(
+                record
+                for record in service.artifacts(job.id)
+                if record.kind == "epub"
+            )
+            self.assertEqual(restored_identity.status, "released")
+
+            draft_audit = (
+                Path(job.spec.output_dir)
+                / ".pipeline_graph"
+                / "draft-semantic-audit.json"
+            )
+            reconstruction_audit = (
+                draft_audit
+                if draft_audit.is_file()
+                else Path(job.spec.output_dir)
+                / "audit"
+                / "semantic-reconstruction.json"
+            )
+            audit_bytes = reconstruction_audit.read_bytes()
+            audit_stat = reconstruction_audit.stat()
+            reconstruction_audit.unlink()
+            missing_evidence = next(
+                record
+                for record in service.artifacts(job.id)
+                if record.kind == "epub"
+            )
+            self.assertEqual(missing_evidence.status, "blocked")
+            reconstruction_audit.write_bytes(audit_bytes)
+            os.utime(
+                reconstruction_audit,
+                ns=(audit_stat.st_atime_ns, audit_stat.st_mtime_ns),
+            )
+            restored = next(
+                record
+                for record in service.artifacts(job.id)
+                if record.kind == "epub"
+            )
+            self.assertEqual(restored.status, "released")
+
+            report_mtime = publication.report_path.stat().st_mtime_ns
+            chapter = next((Path(job.spec.output_dir) / "chapters").glob("*.md"))
+            chapter.write_text(
+                chapter.read_text(encoding="utf-8") + "\nchanged after release\n",
+                encoding="utf-8",
+            )
+            older = max(1, report_mtime - 1_000_000_000)
+            os.utime(chapter, ns=(older, older))
+            tampered = next(
+                record
+                for record in service.artifacts(job.id)
+                if record.kind == "epub"
+            )
+            self.assertEqual(tampered.status, "blocked")
 
     def test_epub_report_targets_fail_during_planning(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "book.epub"
-            source.write_bytes(b"epub")
+            _write_epub(source)
             service = ApplicationService(
                 FrontendSettings(
                     database=root / "jobs.sqlite3",

@@ -37,7 +37,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
 
-import fitz
+import pymupdf as fitz
 from PIL import Image
 
 from pipeline_profiles import (

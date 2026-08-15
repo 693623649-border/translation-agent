@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
-import fitz
+import pymupdf as fitz
 
 from book_pipeline import (
     PageRecord,

@@ -17,9 +17,9 @@ from pathlib import Path
 import re
 import tempfile
 import unicodedata
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
-import fitz
+import pymupdf as fitz
 
 from publication_semantics import (
     markdown_footnote_contract_sha256,
@@ -27,10 +27,11 @@ from publication_semantics import (
     semantic_audit_summary,
 )
 from semantic_apply import SemanticApplyError, apply_translation_transaction
+from semantic_ir import SourceLocator, TranslationUnit
 
 
 SCHEMA_VERSION = 1
-IMPORTER_VERSION = "born-digital-pdf-semantic-v1"
+IMPORTER_VERSION = "born-digital-pdf-semantic-v2"
 
 
 class BornDigitalPdfError(ValueError):
@@ -392,24 +393,53 @@ def _chapter_boundaries(document: fitz.Document, book_title: str) -> tuple[list[
     return entries, issues
 
 
-def _translation_units(chapter_id: str, markdown: str, source_pages: str) -> list[dict[str, Any]]:
-    blocks = [block.strip() for block in re.split(r"\n{2,}", markdown.strip()) if block.strip()]
+def _markdown_blocks(markdown: str) -> list[str]:
+    return [
+        block.strip()
+        for block in re.split(r"\n{2,}", markdown.strip())
+        if block.strip()
+    ]
+
+
+def _translation_units(
+    chapter_id: str,
+    markdown: str,
+    source_pages: str,
+    *,
+    block_pages: Sequence[int | None] | None = None,
+) -> list[dict[str, Any]]:
+    blocks = _markdown_blocks(markdown)
+    if block_pages is None:
+        start_text, separator, end_text = source_pages.partition("-")
+        page = int(start_text) if not separator or start_text == end_text else None
+        block_pages = (page,) * len(blocks)
+    if len(block_pages) != len(blocks):
+        raise BornDigitalPdfError(
+            "translation unit page provenance does not match Markdown blocks"
+        )
     units: list[dict[str, Any]] = []
-    for sequence, block in enumerate(blocks, start=1):
+    for sequence, (block, page) in enumerate(zip(blocks, block_pages), start=1):
         source_sha = _sha256_bytes(block.encode())
         digest = hashlib.sha256(f"{chapter_id}\0{sequence}\0{source_sha}".encode()).hexdigest()[:16]
         kind = "heading" if re.match(r"^#{1,6}\s", block) else "table" if block.startswith("| ") else "paragraph"
         units.append(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "id": f"{chapter_id}-u{sequence:04d}-{digest}",
-                "chapter_id": chapter_id,
-                "sequence": sequence,
-                "kind": kind,
-                "source_pages": source_pages,
-                "source_sha256": source_sha,
-                "source_markdown": block,
-            }
+            TranslationUnit(
+                schema_version=SCHEMA_VERSION,
+                id=f"{chapter_id}-u{sequence:04d}-{digest}",
+                chapter_id=chapter_id,
+                sequence=sequence,
+                kind=kind,
+                source_sha256=source_sha,
+                source_markdown=block,
+                locators=(
+                    SourceLocator(
+                        adapter="text-pdf",
+                        source=f"pages:{source_pages}",
+                        page=page,
+                        block_index=sequence - 1,
+                    ),
+                ),
+            ).to_dict()
         )
     return units
 
@@ -478,9 +508,14 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
         title = str(boundary["title"])
         filename = f"{sequence:03d}_{_slug(title)}.md"
         expected.add(filename)
-        page_bodies = [pages[index - 1][0] for index in range(start, end + 1) if pages[index - 1][0]]
-        markdown = f"# {title}\n\n" + "\n\n".join(page_bodies)
-        markdown = markdown.rstrip() + "\n"
+        chapter_blocks: list[tuple[str, int]] = [(f"# {title}", start)]
+        for page_number in range(start, end + 1):
+            page_markdown = pages[page_number - 1][0]
+            chapter_blocks.extend(
+                (block, page_number)
+                for block in _markdown_blocks(page_markdown)
+            )
+        markdown = "\n\n".join(block for block, _page in chapter_blocks) + "\n"
         inventory = parse_markdown_footnotes(markdown)
         chapter_issues = [
             {**issue, "source_page": f"pdf-{start:04d}-{end:04d}"}
@@ -488,7 +523,12 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
             for issue in pages[index - 1][2]
         ]
         source_pages = f"{start}-{end}"
-        chapter_units = _translation_units(chapter_id, markdown, source_pages)
+        chapter_units = _translation_units(
+            chapter_id,
+            markdown,
+            source_pages,
+            block_pages=tuple(page for _block, page in chapter_blocks),
+        )
         metrics = {
             "table_count": sum(pages[index - 1][1]["table_count"] for index in range(start, end + 1)),
             "uri_link_count": sum(pages[index - 1][1]["uri_link_count"] for index in range(start, end + 1)),

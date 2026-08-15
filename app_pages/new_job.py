@@ -93,16 +93,15 @@ with st.form("new_translation_job"):
         translate = st.toggle("翻译为简体中文", value=True)
         verify = st.toggle(
             "执行发布质量门",
-            value=source_mode != "epub",
-            disabled=source_mode == "epub",
+            value=True,
             key=f"new_verify_{source_mode}",
             help="只有 release report 明确通过的文件才会显示为正式产物。",
         )
         if source_mode == "epub":
-            st.warning(
-                "EPUB 原生发布验证尚未接入。任务可以完成语义翻译和 EPUB/Word 草稿，"
-                "但不会标记为正式发布产物。",
-                icon=":material/warning:",
+            st.info(
+                "EPUB 原生质量门会核验 source identity、语义审计、脚注闭环、"
+                "package/spine/nav/资源与译文内容。Word 输出仍作为草稿。",
+                icon=":material/verified:",
             )
         title = st.text_input("书名", placeholder="默认使用源文件名")
         author = st.text_input("作者", placeholder="可选")
@@ -149,9 +148,10 @@ with st.form("new_translation_job"):
         )
         recipe = st.selectbox(
             "Graph Recipe",
-            recipe_options,
+            [None] if source_mode == "epub" else recipe_options,
             format_func=lambda value: "自动" if value is None else value.stem,
             help="Recipe 只定义拓扑；模型和密钥仍来自 Profile。",
+            disabled=source_mode == "epub",
         )
         include_proofread = st.toggle(
             "OCR 后执行校勘",
@@ -210,7 +210,12 @@ format_targets = {
     "参考 PDF": "publication.reference_pdf",
 }
 direct_targets = tuple(format_targets[name] for name in (selected_formats or ()))
-if source_mode != "epub" and verify:
+if source_mode == "epub" and verify:
+    targets = (
+        "publication.epub_report",
+        *(("publication.docx",) if "publication.docx" in direct_targets else ()),
+    )
+elif verify:
     targets = (
         ("publication.word_report",)
         if set(direct_targets) == {"publication.docx"}
@@ -253,6 +258,16 @@ if preview_clicked or submit_clicked:
     if not direct_targets:
         st.error("至少选择一个出版格式。", icon=":material/error:")
     elif (
+        source_mode == "epub"
+        and verify
+        and "publication.epub" not in direct_targets
+    ):
+        st.error(
+            "EPUB 原生发布门必须包含 EPUB 输出。若只需要 Word，请关闭发布质量门，"
+            "Word 将作为草稿生成。",
+            icon=":material/error:",
+        )
+    elif (
         source_mode != "epub"
         and verify
         and set(direct_targets)
@@ -279,7 +294,11 @@ if preview_clicked or submit_clicked:
         try:
             if preview_clicked:
                 plan = (
-                    service.preview_upload_plan(spec, filename=uploaded.name)
+                    service.preview_upload_plan(
+                        spec,
+                        filename=uploaded.name,
+                        content=uploaded.getvalue(),
+                    )
                     if uploaded is not None
                     else service.preview_plan(spec)
                 )

@@ -1,14 +1,15 @@
 """Single product-level compiler and executor for :class:`RunSpec`.
 
 This module is the only place where the stable product contract is translated
-into the current Graph API or the bounded EPUB adapter workflow.  CLI and Web
-clients should call :func:`plan_runspec` / :func:`execute_runspec` instead of
-re-implementing target resolution or adapter orchestration.
+into the source-specific Graph API.  CLI and Web clients should call
+:func:`plan_runspec` / :func:`execute_runspec` instead of re-implementing
+target resolution, provider identity, or release-profile selection.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,8 +58,20 @@ PDF_TARGETS = frozenset(
         "pipeline.status",
     }
 )
-EPUB_TARGETS = frozenset({"publication.epub", "publication.docx"})
-DEFAULT_EPUB_TARGETS = ("publication.epub", "publication.docx")
+EPUB_TARGETS = frozenset(
+    {
+        "source.epub",
+        "chapters.semantic",
+        "semantic.translation_units",
+        "semantic.translations",
+        "chapters.reader",
+        "publication.epub",
+        "publication.docx",
+        "publication.epub_report",
+    }
+)
+DEFAULT_EPUB_DRAFT_TARGETS = ("publication.epub", "publication.docx")
+DEFAULT_EPUB_VERIFIED_TARGETS = ("publication.epub_report",)
 DIRECT_PUBLICATION_TARGETS = frozenset(
     {
         "publication.epub",
@@ -67,7 +80,13 @@ DIRECT_PUBLICATION_TARGETS = frozenset(
         "publication.reference_pdf",
     }
 )
-REPORT_TARGETS = frozenset({"publication.report", "publication.word_report"})
+REPORT_TARGETS = frozenset(
+    {
+        "publication.report",
+        "publication.word_report",
+        "publication.epub_report",
+    }
+)
 
 _BOOLEAN_OPTIONS = frozenset(
     {
@@ -299,8 +318,8 @@ def _validate_options(options: Mapping[str, Any]) -> None:
 
 
 def _release_profile(spec: RunSpec, targets: tuple[str, ...]) -> str:
-    if spec.source_mode == "epub":
-        return "draft-only"
+    if "publication.epub_report" in targets:
+        return "epub"
     if "publication.word_report" in targets:
         return "word"
     if "publication.report" in targets:
@@ -339,11 +358,11 @@ def _validate_targets(spec: RunSpec, targets: tuple[str, ...]) -> None:
         )
     if len(set(targets)) != len(targets):
         raise RunResolutionError("resolved targets must not contain duplicates")
-    if set(REPORT_TARGETS) <= set(targets):
-        raise RunResolutionError(
-            "choose either publication.report or publication.word_report, not both"
-        )
     requested_reports = set(targets) & REPORT_TARGETS
+    if len(requested_reports) > 1:
+        raise RunResolutionError(
+            "choose exactly one release report target"
+        )
     if requested_reports and not spec.verify:
         raise RunResolutionError(
             "release report targets require verify=true; use direct publication "
@@ -351,8 +370,15 @@ def _validate_targets(spec: RunSpec, targets: tuple[str, ...]) -> None:
         )
     requested_direct = set(targets) & DIRECT_PUBLICATION_TARGETS
     if spec.verify and requested_direct and not requested_reports:
+        if spec.source_mode == "epub" and "publication.epub" not in requested_direct:
+            raise RunResolutionError(
+                "EPUB-native verification covers the EPUB artifact only; set "
+                "verify=false to generate a Word draft"
+            )
         recommendation = (
-            "publication.word_report"
+            "publication.epub_report"
+            if spec.source_mode == "epub"
+            else "publication.word_report"
             if requested_direct == {"publication.docx"}
             else "publication.report"
         )
@@ -488,12 +514,6 @@ class RunExecutionService:
                 "EPUB adapter runs do not support Graph Recipe files yet; "
                 "select publication.epub/publication.docx targets explicitly"
             )
-        if spec.source_mode == "epub" and spec.verify:
-            raise RunResolutionError(
-                "EPUB-native release verification is not available; set "
-                "verify=false (CLI: --no-verify) to explicitly authorize "
-                "draft artifacts"
-            )
         if (
             spec.source_mode != "epub"
             and spec.verify
@@ -505,14 +525,20 @@ class RunExecutionService:
                 "verify=false or use phase='all' with a release report target"
             )
         targets = spec.targets or (
-            DEFAULT_EPUB_TARGETS if spec.source_mode == "epub" else ()
+            (
+                DEFAULT_EPUB_VERIFIED_TARGETS
+                if spec.verify
+                else DEFAULT_EPUB_DRAFT_TARGETS
+            )
+            if spec.source_mode == "epub"
+            else ()
         )
         _validate_targets(spec, targets)
         resolved_spec = spec if targets == spec.targets else replace(spec, targets=targets)
         return ResolvedRun(
             spec=resolved_spec,
             targets=tuple(targets),
-            backend=("epub-adapter+graph-publish" if spec.source_mode == "epub" else "graph"),
+            backend="graph",
             release_profile=_release_profile(resolved_spec, tuple(targets)),
         )
 
@@ -521,33 +547,175 @@ class RunExecutionService:
         plan, _prepared = self._prepare_plan(resolved)
         return plan
 
+    def _prepare_epub_graph(self, resolved: ResolvedRun):
+        """Compile one credential-safe EPUB graph from the resolved RunSpec."""
+
+        from pipeline_graph.epub import EpubGraphOptions, prepare_epub_graph
+        from semantic_translation_runner import (
+            PROMPT_CONTRACT_SHA256,
+            RUNNER_VERSION,
+            build_openai_chat_request,
+            load_glossary,
+        )
+
+        spec = resolved.spec
+        options = dict(spec.options)
+        glossary_value = options.get("glossary")
+        glossary = (
+            load_glossary(Path(str(glossary_value)).expanduser())
+            if glossary_value
+            else {}
+        )
+        request: Callable[[str], str] | None = None
+        request_fingerprint: str | None = None
+        redaction_values: tuple[str, ...] = ()
+        provider = "deepseek"
+        base_url = "https://api.deepseek.com"
+        model = "deepseek-v4-flash"
+        prompt_profile = RUNNER_VERSION
+        thinking = "disabled"
+        timeout = 120
+        concurrency = int(options.get("translation_concurrency") or 16)
+
+        if spec.translate:
+            profile = None
+            if spec.config is not None:
+                from pipeline_profiles import load_pipeline_profiles
+
+                profile = load_pipeline_profiles(spec.config).for_stage(
+                    "translation",
+                    options.get("translation_profile"),
+                )
+            elif options.get("translation_profile"):
+                raise RunResolutionError(
+                    "translation_profile requires a RunSpec.config profile file"
+                )
+            if profile is not None:
+                if profile.adapter != "openai-chat":
+                    raise RunResolutionError(
+                        "semantic EPUB translation requires an openai-chat "
+                        f"profile adapter, got {profile.adapter!r}"
+                    )
+                provider = profile.provider
+                base_url = profile.base_url or base_url
+                model = profile.model
+                prompt_profile = profile.name
+                thinking = profile.thinking
+                timeout = profile.timeout
+                concurrency = int(
+                    options.get("translation_concurrency")
+                    or profile.concurrency
+                )
+                credential_env = profile.credential_env
+            else:
+                credential_env = "DEEPSEEK_API_KEY"
+
+            temperature = float(options.get("translation_temperature", 0.0))
+            max_tokens = int(options.get("translation_max_tokens", 32768))
+            request_identity = {
+                "provider": provider,
+                "base_url": base_url.rstrip("/"),
+                "model": model,
+                "prompt_profile": prompt_profile,
+                "prompt_contract_sha256": PROMPT_CONTRACT_SHA256,
+                "thinking": thinking,
+                "temperature": temperature,
+                "timeout": timeout,
+                "max_tokens": max_tokens,
+                "credential_env": credential_env,
+            }
+            request_fingerprint = hashlib.sha256(
+                json.dumps(
+                    request_identity,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            cached_request: Callable[[str], str] | None = None
+
+            def request(prompt: str) -> str:
+                nonlocal cached_request
+                if cached_request is None:
+                    credential = os.getenv(credential_env or "", "").strip()
+                    if not credential:
+                        raise RunExecutionError(
+                            "missing credential environment variable: "
+                            f"{credential_env}"
+                        )
+                    cached_request = build_openai_chat_request(
+                        api_key=credential,
+                        base_url=base_url,
+                        model=model,
+                        timeout=timeout,
+                        thinking=thinking,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                return cached_request(prompt)
+
+            credential = os.getenv(credential_env or "", "").strip()
+            if credential:
+                redaction_values = (credential,)
+
+        graph_options = EpubGraphOptions(
+            translation_mode="run" if spec.translate else "none",
+            target_artifacts=frozenset(resolved.targets),
+            target_language=spec.target_language,
+            glossary=glossary,
+            translation_request=request,
+            translation_request_fingerprint=request_fingerprint,
+            translation_provider=provider,
+            translation_base_url=base_url,
+            translation_model=model,
+            translation_prompt_profile=prompt_profile,
+            translation_thinking=thinking,
+            translation_temperature=float(
+                options.get("translation_temperature", 0.0)
+            ),
+            translation_max_chars=int(
+                options.get("translation_max_chars", 9000)
+            ),
+            translation_concurrency=concurrency,
+            translation_retries=int(options.get("translation_retries", 3)),
+            translation_cache_dir=resolved.semantic_cache_dir,
+            book_title=spec.title,
+            author=spec.author,
+            force_nodes=frozenset(options.get("force_nodes", ())),
+            force_all=bool(options.get("force_all", False)),
+        )
+        return prepare_epub_graph(
+            Path(str(spec.source)).expanduser().resolve(),
+            Path(spec.output_dir).expanduser().resolve(),
+            options=graph_options,
+            redaction_values=redaction_values,
+        )
+
     def _prepare_plan(self, resolved: ResolvedRun) -> tuple[RunPlan, Any | None]:
         """Compile once and retain the exact Graph instance for execution."""
 
         if resolved.spec.source_mode == "epub":
-            nodes: list[PlanStep] = [
-                PlanStep("adapter.epub.semantic_import", "adapter")
-            ]
-            if resolved.spec.translate:
-                nodes.extend(
-                    [
-                        PlanStep("adapter.semantic.translate", "adapter"),
-                        PlanStep("adapter.epub.apply_translations", "adapter"),
-                    ]
+            prepared = self._prepare_epub_graph(resolved)
+            nodes = tuple(
+                PlanStep(
+                    name=node.name,
+                    executor="graph",
+                    version=node.version,
+                    requires=tuple(sorted(node.requires)),
+                    provides=tuple(sorted(node.provides)),
+                    cache=node.cache,
                 )
-            if "publication.epub" in resolved.targets:
-                nodes.append(PlanStep("core.publish.epub", "graph"))
-            if "publication.docx" in resolved.targets:
-                nodes.append(PlanStep("core.publish.docx", "graph"))
+                for node in prepared.plan()
+            )
             return (
                 RunPlan(
                     source_mode=resolved.spec.source_mode,
-                    targets=resolved.targets,
+                    targets=tuple(sorted(prepared.targets)),
                     backend=resolved.backend,
                     release_profile=resolved.release_profile,
-                    nodes=tuple(nodes),
+                    nodes=nodes,
                 ),
-                None,
+                prepared,
             )
 
         from translation_agent_api import prepare_graph
@@ -603,11 +771,8 @@ class RunExecutionService:
             targets=list(plan.targets),
             nodes=list(plan.node_names),
         )
-        if resolved.spec.source_mode == "epub":
-            return self._execute_epub(resolved, progress=progress)
-
-        if prepared is None:  # pragma: no cover - guarded by source_mode above
-            raise AssertionError("PDF execution requires a prepared Graph")
+        if prepared is None:  # pragma: no cover - every source is Graph-backed
+            raise AssertionError("execution requires a prepared Graph")
         # Execute the exact graph instance whose targets and node order were
         # returned above.  Re-parsing Recipe/config here would create a TOCTOU
         # window in which plan and execution could mean different things.
@@ -619,7 +784,7 @@ class RunExecutionService:
                 f"{missing_targets}"
             )
         release_ready = self._verified_release_ready(resolved.spec, plan)
-        if plan.release_profile in {"word", "full"} and not release_ready:
+        if plan.release_profile in {"epub", "word", "full"} and not release_ready:
             raise RunExecutionError(
                 "Graph verifier did not produce a release-ready "
                 f"{plan.release_profile!r} report"
@@ -652,12 +817,14 @@ class RunExecutionService:
         """Trust only the verifier's materialized report, never intent flags."""
 
         report_name = {
+            "epub": "epub-release-report.json",
             "word": "word-release-report.json",
             "full": "release-report.json",
         }.get(plan.release_profile)
         if report_name is None:
             return False
         verifier_node = {
+            "epub": "core.publication.verify.epub",
             "word": "core.publication.verify.word",
             "full": "core.publication.verify",
         }[plan.release_profile]
@@ -676,185 +843,6 @@ class RunExecutionService:
             and payload.get("mode") == "full"
             and payload.get("publication_profile") == plan.release_profile
         )
-
-    def _execute_epub(
-        self,
-        resolved: ResolvedRun,
-        *,
-        progress: ProgressCallback | None,
-    ) -> RunExecutionResult:
-        from epub_semantic_import import import_epub
-
-        spec = resolved.spec
-        output = Path(spec.output_dir).expanduser().resolve()
-        source = Path(str(spec.source)).expanduser().resolve()
-        _emit(progress, "adapter_started", adapter="epub.semantic_import")
-        imported = import_epub(source, output)
-        if imported.get("release_blocked") is True or imported.get("status") in {
-            "blocked",
-            "failed",
-        }:
-            raise RunExecutionError(
-                "EPUB semantic reconstruction is blocked; review its audit"
-            )
-        _emit(progress, "adapter_finished", adapter="epub.semantic_import")
-
-        translation_result: Mapping[str, Any] | None = None
-        apply_result: Mapping[str, Any] | None = None
-        if spec.translate:
-            from epub_semantic_import import apply_translations
-            from semantic_translation_runner import (
-                RUNNER_VERSION,
-                _deepseek_request,
-                load_glossary,
-                translate_units,
-            )
-
-            options = dict(spec.options)
-            profile = None
-            if spec.config is not None:
-                from pipeline_profiles import load_pipeline_profiles
-
-                profile = load_pipeline_profiles(spec.config).for_stage(
-                    "translation",
-                    options.get("translation_profile"),
-                )
-            elif options.get("translation_profile"):
-                raise RunExecutionError(
-                    "translation_profile requires a RunSpec.config profile file"
-                )
-
-            model = profile.model if profile else "deepseek-v4-flash"
-            provider = profile.provider if profile else "deepseek"
-            base_url = (
-                profile.base_url if profile and profile.base_url else "https://api.deepseek.com"
-            )
-            prompt_profile = profile.name if profile else RUNNER_VERSION
-            thinking = profile.thinking if profile else "disabled"
-            timeout = profile.timeout if profile else 120
-            concurrency = int(
-                options.get("translation_concurrency")
-                or (profile.concurrency if profile else 16)
-            )
-            credential_env = (
-                profile.credential_env if profile else "DEEPSEEK_API_KEY"
-            )
-            credential = os.getenv(credential_env or "", "")
-            if not credential:
-                raise RunExecutionError(
-                    f"missing credential environment variable: {credential_env}"
-                )
-            temperature = float(options.get("translation_temperature", 0.0))
-            request = _deepseek_request(
-                api_key=credential,
-                base_url=base_url,
-                model=model,
-                timeout=timeout,
-                thinking=thinking,
-                temperature=temperature,
-                max_tokens=int(options.get("translation_max_tokens", 32768)),
-            )
-            glossary_value = options.get("glossary")
-            glossary = (
-                load_glossary(Path(str(glossary_value)).expanduser())
-                if glossary_value
-                else {}
-            )
-            translations = output / "semantic" / "translations.jsonl"
-            _emit(progress, "adapter_started", adapter="semantic.translate")
-            translation_result = translate_units(
-                output / "semantic" / "translation-units.jsonl",
-                translations,
-                target_language=spec.target_language,
-                glossary=glossary,
-                model=model,
-                provider=provider,
-                base_url=base_url,
-                prompt_profile=prompt_profile,
-                thinking=thinking,
-                temperature=temperature,
-                cache_dir=resolved.semantic_cache_dir,
-                request=request,
-                max_chars=int(options.get("translation_max_chars", 9000)),
-                concurrency=concurrency,
-                retries=int(options.get("translation_retries", 3)),
-                progress=lambda done, total, cached: _emit(
-                    progress,
-                    "translation_progress",
-                    completed=done,
-                    total=total,
-                    cached=cached,
-                ),
-            )
-            _emit(progress, "adapter_finished", adapter="semantic.translate")
-            apply_result = apply_translations(
-                output,
-                translations,
-                target_language=spec.target_language,
-                glossary=glossary,
-            )
-            if apply_result.get("release_blocked") is True or apply_result.get(
-                "status"
-            ) in {"blocked", "failed"}:
-                raise RunExecutionError(
-                    "EPUB translated semantic reconstruction is blocked; review its audit"
-                )
-
-        graph_runs: list[dict[str, Any]] = []
-        from translation_agent_api import run_graph
-
-        for artifact, phase in (
-            ("publication.epub", "epub"),
-            ("publication.docx", "docx"),
-        ):
-            if artifact not in resolved.targets:
-                continue
-            phase_spec = replace(spec, phase=phase, targets=())
-            result = run_graph(
-                _graph_request(
-                    phase_spec,
-                    (artifact,),
-                    load_dotenv=self.load_dotenv,
-                )
-            )
-            if artifact not in result.values:
-                raise RunExecutionError(
-                    f"Graph publisher completed without requested target {artifact!r}"
-                )
-            graph_runs.append(
-                {
-                    "artifact": artifact,
-                    "run_id": result.run_id,
-                    "executed": list(result.executed),
-                    "skipped": list(result.skipped),
-                }
-            )
-
-        run_id = graph_runs[-1]["run_id"] if graph_runs else None
-        _emit(progress, "run_finished", run_id=run_id, status="passed")
-        return RunExecutionResult(
-            status="passed",
-            source_mode=spec.source_mode,
-            targets=resolved.targets,
-            release_profile=resolved.release_profile,
-            release_ready=False,
-            run_id=run_id,
-            details={
-                "publication_status": "draft",
-                "reason": (
-                    "EPUB-native release verification is not available; "
-                    "artifacts remain drafts"
-                ),
-                "ingest": dict(imported),
-                "translation": (
-                    dict(translation_result) if translation_result is not None else None
-                ),
-                "apply": dict(apply_result) if apply_result is not None else None,
-                "publications": graph_runs,
-                "semantic_cache": str(resolved.semantic_cache_dir),
-            },
-        )
-
 
 _DEFAULT_SERVICE = RunExecutionService()
 

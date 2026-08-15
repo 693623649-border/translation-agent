@@ -52,8 +52,8 @@ Graph 还提供 `--source-mode text-pdf`，用于每页都有完整可复制
 
 产品入口是 `translation-agent`（`document_pipeline.py`）。CLI 与 WebUI 通过
 `run_execution_service.py` 共用同一套 RunSpec 解析、来源能力、目标选择、计划和
-执行语义；计划会明确标出步骤由 `graph` 还是受限 `adapter` 执行。现有 PDF 全链
-仍由 `graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
+执行语义；三种来源的计划现在都由真实 `NodeSpec` 组成并标记为 `executor=graph`。
+PDF 全链仍由 `graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
 复用 `book_pipeline.py` 的成熟实现和全部旧参数。`book_pipeline.py` 仍是完全
 兼容的阶段式入口。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）
 仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的
@@ -63,9 +63,10 @@ Graph 还提供 `--source-mode text-pdf`，用于每页都有完整可复制
 
 影印 PDF、带文本层 PDF 和 EPUB 的统一语义层顺序、CLI 迁移名和发布阻断标准
 见 [`docs/unified-semantic-dag.md`](docs/unified-semantic-dag.md)。EPUB 当前可执行
-命令另见 [`docs/epub-semantic-input.md`](docs/epub-semantic-input.md)。EPUB-native
-正式发布门尚未接入，因此 CLI/WebUI 会明确将这条路径标为草稿，不能伪造
-`release_ready`。产品层、版本化契约和 WebUI 安全边界见
+命令另见 [`docs/epub-semantic-input.md`](docs/epub-semantic-input.md)。EPUB 已有
+first-class DAG 和无模型的原生发布门；`publication.epub_report` 是正式 EPUB
+目标，裸 `publication.epub` / `publication.docx` 仍是草稿目标。产品层、版本化
+契约和 WebUI 安全边界见
 [`docs/product-architecture.md`](docs/product-architecture.md)。
 
 ## 本版本改动（2026-08）
@@ -124,6 +125,7 @@ translation-agent/
 ├── pipeline_graph/
 │   ├── core.py                   # NodeSpec、拓扑规划、缓存、事件与执行器
 │   ├── book.py                   # book_pipeline 的 Graph 适配节点
+│   ├── epub.py                   # EPUB spine 语义 DAG 与原生发布目标
 │   └── recipe.py                 # 严格 Recipe 与 allowlist 插件注册表
 ├── recipes/
 │   ├── full-publication.toml     # 完整出版物
@@ -144,6 +146,9 @@ translation-agent/
 ├── pipeline_profiles.py          # Provider/Profile 配置与模型指纹
 ├── pipeline_runtime.py           # 共享重试和起始限速器
 ├── publication_verifier.py       # 无模型调用的统一发布质量门
+├── epub_publication_verifier.py  # EPUB-native 语义、包、导航与链接发布门
+├── epub_semantic_import.py       # EPUB spine → canonical TranslationUnit
+├── born_digital_pdf_import.py    # 文字 PDF → canonical TranslationUnit
 ├── pipeline.example.toml         # 不含密钥的模型配置示例
 ├── pdf_text_agent.py             # 兼容旧检查点的旧入口
 ├── patch_translations.py         # 新格式译文人工修补工具
@@ -160,12 +165,22 @@ translation-agent/
 
 ## Graph 执行引擎
 
-`graph_pipeline.py` 是 `book_pipeline.py` 之上的轻量依赖图，不是另一套不兼容
-的流水线。内置节点仍调用原有 OCR、校勘、翻译、目录、编译及发布阶段，因此
+PDF 的 `graph_pipeline.py` 是 `book_pipeline.py` 之上的轻量依赖图，不是另一套
+不兼容的流水线。内置节点仍调用原有 OCR、校勘、翻译、目录、编译及发布阶段，因此
 继续使用相同的 `pages/page_XXXX.json`、`toc.json`、章节目录、模型 Profile、
 页级 CAS 和断点检查点。Graph 只接管节点选择、依赖规划、节点缓存、事件记录
 和输出目录互斥。原有命令可以继续使用；要获得可组合能力时，把入口改为
 `graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
+
+EPUB 走 `pipeline_graph/epub.py` 的独立 first-class Graph：它绑定源 ZIP 字节，
+按 spine 重建不可变语义章节和 canonical `TranslationUnit`，可选运行或回填翻译，
+物化唯一 reader bundle，再发布 EPUB/Word。它不伪造 PDF 页、OCR 或 TOC 节点，
+但复用同一个 Graph 内核、缓存指纹、事件日志和输出目录锁。
+
+该 EPUB Graph 当前用显式 `--target` 选产物，尚不接受 Recipe TOML。native gate
+检查包、语义、导航、资源和内部链接，但不是视觉渲染门；普通跨-spine XHTML
+链接及 fragment 已重映射闭合，图片复制和非 spine 资源管线仍是 text-first 路径的
+已知限制，详见 EPUB 输入文档。
 
 ### 先查看计划
 
@@ -237,6 +252,20 @@ python graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书"
 | `core.publication.verify.word` | 验收真脚注 DOCX 的 OOXML 结构与固定字体渲染，产出 `publication.word_report` |
 | `core.publication.verify` | 验收完整多格式出版物，产出 `publication.report` |
 | `core.pipeline.status` | 读取检查点与产物状态 |
+
+EPUB Graph 的节点和产物为：
+
+| 节点 | 职责 / 主要产物 |
+| --- | --- |
+| `core.source.epub.inspect` | 绑定源 EPUB 路径、SHA-256、ZIP 成员数与解压大小（`source.epub`） |
+| `core.reconstruct.epub_semantic` | 按 spine 重建不可变章节和 canonical 单元（`chapters.semantic`、`semantic.translation_units`） |
+| `core.semantic.translate` | 通过显式请求回调翻译哈希绑定单元（`semantic.translations`） |
+| `core.semantic.translations.inspect` | `apply` 模式下绑定外部翻译 JSONL；与在线翻译节点二选一 |
+| `core.semantic.apply` | 完整复验并物化译文 reader bundle（`chapters.reader`） |
+| `core.semantic.materialize_reader` | 不翻译时物化并验证源语言 reader bundle（`chapters.reader`） |
+| `core.publish.epub` | 从唯一 reader bundle 发布 EPUB（`publication.epub`） |
+| `core.publish.docx` | 从同一 reader bundle 发布草稿 Word（`publication.docx`） |
+| `core.publication.verify.epub` | 无模型验收源身份、语义、包、导航、内容和链接，产出 `publication.epub_report` |
 
 每个 `NodeSpec` 明确声明 `requires`、`provides`、版本、缓存指纹和资源锁。
 规划器会在执行前阻断缺依赖、重复 Provider 和循环依赖。每次执行在输出目录
@@ -461,9 +490,12 @@ translation-agent-web
 - 查看结构化状态、最近日志、取消/恢复任务；
 - 只下载与 Graph 产物身份和通过的 release report 哈希一致的正式产物。
 
-EPUB 原生发布验证尚未接入，界面会固定关闭该入口的“正式发布质量门”，产物只
-标记为草稿。PDF 任务只有在 `release_ready=true` 且报告与 Graph 身份匹配时才
-显示“正式产物”。
+EPUB 默认开启原生发布质量门，目标规范化为 `publication.epub_report`；只有
+`audit/epub-release-report.json` 声明 `release_ready=true`，且报告、Graph state
+与 EPUB 文件 SHA-256 相互匹配时，产物页才显示正式 EPUB。关闭质量门后可选择
+裸 `publication.epub` / `publication.docx`，二者都标记为草稿；EPUB 路径目前没有
+Word-native release profile，因此 Word 不能借 EPUB 报告转正。PDF 的 Word/full
+profile 保持原有语义。
 
 启动器拒绝 `0.0.0.0` 和其他非 loopback 地址。远程服务器请保持本机绑定：
 
@@ -1018,6 +1050,7 @@ outputs/my_book/
 ├── chapters.json             # 章节文件清单与页区间
 ├── audit/
 │   ├── semantic-reconstruction.json # 引用落点及阻断问题审计
+│   ├── epub-release-report.json      # EPUB-native 正式验收报告
 │   ├── word-release-report.json      # Word Recipe 的正式验收报告
 │   └── release-report.json           # 完整多格式发布报告
 ├── knowledge_base.jsonl      # 仅含章节、顺序和正文的无分页 RAG 记录

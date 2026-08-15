@@ -35,6 +35,7 @@ from publication_semantics import (
     semantic_audit_summary,
 )
 from semantic_apply import SemanticApplyError, apply_translation_transaction
+from semantic_ir import SourceLocator, TranslationUnit
 
 
 EPUB_NS = "http://www.idpf.org/2007/ops"
@@ -42,7 +43,7 @@ CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 OPF_NS = "http://www.idpf.org/2007/opf"
 DC_NS = "http://purl.org/dc/elements/1.1/"
 SCHEMA_VERSION = 1
-IMPORTER_VERSION = "epub-semantic-v1"
+IMPORTER_VERSION = "epub-semantic-v3"
 
 
 class EpubSemanticError(ValueError):
@@ -294,8 +295,14 @@ def _escape_markdown(value: str) -> str:
 
 
 class _XhtmlRenderer:
-    def __init__(self, documents: Mapping[str, etree._Element]):
+    def __init__(
+        self,
+        documents: Mapping[str, etree._Element],
+        *,
+        publication_hrefs: Mapping[str, str] | None = None,
+    ):
         self.documents = documents
+        self.publication_hrefs = dict(publication_hrefs or {})
         self.note_roots: set[etree._Element] = set()
         self.targets: dict[tuple[str, str], etree._Element] = {}
         for href, root in documents.items():
@@ -312,6 +319,7 @@ class _XhtmlRenderer:
         self.note_continuations: dict[etree._Element, list[etree._Element]] = {}
         self.element_hrefs: dict[etree._Element, str] = {}
         self.render_metrics: dict[str, dict[str, int]] = {}
+        self.referenced_fragments: set[tuple[str, str]] = set()
         for href, root in documents.items():
             for parent in root.iter():
                 last_identified_note: etree._Element | None = None
@@ -338,6 +346,81 @@ class _XhtmlRenderer:
                         )
             for element in root.iter():
                 self.element_hrefs[element] = href
+                if _local_name(element) != "a" or _is_noteref(element):
+                    continue
+                raw_href = str(element.get("href") or "")
+                parsed = urlsplit(raw_href)
+                fragment = unquote(parsed.fragment)
+                label = _text_value(element)
+                if (
+                    parsed.scheme
+                    or parsed.netloc
+                    or not fragment
+                    or fragment.lower().startswith("page_")
+                    or re.fullmatch(r"[ivxlcdm]+|\d+(?:[-–]\d+)?", label, re.I)
+                    and parsed.path
+                ):
+                    continue
+                try:
+                    target_href = (
+                        _resolve_member(href, parsed.path)
+                        if parsed.path
+                        else href
+                    )
+                except EpubSemanticError:
+                    continue
+                if (target_href, fragment) in self.targets:
+                    self.referenced_fragments.add((target_href, fragment))
+
+    def _anchor_marker(self, element: etree._Element, current_href: str) -> str:
+        fragment = _element_id(element)
+        if not fragment or (current_href, fragment) not in self.referenced_fragments:
+            return ""
+        return f'<span id="{html.escape(fragment, quote=True)}"></span>'
+
+    def _anchor_markers_within(
+        self,
+        element: etree._Element,
+        current_href: str,
+    ) -> list[str]:
+        """Return referenced anchors owned by one rendered block.
+
+        EPUB generators commonly put the actual fragment target in an empty
+        ``a``/``span`` nested inside a heading.  Keeping that marker inline
+        makes it indistinguishable from a duplicate running title to the
+        publication cleaner, which can remove the whole heading and its only
+        anchor.  Hoisting the marker to its own invisible Markdown block keeps
+        navigation intact even when the duplicate visible title is removed.
+        """
+
+        markers: list[str] = []
+        for candidate in element.iter():
+            marker = self._anchor_marker(candidate, current_href)
+            if marker and marker not in markers:
+                markers.append(marker)
+        return markers
+
+    def _publication_link(self, href: str, current_href: str) -> str:
+        parsed = urlsplit(href)
+        if parsed.scheme or parsed.netloc:
+            return href
+        try:
+            target_href = (
+                _resolve_member(current_href, parsed.path)
+                if parsed.path
+                else current_href
+            )
+        except EpubSemanticError:
+            return href
+        published = self.publication_hrefs.get(target_href)
+        if published is None:
+            return href
+        target = published if parsed.path else ""
+        if parsed.query:
+            target += f"?{parsed.query}"
+        if parsed.fragment:
+            target += f"#{parsed.fragment}"
+        return target or href
 
     def _note_reference(self, element: etree._Element, current_href: str) -> str:
         href = str(element.get("href") or "")
@@ -415,23 +498,28 @@ class _XhtmlRenderer:
 
     def _inline(self, element: etree._Element, current_href: str) -> str:
         tag = _local_name(element)
+        anchor = self._anchor_marker(element, current_href)
+
+        def anchored(value: str) -> str:
+            return f"{anchor}{value}" if anchor else value
+
         if tag in {"script", "style"}:
             return ""
         if tag == "a" and _is_noteref(element):
             return self._note_reference(element, current_href)
         inner = self._inline_children(element, current_href)
         if tag in {"em", "i"} and inner.strip():
-            return f"*{inner.strip()}*"
+            return anchored(f"*{inner.strip()}*")
         if tag in {"strong", "b"} and inner.strip():
-            return f"**{inner.strip()}**"
+            return anchored(f"**{inner.strip()}**")
         if tag == "code" and inner.strip():
-            return f"`{inner.strip()}`"
+            return anchored(f"`{inner.strip()}`")
         if tag == "br":
-            return "  \n"
+            return anchored("  \n")
         if tag == "img":
             alt = _escape_markdown(str(element.get("alt") or ""))
             src = str(element.get("src") or "")
-            return f"![{alt}]({src})" if src else ""
+            return anchored(f"![{alt}]({src})" if src else "")
         if tag == "a":
             href = str(element.get("href") or "")
             label = inner.strip()
@@ -444,15 +532,41 @@ class _XhtmlRenderer:
                 or re.fullmatch(r"[ivxlcdm]+|\d+(?:[-–]\d+)?", label, re.I)
                 and parsed.path
             ):
-                return label
-            return f"[{label}]({href})" if href and label else label
+                return anchored(label)
+            rewritten = self._publication_link(href, current_href)
+            return anchored(
+                f"[{label}]({rewritten})" if rewritten and label else label
+            )
         if tag == "sup" and inner.strip():
-            return f"<sup>{html.escape(inner.strip())}</sup>"
+            return anchored(f"<sup>{html.escape(inner.strip())}</sup>")
         if tag == "sub" and inner.strip():
-            return f"<sub>{html.escape(inner.strip())}</sub>"
-        return inner
+            return anchored(f"<sub>{html.escape(inner.strip())}</sub>")
+        return anchored(inner)
 
     def _blocks(self, element: etree._Element, current_href: str) -> Iterator[str]:
+        tag = _local_name(element)
+        # Heading anchors (including anchors nested inside the heading) are
+        # emitted as standalone blocks by ``_blocks_content`` below.
+        marker = (
+            ""
+            if tag in {f"h{level}" for level in range(1, 7)}
+            else self._anchor_marker(element, current_href)
+        )
+        emitted = False
+        for block in self._blocks_content(element, current_href):
+            if marker and not emitted:
+                yield f"{marker}\n{block}"
+            else:
+                yield block
+            emitted = True
+        if marker and not emitted:
+            yield marker
+
+    def _blocks_content(
+        self,
+        element: etree._Element,
+        current_href: str,
+    ) -> Iterator[str]:
         if element in self.note_roots:
             return
         tag = _local_name(element)
@@ -460,7 +574,11 @@ class _XhtmlRenderer:
             return
         if tag in {f"h{level}" for level in range(1, 7)}:
             level = int(tag[1])
+            markers = self._anchor_markers_within(element, current_href)
             value = " ".join(self._inline_children(element, current_href).split())
+            for marker in markers:
+                value = value.replace(marker, "")
+            yield from markers
             if value:
                 yield f"{'#' * level} {value}"
             return
@@ -481,6 +599,9 @@ class _XhtmlRenderer:
                 if item in self.note_roots:
                     continue
                 value = " ".join(self._inline_children(item, current_href).split())
+                item_marker = self._anchor_marker(item, current_href)
+                if item_marker:
+                    value = f"{item_marker}{value}"
                 if value:
                     yield f"{index}. {value}" if ordered else f"- {value}"
             return
@@ -488,7 +609,12 @@ class _XhtmlRenderer:
             rows: list[list[str]] = []
             for row in element.xpath(".//*[local-name()='tr']"):
                 cells = [
-                    " ".join(self._inline_children(cell, current_href).split())
+                    (
+                        self._anchor_marker(cell, current_href)
+                        + " ".join(
+                            self._inline_children(cell, current_href).split()
+                        )
+                    )
                     for cell in row
                     if _local_name(cell) in {"th", "td"}
                 ]
@@ -548,7 +674,8 @@ def _heading_title(markdown: str, fallback: str) -> str:
     for line in markdown.splitlines():
         match = re.match(r"^#{1,6}\s+(.+?)\s*$", line)
         if match:
-            return re.sub(r"[*_`]+", "", match.group(1)).strip() or fallback
+            value = re.sub(r"<[^>]+>", "", match.group(1))
+            return html.unescape(re.sub(r"[*_`]+", "", value)).strip() or fallback
     return fallback
 
 
@@ -556,7 +683,8 @@ def _document_title(markdown: str, *, navigation: str, fallback: str) -> str:
     for line in markdown.splitlines():
         match = re.match(r"^#\s+(.+?)\s*$", line)
         if match:
-            return re.sub(r"[*_`]+", "", match.group(1)).strip() or fallback
+            value = re.sub(r"<[^>]+>", "", match.group(1))
+            return html.unescape(re.sub(r"[*_`]+", "", value)).strip() or fallback
     if navigation.strip():
         return navigation.strip()
     heading = _heading_title(markdown, "")
@@ -599,20 +727,27 @@ def _translation_units(chapter_id: str, markdown: str, source_href: str) -> list
         kind = (
             "heading" if re.match(r"^#{1,6}\s", block)
             else "footnote_definition" if re.match(r"^\[\^[^]]+\]:", block)
-            else "list" if re.match(r"^(?:[-*+] |\d+\. )", block)
+            else "list_item" if re.match(r"^(?:[-*+] |\d+\. )", block)
             else "paragraph"
         )
         units.append(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "id": f"{chapter_id}-u{index:04d}-{unit_digest}",
-                "chapter_id": chapter_id,
-                "sequence": index,
-                "kind": kind,
-                "source_href": source_href,
-                "source_sha256": source_sha256,
-                "source_markdown": block,
-            }
+            TranslationUnit(
+                schema_version=SCHEMA_VERSION,
+                id=f"{chapter_id}-u{index:04d}-{unit_digest}",
+                chapter_id=chapter_id,
+                sequence=index,
+                kind=kind,
+                source_sha256=source_sha256,
+                source_markdown=block,
+                locators=(
+                    SourceLocator(
+                        adapter="epub",
+                        source=source_href,
+                        href=source_href,
+                        block_index=index - 1,
+                    ),
+                ),
+            ).to_dict()
         )
     return units
 
@@ -623,24 +758,42 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     source = source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
     metadata, documents, roots, title_hints, opf_member = _package_documents(source)
-    renderer = _XhtmlRenderer(roots)
     chapter_dir = output_dir / "chapters"
     source_dir = output_dir / "semantic" / "source_chapters"
     chapter_dir.mkdir(parents=True, exist_ok=True)
     source_dir.mkdir(parents=True, exist_ok=True)
 
+    # Publication filenames depend on reconstructed titles, while internal
+    # links need those final filenames during reconstruction.  A read-only
+    # first render resolves that cycle; the final render uses a fresh renderer
+    # so footnote occurrence identities and audits are not double-counted.
+    preliminary_renderer = _XhtmlRenderer(roots)
+    document_plan: list[tuple[int, _SpineDocument, str, str, str]] = []
+    for sequence, document in enumerate(documents, start=1):
+        preliminary_body, _definitions, _issues = preliminary_renderer.render(
+            document
+        )
+        fallback = PurePosixPath(document.href).stem
+        title = _document_title(
+            preliminary_body,
+            navigation=title_hints.get(document.href, ""),
+            fallback=fallback,
+        )
+        chapter_id = f"epub-{sequence:04d}"
+        filename = f"{sequence:03d}_{_slug(title)}.md"
+        document_plan.append((sequence, document, title, chapter_id, filename))
+    publication_hrefs = {
+        document.href: str(PurePosixPath(filename).with_suffix(".xhtml"))
+        for _sequence, document, _title, _chapter_id, filename in document_plan
+    }
+    renderer = _XhtmlRenderer(roots, publication_hrefs=publication_hrefs)
+
     manifest: list[dict[str, Any]] = []
     audit_chapters: list[dict[str, Any]] = []
     units: list[dict[str, Any]] = []
     expected_files: set[str] = set()
-    for sequence, document in enumerate(documents, start=1):
+    for sequence, document, title, chapter_id, filename in document_plan:
         body, definitions, issues = renderer.render(document)
-        fallback = PurePosixPath(document.href).stem
-        title = _document_title(
-            body,
-            navigation=title_hints.get(document.href, ""),
-            fallback=fallback,
-        )
         if not re.match(r"^#\s+", body):
             body = f"# {title}\n\n{body}".strip()
         if definitions:
@@ -667,8 +820,6 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
                         "evidence": {"values": list(values)},
                     }
                 )
-        chapter_id = f"epub-{sequence:04d}"
-        filename = f"{sequence:03d}_{_slug(title)}.md"
         expected_files.add(filename)
         _atomic_write_text(chapter_dir / filename, markdown)
         _atomic_write_text(source_dir / filename, markdown)

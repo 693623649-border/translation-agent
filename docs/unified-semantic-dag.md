@@ -20,10 +20,11 @@ flowchart LR
         SP --> ST["可选 core.pages.translate"]
     end
 
-    subgraph E["入口二：EPUB（当前为独立语义 CLI）"]
-        E1["epub_semantic_import"] --> E2["translation-units.jsonl"]
-        E2 --> E3["semantic_translation_runner"]
-        E3 --> E4["apply-translations"]
+    subgraph E["入口二：EPUB first-class Graph"]
+        E1["core.source.epub.inspect"] --> E2["core.reconstruct.epub_semantic"]
+        E2 --> E3["可选 core.semantic.translate"]
+        E3 --> E4["core.semantic.apply"]
+        E2 --> EN["不翻译：core.semantic.materialize_reader"]
     end
 
     subgraph P["入口三：带文本层 PDF"]
@@ -35,19 +36,22 @@ flowchart LR
     PT --> TOC
     TOC --> DRAFT["core.chapters.compile"]
     DRAFT --> SEM["core.reconstruct.semantic"]
-    E4 --> LOAD["core.chapters.load"]
-    LOAD --> SEM
+    E4 --> EREADER["chapters.reader"]
+    EN --> EREADER
     SEM --> SAN["core.publication.sanitize"]
     SAN --> PUB["EPUB / DOCX / KB"]
     PUB --> VERIFY["publication.word_report / publication.report"]
+    EREADER --> EPUBPUB["core.publish.epub / core.publish.docx"]
+    EPUBPUB --> EPUBVERIFY["core.publication.verify.epub\npublication.epub_report"]
     S1 -. "源 PDF + TOC 视觉旁路" .-> REFPDF["reference PDF"]
     P1 -. "源 PDF + TOC 视觉旁路" .-> REFPDF
     REFPDF --> VERIFY
 ```
 
 这张图是现在可以执行的事实：影印 PDF 和带文本层 PDF 在页层可选翻译；EPUB
-由语义导入器、runner 和回填命令生成章节后，再由 Graph 的
-`core.chapters.load` 接入共同下游。带文本层 PDF 不含
+不再由产品层串接 adapter，而是从源 ZIP 到 native report 全程运行真实 Graph
+节点。它直接产生 immutable semantic bundle、canonical translation units 和唯一
+reader bundle，不绕行 `core.chapters.load`。带文本层 PDF 不含
 `core.pages.ocr`；来源类型必须显式选择，不会自动猜测或静默回退。
 `reference PDF` 是保留原始页面的视觉旁路，只读取源 PDF 与 TOC，并与语义
 出版物一起进入最终 verifier；它不是由 reader Markdown 重新排版的文字出版物。
@@ -159,8 +163,8 @@ publication recipe：它不会伪造 `pages/page_XXXX.json`。需要正式
 `pdf_visible_superscript_unresolved` 阻断，待人工恢复脚注关系后才可回填译文。
 
 当前产品 facade 已使用“动作 + 来源类型”，不再让 WebUI 直接拼 legacy CLI。
-CLI 与 Web worker 都由 `RunExecutionService` 编译同一份 RunSpec；PDF 动作委托给
-Graph，EPUB 动作委托给有界语义 adapter，并明确保持草稿状态：
+CLI 与 Web worker 都由 `RunExecutionService` 编译同一份 RunSpec；PDF 与 EPUB 的
+完整 `run` 都编译为真实 Graph target closure：
 
 ```text
 translation-agent plan      SOURCE -o OUTPUT [--source-mode scanned-pdf|text-pdf|epub]
@@ -174,19 +178,86 @@ translation-agent status           -o OUTPUT
 ```
 
 `run` 是完整产品动作；其余命令是可审查、可恢复的兼容细粒度动作。PDF 的现行
-翻译仍由 Graph 内的页级节点完成，EPUB 才使用语义 translation-unit adapter；计划
-中的 `executor` 字段会如实区分两者，不把目标态节点伪装为已经注册。
+翻译仍由 Graph 内的页级节点完成，EPUB 使用 canonical translation-unit 节点；两者
+计划中的 `executor` 都是 `graph`。单独 `publish` 命令仍是兼容草稿工具，不运行
+native report，不等价于完整 `run`。
 
-`translate` 的模型结果仍必须经过共享 `semantic_apply` 复验后才能写入章节；
-`publish` 在没有兼容 verifier 时只返回 `publication_status=draft`。正式 Word 的
-Graph 目标仍是 `publication.word_report`，不能以裸 `publication.docx` 作为成功
-条件。EPUB 运行必须显式 `--no-verify` 才允许生成草稿，避免把未实现的原生门
-静默当作成功。
+`translate` 的模型结果仍必须经过共享 `semantic_apply` 复验后才能写入章节。正式
+Word 的 PDF Graph 目标仍是 `publication.word_report`，不能以裸
+`publication.docx` 作为成功条件。EPUB 的正式目标是
+`publication.epub_report`；默认 `verify=true` 且 targets 为空时自动选择它，报告
+写入 `audit/epub-release-report.json`。`--no-verify` 时空 targets 才规范化为
+`publication.epub` 与 `publication.docx` 两个草稿。
 
-EPUB 目前只支持 `publication.epub` 与 `publication.docx` 草稿目标；空 targets 会
-规范化为两者。`publication.report`、`publication.word_report`、知识库和参考 PDF
-会在计划阶段失败；Graph Recipe 也会被明确拒绝而不是静默忽略。所有语义 adapter 统一使用
-`.translation-cache/`，CLI 与 WebUI 不再生成两套缓存身份。
+EPUB target 集合还包括 `source.epub`、`chapters.semantic`、
+`semantic.translation_units`、`semantic.translations` 和 `chapters.reader`，便于
+缩窄目标做检查或恢复。EPUB 不支持知识库、参考 PDF、`publication.report` 或
+`publication.word_report`；Graph Recipe 也尚未接入 EPUB Graph，传入 `--recipe`
+会在计划阶段明确失败，而不是静默忽略。EPUB native report 只覆盖 EPUB；同一任务
+额外生成的 Word 仍为草稿。所有语义路径统一使用 `.translation-cache/`。
+
+CLI 示例：
+
+```bash
+# 只计划；会读取并安全检查源 EPUB，但不调用模型
+translation-agent plan book.epub -o outputs/book \
+  --source-mode epub --target publication.epub_report
+
+# 默认：翻译并运行 EPUB-native 正式发布门
+translation-agent run book.epub -o outputs/book \
+  --source-mode epub --config pipeline.toml \
+  --translation-profile deepseek_flash
+
+# 原语言正式 EPUB（不调用翻译模型，语言目标需与内容一致）
+translation-agent run book.epub -o outputs/book \
+  --source-mode epub --no-translate --target-language en
+
+# 明确生成未验收草稿
+translation-agent run book.epub -o outputs/book \
+  --source-mode epub --no-verify
+```
+
+WebUI 使用同一规则：EPUB 默认开启质量门；启用时必须选择 EPUB，目标为 native
+report。关闭质量门后才能创建裸 EPUB/Word 草稿任务。产物页只有在 report、Graph
+state 和 EPUB 文件哈希匹配时才把 EPUB 标为正式。
+
+## Canonical TranslationUnit 契约
+
+EPUB 与独立 born-digital PDF importer 的当前 writer 都写同一种 JSONL 行：
+
+```json
+{
+  "schema_version": 1,
+  "id": "chapter-0001-u0001-...",
+  "chapter_id": "chapter-0001",
+  "sequence": 1,
+  "kind": "paragraph",
+  "source_markdown": "...",
+  "source_sha256": "...",
+  "locators": [
+    {
+      "adapter": "epub",
+      "source": "OEBPS/chapter.xhtml",
+      "page": null,
+      "href": "OEBPS/chapter.xhtml",
+      "anchor": null,
+      "block_index": 0
+    }
+  ]
+}
+```
+
+八个顶层字段固定；`source_sha256` 必须等于 `source_markdown` 的 SHA-256，
+`sequence` 从 1 连续递增，`block_index` 从 0 计数。`kind` 使用 canonical
+`heading`、`paragraph`、`list_item`、`table`、`footnote_definition` 等枚举。
+EPUB locator 保存源 spine `href`；文字 PDF locator 使用 `adapter=text-pdf` 并保存
+页或页范围证据。locator 只存在审计层，发布清洗不得把源坐标泄漏到读者产物。
+
+`TranslationUnit.from_dict()` 是 strict reader，只接收以上 canonical 形状。为保持
+既有检查点可恢复，runner 与 apply 的输入边界使用兼容 normalizer：schema-v1 旧
+EPUB 行的 `source_href` 会转换成 locator，旧文字 PDF 的 `source_pages` 亦然，
+`kind=list` 转为 `list_item`。兼容读取拒绝新旧 locator 字段混写；所有当前 writer
+只写 canonical 形状，旧字段不会继续传播到新产物。
 
 ## 发布硬阻断
 
@@ -207,6 +278,14 @@ EPUB 目前只支持 `publication.epub` 与 `publication.docx` 草稿目标；�
 | `PACKAGE_VERIFY` | EPUB manifest/spine/nav 断裂；DOCX OOXML 关系、脚注类型或 ID 错误 |
 | `RENDER_VERIFY` | 异常空白、溢出、超密页、意外分页、缺字或字体环境漂移 |
 
+EPUB-native gate 当前覆盖 package、资源清单、canonical 可见文本、脚注计数、导航
+顺序及所有输出 XHTML 的 `href`/`src` 目标与 fragment；外部超链接只允许
+`http`、`https`、`mailto`，外部图片/媒体一律阻断。它不是视觉渲染门，也不验证
+阅读器兼容矩阵、图片像素或 alt 文本质量。当前 text-first publisher 已用两遍
+manifest 映射重写普通跨-spine XHTML 链接并保留目标 fragment，但尚未完整复制
+源 EPUB 图片或重写非 spine 资源；此类书
+可能在 native gate 明确失败，应先补资产/链接重写能力，不能关闭检查后宣称正式。
+
 索引中的目标页码不能用普通“译文长度”门替代。翻译前应解析为独立 locator
 token，翻译后逐 token 对账；例如 `158n.5` 不得被不一致地改成 `158注5`，
 `180–84` 也不能被当作普通数字短语重写。
@@ -215,7 +294,9 @@ token，翻译后逐 token 对账；例如 `158n.5` 不得被不一致地改成 
 
 ### 单元契约
 
-- 三种 adapter 均产出相同 schema 版本、稳定 unit ID、源 SHA 和严格顺序；
+- canonical unit writer（EPUB 与独立文字 PDF importer）均产出相同八字段形状、
+  稳定 unit ID、源 SHA、locators 和严格顺序；PDF Graph 切换单元级翻译后必须复用
+  同一断言；
 - `assemble_draft` 必须拓扑先于 `reconstruct.semantic`，所有 publisher 必须依赖
   `semantic.reviewed` 和 `publication.sanitized`；
 - 翻译响应分别注入：缺 token、重复 token、错序 token、模型前言、代码围栏、
@@ -245,12 +326,13 @@ token，翻译后逐 token 对账；例如 `158n.5` 不得被不一致地改成 
 `core.pages.text_extract` 产出的 PageRecord 会固定声明
 `ocr_model=text-layer/pymupdf-v1`，随后使用既有页级翻译、目录与章节编译节点。
 该兼容路径不会调用 OCR，也不会自动猜测来源类型。独立
-`born_digital_pdf_import.py` 与 EPUB importer 则生成标准语义翻译单元；未来把
-`core.semantic.translate.run` 注册为三入口统一 Provider 时，可以替换这条页级
+`born_digital_pdf_import.py` 与 EPUB importer 已生成相同 canonical 语义翻译单元；
+未来让 PDF Graph 也采用已注册的 `core.semantic.translate` 单元级 Provider 时，
+可以替换这条页级
 翻译兼容边而不改变下游 semantic/sanitize/publisher 契约。
 
 这里的“统一”指三个入口共享语义、清洗、发布与验证不变量；当前可执行实现仍有
-两种翻译粒度：Graph 的文本 PDF 兼容边是 page-level translation，EPUB 与独立
-PDF importer 使用 `translation-units.jsonl`。文档中的
-`core.semantic.translate.*` 是下一步统一 Provider 的目标命名，尚不能作为已注册
-Graph 节点调用。
+两种翻译粒度：Graph 的 PDF 兼容边是 page-level translation，EPUB 与独立 PDF
+importer 使用 `translation-units.jsonl`。`core.semantic.translate` 已在 EPUB Graph
+注册；将 PDF Graph 也切换为同一单元级 Provider 仍是下一步，不能把 EPUB 节点的
+存在误写成三入口翻译实现已经完全统一。

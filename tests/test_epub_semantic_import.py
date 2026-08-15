@@ -9,6 +9,8 @@ from unittest import mock
 import zipfile
 
 from epub_semantic_import import EpubSemanticError, apply_translations, import_epub
+from epub_publication_verifier import verify_epub_publication
+from book_pipeline import build_epub
 from publication_semantics import parse_markdown_footnotes
 
 
@@ -56,7 +58,83 @@ def _write_orphan_note_epub(path: Path) -> None:
             archive.writestr(name, value)
 
 
+def _write_cross_spine_link_epub(path: Path) -> None:
+    _write_epub(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    package = members["OEBPS/content.opf"].decode()
+    package = package.replace(
+        '<item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>',
+        '<item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/>'
+        '<item id="c2" href="chapter2.xhtml" media-type="application/xhtml+xml"/>',
+    ).replace(
+        '<spine><itemref idref="c1"/></spine>',
+        '<spine><itemref idref="c1"/><itemref idref="c2"/></spine>',
+    )
+    members["OEBPS/content.opf"] = package.encode()
+    first = members["OEBPS/chapter1.xhtml"].decode()
+    first = first.replace(
+        "</section>",
+        '<p><a href="chapter2.xhtml#id_673">Continue reading</a>.</p></section>',
+    )
+    members["OEBPS/chapter1.xhtml"] = first.encode()
+    members["OEBPS/chapter2.xhtml"] = b'''<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<h2><span id="id_673"></span>Second Chapter</h2>
+<p>Target paragraph.</p></body></html>'''
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
 class EpubSemanticImportTests(unittest.TestCase):
+    def test_cross_spine_links_are_rewritten_and_target_anchors_survive_publish(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_cross_spine_link_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            by_href = {item["source_href"]: item for item in manifest}
+            first = (output / "chapters" / by_href["OEBPS/chapter1.xhtml"]["filename"]).read_text(
+                encoding="utf-8"
+            )
+            second_item = by_href["OEBPS/chapter2.xhtml"]
+            second = (output / "chapters" / second_item["filename"]).read_text(
+                encoding="utf-8"
+            )
+            published_target = Path(second_item["filename"]).with_suffix(".xhtml").name
+
+            self.assertEqual(result["status"], "passed")
+            self.assertIn(f"]({published_target}#id_673)", first)
+            self.assertIn('<span id="id_673"></span>\n\n## Second Chapter', second)
+            self.assertNotIn("<span", second_item["display_title"])
+
+            artifact = output / "Test_Book.epub"
+            build_epub(
+                artifact,
+                output / "chapters",
+                manifest,
+                book_title="Test Book",
+                language="en",
+            )
+            report = verify_epub_publication(
+                output,
+                source_epub=source,
+                artifact_path=artifact,
+                target_language="en",
+                require_translation=False,
+            )
+            self.assertTrue(report["release_ready"], report["errors"])
+
     def test_spine_and_notes_become_publishable_semantic_chapters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-import fitz
+import pymupdf as fitz
 
 import book_pipeline as legacy
 import extract_textbook_layer

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
+import tempfile
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -74,12 +76,106 @@ class ApplicationService:
     ) -> RunSpec:
         config = self._validate_control_file(spec.config, suffix=".toml")
         recipe = self._validate_control_file(spec.recipe, suffix=".toml")
+        options = dict(spec.options)
+        glossary_value = options.get("glossary")
+        if glossary_value is not None and str(glossary_value).strip():
+            glossary = self._validate_control_file(
+                str(glossary_value),
+                suffix=".json",
+            )
+            options["glossary"] = str(glossary)
         return replace(
             spec,
             source=source,
             output_dir=output,
             config=config,
             recipe=recipe,
+            options=options,
+        )
+
+    @staticmethod
+    def _snapshot_file(source: Path, destination: Path) -> None:
+        """Copy one regular input through a stable descriptor.
+
+        Product jobs must not keep reading mutable server paths after they have
+        been accepted.  Opening with ``O_NOFOLLOW`` and comparing the source
+        descriptor before and after the copy also rejects a file that changes
+        while the snapshot is being materialized.
+        """
+
+        source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        source_descriptor = os.open(source, source_flags)
+        try:
+            before = os.fstat(source_descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"not a regular file: {source}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            try:
+                with os.fdopen(destination_descriptor, "wb") as target:
+                    while True:
+                        chunk = os.read(source_descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        target.write(chunk)
+                    target.flush()
+                    os.fsync(target.fileno())
+            except Exception:
+                destination.unlink(missing_ok=True)
+                raise
+            after = os.fstat(source_descriptor)
+            identity_before = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            identity_after = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if identity_after != identity_before:
+                destination.unlink(missing_ok=True)
+                raise ValueError(f"input changed while being snapshotted: {source}")
+        finally:
+            os.close(source_descriptor)
+
+    def _snapshot_control_inputs(
+        self,
+        spec: RunSpec,
+        *,
+        workspace: Path,
+    ) -> RunSpec:
+        """Bind config, recipe and glossary bytes to the registered job."""
+
+        control_dir = workspace / "control"
+        config: Path | None = None
+        recipe: Path | None = None
+        options = dict(spec.options)
+        if spec.config is not None:
+            config = control_dir / "pipeline.toml"
+            self._snapshot_file(Path(spec.config), config)
+        if spec.recipe is not None:
+            recipe = control_dir / "recipe.toml"
+            self._snapshot_file(Path(spec.recipe), recipe)
+        glossary_value = options.get("glossary")
+        if glossary_value:
+            glossary = control_dir / "glossary.json"
+            self._snapshot_file(Path(str(glossary_value)), glossary)
+            options["glossary"] = str(glossary)
+        return replace(
+            spec,
+            config=config,
+            recipe=recipe,
+            options=options,
         )
 
     def submit_path(
@@ -96,12 +192,26 @@ class ApplicationService:
             str(spec.source or ""), suffixes=suffixes
         )
         job_id = uuid.uuid4().hex
-        workspace, _input_dir, output = self._job_paths(job_id)
+        workspace, input_dir, output = self._job_paths(job_id)
         workspace.mkdir(parents=True, mode=0o700)
         registered = False
         try:
+            input_dir.mkdir()
             output.mkdir(parents=True)
-            normalized = self._normalized_spec(spec, source=source, output=output)
+            snapshot = input_dir / safe_upload_name(
+                source.name,
+                source_mode=spec.source_mode,
+            )
+            self._snapshot_file(source, snapshot)
+            normalized = self._normalized_spec(
+                spec,
+                source=snapshot,
+                output=output,
+            )
+            normalized = self._snapshot_control_inputs(
+                normalized,
+                workspace=workspace,
+            )
             plan = self.execution.plan(normalized)
             self._write_spec(workspace, normalized)
             job = self.registry.create(
@@ -139,9 +249,13 @@ class ApplicationService:
             input_dir.mkdir()
             output.mkdir()
             source = input_dir / safe_upload_name(filename, source_mode=spec.source_mode)
-            normalized = self._normalized_spec(spec, source=source, output=output)
-            plan = self.execution.plan(normalized)
             self._write_upload(source, content)
+            normalized = self._normalized_spec(spec, source=source, output=output)
+            normalized = self._snapshot_control_inputs(
+                normalized,
+                workspace=workspace,
+            )
+            plan = self.execution.plan(normalized)
             self._write_spec(workspace, normalized)
             job = self.registry.create(
                 job_id,
@@ -219,17 +333,30 @@ class ApplicationService:
         )
         return self.execution.plan(normalized).node_names
 
-    def preview_upload_plan(self, spec: RunSpec, *, filename: str) -> tuple[str, ...]:
-        """Plan an uploaded source without persisting its bytes or a job row."""
+    def preview_upload_plan(
+        self,
+        spec: RunSpec,
+        *,
+        filename: str,
+        content: bytes | bytearray | memoryview | BinaryIO,
+    ) -> tuple[str, ...]:
+        """Plan against temporary uploaded bytes without creating a task row."""
 
         safe_name = safe_upload_name(filename, source_mode=spec.source_mode)
-        preview_root = (self.settings.jobs_root / ".plan-preview").resolve()
-        normalized = self._normalized_spec(
-            spec,
-            source=preview_root / safe_name,
-            output=preview_root / "output",
-        )
-        return self.execution.plan(normalized).node_names
+        with tempfile.TemporaryDirectory(
+            prefix=".plan-preview-",
+            dir=self.settings.jobs_root,
+        ) as temporary:
+            preview_root = Path(temporary).resolve()
+            source = preview_root / safe_name
+            output = preview_root / "output"
+            self._write_upload(source, content)
+            normalized = self._normalized_spec(
+                spec,
+                source=source,
+                output=output,
+            )
+            return self.execution.plan(normalized).node_names
 
     def get_job(self, job_id: str) -> JobRecord:
         self.registry.reconcile_workers()

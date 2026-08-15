@@ -18,9 +18,25 @@ import urllib.request
 
 from pipeline_profiles import ModelProfile, load_pipeline_profiles
 from semantic_apply import SemanticApplyError, validate_translation_pair
+from semantic_ir import SemanticContractError, normalize_translation_unit_record
 
 
 RUNNER_VERSION = "semantic-provider-batch-v4"
+SYSTEM_PROMPT = "你是严谨的英译中学术图书译者，必须完整保留输入的语义和结构契约。"
+USER_PROMPT_TEMPLATE = (
+    "将以下英文图书 Markdown 完整、忠实地翻译为{target_language}，采用严谨、流畅的学术出版文体。\n"
+    "不得摘要、删节、扩写或评论；正文、引文、标题、表格、图注和脚注都必须逐项翻译。\n"
+    "只输出由 UNIT 标记包围的译文，不要代码围栏、说明、译者按或其他附加文字。\n"
+    "UNIT 标记、SEMANTIC_TOKEN 占位符、标题层级、强调、列表、表格、链接和脚注结构必须原样且顺序不变。\n"
+    "保持每个 UNIT 独立，不得跨 UNIT 合并、拆分或移动内容。修复明显的电子书断词或字母间误空格，但不猜改含义。\n"
+    "书目与脚注引文中的作者名、原文书名/篇名、期刊名、出版信息和页码须准确保留；其解释性文字仍须翻译。\n"
+    "索引概念词可翻译，人名、原文书名和定位页码须保持可识别且不得遗漏。\n"
+    "使用中国大陆通行的简体字、中文标点和既定学术译名；同一术语和人名在全书中保持一致。\n"
+    "术语表：\n{terms}\n\n{sections}"
+)
+PROMPT_CONTRACT_SHA256 = hashlib.sha256(
+    f"{SYSTEM_PROMPT}\0{USER_PROMPT_TEMPLATE}".encode("utf-8")
+).hexdigest()
 TOKEN_PATTERN = re.compile(
     r"\[\^[^\]\s]+\]"
     r"|\[\[[A-Z]+:[^\]]+\]\]"
@@ -117,16 +133,38 @@ def restore_tokens(value: str, tokens: Iterable[str]) -> str:
 
 def _validate_units(units: list[dict[str, Any]]) -> None:
     seen: set[str] = set()
-    previous: tuple[str, int] | None = None
-    for unit in units:
-        unit_id = str(unit.get("id") or "")
-        source = str(unit.get("source_markdown") or "")
-        key = (str(unit.get("chapter_id") or ""), int(unit.get("sequence") or 0))
-        if not unit_id or unit_id in seen or hashlib.sha256(source.encode()).hexdigest() != unit.get("source_sha256"):
-            raise SemanticTranslationError(f"duplicate id or stale source hash: {unit_id!r}")
-        if previous is not None and key[0] == previous[0] and key[1] != previous[1] + 1:
-            raise SemanticTranslationError(f"non-contiguous chapter units: {key[0]}")
-        seen.add(unit_id); previous = key
+    closed_chapters: set[str] = set()
+    current_chapter = ""
+    expected_sequence = 0
+    for position, unit in enumerate(units, 1):
+        try:
+            canonical = normalize_translation_unit_record(unit)
+        except (SemanticContractError, TypeError, ValueError) as exc:
+            raise SemanticTranslationError(
+                f"invalid source translation unit at position {position}: {exc}"
+            ) from exc
+        if canonical.id in seen:
+            raise SemanticTranslationError(
+                f"duplicate translation unit id: {canonical.id!r}"
+            )
+        if canonical.chapter_id != current_chapter:
+            if canonical.chapter_id in closed_chapters:
+                raise SemanticTranslationError(
+                    f"chapter units are not contiguous: {canonical.chapter_id}"
+                )
+            if current_chapter:
+                closed_chapters.add(current_chapter)
+            current_chapter = canonical.chapter_id
+            expected_sequence = 1
+        else:
+            expected_sequence += 1
+        if canonical.sequence != expected_sequence:
+            raise SemanticTranslationError(
+                "non-contiguous chapter units: "
+                f"{canonical.chapter_id} expected={expected_sequence} "
+                f"actual={canonical.sequence}"
+            )
+        seen.add(canonical.id)
 
 
 def batch_units(units: list[dict[str, Any]], *, max_chars: int = 9000) -> list[list[dict[str, Any]]]:
@@ -156,15 +194,11 @@ def build_prompt(batch: list[dict[str, Any]], *, target_language: str, glossary:
         sections.append(f"{UNIT_START.format(unit_id=unit_id)}\n{body}\n{UNIT_END.format(unit_id=unit_id)}")
     terms = "\n".join(f"- {a} => {b}" for a, b in glossary.items()) or "- 无"
     return (
-        f"将以下英文图书 Markdown 完整、忠实地翻译为{target_language}，采用严谨、流畅的学术出版文体。\n"
-        "不得摘要、删节、扩写或评论；正文、引文、标题、表格、图注和脚注都必须逐项翻译。\n"
-        "只输出由 UNIT 标记包围的译文，不要代码围栏、说明、译者按或其他附加文字。\n"
-        "UNIT 标记、SEMANTIC_TOKEN 占位符、标题层级、强调、列表、表格、链接和脚注结构必须原样且顺序不变。\n"
-        "保持每个 UNIT 独立，不得跨 UNIT 合并、拆分或移动内容。修复明显的电子书断词或字母间误空格，但不猜改含义。\n"
-        "书目与脚注引文中的作者名、原文书名/篇名、期刊名、出版信息和页码须准确保留；其解释性文字仍须翻译。\n"
-        "索引概念词可翻译，人名、原文书名和定位页码须保持可识别且不得遗漏。\n"
-        "使用中国大陆通行的简体字、中文标点和既定学术译名；同一术语和人名在全书中保持一致。\n"
-        f"术语表：\n{terms}\n\n" + "\n\n".join(sections),
+        USER_PROMPT_TEMPLATE.format(
+            target_language=target_language,
+            terms=terms,
+            sections="\n\n".join(sections),
+        ),
         protected,
     )
 
@@ -181,8 +215,15 @@ def _batch_key(
     thinking: str = "disabled",
     temperature: float = 0.0,
 ) -> str:
+    prompt, _protected = build_prompt(
+        batch,
+        target_language=target_language,
+        glossary=glossary,
+    )
     payload = {
         "runner": RUNNER_VERSION,
+        "prompt_contract_sha256": PROMPT_CONTRACT_SHA256,
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         "units": [(u["id"], u["source_sha256"]) for u in batch],
         "provider": provider.strip().lower(),
         "base_url": base_url.rstrip("/"),
@@ -386,7 +427,9 @@ def translate_units(
     return {"status": "passed", "mode": "run", "unit_count": len(results), "batch_count": len(batches), "cache_hits": cache_hits, "output": str(output_path.resolve())}
 
 
-def _deepseek_request(*, api_key: str, base_url: str, model: str, timeout: int, thinking: str = "disabled", temperature: float = 0.0, max_tokens: int = 32768) -> Callable[[str], str]:
+def build_openai_chat_request(*, api_key: str, base_url: str, model: str, timeout: int, thinking: str = "disabled", temperature: float = 0.0, max_tokens: int = 32768) -> Callable[[str], str]:
+    """Build the explicit OpenAI-compatible transport used by product callers."""
+
     def request(prompt: str) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -395,7 +438,7 @@ def _deepseek_request(*, api_key: str, base_url: str, model: str, timeout: int, 
             "messages": [
                 {
                     "role": "system",
-                    "content": "你是严谨的英译中学术图书译者，必须完整保留输入的语义和结构契约。",
+                    "content": SYSTEM_PROMPT,
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -417,17 +460,22 @@ def _deepseek_request(*, api_key: str, base_url: str, model: str, timeout: int, 
                 response_payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1200]
-            raise SemanticTranslationError(f"DeepSeek HTTP {exc.code}: {detail}") from exc
+            raise SemanticTranslationError(f"OpenAI-compatible HTTP {exc.code}: {detail}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise SemanticTranslationError(f"DeepSeek request failed: {exc}") from exc
+            raise SemanticTranslationError(f"OpenAI-compatible request failed: {exc}") from exc
         try:
             value = response_payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise SemanticTranslationError("DeepSeek response has no message content") from exc
+            raise SemanticTranslationError("OpenAI-compatible response has no message content") from exc
         if not isinstance(value, str) or not value.strip():
-            raise SemanticTranslationError("DeepSeek returned empty content")
+            raise SemanticTranslationError("OpenAI-compatible endpoint returned empty content")
         return value
     return request
+
+
+# Backward-compatible alias for archived callers. New orchestration code uses
+# the public transport factory above rather than coupling to a private seam.
+_deepseek_request = build_openai_chat_request
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -462,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         api_key = os.getenv(credential_env, "")
         if not api_key:
             raise SystemExit(f"missing credential environment variable: {credential_env}")
-        request = _deepseek_request(api_key=api_key, base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=thinking, temperature=args.temperature)
+        request = build_openai_chat_request(api_key=api_key, base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=thinking, temperature=args.temperature)
     result = translate_units(
         Path(args.units).expanduser(),
         Path(args.output).expanduser(),

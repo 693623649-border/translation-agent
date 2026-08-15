@@ -97,7 +97,7 @@ JOB_STATUSES = frozenset(
     }
 )
 TERMINAL_STATUSES = frozenset({"cancelled", "succeeded", "failed", "interrupted"})
-RELEASE_PROFILES = frozenset({"draft", "draft-only", "word", "full"})
+RELEASE_PROFILES = frozenset({"draft", "draft-only", "epub", "word", "full"})
 SOURCE_EXTENSIONS = {
     "scanned-pdf": frozenset({".pdf"}),
     "text-pdf": frozenset({".pdf"}),
@@ -108,9 +108,11 @@ PUBLICATION_KINDS = {
     "publication.docx": "docx",
     "publication.knowledge_base": "knowledge_base",
     "publication.reference_pdf": "reference_pdf",
+    "publication.epub_report": "release_report",
     "publication.report": "release_report",
     "publication.word_report": "release_report",
 }
+GRAPH_RELEASE_EVIDENCE = frozenset({"semantic.translations"})
 MEDIA_TYPES = {
     "epub": "application/epub+zip",
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -954,7 +956,7 @@ def execute_job(database: Path | str, job_id: str, worker_token: str) -> int:
                 "execution result does not satisfy the resolved target contract: "
                 f"expected {list(plan.targets)}, got {list(result.targets)}"
             )
-        if plan.release_profile in {"word", "full"} and not result.release_ready:
+        if plan.release_profile in {"epub", "word", "full"} and not result.release_ready:
             raise RuntimeError(
                 "execution completed without a release-ready verifier report for "
                 f"profile {plan.release_profile!r}"
@@ -1208,7 +1210,9 @@ def _graph_artifacts(output_dir: Path) -> dict[str, dict[str, Any]]:
         if not isinstance(outputs, dict):
             continue
         for name, value in outputs.items():
-            if name in PUBLICATION_KINDS and isinstance(value, dict):
+            if (
+                name in PUBLICATION_KINDS or name in GRAPH_RELEASE_EVIDENCE
+            ) and isinstance(value, dict):
                 artifacts[name] = value
     return artifacts
 
@@ -1268,10 +1272,183 @@ def _report_is_fresh(
                 *output_dir.glob("*_带目录.pdf"),
             ]
         )
+    elif publication_profile == "epub":
+        watched.extend(
+            [
+                output_dir / "semantic" / "source-manifest.json",
+                output_dir / "semantic" / "translation-units.jsonl",
+                output_dir / "semantic" / "translations.jsonl",
+                output_dir / "audit" / "semantic-reconstruction.json",
+                output_dir / "audit" / "semantic-translation.json",
+                *output_dir.glob("*.epub"),
+                *(output_dir / "semantic" / "source_chapters").glob("*.md"),
+            ]
+        )
     return not any(
         path.is_file() and path.stat().st_mtime_ns > report_mtime
         for path in watched
     )
+
+
+def _epub_report_semantics_are_current(
+    output_dir: Path,
+    report: Mapping[str, Any],
+    *,
+    source_path: Path,
+    publication_identity: Mapping[str, Any] | None,
+    translation_identity: Mapping[str, Any] | None,
+) -> bool:
+    """Verify the content identities signed by the EPUB-native report.
+
+    Modification times remain a useful early warning, but they are not a
+    security identity: callers can restore an older timestamp after changing a
+    file. The native report therefore signs the canonical manifest and ordered
+    chapter bundle, and the Web catalog recomputes both before labeling an EPUB
+    as released.
+    """
+
+    source = report.get("source_epub")
+    artifact = report.get("artifact")
+    semantic = report.get("semantic")
+    if not isinstance(source, Mapping):
+        return False
+    if not isinstance(semantic, Mapping):
+        return False
+    if not isinstance(artifact, Mapping) or not isinstance(
+        publication_identity, Mapping
+    ):
+        return False
+    identity_path_value = publication_identity.get("path")
+    identity_hash = publication_identity.get("sha256")
+    report_artifact_path = artifact.get("path")
+    report_artifact_hash = artifact.get("sha256")
+    if (
+        artifact.get("target") != "publication.epub"
+        or not isinstance(identity_path_value, str)
+        or not isinstance(identity_hash, str)
+        or not isinstance(report_artifact_path, str)
+        or report_artifact_hash != identity_hash
+    ):
+        return False
+    raw_identity_path = Path(identity_path_value).expanduser()
+    identity_path = raw_identity_path.resolve()
+    if (
+        raw_identity_path.is_symlink()
+        or not identity_path.is_file()
+        or not _is_relative_to(identity_path, output_dir)
+        or Path(report_artifact_path).expanduser().resolve() != identity_path
+        or _sha256_file(identity_path) != identity_hash
+    ):
+        return False
+    expected_source_path = source.get("path")
+    expected_source_hash = source.get("sha256")
+    if not isinstance(expected_source_path, str) or not isinstance(
+        expected_source_hash, str
+    ):
+        return False
+    resolved_source = source_path.expanduser().resolve()
+    if (
+        Path(expected_source_path).expanduser().resolve() != resolved_source
+        or not resolved_source.is_file()
+        or resolved_source.is_symlink()
+        or _sha256_file(resolved_source) != expected_source_hash
+    ):
+        return False
+    expected_reconstruction = semantic.get("reconstruction_sha256")
+    if not isinstance(expected_reconstruction, str):
+        return False
+    draft_audit = output_dir / ".pipeline_graph" / "draft-semantic-audit.json"
+    reconstruction_audit = (
+        draft_audit
+        if draft_audit.is_file() and not draft_audit.is_symlink()
+        else output_dir / "audit" / "semantic-reconstruction.json"
+    )
+    if (
+        not reconstruction_audit.is_file()
+        or reconstruction_audit.is_symlink()
+        or _sha256_file(reconstruction_audit) != expected_reconstruction
+    ):
+        return False
+    translation_audit = output_dir / "audit" / "semantic-translation.json"
+    translation_applied = semantic.get("translation_applied") is True
+    expected_translation = semantic.get("translation_sha256")
+    expected_translation_input = semantic.get("translation_input_sha256")
+    if translation_applied:
+        if (
+            not isinstance(expected_translation, str)
+            or not isinstance(expected_translation_input, str)
+            or not translation_audit.is_file()
+            or translation_audit.is_symlink()
+            or _sha256_file(translation_audit) != expected_translation
+        ):
+            return False
+        if not isinstance(translation_identity, Mapping):
+            return False
+        raw_translation_path = translation_identity.get("path")
+        translation_hash = translation_identity.get("sha256")
+        if (
+            not isinstance(raw_translation_path, str)
+            or translation_hash != expected_translation_input
+        ):
+            return False
+        translation_path_value = Path(raw_translation_path).expanduser()
+        translation_path = translation_path_value.resolve()
+        if (
+            translation_path_value.is_symlink()
+            or not translation_path.is_file()
+            or _sha256_file(translation_path) != expected_translation_input
+        ):
+            return False
+        try:
+            translation_payload = json.loads(
+                translation_audit.read_text(encoding="utf-8")
+            )
+            audited_input = translation_payload["translation_input"]["sha256"]
+        except (KeyError, OSError, TypeError, json.JSONDecodeError):
+            return False
+        if audited_input != expected_translation_input:
+            return False
+    elif (
+        expected_translation is not None
+        or expected_translation_input is not None
+        or translation_audit.exists()
+    ):
+        return False
+    expected_manifest = semantic.get("canonical_manifest_sha256")
+    expected_chapters = semantic.get("canonical_chapters_sha256")
+    if not isinstance(expected_manifest, str) or not isinstance(
+        expected_chapters, str
+    ):
+        return False
+    manifest_path = output_dir / "chapters.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return False
+    try:
+        if _sha256_file(manifest_path) != expected_manifest:
+            return False
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, list) or not manifest:
+            return False
+        chapter_paths: list[Path] = []
+        for item in manifest:
+            if not isinstance(item, Mapping):
+                return False
+            filename = item.get("filename")
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                return False
+            chapter = output_dir / "chapters" / filename
+            if not chapter.is_file() or chapter.is_symlink():
+                return False
+            chapter_paths.append(chapter)
+        digest = hashlib.sha256()
+        for chapter in sorted(chapter_paths, key=lambda path: path.as_posix()):
+            digest.update(chapter.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(_sha256_file(chapter).encode("ascii"))
+            digest.update(b"\0")
+        return digest.hexdigest() == expected_chapters
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
 
 
 def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
@@ -1289,10 +1466,15 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
         else "word"
         if job.release_profile == "word"
         and "publication.word_report" in requested
+        else "epub"
+        if job.release_profile == "epub"
+        and "publication.epub_report" in requested
         else "full"
         if not has_resolved_plan and "publication.report" in requested
         else "word"
         if not has_resolved_plan and "publication.word_report" in requested
+        else "epub"
+        if not has_resolved_plan and "publication.epub_report" in requested
         else None
     )
     report_names = (
@@ -1300,6 +1482,8 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
         if expected_profile == "full"
         else ("publication.word_report",)
         if expected_profile == "word"
+        else ("publication.epub_report",)
+        if expected_profile == "epub"
         else ()
     )
     _report_artifact, report_path, report = _release_report(
@@ -1313,6 +1497,16 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
         and report.get("mode") == "full"
         and report.get("publication_profile") == expected_profile
         and report_path is not None
+        and (
+            expected_profile != "epub"
+            or _epub_report_semantics_are_current(
+                output,
+                report,
+                source_path=Path(job.spec.source or ""),
+                publication_identity=identities.get("publication.epub"),
+                translation_identity=identities.get("semantic.translations"),
+            )
+        )
         and _report_is_fresh(
             output,
             report_path,
@@ -1322,14 +1516,26 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
     covered_artifacts = (
         {"publication.docx"}
         if expected_profile == "word"
+        else {"publication.epub"}
+        if expected_profile == "epub"
         else set(PUBLICATION_KINDS)
-        - {"publication.report", "publication.word_report"}
+        - {
+            "publication.report",
+            "publication.word_report",
+            "publication.epub_report",
+        }
         if expected_profile == "full"
         else set()
     )
     records: list[ArtifactRecord] = []
     for artifact_name, identity in sorted(identities.items()):
-        if artifact_name in {"publication.report", "publication.word_report"}:
+        if artifact_name in GRAPH_RELEASE_EVIDENCE:
+            continue
+        if artifact_name in {
+            "publication.report",
+            "publication.word_report",
+            "publication.epub_report",
+        }:
             continue
         raw_path = identity.get("path")
         if not isinstance(raw_path, str):

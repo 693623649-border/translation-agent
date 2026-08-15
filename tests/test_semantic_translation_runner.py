@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from semantic_translation_runner import (
     SemanticTranslationError,
@@ -18,12 +19,25 @@ from semantic_translation_runner import (
 )
 
 
+def _unit(unit_id: str, chapter_id: str, sequence: int, source: str) -> dict:
+    return {
+        "schema_version": 1,
+        "id": unit_id,
+        "chapter_id": chapter_id,
+        "sequence": sequence,
+        "kind": "paragraph",
+        "source_href": f"{chapter_id}.xhtml",
+        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "source_markdown": source,
+    }
+
+
 class SemanticTranslationRunnerTests(unittest.TestCase):
     def test_prepare_is_network_free_and_contains_glossary(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = "# Heading\n\nBody[^n]."
-            unit = {"id": "c-u1", "chapter_id": "c", "sequence": 1, "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "source_markdown": source}
+            unit = _unit("c-u1", "c", 1, source)
             units = root / "units.jsonl"
             units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
             output = root / "prepared.jsonl"
@@ -55,7 +69,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = "Text[^n].\n\n[^n]: Note."
-            unit = {"id": "c-u1", "chapter_id": "c", "sequence": 1, "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "source_markdown": source}
+            unit = _unit("c-u1", "c", 1, source)
             units = root / "units.jsonl"
             units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
             calls = []
@@ -85,7 +99,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             ("a", 1, "one"), ("a", 2, "two"), ("a", 3, "x" * 100),
             ("b", 1, "three"),
         ):
-            units.append({"id": f"{chapter}-{sequence}", "chapter_id": chapter, "sequence": sequence, "source_sha256": hashlib.sha256(text.encode()).hexdigest(), "source_markdown": text})
+            units.append(_unit(f"{chapter}-{sequence}", chapter, sequence, text))
 
         batches = batch_units(units, max_chars=150)
 
@@ -98,7 +112,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             units = []
             for chapter in ("a", "b"):
                 source = f"English sentence for {chapter}."
-                units.append({"id": f"{chapter}-1", "chapter_id": chapter, "sequence": 1, "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "source_markdown": source})
+                units.append(_unit(f"{chapter}-1", chapter, 1, source))
             path = root / "units.jsonl"
             path.write_text("".join(json.dumps(unit) + "\n" for unit in units))
             barrier = threading.Barrier(2)
@@ -122,7 +136,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = "Long English source sentence."
-            unit = {"id": "c-1", "chapter_id": "c", "sequence": 1, "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "source_markdown": source}
+            unit = _unit("c-1", "c", 1, source)
             path = root / "units.jsonl"; path.write_text(json.dumps(unit) + "\n")
             output = root / "out.jsonl"
 
@@ -136,7 +150,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             units = []
             for sequence in (1, 2):
                 source = f"Long English source sentence {sequence}."
-                units.append({"id": f"c-{sequence}", "chapter_id": "c", "sequence": sequence, "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "source_markdown": source})
+                units.append(_unit(f"c-{sequence}", "c", sequence, source))
             path = root / "units.jsonl"
             path.write_text("".join(json.dumps(unit) + "\n" for unit in units))
 
@@ -162,13 +176,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = "A complete English sentence must be translated."
-            unit = {
-                "id": "c-1",
-                "chapter_id": "c",
-                "sequence": 1,
-                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-                "source_markdown": source,
-            }
+            unit = _unit("c-1", "c", 1, source)
             units = root / "units.jsonl"
             units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
 
@@ -192,13 +200,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = "A complete English sentence."
-            unit = {
-                "id": "c-1",
-                "chapter_id": "c",
-                "sequence": 1,
-                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-                "source_markdown": source,
-            }
+            unit = _unit("c-1", "c", 1, source)
             units = root / "units.jsonl"
             units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
 
@@ -223,6 +225,28 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             one = json.loads((root / "one.jsonl").read_text(encoding="utf-8"))
             two = json.loads((root / "two.jsonl").read_text(encoding="utf-8"))
 
+            self.assertNotEqual(one["cache_key"], two["cache_key"])
+
+    def test_cache_identity_includes_the_actual_prompt_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unit = _unit("c-1", "c", 1, "A complete English sentence.")
+            units = root / "units.jsonl"
+            units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
+
+            with patch(
+                "semantic_translation_runner.PROMPT_CONTRACT_SHA256",
+                "0" * 64,
+            ):
+                translate_units(units, root / "one.jsonl")
+            with patch(
+                "semantic_translation_runner.PROMPT_CONTRACT_SHA256",
+                "1" * 64,
+            ):
+                translate_units(units, root / "two.jsonl")
+
+            one = json.loads((root / "one.jsonl").read_text(encoding="utf-8"))
+            two = json.loads((root / "two.jsonl").read_text(encoding="utf-8"))
             self.assertNotEqual(one["cache_key"], two["cache_key"])
 
 

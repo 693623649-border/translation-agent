@@ -31,18 +31,13 @@ from publication_semantics import (
     parse_markdown_footnotes,
 )
 from semantic_ir import (
-    BLOCK_KINDS,
     SEMANTIC_SCHEMA_VERSION,
     SemanticContractError,
-    SourceLocator,
-    TranslationUnit,
+    normalize_translation_unit_record,
 )
 
 
 TRANSLATION_SET_SCHEMA_VERSION = SEMANTIC_SCHEMA_VERSION
-# ``list`` is the only pre-IR kind still emitted by the EPUB adapter.  New
-# adapters use canonical ``list_item``; both are accepted during migration.
-SUPPORTED_UNIT_KINDS = BLOCK_KINDS | frozenset({"list"})
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _LATIN = re.compile(r"[A-Za-z]")
 _LINK = re.compile(
@@ -85,10 +80,11 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
+def _read_jsonl_with_sha256(path: Path) -> tuple[list[dict[str, Any]], str]:
     records: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        raw = path.read_bytes()
+        lines = raw.decode("utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         raise SemanticApplyError(f"translation JSONL is missing or unreadable: {path}") from exc
     for line_number, line in enumerate(lines, 1):
@@ -103,7 +99,11 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         records.append(value)
     if not records:
         raise SemanticApplyError(f"translation JSONL contains no units: {path}")
-    return records
+    return records, _sha256_bytes(raw)
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return _read_jsonl_with_sha256(path)[0]
 
 
 def load_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
@@ -160,51 +160,6 @@ def assert_reconstruction_allows_apply(audit: Mapping[str, Any]) -> None:
             raise SemanticApplyError(
                 f"semantic reconstruction chapter is blocked: {chapter.get('chapter_id')!r}"
             )
-
-
-def _unit_kind(unit: Mapping[str, Any]) -> str:
-    kind = str(unit.get("kind") or "").strip()
-    if kind not in SUPPORTED_UNIT_KINDS:
-        raise SemanticApplyError(f"unsupported or missing semantic unit kind: {kind!r}")
-    return kind
-
-
-def _validate_source_unit_contract(
-    source: Mapping[str, Any],
-    *,
-    unit_id: str,
-    chapter_id: str,
-    sequence: int,
-    kind: str,
-    source_markdown: str,
-    source_sha256: str,
-) -> None:
-    """Use canonical IR validation when present, else accept v1 legacy locators."""
-
-    raw_locators = source.get("locators")
-    if raw_locators is not None:
-        if not isinstance(raw_locators, Sequence) or isinstance(raw_locators, (str, bytes)):
-            raise SemanticApplyError(f"semantic source locators are invalid: {unit_id}")
-        try:
-            locators = tuple(
-                item if isinstance(item, SourceLocator) else SourceLocator.from_dict(item)
-                for item in raw_locators
-            )
-            TranslationUnit(
-                schema_version=TRANSLATION_SET_SCHEMA_VERSION,
-                id=unit_id,
-                chapter_id=chapter_id,
-                sequence=sequence,
-                kind=kind,
-                source_markdown=source_markdown,
-                source_sha256=source_sha256,
-                locators=locators,
-            )
-        except (SemanticContractError, TypeError, ValueError) as exc:
-            raise SemanticApplyError(f"canonical translation unit is invalid: {unit_id}: {exc}") from exc
-        return
-    if not str(source.get("source_href") or source.get("source_pages") or "").strip():
-        raise SemanticApplyError(f"semantic source locator is missing: {unit_id}")
 
 
 def _heading_signature(markdown: str) -> tuple[int, ...]:
@@ -381,17 +336,21 @@ def validate_translation_set(
     for index, (source, translated) in enumerate(zip(source_units, translated_units), 1):
         if not isinstance(source, Mapping) or not isinstance(translated, Mapping):
             raise SemanticApplyError(f"semantic unit must be an object at position {index}")
-        if source.get("schema_version") != TRANSLATION_SET_SCHEMA_VERSION:
-            raise SemanticApplyError(f"unsupported source unit schema at position {index}")
+        try:
+            canonical = normalize_translation_unit_record(source)
+        except (SemanticContractError, TypeError, ValueError) as exc:
+            raise SemanticApplyError(
+                f"source translation unit is invalid at position {index}: {exc}"
+            ) from exc
         if translated.get("schema_version") != source.get("schema_version"):
             raise SemanticApplyError(f"translation unit schema mismatch at position {index}")
 
-        unit_id = str(source.get("id") or "").strip()
+        unit_id = canonical.id
         translated_id = str(translated.get("id") or "").strip()
-        chapter_id = str(source.get("chapter_id") or "").strip()
+        chapter_id = canonical.chapter_id
         translated_chapter = str(translated.get("chapter_id") or "").strip()
         try:
-            sequence = int(source.get("sequence"))
+            sequence = canonical.sequence
             translated_sequence = int(translated.get("sequence"))
         except (TypeError, ValueError) as exc:
             raise SemanticApplyError(f"semantic unit sequence is invalid: {unit_id!r}") from exc
@@ -419,23 +378,10 @@ def validate_translation_set(
                 f"chapter unit sequence is not contiguous: {chapter_id} expected={expected_sequence} actual={sequence}"
             )
 
-        kind = _unit_kind(source)
-        source_markdown = source.get("source_markdown")
-        source_sha256 = source.get("source_sha256")
-        if not isinstance(source_markdown, str) or not source_markdown.strip():
-            raise SemanticApplyError(f"source_markdown is empty: {unit_id}")
+        kind = canonical.kind
+        source_markdown = canonical.source_markdown
+        source_sha256 = canonical.source_sha256
         actual_sha256 = _sha256_bytes(source_markdown.encode("utf-8"))
-        if source_sha256 != actual_sha256:
-            raise SemanticApplyError(f"stored source unit hash is stale: {unit_id}")
-        _validate_source_unit_contract(
-            source,
-            unit_id=unit_id,
-            chapter_id=chapter_id,
-            sequence=sequence,
-            kind=kind,
-            source_markdown=source_markdown,
-            source_sha256=actual_sha256,
-        )
         if translated.get("source_sha256") != actual_sha256:
             raise SemanticApplyError(f"translated unit is bound to different source bytes: {unit_id}")
         translated_markdown = translated.get("translated_markdown")
@@ -664,9 +610,10 @@ def apply_translation_transaction(
     reconstruction_path = output_dir / "audit" / "semantic-reconstruction.json"
     reconstruction, reconstruction_sha256 = load_reconstruction_audit(reconstruction_path)
     source_units_path = output_dir / "semantic" / "translation-units.jsonl"
-    source_units = read_jsonl(source_units_path)
-    source_units_sha256 = _sha256_bytes(source_units_path.read_bytes())
-    translated_units = read_jsonl(translations_path)
+    source_units, source_units_sha256 = _read_jsonl_with_sha256(source_units_path)
+    translated_units, translation_input_sha256 = _read_jsonl_with_sha256(
+        translations_path
+    )
     validation = validate_translation_set(
         source_units,
         translated_units,
@@ -768,6 +715,10 @@ def apply_translation_transaction(
                 "schema_version": reconstruction.get("schema_version"),
                 "status": reconstruction.get("status"),
             },
+            "translation_input": {
+                "sha256": translation_input_sha256,
+                "unit_count": len(translated_units),
+            },
             "review_resolution": {
                 "schema_version": SEMANTIC_SCHEMA_VERSION,
                 "decisions": [],
@@ -800,6 +751,8 @@ def apply_translation_transaction(
             raise SemanticApplyError("semantic reconstruction audit changed during translation apply")
         if _sha256_bytes(source_units_path.read_bytes()) != source_units_sha256:
             raise SemanticApplyError("semantic translation units changed during translation apply")
+        if _sha256_bytes(translations_path.read_bytes()) != translation_input_sha256:
+            raise SemanticApplyError("translation input changed during translation apply")
         if _sha256_bytes(manifest_path.read_bytes()) != _sha256_bytes(raw_manifest_bytes):
             raise SemanticApplyError("chapter manifest changed during translation apply")
         for source_path, expected_sha256 in source_chapter_sha256.items():
@@ -816,6 +769,7 @@ def apply_translation_transaction(
         "status": "passed",
         "manifest": str(manifest_path),
         "translation_audit": str(output_dir / "audit" / "semantic-translation.json"),
+        "translation_input_sha256": translation_input_sha256,
     }
 
 
