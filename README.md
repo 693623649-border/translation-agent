@@ -160,6 +160,8 @@ translation-agent/
 ├── repository_guard.py           # 密钥、大文件和本地书稿防泄漏门
 ├── pipeline_profiles.py          # Provider/Profile 配置与模型指纹
 ├── pipeline_runtime.py           # 共享重试和起始限速器
+├── publication_service.py        # CLI/PDF Graph 共用的类型化发布验收服务
+├── publication_checks/           # 可独立测试的确定性发布检查
 ├── publication_verifier.py       # 无模型调用的统一发布质量门
 ├── epub_publication_verifier.py  # EPUB-native 语义、包、导航与链接发布门
 ├── epub_semantic_import.py       # EPUB spine → canonical TranslationUnit
@@ -186,6 +188,13 @@ PDF 的 `graph_pipeline.py` 是 `book_pipeline.py` 之上的轻量依赖图，�
 页级 CAS 和断点检查点。Graph 只接管节点选择、依赖规划、节点缓存、事件记录
 和输出目录互斥。原有命令可以继续使用；要获得可组合能力时，把入口改为
 `graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
+
+发布验收是当前 legacy 收敛的第一个完成边界：`book_pipeline.py` 与 PDF Graph
+共同调用类型化 `publication_service`，Graph verify 不再通过 argv 或私有
+`_main_unlocked` 回调阶段入口。`runtime.hygiene` 也已成为
+`publication_checks/` 下首个可独立测试的检查；拆分保持既有报告 ID、schema 和
+检查顺序不变。OCR、目录、校勘、翻译与编译节点仍委托 legacy 阶段实现，后续按节点
+边界逐步收敛。
 
 EPUB 走 `pipeline_graph/epub.py` 的独立 first-class Graph：它绑定源 ZIP 字节，
 按 spine 重建不可变语义章节和 canonical `TranslationUnit`，可选运行或回填翻译，

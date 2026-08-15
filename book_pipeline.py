@@ -52,7 +52,15 @@ from pipeline_runtime import (
     StartRateLimiter,
     retry_with_backoff,
 )
-from publication_verifier import verify_publication
+from publication_service import (
+    BOOKMARKED_PDF,
+    DOCX,
+    EPUB,
+    KNOWLEDGE_BASE,
+    PublicationArtifact,
+    PublicationVerificationRequest,
+    run_publication_verification,
+)
 from docx_footnotes import patch_docx_footnotes
 from publication_semantics import (
     append_markdown_footnotes,
@@ -5782,6 +5790,23 @@ def _shared_output_directory_locked(operation: Any) -> Any:
     return wrapped
 
 
+def _required_verification_artifacts(
+    args: argparse.Namespace,
+) -> frozenset[PublicationArtifact]:
+    """Translate legacy negative CLI flags into a positive service contract."""
+
+    return frozenset(
+        artifact
+        for artifact, required in (
+            (EPUB, not args.no_epub),
+            (DOCX, not args.no_docx),
+            (KNOWLEDGE_BASE, not args.no_kb),
+            (BOOKMARKED_PDF, not args.no_bookmarked_pdf),
+        )
+        if required
+    )
+
+
 def _main_unlocked(
     argv: list[str] | None = None,
     *,
@@ -5954,35 +5979,33 @@ def _main_unlocked(
         else output_dir / "audit" / default_report_name
     )
     if args.phase == "verify":
-        report = verify_publication(
-            output_dir,
-            source_pdf=pdf_path,
-            book_title=args.title,
-            expected_language=(
-                "zh-CN"
-                if args.target_language == "简体中文"
-                else args.target_language
-            ),
-            expected_translation_fingerprint=(
-                expected_translation_identity.fingerprint
-                if args.require_translation
-                else None
-            ),
-            require_translation=args.require_translation,
-            require_epub=not args.no_epub,
-            require_docx=not args.no_docx,
-            require_docx_render=(
-                not args.no_docx and not args.no_docx_render
-            ),
-            require_knowledge_base=not args.no_kb,
-            require_bookmarked_pdf=not args.no_bookmarked_pdf,
-            require_all_reviewed=args.require_all_reviewed,
-            publication_profile=args.verification_profile,
-            chapter_ids=args.chapter_id or None,
-            report_path=verification_report_path,
+        verification = run_publication_verification(
+            PublicationVerificationRequest(
+                output_dir=output_dir,
+                source_pdf=pdf_path,
+                book_title=args.title,
+                expected_language=(
+                    "zh-CN"
+                    if args.target_language == "简体中文"
+                    else args.target_language
+                ),
+                expected_translation_fingerprint=(
+                    expected_translation_identity.fingerprint
+                    if args.require_translation
+                    else None
+                ),
+                require_translation=args.require_translation,
+                required_artifacts=_required_verification_artifacts(args),
+                require_docx_render=not args.no_docx_render,
+                require_all_reviewed=args.require_all_reviewed,
+                publication_profile=args.verification_profile,
+                chapter_ids=tuple(args.chapter_id),
+                report_path=verification_report_path,
+            )
         )
+        report = verification.report
         print(json.dumps(report, ensure_ascii=False, indent=2))
-        return 0 if bool(report.get("ok")) else 1
+        return 0 if verification.ok else 1
     if args.phase in {"epub", "docx"}:
         manifest_path = output_dir / "chapters.json"
         if not manifest_path.exists():
@@ -6411,32 +6434,30 @@ def _main_unlocked(
                     toc_payload,
                 )
             if not args.no_verify:
-                report = verify_publication(
-                    output_dir,
-                    source_pdf=pdf_path,
-                    book_title=book_title,
-                    expected_language=(
-                        "zh-CN"
-                        if args.target_language == "简体中文"
-                        else args.target_language
-                    ),
-                    expected_translation_fingerprint=(
-                        expected_translation_identity.fingerprint
-                        if args.require_translation
-                        else None
-                    ),
-                    require_translation=args.require_translation,
-                    require_epub=not args.no_epub,
-                    require_docx=not args.no_docx,
-                    require_docx_render=(
-                        not args.no_docx and not args.no_docx_render
-                    ),
-                    require_knowledge_base=not args.no_kb,
-                    require_bookmarked_pdf=not args.no_bookmarked_pdf,
-                    require_all_reviewed=args.require_all_reviewed,
-                    publication_profile=args.verification_profile,
-                    report_path=verification_report_path,
+                verification = run_publication_verification(
+                    PublicationVerificationRequest(
+                        output_dir=output_dir,
+                        source_pdf=pdf_path,
+                        book_title=book_title,
+                        expected_language=(
+                            "zh-CN"
+                            if args.target_language == "简体中文"
+                            else args.target_language
+                        ),
+                        expected_translation_fingerprint=(
+                            expected_translation_identity.fingerprint
+                            if args.require_translation
+                            else None
+                        ),
+                        require_translation=args.require_translation,
+                        required_artifacts=_required_verification_artifacts(args),
+                        require_docx_render=not args.no_docx_render,
+                        require_all_reviewed=args.require_all_reviewed,
+                        publication_profile=args.verification_profile,
+                        report_path=verification_report_path,
+                    )
                 )
+                report = verification.report
                 summary = report.get("summary", {})
                 print(
                     "[verify] "
@@ -6445,7 +6466,7 @@ def _main_unlocked(
                     f"failed={summary.get('failed', 0)} "
                     f"report={verification_report_path}"
                 )
-                if not bool(report.get("ok")):
+                if not verification.ok:
                     raise ValueError(
                         "Publication quality gate failed; inspect "
                         f"{verification_report_path}."

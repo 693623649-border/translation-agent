@@ -401,6 +401,7 @@ class PublicationVerifierTests(unittest.TestCase):
             "docx.render",
             "knowledge_base.structure",
             "pdf.bookmarks",
+            "runtime.hygiene",
         ):
             with self.subTest(check_id=check_id):
                 self.assertEqual(checks[check_id]["status"], "passed")

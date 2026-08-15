@@ -24,6 +24,14 @@ import pymupdf as fitz
 import book_pipeline as legacy
 import extract_textbook_layer
 from pipeline_profiles import load_pipeline_profiles
+from publication_service import (
+    BOOKMARKED_PDF as VERIFY_BOOKMARKED_PDF,
+    DOCX as VERIFY_DOCX,
+    EPUB as VERIFY_EPUB,
+    KNOWLEDGE_BASE as VERIFY_KNOWLEDGE_BASE,
+    PublicationVerificationRequest,
+    run_publication_verification,
+)
 
 from .core import (
     GraphContext,
@@ -2870,17 +2878,18 @@ def _verify_handler(
     page_artifact: str | None = None,
     report_artifact: str = ART_REPORT,
 ) -> Any:
-    flags = {
-        ART_KB: "--no-kb",
-        ART_EPUB: "--no-epub",
-        ART_DOCX: "--no-docx",
-        ART_REFERENCE_PDF: "--no-bookmarked-pdf",
+    service_artifacts = {
+        ART_KB: VERIFY_KNOWLEDGE_BASE,
+        ART_EPUB: VERIFY_EPUB,
+        ART_DOCX: VERIFY_DOCX,
+        ART_REFERENCE_PDF: VERIFY_BOOKMARKED_PDF,
     }
 
     def handler(context: GraphContext) -> NodeResult:
         declared_inputs = set(context.values)
+        source_pdf: Path | None = None
         if ART_SOURCE in declared_inputs:
-            _require_source_argument(context)
+            source_pdf = _require_source_argument(context)
         if page_artifact is not None and page_artifact in declared_inputs:
             _materialize_pages_artifact(context, page_artifact)
         if ART_TOC in declared_inputs:
@@ -2891,71 +2900,67 @@ def _verify_handler(
             context,
             selected_artifacts & declared_inputs,
         )
-        add = tuple(
-            option
-            for artifact, option in flags.items()
-            if artifact not in selected_artifacts
-        )
-        remove = tuple(
-            (option, False)
-            for artifact, option in flags.items()
-            if artifact in selected_artifacts
-        )
         args = _parsed_args(context)
+        if source_pdf is None and args.input:
+            source_pdf = Path(args.input).expanduser().resolve()
+            if not source_pdf.is_file() or source_pdf.suffix.lower() != ".pdf":
+                raise BookGraphConfigurationError(
+                    f"Input must be an existing PDF: {source_pdf}"
+                )
+            # Standalone chapter/Word verification may not need a source
+            # artifact edge, but an explicitly supplied input retains the CLI
+            # contract: it must still be an openable PDF.
+            with fitz.open(source_pdf):
+                pass
         publication_profile = (
             "word" if report_artifact == ART_WORD_REPORT else "full"
         )
-        argv = _phase_argv(
-            context,
-            "verify",
-            add=(
-                *add,
-                "--verification-profile",
-                publication_profile,
-            ),
-            remove=(*remove, ("--verification-profile", True)),
-        )
-        if context.config.get("source_mode") == "text-pdf":
-            argv = _remove_option(
-                argv,
-                "--required-ocr-model-prefix",
-                takes_value=True,
+        expected_translation_fingerprint: str | None = None
+        if args.require_translation:
+            selected_profiles = _selected_model_profiles(args)
+            expected_translation_fingerprint = (
+                legacy.resolve_expected_translation_identity(
+                    args,
+                    toc_profile=selected_profiles["toc"],
+                    translation_profile=selected_profiles["translation"],
+                ).fingerprint
             )
-            argv.extend(
-                [
-                    "--required-ocr-model-prefix",
-                    extract_textbook_layer.TEXT_LAYER_MODEL,
-                ]
-            )
-        if use_fallback_title and not args.title:
-            argv.extend(["--title", _book_title(context)])
-        try:
-            exit_code = _call_legacy_main(
-                argv,
-                load_dotenv=_load_dotenv(context),
-            )
-        except SystemExit as exc:
-            try:
-                exit_code = int(exc.code)
-            except (TypeError, ValueError):
-                exit_code = 1
-        if exit_code:
-            raise LegacyStageError("verify", exit_code)
-        report_path = (
-            Path(args.report).expanduser().resolve()
-            if args.report
-            else context.output_dir
-            / "audit"
-            / (
-                "chapter-report.json"
-                if args.chapter_id
-                else (
-                    "word-release-report.json"
-                    if publication_profile == "word"
-                    else "release-report.json"
-                )
+        verification = run_publication_verification(
+            PublicationVerificationRequest(
+                output_dir=context.output_dir,
+                source_pdf=source_pdf,
+                book_title=(
+                    _book_title(context)
+                    if use_fallback_title and not args.title
+                    else args.title
+                ),
+                expected_language=(
+                    "zh-CN"
+                    if args.target_language == "简体中文"
+                    else args.target_language
+                ),
+                expected_translation_fingerprint=(
+                    expected_translation_fingerprint
+                ),
+                require_translation=args.require_translation,
+                required_artifacts=frozenset(
+                    service_artifacts[artifact]
+                    for artifact in selected_artifacts
+                ),
+                require_docx_render=not args.no_docx_render,
+                require_all_reviewed=args.require_all_reviewed,
+                publication_profile=publication_profile,
+                chapter_ids=tuple(args.chapter_id),
+                report_path=(
+                    Path(args.report).expanduser().resolve()
+                    if args.report
+                    else None
+                ),
             )
         )
+        if not verification.ok:
+            raise LegacyStageError("verify", 1)
+        report_path = verification.report_path
         artifact = _file_artifact(report_path)
         return NodeResult(
             outputs={report_artifact: artifact},

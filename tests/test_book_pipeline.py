@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import fitz
 from PIL import Image
+from publication_service import DOCX, PublicationVerificationResult
 
 from book_pipeline import (
     ChatTranslator,
@@ -56,6 +57,59 @@ from book_pipeline import (
 
 
 class UtilityTests(unittest.TestCase):
+    def test_legacy_verify_cli_builds_typed_service_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            captured = []
+
+            def verify(request):
+                captured.append(request)
+                return PublicationVerificationResult(
+                    request=request,
+                    report={"ok": True, "release_ready": False},
+                )
+
+            with (
+                patch(
+                    "book_pipeline.run_publication_verification",
+                    side_effect=verify,
+                ),
+                patch("builtins.print"),
+            ):
+                exit_code = main(
+                    [
+                        "--output-dir",
+                        str(output),
+                        "--phase",
+                        "verify",
+                        "--verification-profile",
+                        "word",
+                        "--chapter-id",
+                        "chapter-1",
+                        "--require-translation",
+                        "--no-epub",
+                        "--no-kb",
+                        "--no-bookmarked-pdf",
+                    ],
+                    load_dotenv=False,
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(captured), 1)
+        request = captured[0]
+        self.assertIsNone(request.source_pdf)
+        self.assertIsNone(request.book_title)
+        self.assertEqual(request.publication_profile, "word")
+        self.assertEqual(request.chapter_ids, ("chapter-1",))
+        self.assertEqual(request.required_artifacts, frozenset({DOCX}))
+        self.assertTrue(request.require_translation)
+        self.assertIsInstance(request.expected_translation_fingerprint, str)
+        self.assertTrue(request.expected_translation_fingerprint)
+        self.assertEqual(
+            request.resolved_report_path,
+            output.resolve() / "audit" / "chapter-report.json",
+        )
+
     def test_public_cli_defaults_to_dotenv_and_can_disable_it_explicitly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"

@@ -16,6 +16,14 @@ import fitz
 
 import book_pipeline
 import graph_pipeline
+from publication_service import (
+    BOOKMARKED_PDF,
+    DOCX,
+    EPUB,
+    KNOWLEDGE_BASE,
+    PublicationVerificationRequest,
+    PublicationVerificationResult,
+)
 from publication_verifier import verify_publication
 from pipeline_graph import (
     GraphContext,
@@ -121,6 +129,18 @@ def _chapters_fixture(
         "manifest": str(manifest_path.resolve()),
         "sha256": _files_sha256(files),
     }
+
+
+def _write_verification_result(
+    request: PublicationVerificationRequest,
+    *,
+    ok: bool = True,
+) -> PublicationVerificationResult:
+    report_path = request.resolved_report_path
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {"ok": ok, "release_ready": ok}
+    report_path.write_text(json.dumps(report) + "\n", encoding="utf-8")
+    return PublicationVerificationResult(request=request, report=report)
 
 
 class BookGraphPlanningTests(unittest.TestCase):
@@ -795,9 +815,13 @@ translation_profile = "text"
             ),
         ):
             output = Path(directory) / "output"
+            source_pdf = Path(directory) / "book.pdf"
+            with fitz.open() as document:
+                document.new_page().insert_text((72, 72), "Source")
+                document.save(source_pdf)
             prepared = prepare_book_graph(
                 [
-                    str(Path(directory) / "book.pdf"),
+                    str(source_pdf),
                     "--output-dir",
                     str(output),
                     "--phase",
@@ -833,33 +857,21 @@ translation_profile = "text"
             )
 
             report = output / "audit" / "word-release-report.json"
-
-            def successful_verify(argv: list[str]) -> int:
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text('{"ok": true}\n', encoding="utf-8")
-                return 0
-
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
-                side_effect=successful_verify,
-            ) as legacy_main:
+                "pipeline_graph.book.run_publication_verification",
+                side_effect=_write_verification_result,
+            ) as verification_service:
                 result = by_name[NODE_VERIFY_WORD].handler(prepared.context)
 
-        verify_argv = legacy_main.call_args.args[0]
+        request = verification_service.call_args.args[0]
         self.assertEqual(
             result.outputs[ART_WORD_REPORT]["path"],
             str(report.resolve()),
         )
-        self.assertEqual(
-            verify_argv[
-                verify_argv.index("--verification-profile") + 1
-            ],
-            "word",
-        )
-        self.assertNotIn("--no-docx", verify_argv)
-        self.assertIn("--no-kb", verify_argv)
-        self.assertIn("--no-epub", verify_argv)
-        self.assertIn("--no-bookmarked-pdf", verify_argv)
+        self.assertEqual(request.publication_profile, "word")
+        self.assertEqual(request.required_artifacts, frozenset({DOCX}))
+        self.assertEqual(request.book_title, "Book")
+        self.assertEqual(request.resolved_report_path, report.resolve())
 
     def test_import_is_one_node_and_is_removed_from_wrapped_phase_argv(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1003,9 +1015,13 @@ translation_profile = "text"
     def test_compile_splits_sanitizer_and_removed_publishers_from_verify(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
+            source_pdf = Path(directory) / "book.pdf"
+            with fitz.open() as document:
+                document.new_page().insert_text((72, 72), "Source")
+                document.save(source_pdf)
             prepared = prepare_book_graph(
                 [
-                    str(Path(directory) / "book.pdf"),
+                    str(source_pdf),
                     "--output-dir",
                     str(output),
                     "--phase",
@@ -1039,28 +1055,165 @@ translation_profile = "text"
             )
 
             report = output / "audit" / "release-report.json"
-
-            def successful_verify(argv: list[str]) -> int:
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text('{"ok": true}\n', encoding="utf-8")
-                self.assertEqual(argv[argv.index("--phase") + 1], "verify")
-                return 0
-
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
-                side_effect=successful_verify,
-            ) as legacy_main:
+                "pipeline_graph.book.run_publication_verification",
+                side_effect=_write_verification_result,
+            ) as verification_service:
                 result = by_name[NODE_VERIFY].handler(prepared.context)
 
-            verify_argv = legacy_main.call_args.args[0]
-            self.assertIn("--no-epub", verify_argv)
-            self.assertIn("--no-docx", verify_argv)
-            self.assertNotIn("--no-kb", verify_argv)
-            self.assertNotIn("--no-bookmarked-pdf", verify_argv)
+            request = verification_service.call_args.args[0]
+            self.assertEqual(
+                request.required_artifacts,
+                frozenset({KNOWLEDGE_BASE, BOOKMARKED_PDF}),
+            )
+            self.assertEqual(request.publication_profile, "full")
+            self.assertEqual(request.book_title, "book")
             self.assertEqual(
                 result.outputs["publication.report"]["path"],
                 str(report.resolve()),
             )
+
+    def test_verify_service_preserves_standalone_chapter_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            prepared = prepare_book_graph(
+                [
+                    "--output-dir",
+                    str(output),
+                    "--phase",
+                    "verify",
+                    "--verification-profile",
+                    "word",
+                    "--chapter-id",
+                    "chapter-1",
+                    "--require-translation",
+                    "--no-epub",
+                    "--no-kb",
+                    "--no-bookmarked-pdf",
+                ],
+                options=BookGraphOptions(
+                    target_artifacts=frozenset({ART_WORD_REPORT})
+                ),
+            )
+            verify = next(
+                node
+                for node in prepared.graph.nodes
+                if node.name == NODE_VERIFY_WORD
+            )
+            with (
+                patch(
+                    "pipeline_graph.book.run_publication_verification",
+                    side_effect=_write_verification_result,
+                ) as verification_service,
+                patch(
+                    "pipeline_graph.book.legacy._main_unlocked"
+                ) as legacy_main,
+            ):
+                result = verify.handler(prepared.context)
+
+        legacy_main.assert_not_called()
+        request = verification_service.call_args.args[0]
+        self.assertIsNone(request.source_pdf)
+        self.assertIsNone(request.book_title)
+        self.assertEqual(request.publication_profile, "word")
+        self.assertEqual(request.chapter_ids, ("chapter-1",))
+        self.assertTrue(request.require_translation)
+        self.assertIsInstance(request.expected_translation_fingerprint, str)
+        self.assertTrue(request.expected_translation_fingerprint)
+        self.assertEqual(request.required_artifacts, frozenset({DOCX}))
+        self.assertEqual(
+            request.resolved_report_path,
+            output.resolve() / "audit" / "chapter-report.json",
+        )
+        self.assertEqual(
+            result.outputs[ART_WORD_REPORT]["path"],
+            str(request.resolved_report_path),
+        )
+
+    def test_verify_service_preserves_explicit_optional_source_and_word_report(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "output"
+            source_pdf = root / "optional.pdf"
+            with fitz.open() as document:
+                document.new_page().insert_text((72, 72), "Source")
+                document.save(source_pdf)
+            prepared = prepare_book_graph(
+                [
+                    str(source_pdf),
+                    "--output-dir",
+                    str(output),
+                    "--phase",
+                    "verify",
+                    "--verification-profile",
+                    "word",
+                    "--no-bookmarked-pdf",
+                ],
+                options=BookGraphOptions(
+                    target_artifacts=frozenset({ART_WORD_REPORT})
+                ),
+            )
+            self.assertNotIn(ART_SOURCE, prepared.context.values)
+            verify = next(
+                node
+                for node in prepared.graph.nodes
+                if node.name == NODE_VERIFY_WORD
+            )
+            with patch(
+                "pipeline_graph.book.run_publication_verification",
+                side_effect=_write_verification_result,
+            ) as verification_service:
+                verify.handler(prepared.context)
+
+        request = verification_service.call_args.args[0]
+        self.assertEqual(request.source_pdf, source_pdf.resolve())
+        self.assertEqual(
+            request.resolved_report_path,
+            output.resolve() / "audit" / "word-release-report.json",
+        )
+
+    def test_verify_service_failure_preserves_report_and_legacy_error_contract(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            prepared = prepare_book_graph(
+                [
+                    "--output-dir",
+                    str(output),
+                    "--phase",
+                    "verify",
+                    "--chapter-id",
+                    "chapter-1",
+                    "--no-bookmarked-pdf",
+                ]
+            )
+            verify = next(
+                node for node in prepared.graph.nodes if node.name == NODE_VERIFY
+            )
+
+            def failed(
+                request: PublicationVerificationRequest,
+            ) -> PublicationVerificationResult:
+                return _write_verification_result(request, ok=False)
+
+            with (
+                patch(
+                    "pipeline_graph.book.run_publication_verification",
+                    side_effect=failed,
+                ),
+                self.assertRaises(LegacyStageError) as raised,
+            ):
+                verify.handler(prepared.context)
+            report_exists = (
+                output / "audit" / "chapter-report.json"
+            ).is_file()
+
+        self.assertEqual(raised.exception.phase, "verify")
+        self.assertEqual(raised.exception.exit_code, 1)
+        self.assertTrue(report_exists)
 
     def test_verify_materializes_all_noncanonical_publications_before_legacy_gate(
         self,
@@ -1218,8 +1371,9 @@ translation_profile = "text"
 
             report = output / "audit" / "release-report.json"
 
-            def verify_canonical_files(argv: list[str]) -> int:
-                self.assertEqual(argv[argv.index("--phase") + 1], "verify")
+            def verify_canonical_files(
+                request: PublicationVerificationRequest,
+            ) -> PublicationVerificationResult:
                 for artifact_name, path in canonical.items():
                     self.assertEqual(path.read_bytes(), expected_contents[artifact_name])
                     self.assertTrue(staged[artifact_name].exists())
@@ -1243,16 +1397,20 @@ translation_profile = "text"
                     sorted(path.name for path in output.glob("*.pdf")),
                     ["Book_带目录.pdf"],
                 )
-                report.parent.mkdir(parents=True, exist_ok=True)
-                report.write_text('{"ok": true}\n', encoding="utf-8")
-                return 0
+                self.assertEqual(
+                    request.required_artifacts,
+                    frozenset(
+                        {DOCX, EPUB, KNOWLEDGE_BASE, BOOKMARKED_PDF}
+                    ),
+                )
+                return _write_verification_result(request)
 
             graph = PipelineGraph([*providers, by_name[NODE_VERIFY]])
             executor = GraphExecutor(graph)
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "pipeline_graph.book.run_publication_verification",
                 side_effect=verify_canonical_files,
-            ) as legacy_main:
+            ) as verification_service:
                 first = executor.execute(
                     prepared.context,
                     targets={ART_REPORT},
@@ -1264,7 +1422,7 @@ translation_profile = "text"
                     targets={ART_REPORT},
                 )
 
-            self.assertEqual(legacy_main.call_count, 2)
+            self.assertEqual(verification_service.call_count, 2)
             self.assertEqual(provider_calls, dict.fromkeys(staged, 1))
             self.assertEqual(
                 set(second.skipped),
@@ -1306,12 +1464,14 @@ translation_profile = "text"
             )
 
             with (
-                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                patch(
+                    "pipeline_graph.book.run_publication_verification"
+                ) as verification_service,
                 self.assertRaises(BookGraphConfigurationError),
             ):
                 verify.handler(prepared.context)
 
-            legacy_main.assert_not_called()
+            verification_service.assert_not_called()
             self.assertTrue(plugin_docx.is_file())
             self.assertFalse((output / "Book.docx").exists())
 

@@ -23,6 +23,9 @@
 - 增加 hash-bound 人工复核闭环：raw reconstruction audit 保持不可变，append-only
   决议、中央 policy、内容寻址 review audit、effective semantic bundle、Graph 节点、
   EPUB/Word/full verifier 与 Web 正式产物目录共同验证同一 provenance 链。
+- 发布验收改由 legacy CLI 与 PDF DAG 共用的类型化 `publication_service` 调用；Graph
+  verify 不再拼接 argv 或调用私有 `_main_unlocked`。首个确定性检查
+  `runtime.hygiene` 已拆入 `publication_checks/`，报告 ID、schema 与检查顺序不变。
 
 ## 0.1.0 — 2026-08-14
 
