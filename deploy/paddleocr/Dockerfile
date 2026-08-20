@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" "paddleocr==${PADDLEOCR_VER
 
 WORKDIR /workspace
 
-COPY download_models.py verify_ocr.py models.manifest.json /opt/paddleocr-tools/
+COPY download_models.py verify_ocr.py bench_ocr.py models.manifest.json /opt/paddleocr-tools/
 
 # PaddleX/PaddleOCR 运行期自动下载缓存也固定到挂载卷内，避免写进镜像层
 ENV PADDLE_PDX_CACHE_HOME=/workspace/models/cache \

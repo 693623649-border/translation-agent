@@ -2,6 +2,62 @@
 
 本目录包含在本机（AMD Ryzen 7 9700X / RTX 5090 D 32GB / Windows + Docker Desktop WSL2 后端）部署 PaddleOCR 的全部配置：GPU 容器环境、官方模型权重的自由下载清单与脚本、部署验证脚本。
 
+## 推理配置调优（RTX 5090 D 实测，2026-08-20）
+
+基准方法：`bench_ocr.py` 生成 A4 300dpi 中英混排密集文档页（55 行真值），每配置预热后跑 6 页，统计吞吐、行召回率（编辑距离≤行长10% 视为命中）、CER、显存峰值。运行方式：
+
+```bash
+docker compose --profile gpu run --rm paddleocr python /opt/paddleocr-tools/bench_ocr.py --pages 6 --matrix full
+```
+
+### 实测结果
+
+| 配置 | 页/秒 | 行召回% | CER% | 显存峰值 |
+|---|---|---|---|---|
+| server det fp32 + rec fp32, b32 | 1.27 | 98.2 | 0.73 | 10.0GB |
+| **server det fp32 + rec fp16, b16** | **1.65** | **98.2** | **0.73** | 10.0GB |
+| mobile det fp16 + rec fp16, b32 | 2.51 | 98.2 | 1.07 | 3.9GB |
+| mobile det + server rec（混合） | 2.78 | 70.9† | 0.34† | 4.4GB |
+
+† 混合配置识别文本出现跨行合并，行对齐指标失真，不推荐。
+
+### 推荐配置
+
+- **精度优先（默认，翻译流水线用）**：`PP-OCRv5_server` 检测 fp32 + 识别 fp16，`text_recognition_batch_size=16`，`text_det_limit_side_len=736 / limit_type=min`。相对全 fp32 提速约 30%，识别质量完全一致（rec 的 fp16 在本机无损）。
+- **吞吐优先（批量预筛/草稿）**：`PP-OCRv5_mobile` 全 fp16，b32。约 2.5 页/秒，CER 从 0.73% 升到 1.07%（CJK 密集文本），显存只需 4GB。
+
+### 本机特有的坑（Blackwell sm_120）
+
+- **`PP-OCRv5_server_det` 禁用 fp16**：在 RTX 5090（sm_120）上 `paddle_fp16` 输出全零、检出 0 行（对齐 Paddle 社区已知的 Blackwell fp16 内核缺陷）；`mobile_det` 与两种 rec 的 fp16 均正常。设精度的正确方式是 SubModule 级 `engine_config`（见 `bench_ocr.py` 的 `build_ocr`，管线级 `pp_option` 不会传导到 runner）。
+- **密集文档页不要上调 det 分辨率**：`limit_type=max + 1536` 会把 A4 300dpi 降采样，丢行 31%（228/330）；默认 `736/min` 不缩放，保持默认即可。
+- **rec batch 加大无收益**：管线逐页串行，批大小只作用于单页内行数；b16-b32 最优，b96 更慢且显存+2GB。
+- 运行间吞吐波动约 ±15%（宿主负载/显存分配），结论按相对差距理解。
+
+### Python API 用法（推荐配置）
+
+```python
+# 精度优先：server det fp32 + rec fp16（经 paddlex engine_config 分级设精度）
+from paddlex import create_pipeline
+from paddleocr import PaddleOCR
+import copy
+
+base = PaddleOCR(
+    device="gpu:0",
+    text_detection_model_name="PP-OCRv5_server_det",
+    text_detection_model_dir="/workspace/models/PP-OCRv5_server_det",
+    text_recognition_model_name="PP-OCRv5_server_rec",
+    text_recognition_model_dir="/workspace/models/PP-OCRv5_server_rec",
+    text_recognition_batch_size=16,
+    use_doc_orientation_classify=False, use_textline_orientation=False, use_doc_unwarping=False,
+)
+cfg = copy.deepcopy(base._merged_paddlex_config)
+del base
+cfg["SubModules"]["TextDetection"]["engine_config"] = {"run_mode": "paddle_fp32", "device_type": "gpu", "device_id": 0}
+cfg["SubModules"]["TextRecognition"]["engine_config"] = {"run_mode": "paddle_fp16", "device_type": "gpu", "device_id": 0}
+ocr = create_pipeline(config=cfg)
+result = list(ocr.predict("/workspace/io/images/page.png"))
+```
+
 ## 已验证的部署结果（2026-08-20，本机实测）
 
 | 项 | 结果 |
