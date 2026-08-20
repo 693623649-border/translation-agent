@@ -2,6 +2,8 @@
 
 本目录包含在本机（AMD Ryzen 7 9700X / RTX 5090 D 32GB / Windows + Docker Desktop WSL2 后端）部署 PaddleOCR 的全部配置：GPU 容器环境、官方模型权重的自由下载清单与脚本、部署验证脚本。
 
+> 分支说明：本分支 `deploy/paddleocr-rtx5090` 面向本机 RTX 5090（Blackwell sm_120）的单卡部署，基于 master 独立演进；A100 双卡后端的流水线集成在另一分支 `paddleOCR`（含 backend 接入与测试），两条分支按硬件与用途分开维护，合并时注意本目录会产生冲突需人工取舍。
+
 ## 推理配置调优（RTX 5090 D 实测，2026-08-20）
 
 基准方法：`bench_ocr.py` 生成 A4 300dpi 中英混排密集文档页（55 行真值），每配置预热后跑 6 页，统计吞吐、行召回率（编辑距离≤行长10% 视为命中）、CER、显存峰值。运行方式：
