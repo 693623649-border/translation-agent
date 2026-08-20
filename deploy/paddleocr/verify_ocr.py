@@ -35,22 +35,22 @@ def make_test_image(path: Path) -> str:
     """生成白底黑字测试图，返回图中绘制的文本。"""
     from PIL import Image, ImageDraw, ImageFont
 
-    text = "PADDLEOCR LOCAL DEPLOY TEST 2026"
-    img = Image.new("RGB", (960, 240), "white")
+    text = "PaddleOCR Local Deploy Test 2026"
+    img = Image.new("RGB", (1024, 260), "white")
     draw = ImageDraw.Draw(img)
     font = None
     for candidate in (
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
     ):
         if Path(candidate).is_file():
-            font = ImageFont.truetype(candidate, 40)
+            font = ImageFont.truetype(candidate, 44)
             break
     if font is None:
         font = ImageFont.load_default()
-    draw.text((40, 90), text, fill="black", font=font)
+    draw.text((60, 100), text, fill="black", font=font)
     img.save(path)
     return text
 
@@ -63,11 +63,16 @@ def run_ocr(image: Path, models_dir: Path, variant: str) -> str:
     doc_ori = models_dir / "PP-LCNet_x1_0_doc_ori"
     kwargs = dict(
         device="gpu:0",
-        det_model_dir=str(det),
-        rec_model_dir=str(rec),
+        text_detection_model_name=det.name,
+        text_detection_model_dir=str(det),
+        text_recognition_model_name=rec.name,
+        text_recognition_model_dir=str(rec),
         use_doc_orientation_classify=bool(doc_ori.exists()),
+        use_textline_orientation=False,
+        use_doc_unwarping=False,
     )
     if doc_ori.exists():
+        kwargs["doc_orientation_classify_model_name"] = doc_ori.name
         kwargs["doc_orientation_classify_model_dir"] = str(doc_ori)
     ocr = PaddleOCR(**kwargs)
     result = ocr.predict(str(image))
@@ -86,7 +91,9 @@ def main() -> int:
     args = parser.parse_args()
 
     here = Path(__file__).resolve().parent
-    models_dir = Path(args.models_dir) if args.models_dir else here / "models"
+    # 容器内权重挂载在 /workspace/models；宿主机运行时取脚本旁的 models/
+    default_models_dir = Path("/workspace/models") if Path("/workspace/models").exists() else here / "models"
+    models_dir = Path(args.models_dir) if args.models_dir else default_models_dir
 
     check_gpu()
 
@@ -103,7 +110,8 @@ def main() -> int:
     print(f"识别结果: {recognized!r}")
     print(f"耗时: {elapsed:.1f}s")
 
-    ok = "PADDLEOCR" in recognized.upper() and "2026" in recognized
+    compact = "".join(recognized.split()).upper()
+    ok = "PADDLEOCR" in compact and "2026" in compact
     print("[通过] GPU 推理与本地权重链路正常" if ok else "[失败] 识别结果与预期不符", file=sys.stderr if not ok else sys.stdout)
     return 0 if ok else 1
 

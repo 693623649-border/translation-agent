@@ -5,7 +5,7 @@ ARG BASE_IMAGE=ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.3.0-gp
 FROM ${BASE_IMAGE}
 
 ARG PADDLEOCR_VERSION=3.7.0
-ARG PIP_INDEX_URL=https://mirror.baidu.com/pypi/simple
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 RUN pip install --no-cache-dir -i "${PIP_INDEX_URL}" "paddleocr==${PADDLEOCR_VERSION}"
 

@@ -2,6 +2,18 @@
 
 本目录包含在本机（AMD Ryzen 7 9700X / RTX 5090 D 32GB / Windows + Docker Desktop WSL2 后端）部署 PaddleOCR 的全部配置：GPU 容器环境、官方模型权重的自由下载清单与脚本、部署验证脚本。
 
+## 已验证的部署结果（2026-08-20，本机实测）
+
+| 项 | 结果 |
+|---|---|
+| GPU 直通 | 容器内识别 RTX 5090 D（32GB），Compute Capability 12.0（sm_120），Driver 610.88 / Runtime CUDA 12.9 |
+| Paddle GPU 计算 | 2048×2048 matmul 通过 |
+| server 变体 OCR | 识别正确（含空格伪影），首次推理 3.7s（含显存预热） |
+| mobile 变体 OCR | `PaddleOCR Local De ploy Test 2026`，首次推理 2.0s |
+| 权重 | 5 个模型共 193MB，宿主机直连官方源下载，容器内经挂载卷加载 |
+
+注意：paddleocr ≥3.7 的默认模型已是 PP-OCRv6 系列；使用本地 PP-OCRv5 权重目录时必须同时传 `*_model_name` 与 `*_model_dir`（verify_ocr.py 已处理），否则报 `Model name mismatch`。
+
 ## 方案要点
 
 | 项 | 选择 | 原因 |
@@ -79,8 +91,8 @@ docker exec paddleocr paddleocr ocr -i /workspace/io/images --save_path /workspa
 from paddleocr import PaddleOCR
 ocr = PaddleOCR(
     device="gpu:0",
-    det_model_dir="/workspace/models/PP-OCRv5_server_det",
-    rec_model_dir="/workspace/models/PP-OCRv5_server_rec",
+    text_detection_model_dir="/workspace/models/PP-OCRv5_server_det",
+    text_recognition_model_dir="/workspace/models/PP-OCRv5_server_rec",
 )
 result = ocr.predict("/workspace/io/images/page.png")
 ```
@@ -96,9 +108,10 @@ result = ocr.predict("/workspace/io/images/page.png")
 
 ## 常见问题
 
+- **拉取镜像报 `wsarecv: An operation on a socket could not be performed...` 且 Docker Desktop 随后退出**：本机 Clash（127.0.0.1:7897）代理在长时间大文件传输时 socket 缓冲区耗尽，Docker Desktop 内置代理链崩溃。解决：Docker Desktop 容器代理改为手动模式并绕过百度 CDN（settings-store.json 已配置 `ContainersProxyHTTPMode=manual` + `ContainersOverrideProxyExclude` 含 `*.bcebos.com,*.baidubce.com`），拉取直连不再经过 Clash；其余流量仍走代理。
 - **`no kernel image is available for execution on the device` / 输出全零**：使用了不含 sm_120 的构建（如 cuda12.6 镜像或 paddlepaddle-gpu ≤3.1）。必须用 `3.x-gpu-cuda12.9-*`（≥3.2.0）镜像或对应 pip 包。
 - **Docker Hub 拉取超时**：本机网络直连 `registry-1.docker.io` TLS 握手超时，统一使用百度 CCR 源。
-- **容器内存不足（OOM）**：Docker Desktop 默认 WSL 虚拟机内存仅 2GB，已在 settings-store.json 中调大；如仍不足，Settings → Resources → Memory 调整。
+- **内存说明**：当前机器 BIOS 仅识别 1×16GB（32GB 中另一根未被检测，需断电重插/清 CMOS）；WSL2 后端下 Docker VM 动态使用宿主可见内存（约 15GB），PP-OCRv5 推理充足。`MemoryMiB` 设置仅对 Hyper-V 后端生效，对 WSL2 无影响。
 - **权重目录被写坏**：删除 `models/<name>/` 后 `--force` 重下，或直接删目录重跑脚本（幂等）。
 
 ## 备选：WSL Ubuntu 原生部署（不用 Docker）
