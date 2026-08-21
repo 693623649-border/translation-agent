@@ -21,5 +21,15 @@ class AgentSkillContractTests(unittest.TestCase):
                 self.assertNotIn("core.publication.verify", recipe)
                 self.assertNotIn("core.publication.verify.word", recipe)
 
+    def test_docx_finisher_keeps_reader_edition_note_and_cleanup_defaults(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        skill = (
+            root / "skills" / "docx-publication-finisher" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("prune-long-footnotes", skill)
+        self.assertIn("--minimum-characters 150", skill)
+        self.assertIn("--remove-standalone-page-markers", skill)
+        self.assertIn(".codex-trash/outputs-cleanup-*", skill)
+
 if __name__ == "__main__":
     unittest.main()

@@ -7,12 +7,83 @@ from publication_semantics import (
     markdown_footnote_contract_sha256,
     markdown_footnotes_to_docx_markers,
     parse_markdown_footnotes,
+    prune_long_markdown_footnotes,
+    prune_standalone_page_markers,
     reconstruct_page_footnotes,
     semantic_audit_summary,
 )
 
 
 class PublicationSemanticsTests(unittest.TestCase):
+    def test_prune_standalone_page_markers_preserves_inline_superscripts(self) -> None:
+        markdown = (
+            "马克思认为<sup>3</sup>这一点成立。\n\n"
+            "公式 x<sup>2</sup> 保留。\n\n"
+            "另一引用<sup>6</sup>仍须保留。\n\n"
+            "连续上标<sup>1</sup><sup>1</sup>[^note]也保留。\n\n"
+            "[^note]: 短注。\n"
+        )
+
+        result = prune_standalone_page_markers(markdown)
+
+        self.assertEqual(result.removed, ())
+        self.assertEqual(result.markdown, markdown)
+
+    def test_prune_standalone_page_markers_requires_monotonic_run(self) -> None:
+        markdown = (
+            "# 章节\n\n正文。\n\n3\n\n后文。\n\n6\n\n再后文。\n\n11\n"
+        )
+
+        result = prune_standalone_page_markers(markdown)
+
+        self.assertEqual(result.removed, (3, 6, 11))
+        self.assertNotRegex(result.markdown, r"(?m)^\s*(?:3|6|11)\s*$")
+        self.assertIn("正文。", result.markdown)
+
+    def test_prune_standalone_page_markers_preserves_ambiguous_numbers(self) -> None:
+        markdown = "正文。\n\n1\n\n后文。\n\n2\n\n```\n3\n```\n"
+
+        result = prune_standalone_page_markers(markdown)
+
+        self.assertEqual(result.markdown, markdown)
+        self.assertEqual(result.removed, ())
+
+    def test_prune_long_footnotes_removes_reference_and_definition_at_boundary(self) -> None:
+        long_note = "长" * 150
+        markdown = (
+            "正文[^short]，继续[^long]。\n\n"
+            "[^short]: 短注。\n\n"
+            f"[^long]: {long_note}\n"
+        )
+
+        result = prune_long_markdown_footnotes(
+            markdown,
+            minimum_characters=150,
+        )
+        inventory = parse_markdown_footnotes(result.markdown)
+
+        self.assertEqual(result.removed, (("long", 150),))
+        self.assertEqual(result.remaining_count, 1)
+        self.assertIn("正文[^short]，继续。", result.markdown)
+        self.assertNotIn("[^long]", result.markdown)
+        self.assertEqual(inventory.definitions, (("short", "短注。"),))
+        self.assertTrue(inventory.valid)
+
+    def test_prune_long_footnotes_preserves_short_multiline_source_format(self) -> None:
+        markdown = (
+            "正文[^keep]。\n\n"
+            "[^keep]: 第一段\n\n"
+            "    第二段\n"
+        )
+
+        result = prune_long_markdown_footnotes(
+            markdown,
+            minimum_characters=20,
+        )
+
+        self.assertEqual(result.markdown, markdown)
+        self.assertEqual(result.removed, ())
+
     def test_page_local_note_is_moved_only_with_one_proven_reference(self) -> None:
         page = (
             "正文在这里引用资料。[1]\n\n"

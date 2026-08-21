@@ -809,7 +809,17 @@ class PublicationVerifierTests(unittest.TestCase):
             if paragraph.style.name == "Heading 1"
         )
         if existing_author is None and not had_author:
-            author = first_heading.insert_paragraph_before("测试作者")
+            title_break = next(
+                (
+                    paragraph
+                    for paragraph in document.paragraphs
+                    if paragraph._p.xpath(".//w:br[@w:type='page']")
+                ),
+                None,
+            )
+            author = (title_break or first_heading).insert_paragraph_before(
+                "测试作者"
+            )
             author.alignment = WD_ALIGN_PARAGRAPH.CENTER
         first_heading_index = next(
             index

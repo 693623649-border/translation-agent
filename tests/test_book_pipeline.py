@@ -2611,6 +2611,7 @@ class MappingAndCompilationTests(unittest.TestCase):
         from docx import Document
 
         document = Document(docx_path)
+        self.assertEqual(document.core_properties.author, "")
         headings = [
             paragraph.text
             for paragraph in document.paragraphs

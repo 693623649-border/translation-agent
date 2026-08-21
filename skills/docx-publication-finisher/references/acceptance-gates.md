@@ -9,8 +9,9 @@
 
 - 只删除有强证据的来源页码：独立数字页标、明确分页元数据相邻的连续数字，或 EPUB
   中非链接页码 superscript/独立页码块。不要全局删除短数字。
-- 保留链接 noteref、真实脚注、年份、公式、列表、章节号、表格数据和引文数字；
-  引用与定义缺失、重复或孤立都阻断发布。
+- 保留年份、公式、列表、章节号、表格数据和引文数字。读者版保留不足 150 个规范化
+  字符的短脚注；达到 150 字符的长脚注须在语义层同时删除引用和定义。完整注释版只有
+  在用户明确要求时启用；无论何种版本，引用与定义缺失、重复或孤立都阻断发布。
 - 合并 OCR/复制产生的视觉软换行；保留作者明确的段落、标题、列表、表格、诗歌短行
   和显式 `<br>`。
 - 译者注/来源注形成独立语义块，不并入前一正文段；正文恢复后不得继续吞入注释样式。
@@ -29,6 +30,9 @@ The Word files must be regenerated through the agent framework, not patched manu
 - 每个路径来自 manifest、report 或明确配置；命令可从仓库脚本和配置重放。
 - canonical 文件若被用户修改/占用，不静默覆盖；保留冲突文件并显式产出安全副本或阻断。
 - 修框架时至少运行针对性测试；交付前运行全量工程测试和静态检查。
+- EPUB 读者版在重建前运行 `epub_semantic_import.py prune-long-footnotes --remove-standalone-page-markers`，并核对 pruning
+  audit 的删除数、阈值和逐章 ID；原始 `semantic/source_chapters` 不得被改写。内联页码必须在 EPUB
+  导入阶段凭来源结构证据移除，不得用通用上标数字规则猜测。
 
 本仓库的 canonical 输出优先通过 `book_pipeline.py ... --phase compile` 自动运行完整门，
 或用 Word Recipe 以 `publication.word_report` 为目标。`publication.docx` 只是中间产物。
@@ -75,6 +79,9 @@ The final handoff must include:
 - 报告结构审计、renderer、逐文档/总页数、视觉样张位置和动态样本数。
 - 报告针对性测试、全量测试、语法/依赖/补丁检查，以及 warnings 的人工判断。
 - 大型输出默认不提交 Git；只提交可重复的框架、skill、脚本、测试和文档。
+- 最终成品确认无误后，把 QA 渲染、临时报告、日志、OCR/EPUB smoke、章节缓存和语义
+  中间层移到 `.codex-trash/outputs-cleanup-*` 可恢复隔离区，使 `outputs/` 只留下明确的
+  canonical 交付物；报告隔离项数量、大小和恢复路径。
 
 ## 已验证基准（仅作校准证据）
 

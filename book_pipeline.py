@@ -5473,8 +5473,7 @@ def build_docx(
         )
     _style_docx_tables(document)
     document.core_properties.title = book_title
-    if author:
-        document.core_properties.author = author
+    document.core_properties.author = author or ""
     document.core_properties.subject = "由章节 Markdown 合并生成的文字版 Word 文档"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(

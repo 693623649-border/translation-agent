@@ -10,7 +10,12 @@ from unittest import mock
 import zipfile
 
 from book_pipeline import build_docx
-from epub_semantic_import import EpubSemanticError, apply_translations, import_epub
+from epub_semantic_import import (
+    EpubSemanticError,
+    apply_translations,
+    import_epub,
+    prune_long_footnotes,
+)
 from publication_semantics import parse_markdown_footnotes
 
 
@@ -103,6 +108,57 @@ def _write_printed_page_marker_epub(path: Path) -> None:
 
 
 class EpubSemanticImportTests(unittest.TestCase):
+    def test_prune_long_footnotes_updates_publication_contract_but_not_source_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_epub(source)
+            import_epub(source, output)
+            manifest_before = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            filename = manifest_before[0]["filename"]
+            source_chapter = output / "semantic" / "source_chapters" / filename
+            source_before = source_chapter.read_bytes()
+            current_chapter = output / "chapters" / filename
+            current_chapter.write_text(
+                current_chapter.read_text(encoding="utf-8")
+                + "\n3\n\n6\n\n11\n",
+                encoding="utf-8",
+            )
+
+            result = prune_long_footnotes(
+                output,
+                minimum_characters=10,
+                remove_standalone_page_markers=True,
+            )
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (output / "chapters" / filename).read_text(encoding="utf-8")
+            audit = json.loads(
+                (output / "audit" / "semantic-reconstruction.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["removed_count"], 1)
+            self.assertEqual(result["remaining_count"], 0)
+            self.assertEqual(result["removed_page_marker_count"], 3)
+            self.assertNotRegex(markdown, r"(?m)^\s*(?:3|6|11)\s*$")
+            self.assertEqual(manifest[0]["semantic_footnote_count"], 0)
+            self.assertEqual(manifest[0]["suppressed_long_footnote_count"], 1)
+            self.assertEqual(parse_markdown_footnotes(markdown).definitions, ())
+            self.assertEqual(source_chapter.read_bytes(), source_before)
+            self.assertEqual(audit["summary"]["footnote_count"], 0)
+            self.assertIn(
+                "core.publication.prune-long-footnotes",
+                audit["generated_by"],
+            )
+            self.assertTrue((output / "audit" / "reader-edition-pruning.json").is_file())
+
     def test_printed_page_markers_are_removed_without_losing_real_footnotes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
