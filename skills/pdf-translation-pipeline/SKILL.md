@@ -34,26 +34,10 @@ PDF 自带可靠 outline 时改用 `recipes/outline-word.toml`。这两个 Recip
 
 ## 处理 Word 返工问题
 
-用户反馈 Word 中存在原文页码数字、不正确换行、字间距异常、正文对齐不统一或脚注排版混入正文时，必须把它当作发布层质量缺陷处理，而不是手工修补 DOCX：
-
-1. 回到 EPUB、PDF OCR 检查点或 `reviewed_chapters/` 等上游语义源，剔除来源页码、分页锚点和页面边界痕迹；只保留真实脚注、正文引注和必要的译者注。独立数字只有能被脚注、年份、公式、列表或正文语境证明时才可保留。
-2. 重新构建受影响章节的 Markdown 语义层，使硬换行按段落语义合并；标题、引文、表格、脚注、来源注和正文段落必须在 Markdown 中表达清楚，不能依赖 Word 后期排版修复阅读顺序。
-3. 重新生成 Word 时使用框架内置样式：正文宋体、两端对齐、零字符间距；标题微软雅黑；脚注为真实 `word/footnotes.xml` 包和上标引用；译者注、来源注使用独立缩进样式。
-4. 运行 Word Recipe 到正式报告，报告目标必须是 `publication.word_report`：
-
-```bash
-python graph_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
-  --config pipeline.toml --recipe recipes/chinese-pdf-word.toml
-```
-
-5. 若只需验收已生成的 Word，运行独立 Word 发布门，不调用模型：
-
-```bash
-python graph_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
-  --config pipeline.toml --recipe recipes/chinese-pdf-word.toml
-```
-
-交付前必须确认 `OUTPUT/audit/word-release-report.json` 满足 `publication_profile=word`、`ok=true`、`release_ready=true`、`status=passed`。允许且只允许 EPUB、知识库和参考 PDF 因不在 Word 发布范围内被 skipped；`docx.structure`、`docx.render`、`semantics.integrity`、真实脚注包、引注闭环和发布卫生不得 skipped。渲染样张中发现页码残留、脚注落入正文、超宽字距、异常换行、正文未两端对齐或空白/裁切页时，回到上游语义源重建后再生成，不要直接编辑 canonical DOCX。
+用户反馈已经生成的 Word 存在来源页码、错误换行、异常字距/对齐、脚注或版面
+问题时，切换到 `$docx-publication-finisher`。它负责源级修复、显式批量重建、
+结构门、隔离渲染、视觉抽检和精确交付清单；本 skill 继续负责 PDF/EPUB 到
+`publication.word_report` 的主编译流程。不要直接编辑 canonical DOCX。
 
 OCR 继续使用 GLM/Coding Plan Profile；中文翻译默认使用独立 DeepSeek `deepseek-v4-flash` Profile，并显式关闭思考模式。模型、端点、worker 和 `credential_env` 写入 `pipeline.toml`，原始 Key 只从环境变量注入；不要写入源码、argv、输出或日志。用 `--ocr-concurrency`、`--proofread-concurrency`、`--translation-concurrency` 独立调整 worker。
 

@@ -52,7 +52,7 @@ Render every canonical DOCX and inspect machine-readable render results:
 - 每个 canonical DOCX 都成功渲染，报告记录 renderer、版本/环境、逐文档页数和动态总页数。
 - 伪空白页、裁切、溢出、页边界外文字、缺字字体替换和失败导出均为零。
 - 渲染器只接受显式 DOCX 路径。Windows fallback 可以与用户已有 Word 共存，但必须
-  通过 `Application.Hwnd` 证明 COM 实例 PID 是本次新建；只关闭该实例。
+  比较 COM 激活前后的 WINWORD 进程集合，证明恰有一个新 PID；只关闭该实例。
 - OOXML 结构检查不能替代渲染；渲染器不可用时结果是 partial/failed，不得发布。
 
 ## 视觉抽检门

@@ -25,7 +25,7 @@ publication report，沿用其身份和路径；只有 DOCX 而没有上游语�
    一致、真实脚注引用与定义闭环、无模型或工具污染。
 5. 再过渲染门。优先使用 `publication_verifier.py` / `docx_render_gate.py`；Windows
    缺少 LibreOffice 时，可用 [隔离 Word 渲染器](scripts/render_docx_with_word.ps1)
-   把显式路径导出为 PDF。渲染器必须证明自己创建了新的 WINWORD PID。
+   把显式路径导出为 PDF。渲染器必须用创建前后进程快照证明只有一个新 WINWORD PID。
 6. 从渲染结果做风险分层视觉抽检，覆盖扉页/章首、普通正文、密集正文、脚注和
    译者注。任一残留页码、拉伸字距、错断行、脚注泄漏、裁切或伪空白页都回到
    上游修复并重建。
