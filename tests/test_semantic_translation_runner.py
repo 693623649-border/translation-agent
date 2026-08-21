@@ -147,7 +147,12 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
                 return f"⟦UNIT:{unit_id}:START⟧\n中文译文。\n⟦UNIT:{unit_id}:END⟧"
 
             report = translate_units(path, root / "out.jsonl", request=request, retries=1)
-            rows = [json.loads(line) for line in (root / "out.jsonl").read_text().splitlines()]
+            rows = [
+                json.loads(line)
+                for line in (root / "out.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
             self.assertEqual(report["unit_count"], 2)
             self.assertEqual([row["id"] for row in rows], ["c-1", "c-2"])

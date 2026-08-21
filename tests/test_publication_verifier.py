@@ -23,6 +23,7 @@ from publication_verifier import (
     _citation_inventory,
     _docx_markdown_body,
     _docx_positive_footnote_texts,
+    _expected_chapter_end_pages,
     _markdown_visible_text,
     verify_publication,
 )
@@ -30,6 +31,23 @@ from publication_verifier import (
 
 class PublicationVerifierTests(unittest.TestCase):
     book_title = "测试书"
+
+    def test_expected_frontmatter_range_stops_before_trailing_toc(self) -> None:
+        entries = [
+            {"id": "intro", "kind": "frontmatter", "level": 1, "pdf_page": 6},
+            {"id": "chapter", "kind": "chapter", "level": 1, "pdf_page": 22},
+        ]
+        self.assertEqual(
+            _expected_chapter_end_pages(
+                entries,
+                entries,
+                granularity="chapter",
+                last_pdf_page=30,
+                printed_pages_per_pdf_page=1,
+                toc_pages=[19],
+            ),
+            {"intro": 18, "chapter": 30},
+        )
 
     def test_markdown_visible_text_mirrors_trailing_page_discard(self) -> None:
         source = "# 章节\n\n正文。\n\n4\n0\n"
@@ -510,7 +528,7 @@ class PublicationVerifierTests(unittest.TestCase):
         reviewed_path = self.output / "reviewed_chapters" / "ch-1.md"
         chapter_path = self.output / "chapters" / manifest[0]["filename"]
         reviewed_path.write_text(orphaned, encoding="utf-8")
-        chapter_path.write_text(orphaned, encoding="utf-8")
+        chapter_path.write_text(orphaned, encoding="utf-8", newline="")
 
         report = self._verify(chapter_ids=["ch-1"], report_name="orphan.json")
         checks = self._checks(report)
@@ -528,7 +546,7 @@ class PublicationVerifierTests(unittest.TestCase):
             orphaned, encoding="utf-8"
         )
         (self.output / "chapters" / manifest[0]["filename"]).write_text(
-            orphaned, encoding="utf-8"
+            orphaned, encoding="utf-8", newline=""
         )
 
         report = self._verify(chapter_ids=["ch-1"], report_name="unused.json")
@@ -552,7 +570,7 @@ class PublicationVerifierTests(unittest.TestCase):
             mixed, encoding="utf-8"
         )
         (self.output / "chapters" / manifest[0]["filename"]).write_text(
-            mixed, encoding="utf-8"
+            mixed, encoding="utf-8", newline=""
         )
         self._refresh_semantic_markdown_digest("ch-1")
 
@@ -695,6 +713,13 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertIn("epub_chapter_language_mismatch", codes)
         self.assertIn("epub_heading_structure_mismatch", codes)
         self.assertIn("epub_chapter_text_mismatch", codes)
+
+    def test_epub_structure_accepts_posix_zip_member_paths(self) -> None:
+        report = self._verify(report_name="epub-posix-paths.json")
+        check = self._checks(report)["epub.structure"]
+
+        self.assertEqual(check["status"], "passed")
+        self.assertEqual(check["issues"], [])
 
     def test_docx_front_matter_heading_quote_and_inline_style_tampering_are_blocked(self) -> None:
         from docx import Document

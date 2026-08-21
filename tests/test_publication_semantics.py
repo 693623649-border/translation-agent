@@ -43,6 +43,19 @@ class PublicationSemanticsTests(unittest.TestCase):
             {"semantic_footnote_reference_missing"},
         )
 
+    def test_bracketed_calendar_year_at_page_start_is_not_a_footnote(self) -> None:
+        page = (
+            "Psychology Today\n"
+            "[1971]，pp.35–40，60–66)。这场讨论涵盖了众多话题。"
+        )
+
+        result = reconstruct_page_footnotes(page, source_page="pdf-0282-physical-01")
+
+        self.assertFalse(result.release_blocked)
+        self.assertEqual(result.footnotes, ())
+        self.assertEqual(result.issues, ())
+        self.assertIn("[1971]", result.body)
+
     def test_multiple_notes_on_one_page_keep_distinct_reference_landings(self) -> None:
         page = (
             "第一条正文引用。[1]\n\n"

@@ -24,6 +24,7 @@ translation_cache/
 # 本地 agent / IDE 自动化配置，不属于产品源码
 .agents/
 .claude/
+.learnings/
 
 # 历史书籍专用脚本只保留在本机
 archive/states_of_injury/

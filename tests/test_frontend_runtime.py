@@ -1,4 +1,5 @@
 import hashlib
+import contextlib
 import json
 import os
 import sqlite3
@@ -100,7 +101,7 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             created = registry.create("a" * 32, workspace, spec)
 
-            with sqlite3.connect(database) as connection:
+            with contextlib.closing(sqlite3.connect(database)) as connection:
                 mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
             self.assertEqual(mode, "wal")
             self.assertEqual(created.spec.to_dict(), spec.to_dict())

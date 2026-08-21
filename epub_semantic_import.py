@@ -305,6 +305,13 @@ class _XhtmlRenderer:
                     self.targets[(href, fragment)] = element
                 if _is_note(element):
                     self.note_roots.add(element)
+        self.legacy_reference_targets: dict[
+            etree._Element,
+            tuple[str, str],
+        ] = {}
+        self.legacy_suppressed_links: set[etree._Element] = set()
+        for href, root in documents.items():
+            self._register_legacy_split_bracket_notes(href, root)
         self.reference_counts: dict[tuple[str, str], int] = {}
         self.definitions: list[tuple[str, str]] = []
         self.issues: list[dict[str, Any]] = []
@@ -339,14 +346,101 @@ class _XhtmlRenderer:
             for element in root.iter():
                 self.element_hrefs[element] = href
 
+    @staticmethod
+    def _legacy_note_target_id(fragment: str) -> tuple[str, str] | None:
+        match = re.fullmatch(r"(?P<prefix>.+)_note_(?P<label>\d+)", fragment)
+        if match:
+            return (
+                f"{match.group('prefix')}_noteBack_{match.group('label')}",
+                match.group("label"),
+            )
+        match = re.fullmatch(r"(?P<prefix>.+)-(?P<label>\d+)-ref", fragment)
+        if match:
+            return (
+                f"{match.group('prefix')}-{match.group('label')}-back",
+                match.group("label"),
+            )
+        return None
+
+    @staticmethod
+    def _nearest_block(element: etree._Element) -> etree._Element:
+        current = element
+        while current.getparent() is not None:
+            current = current.getparent()
+            if _local_name(current) in {"p", "li", "aside", "div", "section"}:
+                return current
+        return element
+
+    @staticmethod
+    def _self_links(
+        container: etree._Element,
+        fragment: str,
+    ) -> list[etree._Element]:
+        links: list[etree._Element] = []
+        for element in container.iter():
+            if _local_name(element) != "a":
+                continue
+            parsed = urlsplit(str(element.get("href") or ""))
+            if not parsed.path and unquote(parsed.fragment) == fragment:
+                links.append(element)
+        return links
+
+    def _register_legacy_split_bracket_notes(
+        self,
+        href: str,
+        root: etree._Element,
+    ) -> None:
+        """Recover self-linked ``[``/``1``/``]`` footnotes from old EPUBs.
+
+        Some Calibre-era books encode a reference and its definition as two
+        self-linked bracket triplets instead of reciprocal noteref/footnote
+        links.  Treat the pair as a semantic footnote only when both IDs and
+        both complete bracket labels are present; otherwise preserve the raw
+        links for fail-visible review.
+        """
+
+        for element in root.iter():
+            if _local_name(element) != "a":
+                continue
+            fragment = _element_id(element)
+            target_spec = self._legacy_note_target_id(fragment)
+            if not fragment or target_spec is None:
+                continue
+            target_fragment, label = target_spec
+            target = self.targets.get((href, target_fragment))
+            if target is None:
+                continue
+            reference_block = self._nearest_block(element)
+            reference_links = self._self_links(reference_block, fragment)
+            definition_links = self._self_links(target, target_fragment)
+            reference_label = "".join(_text_value(link) for link in reference_links)
+            definition_label = "".join(_text_value(link) for link in definition_links)
+            expected_label = f"[{label}]"
+            if (
+                reference_label.replace(" ", "") != expected_label
+                or definition_label.replace(" ", "") != expected_label
+            ):
+                continue
+            self.legacy_reference_targets[element] = (href, target_fragment)
+            self.legacy_suppressed_links.update(reference_links)
+            self.legacy_suppressed_links.discard(element)
+            self.legacy_suppressed_links.update(definition_links)
+            self.note_roots.add(target)
+            self.note_roots.add(self._nearest_block(target))
+
     def _note_reference(self, element: etree._Element, current_href: str) -> str:
         href = str(element.get("href") or "")
-        parsed = urlsplit(href)
-        fragment = unquote(parsed.fragment)
-        try:
-            target_href = _resolve_member(current_href, parsed.path) if parsed.path else current_href
-        except EpubSemanticError:
-            target_href = ""
+        legacy_target = self.legacy_reference_targets.get(element)
+        if legacy_target is not None:
+            target_href, fragment = legacy_target
+            href = f"#{fragment}"
+        else:
+            parsed = urlsplit(href)
+            fragment = unquote(parsed.fragment)
+            try:
+                target_href = _resolve_member(current_href, parsed.path) if parsed.path else current_href
+            except EpubSemanticError:
+                target_href = ""
         target = self.targets.get((target_href, fragment)) if fragment else None
         if target is None:
             self.issues.append(
@@ -417,7 +511,11 @@ class _XhtmlRenderer:
         tag = _local_name(element)
         if tag in {"script", "style"}:
             return ""
-        if tag == "a" and _is_noteref(element):
+        if element in self.legacy_suppressed_links:
+            return ""
+        if tag == "a" and (
+            _is_noteref(element) or element in self.legacy_reference_targets
+        ):
             return self._note_reference(element, current_href)
         inner = self._inline_children(element, current_href)
         if tag in {"em", "i"} and inner.strip():
@@ -444,8 +542,24 @@ class _XhtmlRenderer:
                 or re.fullmatch(r"[ivxlcdm]+|\d+(?:[-–]\d+)?", label, re.I)
                 and parsed.path
             ):
-                return label
-            return f"[{label}]({href})" if href and label else label
+                return _escape_markdown(label)
+            escaped_label = _escape_markdown(label)
+            return (
+                f"[{escaped_label}]({href})"
+                if href and escaped_label
+                else escaped_label
+            )
+        if (
+            tag == "sup"
+            and "calibre14" in str(element.get("class") or "").split()
+            and re.fullmatch(r"\d{1,4}", inner.strip())
+            and not element.xpath(".//*[local-name()='a']")
+        ):
+            # This Calibre class is used by the source book for printed-page
+            # digits embedded in the text flow.  Restrict the cleanup to the
+            # class and to non-linked numbers so mathematical superscripts and
+            # semantic footnote references remain intact.
+            return ""
         if tag == "sup" and inner.strip():
             return f"<sup>{html.escape(inner.strip())}</sup>"
         if tag == "sub" and inner.strip():
@@ -465,6 +579,17 @@ class _XhtmlRenderer:
                 yield f"{'#' * level} {value}"
             return
         if tag in {"p", "dt", "dd", "figcaption"}:
+            if (
+                tag == "p"
+                and "calibre7" in str(element.get("class") or "").split()
+                and element.get("id") is None
+                and re.fullmatch(r"\d{1,4}", _text_value(element))
+                and not element.xpath(".//*[local-name()='a']")
+            ):
+                # Standalone printed page numbers in the repaired source are
+                # paragraphs of this exact structural form.  A class-scoped
+                # predicate avoids deleting legitimate numbered prose.
+                return
             value = self._inline_children(element, current_href).strip()
             if value:
                 yield value

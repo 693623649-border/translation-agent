@@ -152,7 +152,17 @@ def reconstruct_page_footnotes(text: str, *, source_page: str) -> SemanticPage:
     """
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    starts = list(LEGACY_NOTE_START.finditer(normalized))
+    starts = [
+        match
+        for match in LEGACY_NOTE_START.finditer(normalized)
+        # A citation year can begin a wrapped physical page, for example
+        # ``[1971], pp. 35-40``.  Four-digit calendar years are bibliography
+        # content, never page-local footnote labels.  The translation-side
+        # footnote gate applies the same 1800-2099 exclusion.
+        if not 1800
+        <= int(match.group("square") or match.group("corner") or "0")
+        <= 2099
+    ]
     if not starts:
         return SemanticPage(body=normalized)
 

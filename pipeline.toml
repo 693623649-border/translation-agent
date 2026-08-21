@@ -1,0 +1,51 @@
+schema_version = 1
+
+[profiles.glm_vision]
+adapter = "coding-plan-mcp"
+provider = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-4.6v"
+credential_env = "GLM_CODING_API_KEY"
+command = ["cmd", "/c", "npx", "-y", "@z_ai/mcp-server@0.1.4"]
+timeout = 180
+concurrency = 4
+thinking = "omit"
+# Generic preset: choose "vertical" explicitly for Japanese/Chinese tategaki.
+reading_direction = "horizontal"
+
+[profiles.glm_toc]
+adapter = "openai-chat"
+provider = "zhipu"
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+model = "glm-5.2"
+credential_env = "GLM_TOC_API_KEY"
+timeout = 120
+concurrency = 1
+thinking = "disabled"
+
+[profiles.deepseek_pro]
+adapter = "openai-chat"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+credential_env = "DEEPSEEK_API_KEY"
+timeout = 120
+concurrency = 16
+thinking = "disabled"
+
+[profiles.deepseek_flash]
+adapter = "openai-chat"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-flash"
+credential_env = "DEEPSEEK_API_KEY"
+timeout = 120
+concurrency = 32
+thinking = "disabled"
+
+[pipeline]
+ocr_profile = "glm_vision"
+toc_profile = "glm_toc"
+translation_profile = "deepseek_flash"
+# Optional. When omitted, proofreading safely reuses translation_profile.
+proofread_profile = "deepseek_flash"

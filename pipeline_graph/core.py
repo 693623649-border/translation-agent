@@ -692,14 +692,18 @@ class OutputDirectoryLock:
                 raise
             return True
         if msvcrt is not None:  # pragma: no cover - exercised on Windows.
-            handle.seek(0)
-            if not handle.read(1):
+            descriptor = handle.fileno()
+            if os.fstat(descriptor).st_size < 1:
                 handle.seek(0)
                 handle.write(b"\0")
                 handle.flush()
-            handle.seek(0)
+            # ``BufferedRandom.read`` may advance the underlying Windows file
+            # descriptor beyond its logical ``seek`` position.  msvcrt locks
+            # at the descriptor position, so synchronize that position
+            # directly and do not read a byte that another owner may lock.
+            os.lseek(descriptor, 0, os.SEEK_SET)
             try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
             except OSError as exc:
                 if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
                     return False
@@ -713,8 +717,10 @@ class OutputDirectoryLock:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             return
         if msvcrt is not None:  # pragma: no cover - exercised on Windows.
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            descriptor = handle.fileno()
+            handle.flush()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

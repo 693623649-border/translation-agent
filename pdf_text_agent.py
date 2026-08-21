@@ -20,17 +20,36 @@ from typing import Any, Iterable
 import fitz
 from docx import Document
 from docx.oxml.ns import qn
-from openai import AuthenticationError, OpenAI
+try:
+    from openai import AuthenticationError, OpenAI
+except ImportError:  # optional legacy dependency
+    AuthenticationError = RuntimeError  # type: ignore[assignment]
+    OpenAI = None  # type: ignore[assignment]
 from PIL import Image
-from reportlab.lib import colors
-from reportlab.lib.enums import TA_LEFT
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+try:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+except ImportError:  # optional legacy PDF export dependency
+    colors = None  # type: ignore[assignment]
+    TA_LEFT = None  # type: ignore[assignment]
+    A4 = None  # type: ignore[assignment]
+    ParagraphStyle = object  # type: ignore[assignment]
+    getSampleStyleSheet = None  # type: ignore[assignment]
+    mm = 1  # type: ignore[assignment]
+    pdfmetrics = None  # type: ignore[assignment]
+    UnicodeCIDFont = None  # type: ignore[assignment]
+    TTFont = None  # type: ignore[assignment]
+    PageBreak = None  # type: ignore[assignment]
+    Paragraph = None  # type: ignore[assignment]
+    SimpleDocTemplate = None  # type: ignore[assignment]
+    Spacer = None  # type: ignore[assignment]
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -234,6 +253,11 @@ class LLMAgent:
     ) -> None:
         self.client = None
         if not profile.native_http:
+            if OpenAI is None:
+                raise RuntimeError(
+                    "OpenAI client is required for this legacy provider; "
+                    "install the 'legacy' extra."
+                )
             client_kwargs: dict[str, Any] = {
                 "api_key": api_key,
                 "base_url": base_url,
@@ -1045,6 +1069,8 @@ def build_pdf(
     translation: str,
     extracted: str,
 ) -> None:
+    if SimpleDocTemplate is None:
+        raise RuntimeError("PDF export requires the 'legacy' extra with reportlab.")
     font_name = register_pdf_font()
     styles = make_pdf_styles(font_name)
     doc = SimpleDocTemplate(

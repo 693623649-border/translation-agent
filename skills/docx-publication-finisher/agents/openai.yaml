@@ -1,0 +1,4 @@
+interface:
+  display_name: "Word 成品修复与交付"
+  short_description: "清理、重建、渲染并验收翻译 Word 书稿"
+  default_prompt: "使用 $docx-publication-finisher 修复并验收这批翻译 Word 成品。"

@@ -11,8 +11,8 @@ import http.client
 import inspect
 import json
 import os
+import queue
 import re
-import select
 import shlex
 import shutil
 import signal
@@ -356,7 +356,17 @@ def write_json(path: Path, value: Any) -> None:
             json.dumps(value, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(path)
+        for attempt in range(12):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 11:
+                    raise
+                # Two Windows workers replacing the same destination can
+                # transiently receive WinError 5 even though every temp name
+                # is unique. Retrying preserves the atomic replace contract.
+                time.sleep(min(0.001 * (2**attempt), 0.05))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -892,6 +902,13 @@ class McpStdioClient:
             daemon=True,
         )
         self.stderr_thread.start()
+        self.stdout_lines: queue.Queue[str | None] = queue.Queue()
+        self.stdout_thread = threading.Thread(
+            target=self._drain_stdout,
+            name=f"vision-mcp-stdout-{self.process.pid}",
+            daemon=True,
+        )
+        self.stdout_thread.start()
         self.next_id = 1
         self._request(
             "initialize",
@@ -924,6 +941,18 @@ class McpStdioClient:
             # close() may close the pipe while the daemon reader is blocked.
             return
 
+    def _drain_stdout(self) -> None:
+        if self.process.stdout is None:
+            self.stdout_lines.put(None)
+            return
+        try:
+            for raw_line in self.process.stdout:
+                self.stdout_lines.put(raw_line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.stdout_lines.put(None)
+
     def _diagnostics(self) -> str:
         if not self.stderr_lines:
             return ""
@@ -945,14 +974,14 @@ class McpStdioClient:
         if self.process.stdout is None:
             raise RuntimeError("Vision MCP stdout is unavailable.")
         while True:
-            ready, _, _ = select.select([self.process.stdout], [], [], self.request_timeout)
-            if not ready:
+            try:
+                line = self.stdout_lines.get(timeout=self.request_timeout)
+            except queue.Empty:
                 raise RuntimeError(
                     f"Vision MCP request timed out after {self.request_timeout} seconds."
                     f"{self._diagnostics()}"
                 )
-            line = self.process.stdout.readline()
-            if not line:
+            if line is None:
                 code = self.process.poll()
                 raise RuntimeError(
                     f"Vision MCP stopped before responding (exit={code})."
@@ -1038,7 +1067,13 @@ class McpStdioClient:
                 self.process.wait(timeout=3)
         if self.process.stdin is not None and not self.process.stdin.closed:
             self.process.stdin.close()
-        if self.process.stdout is not None and not self.process.stdout.closed:
+        if self.stdout_thread.is_alive():
+            self.stdout_thread.join(timeout=1)
+        if (
+            not self.stdout_thread.is_alive()
+            and self.process.stdout is not None
+            and not self.process.stdout.closed
+        ):
             self.process.stdout.close()
         if self.stderr_thread.is_alive():
             self.stderr_thread.join(timeout=1)
@@ -1068,7 +1103,18 @@ class CodingPlanVisionOCR:
         request_timeout: int = 120,
     ) -> None:
         self.api_key = api_key
-        self.command = shlex.split(command)
+        if os.name == "nt":
+            tokens = shlex.split(command, posix=False)
+            self.command = [
+                token[1:-1]
+                if len(token) >= 2
+                and token[0] == token[-1]
+                and token[0] in {'"', "'"}
+                else token
+                for token in tokens
+            ]
+        else:
+            self.command = shlex.split(command)
         self.vision_model = vision_model.strip() or "glm-4.6v"
         self.request_timeout = max(30, int(request_timeout))
         self.prompt_version = f"{reading_direction}-v2"
@@ -2013,6 +2059,42 @@ def _exclusive_stage_lock(output_dir: Path, stage: str) -> Iterator[None]:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:  # pragma: no cover - exercised on Windows.
+        lock_path.touch(exist_ok=True)
+        with lock_path.open("r+b", buffering=0) as handle:
+            descriptor = handle.fileno()
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    holder = os.read(descriptor, 4096).decode(
+                        "utf-8", errors="replace"
+                    ).strip("\0\r\n ") or "unknown"
+                except OSError:
+                    holder = "unknown"
+                raise RuntimeError(
+                    f"Another {stage} process already owns {lock_path} "
+                    f"(holder={holder}). Wait for it or stop it before resuming."
+                ) from exc
+            try:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.write(
+                    descriptor,
+                    (
+                        f"pid={os.getpid()} "
+                        f"started={dt.datetime.now(dt.timezone.utc).isoformat()}\n"
+                    ).encode("utf-8"),
+                )
+                yield
+            finally:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
         return
     # Windows and platforms without a cross-process flock still benefit from
     # the existing portable exclusive lock implementation.
@@ -2973,8 +3055,29 @@ def title_page_score(title: str, page_text: str) -> float:
     return best
 
 
-def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_end: int) -> list[dict[str, Any]]:
-    searchable = [record for record in records if record.pdf_page > toc_end and record.compile_text]
+def find_title_evidence(
+    entries: list[TocEntry],
+    records: list[PageRecord],
+    toc_end: int,
+    *,
+    toc_pages: Iterable[int] | None = None,
+) -> list[dict[str, Any]]:
+    toc_page_set = {
+        int(page)
+        for page in (
+            toc_pages
+            if toc_pages is not None
+            else ((toc_end,) if toc_end > 0 else ())
+        )
+    }
+    body_records = [
+        record for record in records if record.pdf_page > toc_end and record.compile_text
+    ]
+    all_non_toc_records = [
+        record
+        for record in records
+        if record.pdf_page not in toc_page_set and record.compile_text
+    ]
     evidence: list[dict[str, Any]] = []
     for entry in entries:
         if entry.kind not in {
@@ -2985,6 +3088,11 @@ def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_
             "other",
         }:
             continue
+        searchable = (
+            all_non_toc_records
+            if entry.kind in {"frontmatter", "other"}
+            else body_records
+        )
         best_page: int | None = None
         best_score = 0.0
         for record in searchable:
@@ -3073,20 +3181,41 @@ def infer_page_mapping(
     toc_end: int,
     *,
     divisor_candidates: tuple[int, ...] = (1, 2),
+    toc_pages: Iterable[int] | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
-    evidence = find_title_evidence(entries, records, toc_end)
+    evidence = find_title_evidence(
+        entries,
+        records,
+        toc_end,
+        toc_pages=toc_pages,
+    )
     if not any(item.get("printed_page") is not None for item in evidence):
         raise ValueError("Cannot infer page offset from OCR text. Pass --page-offset after checking one chapter page.")
+    # Front matter can precede a trailing table of contents and often uses an
+    # independent page-number sequence.  Its title matches are authoritative
+    # for those individual entries, but must not determine the body offset.
+    post_toc_evidence = [
+        item for item in evidence if int(item.get("pdf_page") or 0) > toc_end
+    ]
+    mapping_evidence = (
+        post_toc_evidence
+        if any(item.get("printed_page") is not None for item in post_toc_evidence)
+        else evidence
+    )
     valid_candidates = tuple(
         sorted({int(value) for value in divisor_candidates if int(value) >= 1})
     )
     if not valid_candidates:
         raise ValueError("At least one positive printed-page divisor is required.")
     ranked = [
-        (*_mapping_evidence(evidence, divisor), divisor)
+        (*_mapping_evidence(mapping_evidence, divisor), divisor)
         for divisor in valid_candidates
     ]
-    offset, annotated, _rank, divisor = max(ranked, key=lambda item: item[2])
+    offset, _mapping_annotations, _rank, divisor = max(
+        ranked,
+        key=lambda item: item[2],
+    )
+    _unused_offset, annotated, _unused_rank = _mapping_evidence(evidence, divisor)
     return offset, divisor, annotated
 
 
@@ -3100,8 +3229,9 @@ def apply_page_mapping(
 ) -> dict[str, Any]:
     normalized = normalize_toc_payload(toc_payload)
     entries = [TocEntry(**item) for item in normalized["entries"]]
-    toc_end = max(normalized.get("toc_pdf_pages") or [0])
-    evidence = find_title_evidence(entries, records, toc_end)
+    toc_pages = [int(page) for page in normalized.get("toc_pdf_pages") or []]
+    toc_end = max(toc_pages or [0])
+    evidence = find_title_evidence(entries, records, toc_end, toc_pages=toc_pages)
     manual_override = page_offset is not None
     stored_divisor = normalized.get("printed_pages_per_pdf_page")
     divisor = printed_pages_per_pdf_page or (
@@ -3120,6 +3250,7 @@ def apply_page_mapping(
                 records,
                 toc_end,
                 divisor_candidates=(divisor,) if divisor is not None else (1, 2),
+                toc_pages=toc_pages,
             )
     else:
         divisor = divisor or 1
@@ -3132,12 +3263,47 @@ def apply_page_mapping(
         if item.get("score", 0) >= 0.95
     }
     max_page = source_page_count or max((record.pdf_page for record in records), default=0)
+    first_toc_page = min(toc_pages) if toc_pages else None
+    last_assigned_page = 0
     for entry in entries:
-        if entry.id in direct_pages and (not manual_override or entry.printed_page is None):
-            entry.pdf_page = direct_pages[entry.id]
-        elif entry.printed_page is not None:
+        mapped: int | None = None
+        if entry.printed_page is not None:
             mapped = entry.printed_page // divisor + page_offset
-            entry.pdf_page = mapped if 1 <= mapped <= max_page else None
+            mapped = mapped if 1 <= mapped <= max_page else None
+
+        direct = direct_pages.get(entry.id)
+        direct_is_usable = direct is not None and (
+            not manual_override or entry.printed_page is None
+        )
+        if direct_is_usable and entry.printed_page is not None:
+            # An exact title can occur much earlier as a running header, cross-
+            # reference, or table-of-contents line.  Numbered entries therefore
+            # use title evidence only when it corroborates the dominant printed-
+            # page mapping.  Front matter before a trailing TOC is the deliberate
+            # exception because it commonly has an independent page sequence.
+            near_mapped_page = mapped is not None and abs(direct - mapped) <= 8
+            independent_pre_toc_page = (
+                entry.kind in {"frontmatter", "other"}
+                and first_toc_page is not None
+                and direct < first_toc_page
+            )
+            direct_is_usable = near_mapped_page or independent_pre_toc_page
+
+        candidate = direct if direct_is_usable else mapped
+        if candidate is not None and candidate < last_assigned_page:
+            # TOC order is authoritative.  Reject an earlier exact-title hit and
+            # fall back to the inferred mapping; an unnumbered false hit remains
+            # unmapped instead of creating a backwards chapter range.
+            candidate = (
+                mapped
+                if direct_is_usable
+                and mapped is not None
+                and mapped >= last_assigned_page
+                else None
+            )
+        entry.pdf_page = candidate
+        if candidate is not None:
+            last_assigned_page = candidate
 
     # A leading preface commonly has no printed page in the TOC.  When its
     # heading was too damaged to match, place it in the only available front-
@@ -3514,6 +3680,9 @@ def compile_chapters(
         toc_payload.get("printed_pages_per_pdf_page") or 1
     )
     page_offset = int(toc_payload.get("page_offset") or 0)
+    toc_pages = sorted(
+        int(page) for page in toc_payload.get("toc_pdf_pages") or []
+    )
     chapter_ranges: dict[
         str,
         tuple[int, int, int | None, bool, TocEntry | None],
@@ -3543,6 +3712,11 @@ def compile_chapters(
         next_level: int | None = None
         next_entry: TocEntry | None = None
         if granularity == "all":
+            if sequence < len(selected) and selected[sequence].pdf_page:
+                next_entry = selected[sequence]
+                next_start = int(next_entry.pdf_page)
+                next_level = next_entry.level
+        elif granularity == "chapter" and entry.kind in {"frontmatter", "other"}:
             if sequence < len(selected) and selected[sequence].pdf_page:
                 next_entry = selected[sequence]
                 next_start = int(next_entry.pdf_page)
@@ -3577,6 +3751,14 @@ def compile_chapters(
             end = max(start, next_start)
         else:
             end = max(start, next_start - 1)
+        if (
+            toc_pages
+            and entry.kind in {"frontmatter", "other"}
+            and start < toc_pages[0] <= end
+        ):
+            # A table of contents placed after prefatory material is a
+            # structural boundary, not part of the preceding chapter body.
+            end = toc_pages[0] - 1
         entry.end_pdf_page = end
         missing = [page for page in range(start, end + 1) if page not in record_map]
         if missing:
@@ -3758,7 +3940,14 @@ def compile_chapters(
                 publication_title=publication_title,
                 chapter_title=entry.display_title,
             )
-        (chapter_dir / filename).write_text(markdown, encoding="utf-8")
+        # Semantic audit digests bind the exact Markdown bytes.  Disable the
+        # Windows text-mode CRLF translation so the persisted bytes match the
+        # UTF-8 payload hashed below.
+        (chapter_dir / filename).write_text(
+            markdown,
+            encoding="utf-8",
+            newline="",
+        )
         manifest.append(
             {
                 **asdict(entry),
@@ -3839,6 +4028,63 @@ def strip_publication_metadata(
     chapter_title: str | None = None,
 ) -> str:
     """Remove audit-only source/page markers from reader-facing documents."""
+
+    def is_page_comment(line: str) -> int | None:
+        match = re.fullmatch(
+            r"<!--\s*PDF_PAGE:\s*(\d{1,6})\s*-->",
+            line.strip(),
+            flags=re.I,
+        )
+        if match is None:
+            return None
+        page = int(match.group(1))
+        return page if page > 0 else None
+
+    def is_standalone_printed_page(line: str) -> int | None:
+        match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
+        if match is None:
+            return None
+        page = int(match.group(1))
+        return page if 0 < page < 1000 else None
+
+    def is_probable_standalone_footer(
+        current_index: int,
+        stripped: str,
+    ) -> bool:
+        if is_standalone_printed_page(stripped) is None:
+            return False
+        if current_index <= 0:
+            return False
+        if not source_lines[current_index - 1].strip():
+            return False
+        if current_index + 1 >= len(source_lines):
+            return False
+        prev_index = current_index - 1
+        while prev_index >= 0 and not source_lines[prev_index].strip():
+            prev_index -= 1
+        if prev_index < 0:
+            return False
+        next_index = current_index + 1
+        while next_index < len(source_lines) and not source_lines[next_index].strip():
+            next_index += 1
+        if next_index >= len(source_lines):
+            return False
+        previous = source_lines[prev_index].strip()
+        next_line = source_lines[next_index].strip()
+        if len(previous) < 6 or len(next_line) < 6:
+            return False
+        if re.fullmatch(r"\d{1,3}", previous):
+            return False
+        if re.fullmatch(r"\d{1,3}", next_line):
+            return False
+        if re.search(r"\b[0-9０-９]{3,4}\b", previous + next_line):
+            return False
+        if previous[-1:] in "。！？!?…—.”’\"'）)]】》〉」』":
+            return False
+        if next_line[0] in "—-–—":
+            return False
+        return True
+
     output: list[str] = []
     normalized_chapter_title = normalize_match_text(chapter_title or "")
     is_contents_chapter = normalized_chapter_title in {
@@ -3981,8 +4227,14 @@ def strip_publication_metadata(
     # previous page (for example ``凯`` + ``中``), leaving a corrupt fragment
     # even if the remaining title glyphs are removed later.
     source_lines = discard_vertical_running_titles(markdown_text.splitlines())
-    for line in source_lines:
+    for index, line in enumerate(source_lines):
         stripped = line.strip()
+        if re.fullmatch(
+            r"(?:\[|【|\(|（)?\s*(?:空白页|blank\s+page)\s*(?:\]|】|\)|）)?",
+            stripped,
+            flags=re.I,
+        ):
+            continue
         if stripped.startswith('<span epub:type="pagebreak"'):
             is_known_printed_marker = 'id="printed-page-' in stripped
             if not is_known_printed_marker:
@@ -3991,6 +4243,13 @@ def strip_publication_metadata(
             # The known printed-page number was replaced by this marker, so a
             # following standalone number can be real content and must remain.
             skipped_leading_page_number = is_known_printed_marker
+            continue
+        page_comment_number = is_page_comment(stripped)
+        if page_comment_number is not None:
+            # When explicit comment markers remain, keep footer cleaning behavior
+            # aligned with nearby pagebreak spans.
+            pending_page_boundary = True
+            skipped_leading_page_number = False
             continue
         if stripped.startswith("<!--") and stripped.endswith("-->"):
             continue
@@ -4006,6 +4265,18 @@ def strip_publication_metadata(
             continue
         if is_running_title(line):
             continue
+        if output and re.fullmatch(r"#\s*\d{1,4}", stripped):
+            # Vision OCR can prefix a printed page number with a single hash
+            # (for example ``#225``).  Several Markdown consumers still treat
+            # that compact form as an H1, which splits the EPUB/DOCX chapter
+            # stream.  A digits-only H1 inside the generated chapter H1 is a
+            # page artifact, not reader-facing structure.
+            continue
+        if output and re.fullmatch(r"#{1,6}", stripped):
+            # OCR occasionally emits a bare hash as decoration/noise.  In
+            # Markdown it becomes an empty H1 and shifts every following DOCX
+            # chapter boundary, so it has no reader-facing meaning.
+            continue
         if output and re.match(r"^#\s+", line):
             # The generated chapter title is the only reader-facing H1.
             # OCR/model-created headings inside its body remain navigable but
@@ -4019,14 +4290,14 @@ def strip_publication_metadata(
             line = re.sub(r"<(\s*/?\s*)h1\b", r"<\1h2", line, flags=re.I)
             stripped = line.strip()
         if pending_page_boundary:
+            pending_page_mark = is_standalone_printed_page(stripped)
             if not stripped:
                 continue
             # A standalone number immediately following the page marker is
             # the printed page header. Do not discard the same-looking line
             # elsewhere: it may be a real numbered item or data value.
-            numeric_header = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", stripped)
             if (
-                numeric_header
+                pending_page_mark is not None
                 and not skipped_leading_page_number
             ):
                 skipped_leading_page_number = True
@@ -4040,6 +4311,13 @@ def strip_publication_metadata(
                     output.append("")
                 output.append(line.rstrip())
             pending_page_boundary = False
+            continue
+        if (
+            is_probable_standalone_footer(index, stripped)
+            and (index >= 2 or output)
+            and output
+            and not output[-1].strip()
+        ):
             continue
         output.append(line.rstrip())
     discard_trailing_printed_page()
@@ -4099,15 +4377,96 @@ def strip_reviewed_publication_metadata(markdown_text: str) -> str:
             numbers.add(int(title.group(2)))
         return numbers
 
+    def _is_standalone_printed_number(line: str) -> int | None:
+        match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _is_pdf_page_comment(line: str) -> int | None:
+        match = re.fullmatch(
+            r"<!--\s*PDF_PAGE:\s*(\d{1,6})\s*-->",
+            line.strip(),
+            flags=re.I,
+        )
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _is_body_line(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return False
+        if stripped.startswith(("<!--", "<span")):
+            return False
+        if re.fullmatch(r"#{1,6}\s+.*", stripped):
+            return False
+        if re.fullmatch(r"(?:[-*+]|\d+[.)])\s+.+", stripped):
+            return False
+        if stripped.startswith(">") or stripped.startswith("|"):
+            return False
+        return True
+
+    def _looks_like_printed_footer(line: str, previous: str, next_line: str) -> bool:
+        if len(line) != 0 and len(line) <= 4 and _is_standalone_printed_number(line):
+            if previous[-1:] in "。！？!?…—.”’\"'）)]】》〉」』":
+                return False
+            if not (_is_body_line(previous) and _is_body_line(next_line)):
+                return False
+            if len(previous) < 6 or len(next_line) < 6:
+                return False
+            return True
+        return False
+
+    def _belongs_to_consecutive_printed_number_run(
+        current_index: int,
+        current_number: int,
+    ) -> bool:
+        """Recognize page-number runs without treating every small number as metadata."""
+
+        for step in (-1, 1):
+            cursor = current_index + step
+            while 0 <= cursor < len(lines):
+                candidate = lines[cursor].strip()
+                cursor += step
+                if not candidate:
+                    continue
+                if candidate.startswith(("<!--", "<span")):
+                    continue
+                adjacent_number = _is_standalone_printed_number(candidate)
+                if adjacent_number is None:
+                    break
+                if abs(adjacent_number - current_number) == 1:
+                    return True
+                break
+        return False
+
+    lines = markdown_text.splitlines()
     output: list[str] = []
     removed_marker = False
     pending_page_numbers: set[int] | None = None
-    for line in markdown_text.splitlines():
+    for index, line in enumerate(lines):
         stripped = line.strip()
+        if re.fullmatch(
+            r"(?:\[|【|\(|（)?\s*(?:空白页|blank\s+page)\s*(?:\]|】|\)|）)?",
+            stripped,
+            flags=re.I,
+        ):
+            # OCR engines may emit a literal placeholder for a deliberately
+            # blank source page.  It is source metadata, not reader content.
+            removed_marker = True
+            continue
         anchor_numbers = pagebreak_numbers(stripped)
         if anchor_numbers is not None:
             removed_marker = True
             pending_page_numbers = anchor_numbers
+            continue
+        pdf_comment = _is_pdf_page_comment(stripped)
+        if pdf_comment is not None:
+            removed_marker = True
+            if pending_page_numbers is None:
+                pending_page_numbers = set()
+            pending_page_numbers.add(pdf_comment)
             continue
         metadata = re.fullmatch(
             r"<!--\s*(?P<key>source[-_ ]pdf|pdf[-_ ]pages|pdf[-_ ]page)"
@@ -4144,11 +4503,43 @@ def strip_reviewed_publication_metadata(markdown_text: str) -> str:
                 pending_page_numbers = None
                 continue
             pending_page_numbers = None
+
+        number_value = _is_standalone_printed_number(stripped)
+        if number_value is not None:
+            previous_line = ""
+            next_body_line = ""
+            if removed_marker:
+                if _belongs_to_consecutive_printed_number_run(index, number_value):
+                    continue
+                for cursor in range(index - 1, -1, -1):
+                    candidate = lines[cursor].strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith(("<!--", "<span")):
+                        continue
+                    previous_line = candidate
+                    break
+                for cursor in range(index + 1, len(lines)):
+                    candidate = lines[cursor].strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith(("<!--", "<span")):
+                        continue
+                    next_body_line = candidate
+                    break
+                if previous_line and next_body_line and _looks_like_printed_footer(
+                    stripped,
+                    previous_line,
+                    next_body_line,
+                ):
+                    removed_marker = True
+                    continue
         output.append(line)
 
     if not removed_marker:
         return markdown_text
     cleaned = "\n".join(output)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     if markdown_text.endswith(("\n", "\r")):
         cleaned += "\n"
     return cleaned
@@ -4196,6 +4587,179 @@ def _markdown_blocks(markdown_text: str) -> list[str]:
     if current:
         blocks.append(_join_wrapped_lines(current))
     return blocks
+
+
+def _is_docx_structural_markdown_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.match(r"^\s*```", line):
+        return True
+    if re.match(r"^\s*#{1,6}\s+", stripped):
+        return True
+    if re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", stripped):
+        return True
+    if re.match(r"^\s*>", stripped):
+        return True
+    if re.match(r"^\s{0,3}[-*_]{3,}\s*$", stripped):
+        return True
+    if stripped.startswith("|") and stripped.count("|") >= 2:
+        return True
+    if re.fullmatch(r"<aside>.*</aside>", stripped, flags=re.I):
+        return True
+    return False
+
+
+_DOCX_CIRCLED_NOTE_ONLY = re.compile(r"^[①-⑳]$")
+_DOCX_CIRCLED_NOTE_START = re.compile(r"^[①-⑳](?=\S)")
+_DOCX_SOURCE_NOTE_CREDIT = re.compile(
+    r"(?:译者|译注|编者|编注|校者|校注)(?:注)?[。．.]?$"
+)
+
+
+def _docx_note_like_ascii_line(value: str) -> bool:
+    """Return whether an OCR line looks like compact bibliographic note text."""
+
+    compact = "".join(character for character in value if not character.isspace())
+    if not compact:
+        return False
+    ascii_ratio = sum(character.isascii() for character in compact) / len(compact)
+    return ascii_ratio >= 0.7 and bool(
+        re.search(
+            r"(?:\bIbid\b|\b(?:p|pp)\.?\s*\d|\b(?:Paris|London|NewYork)\b|"
+            r"^[A-Z][A-Za-z'’.-]+,)",
+            value,
+            flags=re.I,
+        )
+    )
+
+
+def _docx_source_note_indices(lines: Sequence[str]) -> set[int]:
+    """Locate source footnote blocks that OCR inserted between prose lines.
+
+    This is deliberately narrower than general footnote inference: a block is
+    selected only when it has an isolated circled label, a translator/editor
+    credit, or a bibliographic line immediately adjoining an isolated label.
+    Inline circled references therefore remain in the body.
+    """
+
+    values = [line.strip() for line in lines]
+    note_indices: set[int] = set()
+    for index, value in enumerate(values):
+        if not value:
+            continue
+        if _DOCX_CIRCLED_NOTE_ONLY.fullmatch(value):
+            candidate_indices = [index]
+            cursor = index + 1
+            while cursor < len(values) and values[cursor]:
+                candidate = values[cursor]
+                if _DOCX_CIRCLED_NOTE_ONLY.fullmatch(candidate):
+                    break
+                if (
+                    _DOCX_CIRCLED_NOTE_START.match(candidate)
+                    and not _docx_note_like_ascii_line(candidate[1:])
+                ):
+                    break
+                if _is_docx_structural_markdown_line(candidate):
+                    break
+                candidate_indices.append(cursor)
+                cursor += 1
+            # Long OCR regions often concatenate a real note and resumed body
+            # prose without a boundary.  Styling those regions as notes would
+            # be worse than leaving them untouched, so accept only compact
+            # page-footnote blocks whose extent is unambiguous.
+            if len(candidate_indices) > 12:
+                continue
+            note_indices.update(candidate_indices)
+            previous = index - 1
+            while previous >= 0 and not values[previous]:
+                previous -= 1
+            if previous >= 0 and _docx_note_like_ascii_line(values[previous]):
+                note_indices.add(previous)
+            continue
+        if not _DOCX_CIRCLED_NOTE_START.match(value):
+            continue
+        cursor = index
+        candidate_indices: list[int] = []
+        while cursor < len(values) and values[cursor]:
+            candidate = values[cursor]
+            if cursor > index and _DOCX_CIRCLED_NOTE_START.match(candidate):
+                break
+            if _is_docx_structural_markdown_line(candidate):
+                break
+            candidate_indices.append(cursor)
+            cursor += 1
+        combined = "".join(values[candidate] for candidate in candidate_indices)
+        if (
+            len(candidate_indices) <= 12
+            and _DOCX_SOURCE_NOTE_CREDIT.search(combined)
+        ):
+            note_indices.update(candidate_indices)
+    return note_indices
+
+
+def _mark_docx_source_notes(lines: Sequence[str]) -> list[str]:
+    """Wrap detected OCR note blocks in a semantic element for DOCX styling."""
+
+    note_indices = _docx_source_note_indices(lines)
+    if not note_indices:
+        return list(lines)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index not in note_indices:
+            output.append(lines[index])
+            index += 1
+            continue
+        note_lines: list[str] = []
+        while index < len(lines) and index in note_indices:
+            if lines[index].strip():
+                note_lines.append(lines[index].strip())
+            index += 1
+        if note_lines:
+            output.append(f"<aside>{html.escape(' '.join(note_lines))}</aside>")
+    return output
+
+
+def _normalize_wrapped_markdown_for_docx(markdown_text: str) -> str:
+    """Merge wrapped OCR prose lines for DOCX while preserving markdown structure."""
+
+    blocks: list[str] = []
+    current: list[str] = []
+    in_code_fence = False
+    source_lines = _mark_docx_source_notes(markdown_text.splitlines())
+    for line in source_lines:
+        stripped = line.strip()
+        if re.match(r"^\s*```", line):
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append(line)
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            blocks.append(line)
+            continue
+        if not stripped:
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append("")
+            continue
+        if _is_docx_structural_markdown_line(line):
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append(line)
+            continue
+        current.append(line)
+    if current:
+        blocks.append(_join_wrapped_lines(current))
+    normalized = "\n".join(block for block in blocks if block is not None)
+    if markdown_text.endswith(("\n", "\r")):
+        normalized += "\n"
+    return normalized
+
 
 
 def markdown_inline_to_plain_text(value: str) -> str:
@@ -4259,7 +4823,18 @@ def _append_markdown_to_docx(
 ) -> None:
     """Render reader-facing Markdown without flattening its structure."""
 
-    fragment = markdown_to_html(markdown_text)
+    from docx.enum.text import WD_BREAK  # type: ignore[import-not-found]
+
+    fragment = markdown_to_html(_normalize_wrapped_markdown_for_docx(markdown_text))
+    # Python-Markdown preserves authored raw HTML verbatim, so ``<br>`` may
+    # remain HTML-style even when XHTML output is requested.  ElementTree needs
+    # the void element to be self-closing.
+    fragment = re.sub(
+        r"<br(?P<attrs>[^>]*)>",
+        lambda match: f"<br{match.group('attrs').rstrip().rstrip('/')} />",
+        fragment,
+        flags=re.I,
+    )
     root = ET.fromstring(f"<document>{fragment}</document>")
 
     def append_inline(
@@ -4275,6 +4850,11 @@ def _append_markdown_to_docx(
 
         def add_run(text: str | None, *, run_bold: bool, run_italic: bool, run_underline: bool) -> None:
             if not text:
+                return
+            text = text.replace("\r", "")
+            if "\n" in text:
+                text = re.sub(r"\n+", " ", text)
+            if not text.strip():
                 return
             run = paragraph.add_run(text)
             if run_bold:
@@ -4295,12 +4875,8 @@ def _append_markdown_to_docx(
             if tag in skip_tags:
                 pass
             elif tag == "br":
-                add_run(
-                    "\n",
-                    run_bold=bold,
-                    run_italic=italic,
-                    run_underline=underline,
-                )
+                run = paragraph.add_run()
+                run.add_break(WD_BREAK.LINE)
             else:
                 append_inline(
                     paragraph,
@@ -4326,7 +4902,8 @@ def _append_markdown_to_docx(
     ) -> Any | None:
         if not _html_element_text(element, skip_tags=skip_tags):
             return None
-        paragraph = document.add_paragraph(style=style)
+        resolved_style = style or _docx_style_name(document, "Normal")
+        paragraph = document.add_paragraph(style=resolved_style)
         append_inline(
             paragraph,
             element,
@@ -4393,19 +4970,30 @@ def _append_markdown_to_docx(
         if re.fullmatch(r"h[1-6]", tag):
             level = min(3, int(tag[1]))
             heading = document.add_heading("", level=level)
+            if heading.style is None:
+                heading.style = _docx_style_name(
+                    document,
+                    f"Heading {level}",
+                )
             append_inline(heading, element)
             return
         if tag == "p":
             style = (
                 _docx_style_name(document, "Quote")
                 if quote
-                else body_style
+                else (body_style or _docx_style_name(document, "Normal"))
             )
             add_paragraph(element, style=style)
             return
         if tag == "blockquote":
             for child in element:
                 render(child, quote=True)
+            return
+        if tag == "aside":
+            add_paragraph(
+                element,
+                style=_docx_style_name(document, "Source Note", "Quote"),
+            )
             return
         if tag in {"ol", "ul"}:
             render_list(element)
@@ -4453,6 +5041,7 @@ def _set_docx_style_font(
 ) -> None:
     """Set all Word font slots instead of depending on theme fallbacks."""
 
+    from docx.oxml import OxmlElement  # type: ignore[import-not-found]
     from docx.oxml.ns import qn  # type: ignore[import-not-found]
     from docx.shared import Pt  # type: ignore[import-not-found]
 
@@ -4464,6 +5053,11 @@ def _set_docx_style_font(
     fonts.set(qn("w:hAnsi"), latin)
     fonts.set(qn("w:eastAsia"), east_asia)
     fonts.set(qn("w:cs"), latin)
+    spacing = rpr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        rpr.append(spacing)
+    spacing.set(qn("w:val"), "0")
 
 
 def _configure_book_docx_styles(document: Any) -> str:
@@ -4476,7 +5070,7 @@ def _configure_book_docx_styles(document: Any) -> str:
     normal = document.styles["Normal"]
     _set_docx_style_font(
         normal,
-        east_asia="Songti SC",
+        east_asia="SimSun",
         latin="Times New Roman",
         size=11,
     )
@@ -4494,7 +5088,7 @@ def _configure_book_docx_styles(document: Any) -> str:
         title = document.styles.add_style(title_style_name, WD_STYLE_TYPE.PARAGRAPH)
     _set_docx_style_font(
         title,
-        east_asia="Hiragino Sans GB",
+        east_asia="Microsoft YaHei",
         latin="Arial",
         size=24,
     )
@@ -4513,7 +5107,7 @@ def _configure_book_docx_styles(document: Any) -> str:
         style = document.styles[name]
         _set_docx_style_font(
             style,
-            east_asia="Hiragino Sans GB",
+            east_asia="Microsoft YaHei",
             latin="Arial",
             size=size,
         )
@@ -4530,7 +5124,7 @@ def _configure_book_docx_styles(document: Any) -> str:
     quote = document.styles["Quote"]
     _set_docx_style_font(
         quote,
-        east_asia="Songti SC",
+        east_asia="SimSun",
         latin="Times New Roman",
         size=10.5,
     )
@@ -4538,6 +5132,7 @@ def _configure_book_docx_styles(document: Any) -> str:
     quote.paragraph_format.right_indent = Pt(22)
     quote.paragraph_format.first_line_indent = Pt(0)
     quote.paragraph_format.line_spacing = 1.35
+    quote.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     quote.paragraph_format.space_before = Pt(4)
     quote.paragraph_format.space_after = Pt(4)
 
@@ -4553,16 +5148,27 @@ def _configure_book_docx_styles(document: Any) -> str:
             style = document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
         _set_docx_style_font(
             style,
-            east_asia="Songti SC",
+            east_asia="SimSun",
             latin="Times New Roman",
             size=size,
         )
         style.paragraph_format.left_indent = Pt(left)
         style.paragraph_format.first_line_indent = Pt(first)
         style.paragraph_format.line_spacing = spacing
+        style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         style.paragraph_format.space_before = Pt(0)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.widow_control = True
+
+    for list_style in ("List Bullet", "List Number", "List Bullet 2", "List Number 2", "List Bullet 3", "List Number 3"):
+        try:
+            style = document.styles[list_style]
+        except KeyError:
+            continue
+        style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        style.paragraph_format.space_before = Pt(0)
+        style.paragraph_format.space_after = Pt(0)
+        style.paragraph_format.line_spacing = 1.5
 
     try:
         footnote_text = document.styles["Footnote Text"]
@@ -4572,15 +5178,51 @@ def _configure_book_docx_styles(document: Any) -> str:
         )
     _set_docx_style_font(
         footnote_text,
-        east_asia="Songti SC",
+        east_asia="SimSun",
         latin="Times New Roman",
         size=9,
     )
     footnote_text.paragraph_format.first_line_indent = Pt(0)
     footnote_text.paragraph_format.line_spacing = 1.0
+    footnote_text.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     footnote_text.paragraph_format.space_before = Pt(0)
     footnote_text.paragraph_format.space_after = Pt(0)
     footnote_text.paragraph_format.widow_control = False
+
+    try:
+        footnote_reference = document.styles["Footnote Reference"]
+    except KeyError:
+        footnote_reference = document.styles.add_style(
+            "Footnote Reference", WD_STYLE_TYPE.CHARACTER
+        )
+    _set_docx_style_font(
+        footnote_reference,
+        east_asia="SimSun",
+        latin="Times New Roman",
+        size=8,
+    )
+    footnote_reference.font.superscript = True
+
+    try:
+        source_note = document.styles["Source Note"]
+    except KeyError:
+        source_note = document.styles.add_style(
+            "Source Note", WD_STYLE_TYPE.PARAGRAPH
+        )
+    _set_docx_style_font(
+        source_note,
+        east_asia="SimSun",
+        latin="Times New Roman",
+        size=9,
+    )
+    source_note.paragraph_format.left_indent = Pt(22)
+    source_note.paragraph_format.right_indent = Pt(22)
+    source_note.paragraph_format.first_line_indent = Pt(0)
+    source_note.paragraph_format.line_spacing = 1.0
+    source_note.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    source_note.paragraph_format.space_before = Pt(3)
+    source_note.paragraph_format.space_after = Pt(3)
+    source_note.paragraph_format.widow_control = False
     return title_style_name
 
 
@@ -4730,6 +5372,35 @@ def _style_docx_tables(document: Any) -> None:
                         run.bold = row_index == 0
 
 
+def _is_duplicate_epub_frontmatter_scaffold(
+    item: dict[str, Any],
+    source_markdown: str,
+) -> bool:
+    """Skip source-only EPUB cover scaffolds duplicated by our title page."""
+
+    title = str(item.get("display_title") or "").strip()
+    filename = str(item.get("filename") or "").lower()
+    source_href = str(item.get("source_href") or "").lower()
+    if title.lower() == "titlepage" and re.fullmatch(
+        r"\s*#{1,6}\s+titlepage\s*",
+        source_markdown,
+        flags=re.I,
+    ):
+        return True
+    is_cover_identity = (
+        "cover" in filename
+        or re.search(r"(?:^|[/_-])cover(?:[/_.-]|$)", source_href) is not None
+        or "cover image" in title.lower()
+        or "封面" in title
+    )
+    is_image_only_heading = re.fullmatch(
+        r"\s*#{0,6}\s*!\[[^]]*\]\([^)]+\)\s*",
+        source_markdown,
+        flags=re.I,
+    ) is not None
+    return bool(is_cover_identity and is_image_only_heading)
+
+
 def build_docx(
     output_path: Path,
     chapter_dir: Path,
@@ -4776,6 +5447,8 @@ def build_docx(
     ordered_notes: list[tuple[str, str]] = []
     for sequence, item in enumerate(manifest, start=1):
         source = (chapter_dir / item["filename"]).read_text(encoding="utf-8")
+        if _is_duplicate_epub_frontmatter_scaffold(item, source):
+            continue
         publication = (
             strip_reviewed_publication_metadata(source)
             if item.get("reviewed_override")

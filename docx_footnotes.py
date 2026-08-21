@@ -532,7 +532,10 @@ def _write_package_atomic(
                 info.external_attr = 0o600 << 16
                 destination.writestr(info, data)
 
-        with temporary_path.open("rb") as stream:
+        # Windows implements ``os.fsync`` with ``_commit``, which rejects a
+        # read-only descriptor even though POSIX accepts one.  Reopen the
+        # completed package read/write so the durability barrier is portable.
+        with temporary_path.open("rb+") as stream:
             os.fsync(stream.fileno())
         os.replace(str(temporary_path), str(output_path))
         return output_path

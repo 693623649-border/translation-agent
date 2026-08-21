@@ -198,15 +198,20 @@ def _expected_chapter_end_pages(
     granularity: str,
     last_pdf_page: int,
     printed_pages_per_pdf_page: int,
+    toc_pages: Iterable[int] = (),
 ) -> dict[str, int]:
     positions = {
         str(item.get("id") or ""): index for index, item in enumerate(entries)
     }
+    normalized_toc_pages = sorted(int(page) for page in toc_pages)
     result: dict[str, int] = {}
     for sequence, item in enumerate(selected):
         start = int(item.get("pdf_page") or 0)
         next_item: dict[str, Any] | None = None
         if granularity == "all":
+            if sequence + 1 < len(selected):
+                next_item = selected[sequence + 1]
+        elif granularity == "chapter" and item.get("kind") in {"frontmatter", "other"}:
             if sequence + 1 < len(selected):
                 next_item = selected[sequence + 1]
         else:
@@ -241,6 +246,12 @@ def _expected_chapter_end_pages(
                 )
             )
             end = max(start, next_start if overlap else next_start - 1)
+        if (
+            normalized_toc_pages
+            and item.get("kind") in {"frontmatter", "other"}
+            and start < normalized_toc_pages[0] <= end
+        ):
+            end = normalized_toc_pages[0] - 1
         result[str(item.get("id") or "")] = end
     return result
 
@@ -344,7 +355,13 @@ def _strip_reviewed_publication_metadata(markdown_text: str) -> str:
 def _canonical_reviewed_markdown(markdown_text: str) -> str:
     """Mirror compile-time BOM/outer-whitespace and metadata normalization."""
 
-    normalized = markdown_text.lstrip("\ufeff").strip().rstrip() + "\n"
+    normalized = (
+        markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+        .lstrip("\ufeff")
+        .strip()
+        .rstrip()
+        + "\n"
+    )
     return _strip_reviewed_publication_metadata(normalized).rstrip() + "\n"
 
 
@@ -1349,6 +1366,7 @@ def _check_manifest(context: _VerificationContext) -> dict[str, Any]:
                 printed_pages_per_pdf_page=int(
                     toc_payload.get("printed_pages_per_pdf_page") or 1
                 ),
+                toc_pages=toc_payload.get("toc_pdf_pages") or [],
             )
             mismatched_ranges = [
                 {
@@ -2210,15 +2228,21 @@ def _check_epub(context: _VerificationContext) -> dict[str, Any]:
                     )
                 )
 
-            opf_dir = Path(opf_name).parent
+            opf_dir = posixpath.dirname(opf_name)
             expected_xhtml_members = {
-                str(opf_dir / href) for href in expected_hrefs
+                posixpath.join(opf_dir, href) if opf_dir else href
+                for href in expected_hrefs
             }
             actual_xhtml_members = {
                 name
                 for name in archive.namelist()
-                if Path(name).suffix.lower() == ".xhtml"
-                and name != str(opf_dir / (nav_name or ""))
+                if posixpath.splitext(name)[1].lower() == ".xhtml"
+                and name
+                != (
+                    posixpath.join(opf_dir, nav_name)
+                    if opf_dir and nav_name
+                    else (nav_name or "")
+                )
             }
             if actual_xhtml_members != expected_xhtml_members:
                 issues.append(
@@ -2234,7 +2258,9 @@ def _check_epub(context: _VerificationContext) -> dict[str, Any]:
             if nav_name is None:
                 issues.append(_issue("epub_nav_missing", "EPUB manifest 缺少导航文档。", path=path))
             else:
-                nav_archive_name = str(opf_dir / nav_name)
+                nav_archive_name = (
+                    posixpath.join(opf_dir, nav_name) if opf_dir else nav_name
+                )
                 try:
                     nav_root = ET.fromstring(archive.read(nav_archive_name))
                     nav_links = [
@@ -2260,7 +2286,7 @@ def _check_epub(context: _VerificationContext) -> dict[str, Any]:
                 )
 
             for href, item in zip(expected_hrefs, context.manifest):
-                archive_name = str(opf_dir / href)
+                archive_name = posixpath.join(opf_dir, href) if opf_dir else href
                 chapter_id = str(item.get("id") or "")
                 try:
                     raw = archive.read(archive_name).decode("utf-8")

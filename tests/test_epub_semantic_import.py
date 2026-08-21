@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest import mock
 import zipfile
 
+from book_pipeline import build_docx
 from epub_semantic_import import EpubSemanticError, apply_translations, import_epub
 from publication_semantics import parse_markdown_footnotes
 
@@ -56,7 +58,107 @@ def _write_orphan_note_epub(path: Path) -> None:
             archive.writestr(name, value)
 
 
+def _write_split_bracket_link_epub(path: Path) -> None:
+    _write_epub(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    chapter = members["OEBPS/chapter1.xhtml"].decode()
+    chapter = chapter.replace(
+        "</section>",
+        '''<p>Text <sup><a id="note-1-ref" href="#note-1-ref">[</a></sup><sup><a href="#note-1-ref">1</a></sup><sup><a href="#note-1-ref">]</a></sup>.</p>
+<p><span id="note-1-back"><a href="#note-1-back">[</a><a href="#note-1-back">1</a><a href="#note-1-back">]</a> Note label.</span></p></section>''',
+    )
+    members["OEBPS/chapter1.xhtml"] = chapter.encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
+def _write_printed_page_marker_epub(path: Path) -> None:
+    _write_epub(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    chapter = members["OEBPS/chapter1.xhtml"].decode()
+    chapter = chapter.replace(
+        '<section><h1>Chapter One</h1><p>Body <em>word</em>',
+        '<section><h1>Chapter One</h1>'
+        '<p class="calibre7"><span class="calibre21">17</span></p>'
+        '<p>Body <sup class="calibre14">1</sup>'
+        '<sup class="calibre14">8</sup><em>word</em> x<sup>2</sup>',
+    )
+    members["OEBPS/chapter1.xhtml"] = chapter.encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
 class EpubSemanticImportTests(unittest.TestCase):
+    def test_printed_page_markers_are_removed_without_losing_real_footnotes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_printed_page_marker_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (
+                output / "chapters" / manifest[0]["filename"]
+            ).read_text(encoding="utf-8")
+            inventory = parse_markdown_footnotes(markdown)
+
+            self.assertEqual(result["status"], "passed")
+            self.assertIsNone(re.search(r"(?m)^\s*17\s*$", markdown))
+            self.assertNotIn('<sup>1</sup>', markdown)
+            self.assertNotIn('<sup>8</sup>', markdown)
+            self.assertIn('x<sup>2</sup>', markdown)
+            self.assertTrue(inventory.valid)
+            self.assertEqual(len(inventory.references), 1)
+            self.assertEqual(len(inventory.definitions), 1)
+
+    def test_split_bracket_links_become_semantic_footnotes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_split_bracket_link_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (
+                output / "chapters" / manifest[0]["filename"]
+            ).read_text(encoding="utf-8")
+            destination = root / "book.docx"
+            inventory = parse_markdown_footnotes(markdown)
+
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(inventory.valid)
+            self.assertEqual(len(inventory.definitions), 2)
+            self.assertIn("Note label.", inventory.definitions[1][1])
+            self.assertNotIn("#note-1-ref", markdown)
+            self.assertNotIn("#note-1-back", markdown)
+            build_docx(
+                destination,
+                output / "chapters",
+                manifest,
+                book_title="Test Book",
+            )
+            self.assertTrue(destination.is_file())
+
     def test_spine_and_notes_become_publishable_semantic_chapters(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

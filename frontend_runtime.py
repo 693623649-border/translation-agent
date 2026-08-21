@@ -112,6 +112,13 @@ MEDIA_TYPES = {
 }
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        result = super().__exit__(exc_type, exc, tb)
+        self.close()
+        return bool(result)
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -265,7 +272,11 @@ class JobRegistry:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database, timeout=10)
+        connection = sqlite3.connect(
+            self.database,
+            timeout=10,
+            factory=_ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=10000")
         connection.execute("PRAGMA foreign_keys=ON")

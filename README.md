@@ -109,6 +109,23 @@ Graph 还提供 `--source-mode text-pdf`，用于每页都有完整可复制
 python -m unittest discover tests
 ```
 
+### 项目级 Agent 工作流
+
+仓库在 `skills/` 中提供可自动发现的 Codex skill。`pdf-translation-pipeline`
+负责从 PDF/EPUB 语义输入到发布产物的主流程；`docx-publication-finisher`
+负责已经生成的 Word 成品出现来源页码、OCR 硬换行、异常字距、正文对齐、
+脚注或版面问题时的源级修复、显式批量重建、结构审计、隔离渲染、视觉抽检
+与最终交付清单。后者不直接手改派生 DOCX，也不以少量截图代替整批结构门。
+
+框架或 skill 发生变化后，除相关功能测试外还应运行：
+
+```bash
+python -m unittest tests.test_project_skills
+python -m unittest discover -s tests -q
+python -m compileall -q .
+git diff --check
+```
+
 ## 仓库结构
 
 ```text
@@ -144,6 +161,7 @@ translation-agent/
 ├── patch_translations.py         # 新格式译文人工修补工具
 ├── extract_textbook_layer.py     # 新格式文本层提取工具
 ├── tools/note_reflow.py          # 章节注释重组工具（见下文）
+├── skills/                       # Codex 项目级工作流与发布验收指令
 ├── archive/
 │   ├── karatani/                 # 硬编码单本书的一次性脚本
 │   └── legacy/monitor.py         # 仅适用旧 Windows 流程
