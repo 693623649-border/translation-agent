@@ -87,6 +87,24 @@ class EmbeddingProvider(Protocol):
         """Embed one retrieval query."""
 
 
+def _is_embedding_param_error(exc: BaseException) -> bool:
+    """Detect per-request payload rejections (Zhipu code 1210 and peers)."""
+
+    if isinstance(exc, RagProviderError):
+        message = str(exc)
+        status = getattr(exc.__cause__, "status_code", None)
+        code = getattr(exc.__cause__, "code", None)
+    else:
+        message = str(exc)
+        status = getattr(exc, "status_code", None)
+        code = getattr(exc, "code", None)
+    if status == 400:
+        return True
+    if isinstance(code, (int, str)) and str(code) == "1210":
+        return True
+    return "1210" in message or "Error code: 400" in message
+
+
 class ZhipuEmbeddingProvider:
     """智谱 ``embedding-3`` adapter through its OpenAI-compatible API."""
 
@@ -94,6 +112,8 @@ class ZhipuEmbeddingProvider:
     default_base_url = "https://open.bigmodel.cn/api/paas/v4/"
     supported_dimensions = frozenset({256, 512, 1024, 2048})
     max_batch_size = 64
+    min_shrink_chars = 256
+    shrink_factor = 0.8
 
     def __init__(
         self,
@@ -157,16 +177,7 @@ class ZhipuEmbeddingProvider:
         )
         return self._client
 
-    def _embed(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
-        values = list(texts)
-        if not values:
-            raise RagProviderError("Zhipu embedding input cannot be empty")
-        if len(values) > self.max_batch_size:
-            raise RagProviderError(
-                f"Zhipu embedding-3 accepts at most {self.max_batch_size} inputs per request"
-            )
-        if any(not isinstance(text, str) or not text.strip() for text in values):
-            raise RagProviderError("Zhipu embedding inputs must be non-empty strings")
+    def _embed_request(self, values: list[str]) -> list[tuple[float, ...]]:
         try:
             response = self._openai_client().embeddings.create(
                 model=self.model,
@@ -202,6 +213,44 @@ class ZhipuEmbeddingProvider:
                 "Zhipu embedding response count does not match the request"
             )
         return [by_index[index] for index in range(len(values))]
+
+    def _embed_single(self, text: str) -> tuple[float, ...]:
+        """Embed one document, shrinking token-dense inputs that exceed the
+        API's token budget.  Truncation keeps the one-vector-per-row mapping;
+        the unrepresented tail only weakens that row's retrieval signal."""
+
+        current = text
+        while True:
+            try:
+                return self._embed_request([current])[0]
+            except RagProviderError as exc:
+                if (
+                    not _is_embedding_param_error(exc)
+                    or len(current) <= self.min_shrink_chars
+                ):
+                    raise
+                current = current[: int(len(current) * self.shrink_factor)]
+
+    def _embed(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
+        values = list(texts)
+        if not values:
+            raise RagProviderError("Zhipu embedding input cannot be empty")
+        if len(values) > self.max_batch_size:
+            raise RagProviderError(
+                f"Zhipu embedding-3 accepts at most {self.max_batch_size} inputs per request"
+            )
+        if any(not isinstance(text, str) or not text.strip() for text in values):
+            raise RagProviderError("Zhipu embedding inputs must be non-empty strings")
+        try:
+            return self._embed_request(values)
+        except RagProviderError as exc:
+            # One oversized document poisons the whole batch (e.g. an
+            # ASCII-heavy index chunk over the token budget); embed the
+            # remainder individually so a single bad chunk cannot fail
+            # an otherwise valid batch.
+            if len(values) == 1 or not _is_embedding_param_error(exc):
+                raise
+        return [self._embed_single(text) for text in values]
 
     def embed_documents(
         self,
