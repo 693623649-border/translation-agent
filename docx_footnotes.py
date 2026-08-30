@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import time
 import zipfile
 from collections import Counter
 from copy import deepcopy
@@ -23,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence, Tuple, Union
+
+from os import PathLike
 
 from lxml import etree
 
@@ -36,6 +39,33 @@ XML_NS = "http://www.w3.org/XML/1998/namespace"
 REL_TYPE_FOOTNOTES = (
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
 )
+
+
+def replace_with_retry(
+    source: PathLike,
+    target: PathLike,
+    *,
+    attempts: int = 5,
+    delay: float = 2.0,
+) -> None:
+    """Atomically rename ``source`` over ``target`` with bounded retries.
+
+    A lingering Word renderer can keep the previous publication open on
+    Windows, so the first replace attempt fails with PermissionError.
+    Retrying for a bounded window absorbs that transient lock and surfaces
+    a clear error when it persists.
+    """
+
+    source_path = Path(source)
+    target_path = Path(target)
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(str(source_path), str(target_path))
+            return
+        except PermissionError:
+            if attempt == attempts:
+                raise
+            time.sleep(delay)
 CONTENT_TYPE_FOOTNOTES = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.footnotes+xml"
 )
@@ -672,7 +702,7 @@ def patch_docx_footnotes(
                 "patched DOCX failed footnote audit: %s"
                 % ", ".join(inventory.problems)
             )
-        os.replace(str(staging_path), str(output_path))
+        replace_with_retry(staging_path, output_path)
     except Exception:
         try:
             staging_path.unlink()

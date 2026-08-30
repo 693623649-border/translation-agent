@@ -15,6 +15,22 @@ from translation_agent_api import (
 
 
 class TranslationAgentApiTests(unittest.TestCase):
+    def test_rag_embedding_mode_is_serialized_without_credentials(self) -> None:
+        enabled = RunRequest(output_dir="out", rag_embed=True).to_argv()
+        disabled = RunRequest(output_dir="out", rag_embed=False).to_argv()
+        automatic = RunRequest(output_dir="out", rag_embed=None).to_argv()
+
+        self.assertIn("--rag-embed", enabled)
+        self.assertIn("--no-rag-embed", disabled)
+        self.assertNotIn("--rag-embed", automatic)
+        self.assertFalse(any("API_KEY" in value for value in enabled))
+        with self.assertRaisesRegex(ValueError, "generate_knowledge_base"):
+            RunRequest(
+                output_dir="out",
+                generate_knowledge_base=False,
+                rag_embed=True,
+            ).to_argv()
+
     def test_profile_request_never_serializes_api_key(self) -> None:
         request = RunRequest(
             input_pdf="book.pdf",

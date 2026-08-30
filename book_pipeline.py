@@ -25,6 +25,7 @@ import time
 import tomllib
 import unicodedata
 import urllib.error
+from urllib.parse import unquote, urlsplit
 import urllib.request
 import uuid
 import zipfile
@@ -40,6 +41,7 @@ from typing import Any, Iterable, Iterator, Protocol
 import fitz
 from PIL import Image
 
+import rag_knowledge_base
 from pipeline_profiles import (
     ModelIdentity,
     ModelProfile,
@@ -53,7 +55,7 @@ from pipeline_runtime import (
     retry_with_backoff,
 )
 from publication_verifier import verify_publication
-from docx_footnotes import patch_docx_footnotes
+from docx_footnotes import patch_docx_footnotes, replace_with_retry
 from publication_semantics import (
     append_markdown_footnotes,
     markdown_footnote_contract_sha256,
@@ -325,6 +327,19 @@ class OCRBackend(Protocol):
     def close(self) -> None: ...
 
 
+_UNREADABLE_OCR_RE = re.compile(
+    r"(?:```\s*)?(?:\[|【|\(|（)?\s*(?:"
+    r"\[无法辨认\]|无法辨认|无法辨識|无法识别|"
+    r"(?:无|没有)可见(?:文字|内容)|"
+    r"空白页|blank(?:\s+page)?|"
+    r"(?:the\s+)?(?:image|page|text)?\s*(?:is\s+)?"
+    r"(?:too\s+blurry|unreadable|illegible)"
+    r"(?:\s+to\s+(?:read|recognize|identify))?"
+    r")\s*(?:[，,：:].*)?(?:\]|】|\)|）)?[。.]?(?:\s*```)?",
+    flags=re.I,
+)
+
+
 def load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -408,6 +423,27 @@ def parse_model_prefixes(value: str | None) -> tuple[str, ...]:
         for prefix in (value or "").split(",")
         if prefix.strip()
     )
+
+
+def is_unreadable_ocr_text(text: str) -> bool:
+    return bool(_UNREADABLE_OCR_RE.fullmatch(str(text).strip()))
+
+
+def page_ink_ratio(image_path: Path, *, threshold: int = 245) -> float:
+    with Image.open(image_path) as source:
+        gray = source.convert("L")
+        histogram = gray.histogram()
+    total = sum(histogram)
+    if total <= 0:
+        return 0.0
+    dark_pixels = sum(histogram[: max(0, min(256, threshold))])
+    return dark_pixels / total
+
+
+def is_visually_blank_page(image_path: Path) -> tuple[bool, float]:
+    ratio = page_ink_ratio(image_path)
+    maximum = float(os.getenv("OCR_BLANK_INK_RATIO", "0.001"))
+    return ratio <= maximum, ratio
 
 
 def detect_language(text: str) -> str:
@@ -667,6 +703,7 @@ class GlmClient:
         provider_name: str = "glm",
         adapter_name: str = "openai-chat",
         thinking: str = "disabled",
+        reading_direction: str = "horizontal",
     ) -> None:
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
@@ -679,6 +716,7 @@ class GlmClient:
         if thinking not in {"enabled", "disabled", "omit"}:
             raise ValueError("thinking must be enabled, disabled, or omit")
         self.thinking = thinking
+        self.reading_direction = reading_direction if reading_direction in {"horizontal", "vertical"} else "horizontal"
 
     def model_identity(
         self,
@@ -743,7 +781,17 @@ class GlmClient:
         ) as exc:
             raise RuntimeError(f"{self.service_name} request failed: {exc}") from exc
 
-    def ocr_image(self, image_path: Path) -> tuple[str, str]:
+    @staticmethod
+    def _is_content_filter_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return any(token in message for token in ("contentfilter", '"code":"1301"', "potentially unsafe"))
+
+    @staticmethod
+    def _is_timeout_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "timed out" in message or "timeout" in message
+
+    def _ocr_image_once(self, image_path: Path) -> tuple[str, str]:
         mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         response = self._post(
@@ -760,6 +808,64 @@ class GlmClient:
             raise RuntimeError(f"Unexpected GLM-OCR response; request_id={response.get('request_id', 'unknown')}")
         request_id = str(response.get("request_id") or response.get("id") or "")
         return clean_ocr_text(text), request_id
+
+    def _ocr_segmented(self, image_path: Path, *, segments: int) -> tuple[str, str]:
+        part_paths: list[Path] = []
+        texts: list[str] = []
+        try:
+            with Image.open(image_path) as source:
+                image = source.convert("RGB")
+                width, height = image.size
+                if self.reading_direction == "vertical":
+                    boundaries = [0, *CodingPlanVisionOCR._blank_column_cuts(image, segments), width]
+                    regions = [
+                        (left, 0, right, height)
+                        for left, right in reversed(list(zip(boundaries, boundaries[1:])))
+                    ]
+                else:
+                    boundaries = [0, *CodingPlanVisionOCR._blank_row_cuts(image, segments), height]
+                    regions = [
+                        (0, top, width, bottom)
+                        for top, bottom in zip(boundaries, boundaries[1:])
+                    ]
+                for index, region in enumerate(regions, start=1):
+                    part_path = image_path.with_name(
+                        f"{image_path.stem}_segment_{index}_{uuid.uuid4().hex[:8]}.jpg"
+                    )
+                    image.crop(region).save(part_path, "JPEG", quality=95, optimize=True)
+                    part_paths.append(part_path)
+            for part_path in part_paths:
+                text, _request_id = self._ocr_image_once(part_path)
+                text = text.strip()
+                if text and not is_unreadable_ocr_text(text):
+                    texts.append(text)
+        finally:
+            for part_path in part_paths:
+                part_path.unlink(missing_ok=True)
+        if not texts:
+            raise RuntimeError("Segmented GLM-OCR returned an empty band.")
+        return CodingPlanVisionOCR._merge_band_texts(texts), f"glm-segmented-{uuid.uuid4().hex[:12]}"
+
+    def ocr_image(self, image_path: Path) -> tuple[str, str]:
+        try:
+            return self._ocr_image_once(image_path)
+        except Exception as exc:
+            if not (self._is_content_filter_error(exc) or self._is_timeout_error(exc)):
+                raise
+            segment_counts = (
+                (4, 8, 16, 32)
+                if self._is_content_filter_error(exc)
+                else (2,)
+            )
+            retry_error: Exception = exc
+            for segments in segment_counts:
+                try:
+                    return self._ocr_segmented(image_path, segments=segments)
+                except Exception as segmented_error:  # noqa: BLE001 - preserve original fallback behavior.
+                    retry_error = segmented_error
+                    if not self._is_content_filter_error(segmented_error):
+                        break
+            raise retry_error
 
     def chat_json(self, prompt: str, *, system: str, max_tokens: int = 16384) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -2547,21 +2653,33 @@ def ocr_pdf(
                 raise RuntimeError(
                     f"OCR physical-page structure is inconsistent on page {pdf_page}."
                 )
+            visually_blank = False
+            ink_ratio = 1.0
+            if not text or is_unreadable_ocr_text(text):
+                visually_blank, ink_ratio = is_visually_blank_page(image_path)
+                if visually_blank:
+                    text = "[空白页]"
+                    physical_page_texts = []
             elapsed = time.monotonic() - started_at
             print(
                 f"[ocr-response] page={pdf_page} elapsed={elapsed:.1f}s chars={len(text)}",
                 flush=True,
             )
+            notes = (
+                f"request_id={request_id}; elapsed_seconds={elapsed:.1f}"
+                if request_id
+                else f"elapsed_seconds={elapsed:.1f}"
+            )
+            ocr_model = client.ocr_model
+            if visually_blank:
+                notes += f"; visual_blank=true; ink_ratio={ink_ratio:.6f}"
+                ocr_model = "manual/visually-confirmed-blank"
             record = PageRecord(
                 pdf_page=pdf_page,
                 text=text,
                 language=detect_language(text),
-                notes=(
-                    f"request_id={request_id}; elapsed_seconds={elapsed:.1f}"
-                    if request_id
-                    else f"elapsed_seconds={elapsed:.1f}"
-                ),
-                ocr_model=client.ocr_model,
+                notes=notes,
+                ocr_model=ocr_model,
                 physical_page_texts=physical_page_texts,
             )
             save_page_record(output_dir, record)
@@ -4022,9 +4140,7 @@ def write_knowledge_base(output_path: Path, rows: list[dict[str, Any]]) -> None:
     # Keep the verifier-owned JSONL schema stable while publishing the RAG
     # discovery sidecar.  Embeddings remain optional until a provider is
     # supplied through ``rag_knowledge_base.EmbeddingProvider``.
-    from rag_knowledge_base import initialize_rag_manifest
-
-    initialize_rag_manifest(output_path)
+    rag_knowledge_base.initialize_rag_manifest(output_path)
 
 
 def strip_publication_metadata(
@@ -4809,6 +4925,26 @@ def _html_element_text(
     return "".join(parts).strip()
 
 
+def _html_contains_image(element: ET.Element) -> bool:
+    return any(_html_local_name(node) == "img" for node in element.iter())
+
+
+def _resolve_local_publication_image(src: str, base_dir: Path | None) -> Path | None:
+    parsed = urlsplit(html.unescape(src))
+    if parsed.scheme or parsed.netloc or parsed.path.startswith("data:"):
+        return None
+    candidate = Path(unquote(parsed.path))
+    if not candidate.is_absolute():
+        if base_dir is None:
+            return None
+        candidate = base_dir / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_file() else None
+
+
 def _docx_style_name(
     document: Any,
     preferred: str,
@@ -4826,10 +4962,12 @@ def _append_markdown_to_docx(
     markdown_text: str,
     *,
     body_style: str | None = None,
+    asset_base: Path | None = None,
 ) -> None:
     """Render reader-facing Markdown without flattening its structure."""
 
     from docx.enum.text import WD_BREAK  # type: ignore[import-not-found]
+    from docx.shared import Cm  # type: ignore[import-not-found]
 
     fragment = markdown_to_html(_normalize_wrapped_markdown_for_docx(markdown_text))
     # Python-Markdown preserves authored raw HTML verbatim, so ``<br>`` may
@@ -4883,6 +5021,20 @@ def _append_markdown_to_docx(
             elif tag == "br":
                 run = paragraph.add_run()
                 run.add_break(WD_BREAK.LINE)
+            elif tag == "img":
+                source = _resolve_local_publication_image(
+                    str(child.get("src") or ""),
+                    asset_base,
+                )
+                if source is not None:
+                    paragraph.add_run().add_picture(str(source), width=Cm(12))
+                else:
+                    add_run(
+                        str(child.get("alt") or ""),
+                        run_bold=bold,
+                        run_italic=italic,
+                        run_underline=underline,
+                    )
             else:
                 append_inline(
                     paragraph,
@@ -4906,7 +5058,7 @@ def _append_markdown_to_docx(
         bold: bool = False,
         skip_tags: frozenset[str] = frozenset(),
     ) -> Any | None:
-        if not _html_element_text(element, skip_tags=skip_tags):
+        if not _html_element_text(element, skip_tags=skip_tags) and not _html_contains_image(element):
             return None
         resolved_style = style or _docx_style_name(document, "Normal")
         paragraph = document.add_paragraph(style=resolved_style)
@@ -5036,6 +5188,53 @@ def _docx_manifest_body_style(item: dict[str, Any]) -> str | None:
     if re.search(r"(?:^|\s)index(?:\s|$)|索引", identity):
         return "Index Entry"
     return None
+
+
+def _epub_image_media_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".gif":
+        return "image/gif"
+    if suffix == ".svg":
+        return "image/svg+xml"
+    if suffix == ".webp":
+        return "image/webp"
+    return "application/octet-stream"
+
+
+def _sha256_file(path: Path) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _rewrite_epub_local_images(
+    body: str,
+    *,
+    asset_base: Path,
+    assets: dict[str, Path],
+) -> str:
+    root = ET.fromstring(f"<document>{body}</document>")
+    for element in root.iter():
+        if _html_local_name(element) != "img":
+            continue
+        source = _resolve_local_publication_image(
+            str(element.get("src") or ""),
+            asset_base,
+        )
+        if source is None:
+            continue
+        digest = _sha256_file(source)[:12]
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", source.name).strip("._-")
+        archive_name = f"assets/{digest}-{safe_name or 'image'}"
+        assets.setdefault(archive_name, source)
+        element.set("src", archive_name)
+    return "".join(
+        ET.tostring(child, encoding="unicode", method="xml")
+        for child in root
+    )
 
 
 def _set_docx_style_font(
@@ -5476,6 +5675,7 @@ def build_docx(
             document,
             rendered_markdown,
             body_style=_docx_manifest_body_style(item),
+            asset_base=chapter_dir,
         )
     _style_docx_tables(document)
     document.core_properties.title = book_title
@@ -5498,7 +5698,7 @@ def build_docx(
                 ordered_notes,
             )
         else:
-            os.replace(temporary_path, output_path)
+            replace_with_retry(temporary_path, output_path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -5517,18 +5717,23 @@ def build_epub(
     spine_items: list[str] = []
     manifest_items: list[str] = []
     chapter_files: list[tuple[str, str]] = []
+    asset_files: dict[str, Path] = {}
     for item in manifest:
         md_path = chapter_dir / item["filename"]
         xhtml_name = md_path.with_suffix(".xhtml").name
         source_markdown = md_path.read_text(encoding="utf-8")
-        body = markdown_to_html(
-            strip_reviewed_publication_metadata(source_markdown)
-            if item.get("reviewed_override")
-            else strip_publication_metadata(
-                source_markdown,
-                publication_title=book_title,
-                chapter_title=str(item.get("display_title") or ""),
-            )
+        body = _rewrite_epub_local_images(
+            markdown_to_html(
+                strip_reviewed_publication_metadata(source_markdown)
+                if item.get("reviewed_override")
+                else strip_publication_metadata(
+                    source_markdown,
+                    publication_title=book_title,
+                    chapter_title=str(item.get("display_title") or ""),
+                )
+            ),
+            asset_base=chapter_dir,
+            assets=asset_files,
         )
         title = html.escape(str(item["display_title"]))
         document = f'''<?xml version="1.0" encoding="utf-8"?>
@@ -5552,7 +5757,10 @@ def build_epub(
 <dc:language>{html.escape(language)}</dc:language><meta property="dcterms:modified">{modified}</meta>
 </metadata>
 <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
-<item id="style" href="style.css" media-type="text/css"/>{''.join(manifest_items)}</manifest>
+<item id="style" href="style.css" media-type="text/css"/>{''.join(manifest_items)}{''.join(
+    f'<item id="asset-{index:04d}" href="{html.escape(name)}" media-type="{_epub_image_media_type(path)}"/>'
+    for index, (name, path) in enumerate(sorted(asset_files.items()), start=1)
+)}</manifest>
 <spine>{''.join(spine_items)}</spine></package>'''
     container = '''<?xml version="1.0" encoding="UTF-8"?>
 <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
@@ -5568,6 +5776,8 @@ def build_epub(
         archive.writestr("OEBPS/style.css", css)
         for filename, content in chapter_files:
             archive.writestr(f"OEBPS/{filename}", content)
+        for filename, source in sorted(asset_files.items()):
+            archive.writestr(f"OEBPS/{filename}", source.read_bytes())
 
 
 def build_bookmarked_pdf(source_pdf: Path, output_pdf: Path, toc_payload: dict[str, Any]) -> None:
@@ -5847,6 +6057,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-epub", action="store_true")
     parser.add_argument("--no-docx", action="store_true")
     parser.add_argument("--no-kb", action="store_true")
+    rag_embedding = parser.add_mutually_exclusive_group()
+    rag_embedding.add_argument(
+        "--rag-embed",
+        dest="rag_embed",
+        action="store_true",
+        help=(
+            "Build the Zhipu embedding-3 vector index after publishing the "
+            "knowledge base; without either flag, enable automatically when "
+            "ZHIPU_API_KEY is configured."
+        ),
+    )
+    rag_embedding.add_argument(
+        "--no-rag-embed",
+        dest="rag_embed",
+        action="store_false",
+        help="Publish lexical RAG metadata without calling the embedding API.",
+    )
+    parser.set_defaults(rag_embed=None)
     parser.add_argument("--no-bookmarked-pdf", action="store_true")
     parser.add_argument(
         "--no-verify",
@@ -5914,6 +6142,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _option_was_supplied(argv: list[str], *option_names: str) -> bool:
+    prefixes = tuple(f"{name}=" for name in option_names)
+    return any(token in option_names or token.startswith(prefixes) for token in argv)
 
 
 def _credential_from_env(name: str | None) -> str:
@@ -6451,13 +6684,17 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
 
     load_env_file(Path(__file__).with_name(".env"))
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    explicit_ocr_backend = _option_was_supplied(raw_argv, "--ocr-backend")
     if args.ocr_cache_model and args.ocr_cache_model_prefix:
         parser.error(
             "--ocr-cache-model and --ocr-cache-model-prefix are mutually exclusive."
         )
     if args.chapter_id and args.phase != "verify":
         parser.error("--chapter-id is only valid with --phase verify.")
+    if args.no_kb and args.rag_embed is True:
+        parser.error("--rag-embed cannot be combined with --no-kb.")
     output_dir = Path(args.output_dir).expanduser().resolve()
     if args.phase == "status" and not output_dir.exists():
         parser.error(f"Output directory does not exist: {output_dir}")
@@ -6504,7 +6741,17 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
-    args.ocr_reading_direction = resolve_ocr_reading_direction(args, ocr_profile)
+    effective_ocr_profile = None if explicit_ocr_backend else ocr_profile
+    if explicit_ocr_backend and ocr_profile is not None:
+        print(
+            f"[warning] --ocr-backend={args.ocr_backend} overrides OCR profile "
+            f"{ocr_profile.name!r} adapter={ocr_profile.adapter!r}.",
+            file=sys.stderr,
+        )
+    args.ocr_reading_direction = resolve_ocr_reading_direction(
+        args,
+        effective_ocr_profile,
+    )
     if (
         toc_profile is not None
         and toc_profile.adapter not in {"openai-chat", "glm-chat"}
@@ -6572,8 +6819,14 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
     )
 
     if args.phase == "status":
-        expected_ocr_prefix = resolve_expected_ocr_model_prefix(args, ocr_profile)
-        expected_ocr_exact = resolve_expected_ocr_model_exact(args, ocr_profile)
+        expected_ocr_prefix = resolve_expected_ocr_model_prefix(
+            args,
+            effective_ocr_profile,
+        )
+        expected_ocr_exact = resolve_expected_ocr_model_exact(
+            args,
+            effective_ocr_profile,
+        )
         print(
             json.dumps(
                 output_status(
@@ -6719,7 +6972,7 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
     ):
         parser.error("API timeouts must be positive.")
     toc_key = resolve_api_key(args, toc_profile)
-    ocr_key = resolve_api_key(args, ocr_profile)
+    ocr_key = resolve_api_key(args, effective_ocr_profile)
     toc_text_model = (
         toc_profile.model if toc_profile is not None else args.text_model
     )
@@ -6747,16 +7000,18 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                     raise ValueError(f"--skip-ocr was used but cached OCR pages are missing: {missing[:20]}")
             else:
                 ocr_backend_name = (
-                    ocr_profile.adapter if ocr_profile is not None else args.ocr_backend
+                    effective_ocr_profile.adapter
+                    if effective_ocr_profile is not None
+                    else args.ocr_backend
                 )
                 if ocr_backend_name == "coding-plan-mcp":
                     if not ocr_key:
                         raise ValueError("Coding Plan vision OCR requires GLM_CODING_API_KEY or Z_AI_API_KEY.")
-                    if ocr_profile is not None and ocr_profile.command:
+                    if effective_ocr_profile is not None and effective_ocr_profile.command:
                         ocr_command = (
-                            ocr_profile.command[0]
-                            if len(ocr_profile.command) == 1
-                            else shlex.join(ocr_profile.command)
+                            effective_ocr_profile.command[0]
+                            if len(effective_ocr_profile.command) == 1
+                            else shlex.join(effective_ocr_profile.command)
                         )
                     else:
                         ocr_command = args.ocr_command
@@ -6765,18 +7020,18 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         command=ocr_command,
                         reading_direction=args.ocr_reading_direction,
                         vision_model=(
-                            ocr_profile.model
-                            if ocr_profile is not None
+                            effective_ocr_profile.model
+                            if effective_ocr_profile is not None
                             else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
                         ),
                         request_timeout=(
-                            ocr_profile.timeout
-                            if ocr_profile is not None
+                            effective_ocr_profile.timeout
+                            if effective_ocr_profile is not None
                             else int(os.getenv("CODING_PLAN_VISION_TIMEOUT", "120"))
                         ),
                     )
                 elif ocr_backend_name == "glm-ocr":
-                    standard_ocr_key = resolve_ocr_api_key(args, ocr_profile)
+                    standard_ocr_key = resolve_ocr_api_key(args, effective_ocr_profile)
                     if not standard_ocr_key:
                         raise ValueError(
                             "Standard GLM-OCR is not covered by Coding Plan. Set GLM_OCR_API_KEY separately, "
@@ -6785,21 +7040,22 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                     ocr_backend = GlmClient(
                         api_key=standard_ocr_key,
                         api_base=(
-                            ocr_profile.base_url
-                            if ocr_profile is not None and ocr_profile.base_url
+                            effective_ocr_profile.base_url
+                            if effective_ocr_profile is not None and effective_ocr_profile.base_url
                             else args.ocr_api_base
                         ),
                         ocr_model=(
-                            ocr_profile.model
-                            if ocr_profile is not None
+                            effective_ocr_profile.model
+                            if effective_ocr_profile is not None
                             else args.ocr_model
                         ),
                         text_model=toc_text_model,
                         timeout=(
-                            ocr_profile.timeout
-                            if ocr_profile is not None
+                            effective_ocr_profile.timeout
+                            if effective_ocr_profile is not None
                             else args.api_timeout
                         ),
+                        reading_direction=args.ocr_reading_direction,
                     )
                 elif ocr_backend_name == "tesseract":
                     ocr_backend = TesseractOCR(
@@ -6990,7 +7246,7 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
             if not required_ocr_model_prefix and args.require_complete_ocr:
                 required_ocr_model_prefix = resolve_expected_ocr_model_prefix(
                     args,
-                    ocr_profile,
+                    effective_ocr_profile,
                 )
             if required_ocr_model_prefix:
                 required_prefixes = parse_model_prefixes(
@@ -7040,7 +7296,22 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                 expected_translation_identity=expected_translation_identity,
             )
             if not args.no_kb:
-                write_knowledge_base(output_dir / "knowledge_base.jsonl", knowledge_rows)
+                knowledge_base_path = output_dir / "knowledge_base.jsonl"
+                write_knowledge_base(knowledge_base_path, knowledge_rows)
+                rag_metadata = (
+                    rag_knowledge_base.maybe_build_zhipu_embedding_index(
+                        knowledge_base_path,
+                        requested=args.rag_embed,
+                    )
+                )
+                if rag_metadata is not None:
+                    print(
+                        "[rag] embedding index ready "
+                        f"model={rag_metadata.model} "
+                        f"dimensions={rag_metadata.dimensions} "
+                        f"chunks={rag_metadata.chunk_count}",
+                        flush=True,
+                    )
             if not args.no_epub:
                 build_epub(
                     output_dir / f"{slugify(book_title)}.epub",

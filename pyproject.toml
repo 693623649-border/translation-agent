@@ -30,6 +30,7 @@ translation-agent = "document_pipeline:cli"
 translation-agent-doctor = "doctor:main"
 translation-agent-web = "launch_frontend:main"
 translation-agent-repo-guard = "repository_guard:main"
+translation-agent-kb = "knowledge_base_cli:main"
 
 [tool.setuptools]
 include-package-data = true
@@ -47,6 +48,7 @@ py-modules = [
   "frontend_service",
   "frontend_runtime",
   "graph_pipeline",
+  "knowledge_base_cli",
   "launch_frontend",
   "patch_translations",
   "pdf_text_agent",

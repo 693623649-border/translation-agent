@@ -72,6 +72,7 @@ class RunRequest:
     generate_epub: bool = True
     generate_docx: bool = True
     generate_knowledge_base: bool = True
+    rag_embed: bool | None = None
     generate_bookmarked_pdf: bool = True
     verify_publication: bool = True
     verification_profile: str | None = None
@@ -83,6 +84,10 @@ class RunRequest:
         if self.verification_chapter_ids and self.phase != "verify":
             raise ValueError(
                 "verification_chapter_ids are only valid when phase='verify'."
+            )
+        if self.rag_embed is True and not self.generate_knowledge_base:
+            raise ValueError(
+                "rag_embed=True requires generate_knowledge_base=True."
             )
         argv: list[str] = []
         if self.input_pdf is not None:
@@ -139,6 +144,10 @@ class RunRequest:
             argv.append("--no-docx")
         if not self.generate_knowledge_base:
             argv.append("--no-kb")
+        if self.rag_embed is True:
+            argv.append("--rag-embed")
+        elif self.rag_embed is False:
+            argv.append("--no-rag-embed")
         if not self.generate_bookmarked_pdf:
             argv.append("--no-bookmarked-pdf")
         if not self.verify_publication:

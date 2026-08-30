@@ -81,11 +81,13 @@ class ApplicationService:
         if spec.source_mode == "epub" and spec.targets and not set(spec.targets) <= {
             "publication.epub",
             "publication.docx",
+            "publication.knowledge_base",
             "publication.report",
             "publication.word_report",
         }:
             raise ValueError(
-                "EPUB jobs currently support EPUB, Word, and their release report"
+                "EPUB jobs currently support EPUB, Word, knowledge base, "
+                "and their release report"
             )
         return replace(
             spec,

@@ -544,7 +544,29 @@ def _knowledge_base_is_current(
     if not _single_file_is_current(context, outputs):
         return False
     saved = next(iter(outputs.values()))
-    return rag_knowledge_base.rag_manifest_is_current(Path(str(saved["path"])))
+    path = Path(str(saved["path"]))
+    if not rag_knowledge_base.rag_manifest_is_current(path):
+        return False
+    args = _parsed_args(context)
+    if not rag_knowledge_base.zhipu_embedding_enabled(
+        getattr(args, "rag_embed", None)
+    ):
+        return True
+    try:
+        manifest = rag_knowledge_base.read_rag_manifest(path)
+    except rag_knowledge_base.RagError:
+        return False
+    embedding = manifest["retrieval"]["embedding"]
+    return (
+        embedding["status"] == "ready"
+        and embedding["provider"] == "zhipu"
+        and embedding["model"] == os.getenv(
+            "ZHIPU_EMBEDDING_MODEL",
+            "embedding-3",
+        )
+        and embedding["dimensions"]
+        == int(os.getenv("ZHIPU_EMBEDDING_DIMENSIONS", "2048"))
+    )
 
 
 def _import_source_is_current(
@@ -1031,6 +1053,19 @@ def _publisher_fingerprint(kind: str) -> Any:
         if kind == "knowledge-base":
             source = context.require(ART_SOURCE)
             value["source_filename"] = Path(str(source["path"])).name
+            value["rag_embedding_enabled"] = (
+                rag_knowledge_base.zhipu_embedding_enabled(
+                    getattr(args, "rag_embed", None)
+                )
+            )
+            value["rag_embedding_model"] = os.getenv(
+                "ZHIPU_EMBEDDING_MODEL",
+                "embedding-3",
+            )
+            value["rag_embedding_dimensions"] = os.getenv(
+                "ZHIPU_EMBEDDING_DIMENSIONS",
+                "2048",
+            )
         return value
 
     return fingerprint
@@ -2777,6 +2812,11 @@ def _knowledge_base_handler(context: GraphContext) -> NodeResult:
     )
     path = _publication_target_path(context, ART_KB)
     legacy.write_knowledge_base(path, rows)
+    args = _parsed_args(context)
+    rag_knowledge_base.maybe_build_zhipu_embedding_index(
+        path,
+        requested=getattr(args, "rag_embed", None),
+    )
     _register_managed_publication(context, ART_KB, path)
     artifact = _file_artifact(path)
     rag_manifest = rag_knowledge_base.manifest_path_for(path).resolve()

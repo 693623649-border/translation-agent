@@ -1,5 +1,6 @@
 import json
 import hashlib
+import io
 import os
 import re
 import sys
@@ -603,6 +604,34 @@ class UtilityTests(unittest.TestCase):
             self.assertEqual(payload["model"], "deepseek-v4-flash")
             self.assertEqual(payload["thinking"], {"type": "disabled"})
 
+    def test_standard_glm_ocr_content_filter_uses_segmented_fallback(self) -> None:
+        class FilterThenReadGlm(GlmClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    api_key="test-key",
+                    reading_direction="horizontal",
+                )
+
+            def _ocr_image_once(self, image_path: Path) -> tuple[str, str]:
+                if "_segment_" not in image_path.stem:
+                    raise RuntimeError(
+                        'GLM request failed: GLM HTTP 400: {"contentFilter":[],'
+                        '"error":{"code":"1301","message":"potentially unsafe content"}}'
+                    )
+                match = re.search(r"_segment_(\d+)_", image_path.stem)
+                assert match is not None
+                values = {"1": "（无可见文字）", "2": "彼得", "3": "堡正文。", "4": "结尾。"}
+                return values[match.group(1)], "glm-test"
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.jpg"
+            Image.new("RGB", (240, 800), "white").save(image_path)
+            text, request_id = FilterThenReadGlm().ocr_image(image_path)
+
+            self.assertEqual(text, "彼得堡正文。\n\n结尾。")
+            self.assertTrue(request_id.startswith("glm-segmented-"))
+            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
+
     def test_provider_keys_are_isolated(self) -> None:
         parser = build_parser()
         with patch.dict(
@@ -624,6 +653,76 @@ class UtilityTests(unittest.TestCase):
             args = parser.parse_args(["sample.pdf"])
             self.assertEqual(resolve_api_key(args), "glm-only")
             self.assertEqual(resolve_translation_api_key(args), "")
+
+    def test_explicit_ocr_backend_overrides_profile_adapter(self) -> None:
+        class RecordingGlmOCR:
+            instances: list["RecordingGlmOCR"] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                self.ocr_model = str(kwargs["ocr_model"])
+                self.kwargs = kwargs
+                self.instances.append(self)
+
+            def ocr_image(self, image_path: Path) -> tuple[str, str]:
+                return "识别正文内容。", "glm-override-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "one-page.pdf"
+            document = fitz.open()
+            page = document.new_page(width=200, height=200)
+            page.insert_text((72, 72), "source")
+            document.save(pdf_path)
+            document.close()
+            config_path = root / "profiles.toml"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        "schema_version = 1",
+                        "[profiles.vision]",
+                        'adapter = "coding-plan-mcp"',
+                        'provider = "glm"',
+                        'model = "glm-4.6v"',
+                        'credential_env = "PROFILE_CODING_KEY"',
+                        "[pipeline]",
+                        'ocr_profile = "vision"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch.dict("os.environ", {"GLM_OCR_API_KEY": "standard-key"}, clear=True),
+                patch("book_pipeline.GlmClient", RecordingGlmOCR),
+                patch("sys.stderr", stderr),
+            ):
+                result = main(
+                    [
+                        str(pdf_path),
+                        "-o",
+                        str(root / "out"),
+                        "--phase",
+                        "ocr",
+                        "--config",
+                        str(config_path),
+                        "--ocr-backend",
+                        "glm-ocr",
+                        "--ocr-model",
+                        "glm-ocr",
+                        "--ocr-concurrency",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(RecordingGlmOCR.instances), 1)
+            self.assertEqual(RecordingGlmOCR.instances[0].ocr_model, "glm-ocr")
+            self.assertIn("--ocr-backend=glm-ocr overrides OCR profile", stderr.getvalue())
 
     def test_worker_count_precedence_and_legacy_compatibility(self) -> None:
         parser = build_parser()
@@ -1773,6 +1872,42 @@ for line in sys.stdin:
             self.assertEqual(text, "右列。\n\n左列。")
             self.assertTrue(request_id.startswith("mcp-filtered-"))
             self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
+
+    def test_ocr_pdf_marks_visually_blank_unreadable_page_as_blank_checkpoint(self) -> None:
+        class UnreadableBlankBackend:
+            ocr_model = "glm-ocr"
+
+            def ocr_image(self, image_path: Path) -> tuple[str, str]:
+                return "The image is too blurry to read.", "blank-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "blank.pdf"
+            document = fitz.open()
+            document.new_page(width=200, height=200)
+            document.save(pdf_path)
+            document.close()
+
+            records = ocr_pdf(
+                pdf_path,
+                root / "out",
+                UnreadableBlankBackend(),
+                start_page=1,
+                end_page=1,
+                concurrency=1,
+                dpi=72,
+                max_image_side=400,
+                jpeg_quality=90,
+                keep_page_images=False,
+                force=True,
+            )
+
+            self.assertEqual(records[0].text, "[空白页]")
+            self.assertEqual(records[0].ocr_model, "manual/visually-confirmed-blank")
+            self.assertIn("visual_blank=true", records[0].notes)
 
 
 class MappingAndCompilationTests(unittest.TestCase):

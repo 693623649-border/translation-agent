@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
 from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import unquote, urljoin, urlsplit
@@ -163,6 +164,7 @@ def _package_documents(
     list[_SpineDocument],
     dict[str, etree._Element],
     dict[str, str],
+    dict[str, bytes],
     str,
 ]:
     if not source.is_file() or source.suffix.lower() != ".epub":
@@ -274,7 +276,12 @@ def _package_documents(
                     raw_sha256=_sha256_bytes(raw),
                 )
             )
-    return metadata, documents, all_roots, title_hints, opf_member
+        asset_members: dict[str, bytes] = {}
+        for item in manifest.values():
+            media_type = item["media_type"].lower()
+            if media_type.startswith("image/"):
+                asset_members[item["href"]] = _read_member(archive, item["href"])
+    return metadata, documents, all_roots, title_hints, asset_members, opf_member
 
 
 def _element_id(element: etree._Element) -> str:
@@ -296,8 +303,14 @@ def _escape_markdown(value: str) -> str:
 
 
 class _XhtmlRenderer:
-    def __init__(self, documents: Mapping[str, etree._Element]):
+    def __init__(
+        self,
+        documents: Mapping[str, etree._Element],
+        *,
+        image_resolver: Any | None = None,
+    ):
         self.documents = documents
+        self.image_resolver = image_resolver
         self.note_roots: set[etree._Element] = set()
         self.targets: dict[tuple[str, str], etree._Element] = {}
         for href, root in documents.items():
@@ -531,6 +544,8 @@ class _XhtmlRenderer:
         if tag == "img":
             alt = _escape_markdown(str(element.get("alt") or ""))
             src = str(element.get("src") or "")
+            if src and self.image_resolver is not None:
+                src = self.image_resolver(current_href, src)
             return f"![{alt}]({src})" if src else ""
         if tag == "a":
             href = str(element.get("href") or "")
@@ -744,13 +759,62 @@ def _translation_units(chapter_id: str, markdown: str, source_href: str) -> list
     return units
 
 
+def _asset_filename(member: str, raw: bytes) -> str:
+    suffix = PurePosixPath(member).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+        suffix = ".bin"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", PurePosixPath(member).stem).strip("._-")
+    digest = _sha256_bytes(raw)[:12]
+    return f"{(stem or 'asset')[:48]}-{digest}{suffix}"
+
+
+def _copy_epub_asset(
+    *,
+    output_dir: Path,
+    current_href: str,
+    src: str,
+    asset_members: Mapping[str, bytes],
+) -> str:
+    parsed = urlsplit(src)
+    if parsed.scheme or parsed.netloc or parsed.path.startswith("data:"):
+        return src
+    try:
+        member = _resolve_member(current_href, parsed.path)
+    except EpubSemanticError:
+        return src
+    raw = asset_members.get(member)
+    if raw is None:
+        return src
+    asset_dir = output_dir / "chapters" / "assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    filename = _asset_filename(member, raw)
+    target = asset_dir / filename
+    if not target.is_file() or target.read_bytes() != raw:
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_bytes(raw)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    suffix = f"#{parsed.fragment}" if parsed.fragment else ""
+    return f"assets/{filename}{suffix}"
+
+
 def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     """Import an EPUB spine into chapter Markdown and translation units."""
 
     source = source.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
-    metadata, documents, roots, title_hints, opf_member = _package_documents(source)
-    renderer = _XhtmlRenderer(roots)
+    metadata, documents, roots, title_hints, asset_members, opf_member = _package_documents(source)
+    renderer = _XhtmlRenderer(
+        roots,
+        image_resolver=lambda current_href, src: _copy_epub_asset(
+            output_dir=output_dir,
+            current_href=current_href,
+            src=src,
+            asset_members=asset_members,
+        ),
+    )
     chapter_dir = output_dir / "chapters"
     source_dir = output_dir / "semantic" / "source_chapters"
     chapter_dir.mkdir(parents=True, exist_ok=True)
@@ -840,6 +904,9 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         for stale in directory.glob("*.md"):
             if stale.name not in expected_files:
                 stale.unlink()
+    assets_dir = chapter_dir / "assets"
+    if assets_dir.is_dir() and not asset_members:
+        shutil.rmtree(assets_dir)
     summary = semantic_audit_summary(audit_chapters)
     summary["continuation_merged_count"] = sum(
         int(item["continuation_merged_count"]) for item in audit_chapters

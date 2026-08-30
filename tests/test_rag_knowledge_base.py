@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Sequence
 from unittest.mock import patch
 
-from book_pipeline import write_knowledge_base
+from book_pipeline import build_parser, write_knowledge_base
 from pipeline_graph.book import _knowledge_base_is_current
 from rag_knowledge_base import (
     RagEmbeddingUnavailableError,
@@ -21,6 +21,7 @@ from rag_knowledge_base import (
     build_embedding_index,
     manifest_path_for,
     vector_index_path_for,
+    zhipu_embedding_enabled,
 )
 from translation_agent_api import (
     build_knowledge_base_embedding_index,
@@ -50,6 +51,9 @@ class FakeEmbeddingProvider:
     provider_name = "test-provider"
     model = "test-embedding-v1"
 
+    def __init__(self) -> None:
+        self.document_calls = 0
+
     @staticmethod
     def _vector(text: str) -> list[float]:
         return [
@@ -59,6 +63,7 @@ class FakeEmbeddingProvider:
         ]
 
     def embed_documents(self, texts: Sequence[str]) -> Sequence[Sequence[float]]:
+        self.document_calls += 1
         return [self._vector(text) for text in texts]
 
     def embed_query(self, text: str) -> Sequence[float]:
@@ -146,6 +151,16 @@ class RagKnowledgeBaseTests(unittest.TestCase):
         self.assertEqual(hits[0].retrieval_mode, "semantic")
         self.assertIn(f"[KB:{'a' * 40}]", context.text)
         self.assertEqual(context.hits, tuple(hits))
+
+    def test_unchanged_ready_index_skips_repeat_embedding_cost(self) -> None:
+        self._write()
+        provider = FakeEmbeddingProvider()
+
+        first = build_embedding_index(self.knowledge_path, provider)
+        second = build_embedding_index(self.knowledge_path, provider)
+
+        self.assertEqual(first, second)
+        self.assertEqual(provider.document_calls, 1)
 
     def test_rewriting_documents_invalidates_existing_embedding_index(self) -> None:
         self._write()
@@ -242,7 +257,12 @@ class RagKnowledgeBaseTests(unittest.TestCase):
             "path": str(self.knowledge_path.resolve()),
             "sha256": hashlib.sha256(self.knowledge_path.read_bytes()).hexdigest(),
         }
-        context = SimpleNamespace(output_dir=self.knowledge_path.parent.resolve())
+        pipeline_argv = ["--output-dir", str(self.knowledge_path.parent)]
+        context = SimpleNamespace(
+            output_dir=self.knowledge_path.parent.resolve(),
+            require=lambda name: pipeline_argv if name == "pipeline.argv" else None,
+            fingerprints={},
+        )
 
         self.assertTrue(
             _knowledge_base_is_current(context, {"publication.knowledge_base": saved})
@@ -284,6 +304,22 @@ class RagKnowledgeBaseTests(unittest.TestCase):
             provider = ZhipuEmbeddingProvider(dimensions=256)
             with self.assertRaisesRegex(RagProviderError, "ZHIPU_API_KEY"):
                 provider.embed_query("测试")
+
+    def test_zhipu_auto_activation_honors_explicit_override(self) -> None:
+        with patch.dict(os.environ, {"ZHIPU_API_KEY": "test-key"}, clear=True):
+            self.assertTrue(zhipu_embedding_enabled(None))
+            self.assertTrue(zhipu_embedding_enabled(True))
+            self.assertFalse(zhipu_embedding_enabled(False))
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(zhipu_embedding_enabled(None))
+            self.assertTrue(zhipu_embedding_enabled(True))
+
+    def test_rag_embedding_cli_mode_defaults_to_key_detection(self) -> None:
+        parser = build_parser()
+
+        self.assertIsNone(parser.parse_args([]).rag_embed)
+        self.assertTrue(parser.parse_args(["--rag-embed"]).rag_embed)
+        self.assertFalse(parser.parse_args(["--no-rag-embed"]).rag_embed)
 
 
 if __name__ == "__main__":

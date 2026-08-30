@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 import zipfile
 
-from book_pipeline import build_docx
+from book_pipeline import build_docx, build_epub
 from epub_semantic_import import (
     EpubSemanticError,
     apply_translations,
@@ -97,6 +97,41 @@ def _write_printed_page_marker_epub(path: Path) -> None:
         '<sup class="calibre14">8</sup><em>word</em> x<sup>2</sup>',
     )
     members["OEBPS/chapter1.xhtml"] = chapter.encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
+def _write_relative_image_epub(path: Path) -> None:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), (255, 0, 0)).save(buffer, "PNG")
+    image = buffer.getvalue()
+    members = {
+        "mimetype": b"application/epub+zip",
+        "META-INF/container.xml": b'''<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>''',
+        "OEBPS/content.opf": b'''<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+ <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Image Book</dc:title><dc:language>en</dc:language><dc:identifier>id</dc:identifier></metadata>
+ <manifest><item id="c1" href="Text/chapter1.xhtml" media-type="application/xhtml+xml"/><item id="cover" href="Images/cover.png" media-type="image/png"/></manifest>
+ <spine><itemref idref="c1"/></spine>
+</package>''',
+        "OEBPS/Text/chapter1.xhtml": b'''<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<section><h1>Illustrated</h1><p><img alt="Cover" src="../Images/cover.png"/></p><p>Body.</p></section>
+</body></html>''',
+        "OEBPS/Images/cover.png": image,
+    }
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(
             "mimetype",
@@ -251,6 +286,54 @@ class EpubSemanticImportTests(unittest.TestCase):
                 unit for unit in units if unit["kind"] == "footnote_definition"
             )
             self.assertIn("\n\n    Continuation paragraph.", note_unit["source_markdown"])
+
+    def test_relative_epub_image_paths_are_materialized_for_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_relative_image_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (
+                output / "chapters" / manifest[0]["filename"]
+            ).read_text(encoding="utf-8")
+
+            self.assertEqual(result["status"], "passed")
+            self.assertIn("![Cover](assets/", markdown)
+            self.assertNotIn("../Images/cover.png", markdown)
+            image_refs = re.findall(r"!\[[^]]*]\((assets/[^)]+)\)", markdown)
+            self.assertEqual(len(image_refs), 1)
+            self.assertTrue((output / "chapters" / image_refs[0]).is_file())
+
+            docx_path = root / "image.docx"
+            build_docx(
+                docx_path,
+                output / "chapters",
+                manifest,
+                book_title="Image Book",
+            )
+            with zipfile.ZipFile(docx_path) as archive:
+                self.assertIn("word/media/image1.png", archive.namelist())
+
+            epub_path = root / "image.epub"
+            build_epub(
+                epub_path,
+                output / "chapters",
+                manifest,
+                book_title="Image Book",
+                language="zh-CN",
+            )
+            with zipfile.ZipFile(epub_path) as archive:
+                names = archive.namelist()
+                self.assertTrue(
+                    any(name.startswith("OEBPS/assets/") for name in names)
+                )
+                xhtml = archive.read("OEBPS/001_Illustrated.xhtml").decode()
+            self.assertIn('src="assets/', xhtml)
 
     def test_orphan_anonymous_note_continuation_is_a_visible_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -687,10 +687,27 @@ def build_embedding_index(
     if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
     source = Path(knowledge_base_path)
-    initialize_rag_manifest(source)
+    manifest = initialize_rag_manifest(source)
     rows = load_knowledge_rows(source)
     documents_sha256 = _sha256_file(source)
     provider_name, model = _provider_identity(provider)
+    existing_embedding = manifest["retrieval"]["embedding"]
+    requested_dimensions = getattr(provider, "dimensions", None)
+    if (
+        existing_embedding["status"] == "ready"
+        and existing_embedding["provider"] == provider_name
+        and existing_embedding["model"] == model
+        and (
+            requested_dimensions is None
+            or existing_embedding["dimensions"] == requested_dimensions
+        )
+    ):
+        metadata, _vectors = _load_embedding_index(
+            source,
+            expected_documents_sha256=documents_sha256,
+            expected_ids=[str(row["id"]) for row in rows],
+        )
+        return metadata
     vectors: list[tuple[float, ...]] = []
     dimensions: int | None = None
     for start in range(0, len(rows), batch_size):
@@ -764,6 +781,35 @@ def build_embedding_index(
         documents_sha256=documents_sha256,
         index_sha256=index_sha256,
         index_path=index_path,
+    )
+
+
+def zhipu_embedding_enabled(
+    requested: bool | None,
+    *,
+    api_key_env: str = "ZHIPU_API_KEY",
+) -> bool:
+    """Resolve explicit enable/disable or automatic key-based activation."""
+
+    if requested is not None:
+        return requested
+    return bool(os.getenv(api_key_env, "").strip())
+
+
+def maybe_build_zhipu_embedding_index(
+    knowledge_base_path: Path | str,
+    *,
+    requested: bool | None = None,
+    batch_size: int = 64,
+) -> RagEmbeddingMetadata | None:
+    """Build an idempotent embedding-3 index when configured or requested."""
+
+    if not zhipu_embedding_enabled(requested):
+        return None
+    return build_embedding_index(
+        knowledge_base_path,
+        ZhipuEmbeddingProvider(),
+        batch_size=batch_size,
     )
 
 
@@ -1049,7 +1095,9 @@ __all__ = [
     "initialize_rag_manifest",
     "load_knowledge_rows",
     "manifest_path_for",
+    "maybe_build_zhipu_embedding_index",
     "rag_manifest_is_current",
     "read_rag_manifest",
     "vector_index_path_for",
+    "zhipu_embedding_enabled",
 ]

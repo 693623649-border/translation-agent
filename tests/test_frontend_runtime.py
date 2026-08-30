@@ -17,6 +17,7 @@ from frontend_runtime import (
     artifact_catalog,
     child_environment,
     _run_epub_workflow,
+    plan_runspec,
     safe_upload_name,
     start_job_process,
     validate_upload_size,
@@ -335,6 +336,99 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "reviewable drafts"):
                 service.submit_path(spec, start=False)
+
+    def test_epub_adapter_accepts_knowledge_base_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = FrontendSettings(
+                database=root / "jobs.sqlite3",
+                jobs_root=root / "jobs",
+                source_roots=(root,),
+            )
+            service = ApplicationService(settings)
+            source = root / "book.epub"
+            source.write_bytes(b"epub")
+            spec = RunSpec(
+                source=source,
+                source_mode="epub",
+                output_dir="ignored",
+                targets=("publication.knowledge_base",),
+                translate=False,
+                verify=False,
+            )
+
+            job = service.submit_path(spec, start=False)
+
+            self.assertEqual(job.spec.targets, ("publication.knowledge_base",))
+            self.assertIn("core.publish.knowledge_base", plan_runspec(job.spec))
+
+    def test_epub_runner_publishes_knowledge_base_from_nonempty_chapters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "book.epub"
+            source.write_bytes(b"epub")
+            output = root / "output"
+            spec = RunSpec(
+                source=source,
+                source_mode="epub",
+                output_dir=output,
+                targets=("publication.knowledge_base",),
+                translate=False,
+                verify=False,
+            )
+
+            def fake_import_epub(_source: Path, target: Path) -> dict[str, object]:
+                chapter_dir = target / "chapters"
+                chapter_dir.mkdir(parents=True)
+                (chapter_dir / "001_body.md").write_text(
+                    "# Body\n\nUseful content.\n",
+                    encoding="utf-8",
+                )
+                (chapter_dir / "002_cover.md").write_text(
+                    "# Cover\n\n",
+                    encoding="utf-8",
+                )
+                (target / "chapters.json").write_text(
+                    json.dumps(
+                        [
+                            {
+                                "id": "epub-0001",
+                                "sequence": 1,
+                                "display_title": "Body",
+                                "filename": "001_body.md",
+                                "reviewed_override": False,
+                            },
+                            {
+                                "id": "epub-0002",
+                                "sequence": 2,
+                                "display_title": "Cover",
+                                "filename": "002_cover.md",
+                                "reviewed_override": False,
+                            },
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return {"release_blocked": False}
+
+            with patch(
+                "epub_semantic_import.import_epub",
+                side_effect=fake_import_epub,
+            ), patch("translation_agent_api.run_graph") as run_graph:
+                run_id = _run_epub_workflow(spec)
+
+            self.assertIsNone(run_id)
+            run_graph.assert_not_called()
+            rows = [
+                json.loads(line)
+                for line in (output / "knowledge_base.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual([row["title"] for row in rows], ["Body"])
+            self.assertEqual(rows[0]["content"], "Useful content.")
+            self.assertTrue((output / "knowledge_base.rag.json").is_file())
 
     def test_epub_runner_uses_profile_name_in_translation_cache_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -894,6 +894,26 @@ BM25 回退，因此当前阶段无需任何联网依赖或额外向量数据库
 智谱单次请求最多提交 64 条输入，索引器默认按该上限分批；仅安装 core
 依赖时需使用 `pip install '.[legacy]'` 安装已有的 OpenAI 兼容客户端。
 
+仓库内也提供统一 CLI，方便把成品目录注册成可检索 RAG 产物：
+
+```bash
+translation-agent-kb register "outputs/my_book"
+translation-agent-kb retrieve "outputs/my_book" "作者如何界定文化领导权？" --semantic
+translation-agent-kb status "outputs/my_book"
+```
+
+`register` 默认使用智谱 `embedding-3` / 2048 维并读取 `ZHIPU_API_KEY`；
+如只想生成清单和 BM25 回退，可加 `--lexical-only`。`retrieve --semantic`
+只有在向量索引已就绪时才调用 embedding provider，否则自动回退 lexical 检索。
+临时 DOCX 成品可用 Heading 1 章节结构派生知识库：
+
+```bash
+translation-agent-kb derive-docx "outputs/Book.docx"
+```
+
+该命令会自动创建同名产物目录并写入 `knowledge_base.jsonl` 与 RAG 清单；如果
+DOCX 没有可识别的 Heading 1 章节契约，会直接失败而不是生成不可审计的语料。
+
 ### 发布质量门
 
 `compile` 和 `all` 在生成产物后自动运行一次无模型调用的发布质量门；任何

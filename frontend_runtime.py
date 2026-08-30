@@ -647,10 +647,30 @@ def plan_runspec(spec: RunSpec) -> tuple[str, ...]:
             nodes.append("core.publish.epub")
         if "publication.docx" in spec.targets or "publication.word_report" in spec.targets:
             nodes.append("core.publish.docx")
+        if "publication.knowledge_base" in spec.targets:
+            nodes.append("core.publish.knowledge_base")
         return tuple(nodes)
     from translation_agent_api import plan_graph
 
     return plan_graph(_runspec_to_graph_request(spec))
+
+
+def _publish_epub_knowledge_base(source: Path, output: Path) -> dict[str, Any]:
+    from book_pipeline import build_knowledge_rows_from_manifest, write_knowledge_base
+
+    manifest_path = output / "chapters.json"
+    chapter_dir = output / "chapters"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, list):
+        raise RuntimeError("EPUB chapter manifest must be a list")
+    rows = [
+        row
+        for row in build_knowledge_rows_from_manifest(source, chapter_dir, manifest)
+        if str(row.get("content") or "").strip()
+    ]
+    path = output / "knowledge_base.jsonl"
+    write_knowledge_base(path, rows)
+    return {"path": path, "rows": len(rows), "sha256": _sha256_file(path)}
 
 
 def _run_epub_workflow(spec: RunSpec) -> str | None:
@@ -732,8 +752,9 @@ def _run_epub_workflow(spec: RunSpec) -> str | None:
         or "publication.word_report" in publication_targets
     ):
         phases.append("docx")
+    if "publication.knowledge_base" in publication_targets:
+        _publish_epub_knowledge_base(Path(str(spec.source)).resolve(), output)
     unsupported = publication_targets & {
-        "publication.knowledge_base",
         "publication.reference_pdf",
     }
     if unsupported:
@@ -1060,6 +1081,26 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
                 report_path=report_path if covered else None,
             )
         )
+    for artifact_name, filename in (
+        ("publication.knowledge_base", "knowledge_base.jsonl"),
+    ):
+        if artifact_name not in requested or artifact_name in identities:
+            continue
+        path = (output / filename).resolve()
+        if _is_relative_to(path, output) and path.is_file() and not path.is_symlink():
+            kind = PUBLICATION_KINDS[artifact_name]
+            records.append(
+                ArtifactRecord(
+                    schema_version=CONTRACT_SCHEMA_VERSION,
+                    name=path.name,
+                    kind=kind,
+                    path=path,
+                    status="draft",
+                    sha256=_sha256_file(path),
+                    media_type=MEDIA_TYPES[kind],
+                    report_path=None,
+                )
+            )
     if report_path is not None and report_path.is_file():
         records.append(
             ArtifactRecord(
