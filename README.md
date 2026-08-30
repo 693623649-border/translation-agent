@@ -853,6 +853,47 @@ EPUB 导航、Word 标题和 PDF 书签均从这些结构化标题生成，而�
 python book_pipeline.py -o "outputs/my_book" --phase docx --title "书名"
 ```
 
+### RAG 知识库与 embedding 接口
+
+知识库发布器保留经过发布验收的 `knowledge_base.jsonl` 作为 canonical 文档语料，
+并自动生成 `knowledge_base.rag.json`。在尚未配置 embedding API 时，RAG 运行时
+使用内置 Okapi BM25 检索；接入 API 后，向量单独写入
+`knowledge_base.vectors.jsonl`，不会把向量字段混入正文 JSONL 或破坏稳定 ID、
+全文覆盖与发布验收契约。
+
+本分支已内置智谱 OpenAI 兼容 provider，默认使用
+`https://open.bigmodel.cn/api/paas/v4/`、`embedding-3` 和 2048 维向量。
+密钥只从环境变量读取，不写入源码或 RAG 产物：
+
+```powershell
+$env:ZHIPU_API_KEY = "在智谱控制台生成的密钥"
+```
+
+构建向量索引并检索带 chunk 引用、可直接注入生成提示词的上下文：
+
+```python
+from rag_knowledge_base import ZhipuEmbeddingProvider
+from translation_agent_api import (
+    build_knowledge_base_embedding_index,
+    retrieve_knowledge_base_context,
+)
+
+provider = ZhipuEmbeddingProvider()  # embedding-3 / 2048 dimensions
+build_knowledge_base_embedding_index("outputs/my_book", provider)
+context = retrieve_knowledge_base_context(
+    "outputs/my_book",
+    "作者如何界定文化领导权？",
+    top_k=5,
+    embedding_provider=provider,
+)
+print(context.text)
+```
+
+若暂时不传 `embedding_provider`，`retrieve_knowledge_base_context` 会自动使用
+BM25 回退，因此当前阶段无需任何联网依赖或额外向量数据库。
+智谱单次请求最多提交 64 条输入，索引器默认按该上限分批；仅安装 core
+依赖时需使用 `pip install '.[legacy]'` 安装已有的 OpenAI 兼容客户端。
+
 ### 发布质量门
 
 `compile` 和 `all` 在生成产物后自动运行一次无模型调用的发布质量门；任何
@@ -1034,6 +1075,8 @@ outputs/my_book/
 │   ├── word-release-report.json      # Word Recipe 的正式验收报告
 │   └── release-report.json           # 完整多格式发布报告
 ├── knowledge_base.jsonl      # 仅含章节、顺序和正文的无分页 RAG 记录
+├── knowledge_base.rag.json   # RAG 语料哈希、检索能力与 embedding 状态
+├── knowledge_base.vectors.jsonl # 接入 embedding API 后生成的向量 sidecar
 ├── 书名.epub                  # 无原 PDF 分页信息的 EPUB3
 ├── 书名.docx                  # 无原 PDF 分页信息的 Word 文档
 └── 书名_带目录.pdf            # 原版外观 + 可复制层（若原有）+ 书签

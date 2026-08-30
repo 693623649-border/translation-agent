@@ -1,0 +1,1006 @@
+"""Retrieval runtime and embedding sidecars for published knowledge bases.
+
+``knowledge_base.jsonl`` remains the canonical, verifier-owned document corpus.
+This module adds the two missing RAG layers without changing that stable schema:
+
+* a small discovery manifest with a lexical retrieval fallback;
+* an optional vector sidecar produced by an injected embedding provider.
+
+No network client is embedded here.  A future API adapter only needs to
+implement :class:`EmbeddingProvider`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import tempfile
+import unicodedata
+from collections import Counter
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol
+
+
+RAG_SCHEMA_VERSION = 1
+RAG_MANIFEST_KIND = "translation-agent.rag-knowledge-base"
+RAG_INDEX_KIND = "translation-agent.rag-embedding-index"
+KNOWLEDGE_FIELDS = (
+    "id",
+    "title",
+    "chapter_id",
+    "chapter_order",
+    "content",
+)
+_KNOWLEDGE_FIELD_SET = frozenset(KNOWLEDGE_FIELDS)
+_ROW_ID = re.compile(r"[0-9a-f]{40}")
+_TOKEN_PART = re.compile(
+    r"[a-z0-9_]+|"
+    r"[\u3400-\u9fff]+|"
+    r"[\u3040-\u30ff]+|"
+    r"[\uac00-\ud7af]+",
+    flags=re.I,
+)
+
+
+class RagError(ValueError):
+    """Base class for invalid RAG corpora, indexes, or provider output."""
+
+
+class RagFormatError(RagError):
+    """The canonical corpus or one of its sidecars is malformed."""
+
+
+class RagIndexStaleError(RagError):
+    """A sidecar was built from different knowledge-base bytes."""
+
+
+class RagEmbeddingUnavailableError(RagError):
+    """Semantic retrieval was requested before a vector index was built."""
+
+
+class RagProviderError(RagError):
+    """An embedding provider returned invalid or incompatible data."""
+
+
+class EmbeddingProvider(Protocol):
+    """Vendor-neutral seam for the embedding API supplied later.
+
+    ``provider_name`` and ``model`` are persisted with the vectors so a query
+    cannot silently mix embeddings from incompatible providers or models.
+    """
+
+    provider_name: str
+    model: str
+
+    def embed_documents(
+        self,
+        texts: Sequence[str],
+    ) -> Sequence[Sequence[float]]:
+        """Embed a batch of document texts in the same order."""
+
+    def embed_query(self, text: str) -> Sequence[float]:
+        """Embed one retrieval query."""
+
+
+class ZhipuEmbeddingProvider:
+    """智谱 ``embedding-3`` adapter through its OpenAI-compatible API."""
+
+    provider_name = "zhipu"
+    default_base_url = "https://open.bigmodel.cn/api/paas/v4/"
+    supported_dimensions = frozenset({256, 512, 1024, 2048})
+    max_batch_size = 64
+
+    def __init__(
+        self,
+        *,
+        api_key_env: str = "ZHIPU_API_KEY",
+        base_url: str | None = None,
+        model: str | None = None,
+        dimensions: int | None = None,
+        timeout: float = 60.0,
+        client: Any | None = None,
+    ) -> None:
+        self.api_key_env = api_key_env
+        self.base_url = (
+            base_url
+            or os.getenv("ZHIPU_EMBEDDING_BASE_URL")
+            or self.default_base_url
+        ).rstrip("/") + "/"
+        self.model = (
+            model
+            or os.getenv("ZHIPU_EMBEDDING_MODEL")
+            or "embedding-3"
+        )
+        configured_dimensions: object = dimensions
+        if configured_dimensions is None:
+            configured_dimensions = os.getenv(
+                "ZHIPU_EMBEDDING_DIMENSIONS",
+                "2048",
+            )
+        try:
+            self.dimensions = int(configured_dimensions)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Zhipu embedding dimensions must be an integer") from exc
+        if self.dimensions not in self.supported_dimensions:
+            raise ValueError(
+                "Zhipu embedding-3 dimensions must be one of "
+                f"{sorted(self.supported_dimensions)}"
+            )
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("timeout must be a positive number")
+        self.timeout = float(timeout)
+        self._client = client
+
+    def _openai_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+        api_key = os.getenv(self.api_key_env, "").strip()
+        if not api_key:
+            raise RagProviderError(
+                f"Missing Zhipu API key; set the {self.api_key_env} environment variable"
+            )
+        try:
+            from openai import OpenAI
+        except ImportError as exc:  # pragma: no cover - installation boundary.
+            raise RagProviderError(
+                "Zhipu embeddings require openai>=1; install translation-agent[legacy]"
+            ) from exc
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+        )
+        return self._client
+
+    def _embed(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
+        values = list(texts)
+        if not values:
+            raise RagProviderError("Zhipu embedding input cannot be empty")
+        if len(values) > self.max_batch_size:
+            raise RagProviderError(
+                f"Zhipu embedding-3 accepts at most {self.max_batch_size} inputs per request"
+            )
+        if any(not isinstance(text, str) or not text.strip() for text in values):
+            raise RagProviderError("Zhipu embedding inputs must be non-empty strings")
+        try:
+            response = self._openai_client().embeddings.create(
+                model=self.model,
+                input=values,
+                dimensions=self.dimensions,
+            )
+        except RagProviderError:
+            raise
+        except Exception as exc:
+            raise RagProviderError(f"Zhipu embedding request failed: {exc}") from exc
+        data = getattr(response, "data", None)
+        if not isinstance(data, Sequence) or isinstance(data, (str, bytes)):
+            raise RagProviderError("Zhipu embedding response has no data array")
+        by_index: dict[int, tuple[float, ...]] = {}
+        for item in data:
+            index = getattr(item, "index", None)
+            embedding = getattr(item, "embedding", None)
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or index < 0
+                or index >= len(values)
+                or index in by_index
+            ):
+                raise RagProviderError("Zhipu embedding response contains invalid indices")
+            by_index[index] = _validate_vector(
+                embedding,
+                expected_dimensions=self.dimensions,
+                label=f"Zhipu embedding {index}",
+            )
+        if list(sorted(by_index)) != list(range(len(values))):
+            raise RagProviderError(
+                "Zhipu embedding response count does not match the request"
+            )
+        return [by_index[index] for index in range(len(values))]
+
+    def embed_documents(
+        self,
+        texts: Sequence[str],
+    ) -> Sequence[Sequence[float]]:
+        return self._embed(texts)
+
+    def embed_query(self, text: str) -> Sequence[float]:
+        return self._embed([text])[0]
+
+
+@dataclass(frozen=True)
+class RagEmbeddingMetadata:
+    provider_name: str
+    model: str
+    dimensions: int
+    chunk_count: int
+    documents_sha256: str
+    index_sha256: str
+    index_path: Path
+
+
+@dataclass(frozen=True)
+class RagHit:
+    id: str
+    title: str
+    chapter_id: str
+    chapter_order: int
+    content: str
+    score: float
+    retrieval_mode: str
+
+
+@dataclass(frozen=True)
+class RagContext:
+    query: str
+    hits: tuple[RagHit, ...]
+    text: str
+
+
+def manifest_path_for(knowledge_base_path: Path | str) -> Path:
+    path = Path(knowledge_base_path)
+    return path.with_suffix(".rag.json")
+
+
+def vector_index_path_for(knowledge_base_path: Path | str) -> Path:
+    path = Path(knowledge_base_path)
+    return path.with_suffix(".vectors.jsonl")
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _json_text(value: Mapping[str, Any]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+
+
+def load_knowledge_rows(path: Path | str) -> list[dict[str, Any]]:
+    """Load and validate the verifier-owned five-field JSONL corpus."""
+
+    source = Path(path)
+    if not source.is_file():
+        raise RagFormatError(f"Knowledge base does not exist: {source}")
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise RagFormatError(f"Cannot read knowledge base {source}: {exc}") from exc
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RagFormatError(
+                f"Invalid JSON at {source}:{line_number}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict) or set(raw) != _KNOWLEDGE_FIELD_SET:
+            actual = sorted(raw) if isinstance(raw, dict) else type(raw).__name__
+            raise RagFormatError(
+                f"Invalid fields at {source}:{line_number}; "
+                f"expected {list(KNOWLEDGE_FIELDS)}, got {actual}"
+            )
+        row_id = raw["id"]
+        chapter_order = raw["chapter_order"]
+        if not isinstance(row_id, str) or _ROW_ID.fullmatch(row_id) is None:
+            raise RagFormatError(f"Invalid row id at {source}:{line_number}")
+        if row_id in seen_ids:
+            raise RagFormatError(f"Duplicate row id at {source}:{line_number}: {row_id}")
+        for field in ("title", "chapter_id", "content"):
+            if not isinstance(raw[field], str) or not raw[field].strip():
+                raise RagFormatError(
+                    f"Field {field!r} must be a non-empty string at "
+                    f"{source}:{line_number}"
+                )
+        if not isinstance(chapter_order, int) or isinstance(chapter_order, bool):
+            raise RagFormatError(
+                f"Field 'chapter_order' must be an integer at "
+                f"{source}:{line_number}"
+            )
+        seen_ids.add(row_id)
+        rows.append({field: raw[field] for field in KNOWLEDGE_FIELDS})
+    if not rows:
+        raise RagFormatError(f"Knowledge base contains no chunks: {source}")
+    return rows
+
+
+def _pending_manifest(
+    knowledge_base_path: Path,
+    *,
+    chunk_count: int,
+    documents_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": RAG_SCHEMA_VERSION,
+        "kind": RAG_MANIFEST_KIND,
+        "documents": {
+            "path": knowledge_base_path.name,
+            "sha256": documents_sha256,
+            "chunk_count": chunk_count,
+            "fields": list(KNOWLEDGE_FIELDS),
+        },
+        "retrieval": {
+            "lexical": {
+                "status": "ready",
+                "algorithm": "okapi-bm25",
+            },
+            "embedding": {
+                "status": "awaiting_provider",
+                "index_path": vector_index_path_for(knowledge_base_path).name,
+                "provider": None,
+                "model": None,
+                "dimensions": None,
+                "documents_sha256": None,
+                "index_sha256": None,
+            },
+        },
+    }
+
+
+def _read_manifest_file(knowledge_base_path: Path) -> dict[str, Any]:
+    path = manifest_path_for(knowledge_base_path)
+    if not path.is_file():
+        raise RagFormatError(f"RAG manifest does not exist: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RagFormatError(f"Cannot read RAG manifest {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RagFormatError(f"RAG manifest must be a JSON object: {path}")
+    return value
+
+
+def _provider_identity(provider: EmbeddingProvider) -> tuple[str, str]:
+    provider_name = getattr(provider, "provider_name", None)
+    model = getattr(provider, "model", None)
+    if not isinstance(provider_name, str) or not provider_name.strip():
+        raise RagProviderError("Embedding provider_name must be a non-empty string")
+    if not isinstance(model, str) or not model.strip():
+        raise RagProviderError("Embedding model must be a non-empty string")
+    return provider_name.strip(), model.strip()
+
+
+def _validate_vector(
+    raw: Sequence[float],
+    *,
+    expected_dimensions: int | None = None,
+    label: str,
+) -> tuple[float, ...]:
+    if isinstance(raw, (str, bytes)):
+        raise RagProviderError(f"{label} is not a numeric vector")
+    try:
+        values = tuple(raw)
+    except TypeError as exc:
+        raise RagProviderError(f"{label} is not a sequence") from exc
+    if not values:
+        raise RagProviderError(f"{label} is empty")
+    vector: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RagProviderError(f"{label} contains a non-numeric value")
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise RagProviderError(f"{label} contains a non-finite value")
+        vector.append(converted)
+    if expected_dimensions is not None and len(vector) != expected_dimensions:
+        raise RagProviderError(
+            f"{label} has {len(vector)} dimensions; expected {expected_dimensions}"
+        )
+    if not any(vector):
+        raise RagProviderError(f"{label} is a zero vector")
+    return tuple(vector)
+
+
+def _load_embedding_index(
+    knowledge_base_path: Path,
+    *,
+    expected_documents_sha256: str,
+    expected_ids: Sequence[str],
+) -> tuple[RagEmbeddingMetadata, dict[str, tuple[float, ...]]]:
+    index_path = vector_index_path_for(knowledge_base_path)
+    if not index_path.is_file():
+        raise RagFormatError(f"Embedding index does not exist: {index_path}")
+    try:
+        lines = [
+            line
+            for line in index_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, UnicodeError) as exc:
+        raise RagFormatError(f"Cannot read embedding index {index_path}: {exc}") from exc
+    if not lines:
+        raise RagFormatError(f"Embedding index is empty: {index_path}")
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise RagFormatError(f"Invalid embedding index header: {index_path}") from exc
+    if not isinstance(header, dict):
+        raise RagFormatError(f"Embedding index header must be an object: {index_path}")
+    if (
+        header.get("schema_version") != RAG_SCHEMA_VERSION
+        or header.get("kind") != RAG_INDEX_KIND
+    ):
+        raise RagFormatError(f"Unsupported embedding index schema: {index_path}")
+    documents_sha256 = header.get("documents_sha256")
+    if documents_sha256 != expected_documents_sha256:
+        raise RagIndexStaleError(
+            f"Embedding index was built from different knowledge-base bytes: {index_path}"
+        )
+    provider_name = header.get("provider")
+    model = header.get("model")
+    dimensions = header.get("dimensions")
+    chunk_count = header.get("chunk_count")
+    if not isinstance(provider_name, str) or not provider_name:
+        raise RagFormatError(f"Embedding index provider is invalid: {index_path}")
+    if not isinstance(model, str) or not model:
+        raise RagFormatError(f"Embedding index model is invalid: {index_path}")
+    if not isinstance(dimensions, int) or isinstance(dimensions, bool) or dimensions <= 0:
+        raise RagFormatError(f"Embedding index dimensions are invalid: {index_path}")
+    if chunk_count != len(expected_ids):
+        raise RagFormatError(f"Embedding index chunk count is invalid: {index_path}")
+
+    vectors: dict[str, tuple[float, ...]] = {}
+    for line_number, line in enumerate(lines[1:], start=2):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RagFormatError(
+                f"Invalid vector JSON at {index_path}:{line_number}"
+            ) from exc
+        if not isinstance(item, dict) or set(item) != {"id", "embedding"}:
+            raise RagFormatError(
+                f"Invalid vector row at {index_path}:{line_number}"
+            )
+        row_id = item["id"]
+        if not isinstance(row_id, str) or row_id in vectors:
+            raise RagFormatError(
+                f"Invalid or duplicate vector id at {index_path}:{line_number}"
+            )
+        try:
+            vectors[row_id] = _validate_vector(
+                item["embedding"],
+                expected_dimensions=dimensions,
+                label=f"embedding at {index_path}:{line_number}",
+            )
+        except RagProviderError as exc:
+            raise RagFormatError(str(exc)) from exc
+    if list(vectors) != list(expected_ids):
+        raise RagFormatError(
+            f"Embedding index ids do not match the knowledge-base chunk order: {index_path}"
+        )
+    return (
+        RagEmbeddingMetadata(
+            provider_name=provider_name,
+            model=model,
+            dimensions=dimensions,
+            chunk_count=chunk_count,
+            documents_sha256=documents_sha256,
+            index_sha256=_sha256_file(index_path),
+            index_path=index_path,
+        ),
+        vectors,
+    )
+
+
+def read_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
+    """Read a manifest and prove it still describes the current corpus/index."""
+
+    source = Path(knowledge_base_path)
+    rows = load_knowledge_rows(source)
+    documents_sha256 = _sha256_file(source)
+    manifest = _read_manifest_file(source)
+    if (
+        manifest.get("schema_version") != RAG_SCHEMA_VERSION
+        or manifest.get("kind") != RAG_MANIFEST_KIND
+    ):
+        raise RagFormatError(f"Unsupported RAG manifest schema: {manifest_path_for(source)}")
+    documents = manifest.get("documents")
+    retrieval = manifest.get("retrieval")
+    if not isinstance(documents, dict) or not isinstance(retrieval, dict):
+        raise RagFormatError(f"RAG manifest sections are invalid: {manifest_path_for(source)}")
+    if (
+        documents.get("path") != source.name
+        or documents.get("sha256") != documents_sha256
+        or documents.get("chunk_count") != len(rows)
+        or documents.get("fields") != list(KNOWLEDGE_FIELDS)
+    ):
+        raise RagIndexStaleError(
+            f"RAG manifest does not describe the current knowledge base: "
+            f"{manifest_path_for(source)}"
+        )
+    lexical = retrieval.get("lexical")
+    embedding = retrieval.get("embedding")
+    if not isinstance(lexical, dict) or lexical.get("status") != "ready":
+        raise RagFormatError(f"Lexical retrieval is not ready: {manifest_path_for(source)}")
+    if not isinstance(embedding, dict):
+        raise RagFormatError(f"Embedding manifest is invalid: {manifest_path_for(source)}")
+    status = embedding.get("status")
+    if status not in {"awaiting_provider", "ready"}:
+        raise RagFormatError(f"Unknown embedding status {status!r}")
+    if embedding.get("index_path") != vector_index_path_for(source).name:
+        raise RagFormatError(f"Embedding index path is invalid: {manifest_path_for(source)}")
+    if status == "ready":
+        expected_index_sha256 = embedding.get("index_sha256")
+        if (
+            not isinstance(expected_index_sha256, str)
+            or not expected_index_sha256
+        ):
+            raise RagFormatError(
+                f"Embedding index checksum is invalid: {manifest_path_for(source)}"
+            )
+        index_path = vector_index_path_for(source)
+        if not index_path.is_file():
+            raise RagFormatError(f"Embedding index does not exist: {index_path}")
+        actual_index_sha256 = _sha256_file(index_path)
+        if actual_index_sha256 != expected_index_sha256:
+            raise RagIndexStaleError(
+                f"Embedding index checksum does not match the RAG manifest: "
+                f"{index_path}"
+            )
+        metadata, _vectors = _load_embedding_index(
+            source,
+            expected_documents_sha256=documents_sha256,
+            expected_ids=[str(row["id"]) for row in rows],
+        )
+        if (
+            embedding.get("provider") != metadata.provider_name
+            or embedding.get("model") != metadata.model
+            or embedding.get("dimensions") != metadata.dimensions
+            or embedding.get("documents_sha256") != metadata.documents_sha256
+            or embedding.get("index_sha256") != metadata.index_sha256
+        ):
+            raise RagIndexStaleError(
+                f"Embedding manifest and index disagree: {manifest_path_for(source)}"
+            )
+    return manifest
+
+
+def rag_manifest_is_current(knowledge_base_path: Path | str) -> bool:
+    try:
+        read_rag_manifest(knowledge_base_path)
+    except (OSError, RagError):
+        return False
+    return True
+
+
+def initialize_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
+    """Create or refresh RAG discovery metadata after publishing JSONL.
+
+    A ready embedding index is retained when the canonical JSONL bytes did not
+    change.  Any corpus change marks semantic retrieval as awaiting the future
+    provider while lexical retrieval remains immediately usable.
+    """
+
+    source = Path(knowledge_base_path)
+    rows = load_knowledge_rows(source)
+    documents_sha256 = _sha256_file(source)
+    try:
+        current = read_rag_manifest(source)
+    except RagError:
+        current = None
+    if current is not None:
+        return current
+    manifest = _pending_manifest(
+        source,
+        chunk_count=len(rows),
+        documents_sha256=documents_sha256,
+    )
+    _atomic_write_text(manifest_path_for(source), _json_text(manifest))
+    return manifest
+
+
+def _embedding_document(row: Mapping[str, Any]) -> str:
+    return f"{row['title']}\n\n{row['content']}"
+
+
+def build_embedding_index(
+    knowledge_base_path: Path | str,
+    provider: EmbeddingProvider,
+    *,
+    batch_size: int = 64,
+) -> RagEmbeddingMetadata:
+    """Embed all canonical chunks and atomically publish the vector sidecar."""
+
+    if not isinstance(batch_size, int) or isinstance(batch_size, bool) or batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    source = Path(knowledge_base_path)
+    initialize_rag_manifest(source)
+    rows = load_knowledge_rows(source)
+    documents_sha256 = _sha256_file(source)
+    provider_name, model = _provider_identity(provider)
+    vectors: list[tuple[float, ...]] = []
+    dimensions: int | None = None
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        texts = [_embedding_document(row) for row in batch]
+        try:
+            raw_vectors = list(provider.embed_documents(texts))
+        except Exception as exc:
+            raise RagProviderError(
+                f"Embedding provider failed for document batch {start // batch_size + 1}: {exc}"
+            ) from exc
+        if len(raw_vectors) != len(batch):
+            raise RagProviderError(
+                "Embedding provider returned "
+                f"{len(raw_vectors)} vectors for {len(batch)} documents"
+            )
+        for offset, raw_vector in enumerate(raw_vectors):
+            vector = _validate_vector(
+                raw_vector,
+                expected_dimensions=dimensions,
+                label=f"document embedding {start + offset + 1}",
+            )
+            if dimensions is None:
+                dimensions = len(vector)
+            vectors.append(vector)
+    if dimensions is None:
+        raise RagProviderError("Embedding provider produced no vectors")
+
+    index_path = vector_index_path_for(source)
+    header = {
+        "schema_version": RAG_SCHEMA_VERSION,
+        "kind": RAG_INDEX_KIND,
+        "documents_sha256": documents_sha256,
+        "provider": provider_name,
+        "model": model,
+        "dimensions": dimensions,
+        "chunk_count": len(rows),
+    }
+    index_lines = [json.dumps(header, ensure_ascii=False, sort_keys=True)]
+    index_lines.extend(
+        json.dumps(
+            {"id": row["id"], "embedding": list(vector)},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        for row, vector in zip(rows, vectors, strict=True)
+    )
+    _atomic_write_text(index_path, "\n".join(index_lines) + "\n")
+    index_sha256 = _sha256_file(index_path)
+
+    manifest = _pending_manifest(
+        source,
+        chunk_count=len(rows),
+        documents_sha256=documents_sha256,
+    )
+    manifest["retrieval"]["embedding"] = {
+        "status": "ready",
+        "index_path": index_path.name,
+        "provider": provider_name,
+        "model": model,
+        "dimensions": dimensions,
+        "documents_sha256": documents_sha256,
+        "index_sha256": index_sha256,
+    }
+    _atomic_write_text(manifest_path_for(source), _json_text(manifest))
+    return RagEmbeddingMetadata(
+        provider_name=provider_name,
+        model=model,
+        dimensions=dimensions,
+        chunk_count=len(rows),
+        documents_sha256=documents_sha256,
+        index_sha256=index_sha256,
+        index_path=index_path,
+    )
+
+
+def _normalized_text(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _tokens(value: str) -> list[str]:
+    output: list[str] = []
+    for match in _TOKEN_PART.finditer(_normalized_text(value)):
+        part = match.group(0)
+        if part.isascii():
+            output.append(part)
+            continue
+        characters = list(part)
+        output.extend(characters)
+        output.extend(
+            "".join(characters[index : index + 2])
+            for index in range(len(characters) - 1)
+        )
+    return output
+
+
+def _lexical_scores(
+    rows: Sequence[Mapping[str, Any]],
+    query: str,
+) -> list[float]:
+    query_terms = Counter(_tokens(query))
+    if not query_terms:
+        return [0.0] * len(rows)
+    document_terms = [
+        Counter(_tokens(f"{row['title']} {row['title']} {row['content']}"))
+        for row in rows
+    ]
+    document_lengths = [sum(terms.values()) for terms in document_terms]
+    average_length = sum(document_lengths) / max(len(document_lengths), 1)
+    document_frequency = {
+        term: sum(term in terms for terms in document_terms)
+        for term in query_terms
+    }
+    document_count = len(rows)
+    k1 = 1.5
+    b = 0.75
+    compact_query = re.sub(r"\s+", "", _normalized_text(query))
+    scores: list[float] = []
+    for row, terms, length in zip(
+        rows,
+        document_terms,
+        document_lengths,
+        strict=True,
+    ):
+        score = 0.0
+        for term, query_frequency in query_terms.items():
+            frequency = terms.get(term, 0)
+            if not frequency:
+                continue
+            frequency_in_documents = document_frequency[term]
+            inverse_document_frequency = math.log(
+                1.0
+                + (document_count - frequency_in_documents + 0.5)
+                / (frequency_in_documents + 0.5)
+            )
+            denominator = frequency + k1 * (
+                1.0 - b + b * length / max(average_length, 1.0)
+            )
+            score += (
+                inverse_document_frequency
+                * frequency
+                * (k1 + 1.0)
+                / denominator
+                * query_frequency
+            )
+        compact_document = re.sub(
+            r"\s+",
+            "",
+            _normalized_text(f"{row['title']} {row['content']}"),
+        )
+        if compact_query and compact_query in compact_document:
+            score += 1.0
+        scores.append(score)
+    return scores
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    numerator = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if not left_norm or not right_norm:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+class RagKnowledgeBase:
+    """Validated corpus with lexical or embedding-backed retrieval."""
+
+    def __init__(
+        self,
+        knowledge_base_path: Path,
+        rows: Sequence[Mapping[str, Any]],
+        *,
+        manifest: Mapping[str, Any],
+        embedding_metadata: RagEmbeddingMetadata | None,
+        vectors: Mapping[str, Sequence[float]],
+    ) -> None:
+        self.knowledge_base_path = knowledge_base_path
+        self._rows = tuple(dict(row) for row in rows)
+        self.manifest = dict(manifest)
+        self.embedding_metadata = embedding_metadata
+        self._vectors = {
+            row_id: tuple(vector)
+            for row_id, vector in vectors.items()
+        }
+
+    @classmethod
+    def open(cls, knowledge_base_path: Path | str) -> "RagKnowledgeBase":
+        source = Path(knowledge_base_path)
+        rows = load_knowledge_rows(source)
+        manifest = read_rag_manifest(source)
+        embedding = manifest["retrieval"]["embedding"]
+        metadata: RagEmbeddingMetadata | None = None
+        vectors: dict[str, tuple[float, ...]] = {}
+        if embedding["status"] == "ready":
+            metadata, vectors = _load_embedding_index(
+                source,
+                expected_documents_sha256=_sha256_file(source),
+                expected_ids=[str(row["id"]) for row in rows],
+            )
+        return cls(
+            source,
+            rows,
+            manifest=manifest,
+            embedding_metadata=metadata,
+            vectors=vectors,
+        )
+
+    @property
+    def chunk_count(self) -> int:
+        return len(self._rows)
+
+    @property
+    def embedding_ready(self) -> bool:
+        return self.embedding_metadata is not None
+
+    def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        chapter_ids: set[str] | frozenset[str] | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> list[RagHit]:
+        """Return ranked chunks, using BM25 until an embedding API is attached."""
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
+        rows = [
+            row
+            for row in self._rows
+            if chapter_ids is None or row["chapter_id"] in chapter_ids
+        ]
+        if not rows:
+            return []
+
+        retrieval_mode = "lexical"
+        if embedding_provider is None:
+            scores = _lexical_scores(rows, query)
+        else:
+            metadata = self.embedding_metadata
+            if metadata is None:
+                raise RagEmbeddingUnavailableError(
+                    "Embedding index is not ready; call build_embedding_index() "
+                    "after attaching an EmbeddingProvider"
+                )
+            provider_name, model = _provider_identity(embedding_provider)
+            if (
+                provider_name != metadata.provider_name
+                or model != metadata.model
+            ):
+                raise RagProviderError(
+                    "Query embedding provider/model does not match the stored index: "
+                    f"expected {metadata.provider_name}/{metadata.model}, "
+                    f"got {provider_name}/{model}"
+                )
+            try:
+                raw_query_vector = embedding_provider.embed_query(query)
+            except Exception as exc:
+                raise RagProviderError(f"Embedding provider failed for query: {exc}") from exc
+            query_vector = _validate_vector(
+                raw_query_vector,
+                expected_dimensions=metadata.dimensions,
+                label="query embedding",
+            )
+            scores = [
+                _cosine_similarity(query_vector, self._vectors[str(row["id"])])
+                for row in rows
+            ]
+            retrieval_mode = "semantic"
+
+        ranked = sorted(
+            (
+                (score, row)
+                for score, row in zip(scores, rows, strict=True)
+                if retrieval_mode == "semantic" or score > 0.0
+            ),
+            key=lambda item: (
+                -item[0],
+                int(item[1]["chapter_order"]),
+                str(item[1]["id"]),
+            ),
+        )[:top_k]
+        return [
+            RagHit(
+                id=str(row["id"]),
+                title=str(row["title"]),
+                chapter_id=str(row["chapter_id"]),
+                chapter_order=int(row["chapter_order"]),
+                content=str(row["content"]),
+                score=float(score),
+                retrieval_mode=retrieval_mode,
+            )
+            for score, row in ranked
+        ]
+
+    def retrieve_context(
+        self,
+        query: str,
+        *,
+        top_k: int = 5,
+        max_chars: int = 12_000,
+        chapter_ids: set[str] | frozenset[str] | None = None,
+        embedding_provider: EmbeddingProvider | None = None,
+    ) -> RagContext:
+        """Return citation-labelled text ready to augment a generation prompt."""
+
+        if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+            raise ValueError("max_chars must be a positive integer")
+        hits = self.retrieve(
+            query,
+            top_k=top_k,
+            chapter_ids=chapter_ids,
+            embedding_provider=embedding_provider,
+        )
+        included: list[RagHit] = []
+        blocks: list[str] = []
+        used = 0
+        for hit in hits:
+            prefix = f"[KB:{hit.id}] {hit.title}\n"
+            separator = "\n\n" if blocks else ""
+            available = max_chars - used - len(separator) - len(prefix)
+            if available <= 0:
+                break
+            content = hit.content
+            if len(content) > available:
+                if blocks:
+                    break
+                content = content[: max(available - 1, 0)].rstrip() + "…"
+            block = prefix + content
+            blocks.append(block)
+            included.append(hit)
+            used += len(separator) + len(block)
+        return RagContext(
+            query=query,
+            hits=tuple(included),
+            text="\n\n".join(blocks),
+        )
+
+
+__all__ = [
+    "EmbeddingProvider",
+    "RagContext",
+    "RagEmbeddingMetadata",
+    "RagEmbeddingUnavailableError",
+    "RagError",
+    "RagFormatError",
+    "RagHit",
+    "RagIndexStaleError",
+    "RagKnowledgeBase",
+    "RagProviderError",
+    "ZhipuEmbeddingProvider",
+    "build_embedding_index",
+    "initialize_rag_manifest",
+    "load_knowledge_rows",
+    "manifest_path_for",
+    "rag_manifest_is_current",
+    "read_rag_manifest",
+    "vector_index_path_for",
+]

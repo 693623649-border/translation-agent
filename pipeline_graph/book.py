@@ -23,6 +23,7 @@ import fitz
 
 import book_pipeline as legacy
 import extract_textbook_layer
+import rag_knowledge_base
 from pipeline_profiles import load_pipeline_profiles
 
 from .core import (
@@ -534,6 +535,18 @@ def _single_file_is_current(
     )
 
 
+def _knowledge_base_is_current(
+    context: GraphContext,
+    outputs: Mapping[str, Any],
+) -> bool:
+    """Require both canonical JSONL and its RAG discovery/index metadata."""
+
+    if not _single_file_is_current(context, outputs):
+        return False
+    saved = next(iter(outputs.values()))
+    return rag_knowledge_base.rag_manifest_is_current(Path(str(saved["path"])))
+
+
 def _import_source_is_current(
     context: GraphContext,
     outputs: Mapping[str, Any],
@@ -1004,7 +1017,11 @@ def _publisher_fingerprint(kind: str) -> Any:
         args = _parsed_args(context)
         value: dict[str, Any] = {
             "adapter": GRAPH_ADAPTER_VERSION,
-            "publisher": f"{kind}-v3" if kind == "docx" else f"{kind}-v2",
+            "publisher": (
+                f"{kind}-v3"
+                if kind in {"docx", "knowledge-base"}
+                else f"{kind}-v2"
+            ),
             "title": _book_title(context),
         }
         if kind == "docx":
@@ -2762,10 +2779,17 @@ def _knowledge_base_handler(context: GraphContext) -> NodeResult:
     legacy.write_knowledge_base(path, rows)
     _register_managed_publication(context, ART_KB, path)
     artifact = _file_artifact(path)
+    rag_manifest = rag_knowledge_base.manifest_path_for(path).resolve()
+    rag_metadata = rag_knowledge_base.read_rag_manifest(path)
+    embedding_status = rag_metadata["retrieval"]["embedding"]["status"]
     return NodeResult(
         outputs={ART_KB: artifact},
         fingerprints={ART_KB: str(artifact["sha256"])},
-        metadata={"rows": len(rows)},
+        metadata={
+            "rows": len(rows),
+            "rag_manifest": str(rag_manifest),
+            "embedding_status": embedding_status,
+        },
     )
 
 
@@ -3586,10 +3610,13 @@ def prepare_book_graph(
                             _knowledge_base_handler,
                             requires=(ART_SOURCE, ART_READER_CHAPTERS),
                             provides=(ART_KB,),
-                            version="1",
+                            version="2",
                             fingerprint=_publisher_fingerprint("knowledge-base"),
-                            cache_validator=_single_file_is_current,
-                            description="Publish knowledge-base JSONL from final chapter text.",
+                            cache_validator=_knowledge_base_is_current,
+                            description=(
+                                "Publish RAG knowledge-base JSONL and retrieval metadata "
+                                "from final chapter text."
+                            ),
                         )
                     )
                 if NODE_EPUB in selected_publishers:

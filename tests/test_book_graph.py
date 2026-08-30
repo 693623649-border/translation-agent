@@ -3957,6 +3957,16 @@ translation_profile = "translation"
                 self.assertEqual(language, "zh-CN")
                 output_path.write_bytes(b"epub")
 
+            plugin_rows = [
+                {
+                    "id": "1" * 40,
+                    "title": "Chapter",
+                    "chapter_id": "chapter",
+                    "chapter_order": 1,
+                    "content": "PLUGIN",
+                }
+            ]
+
             def fake_knowledge_rows(
                 pdf_path: Path,
                 chapter_dir: Path,
@@ -3965,14 +3975,24 @@ translation_profile = "translation"
                 self.assertEqual(pdf_path, source_pdf.resolve())
                 self.assertEqual(chapter_dir, alternate_dir.resolve())
                 self.assertEqual(manifest, alternate_manifest)
-                return [{"id": "plugin-row", "content": "PLUGIN"}]
+                return plugin_rows
 
             def fake_write_knowledge_base(
                 output_path: Path,
                 rows: list[dict[str, object]],
             ) -> None:
-                self.assertEqual(rows, [{"id": "plugin-row", "content": "PLUGIN"}])
-                output_path.write_text('{"content":"PLUGIN"}\n', encoding="utf-8")
+                self.assertEqual(rows, plugin_rows)
+                output_path.write_text(
+                    "\n".join(
+                        json.dumps(row, ensure_ascii=False)
+                        for row in rows
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                from rag_knowledge_base import initialize_rag_manifest
+
+                initialize_rag_manifest(output_path)
 
             with (
                 patch(

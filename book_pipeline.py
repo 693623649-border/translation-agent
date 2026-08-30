@@ -4019,6 +4019,12 @@ def write_knowledge_base(output_path: Path, rows: list[dict[str, Any]]) -> None:
     with output_path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # Keep the verifier-owned JSONL schema stable while publishing the RAG
+    # discovery sidecar.  Embeddings remain optional until a provider is
+    # supplied through ``rag_knowledge_base.EmbeddingProvider``.
+    from rag_knowledge_base import initialize_rag_manifest
+
+    initialize_rag_manifest(output_path)
 
 
 def strip_publication_metadata(

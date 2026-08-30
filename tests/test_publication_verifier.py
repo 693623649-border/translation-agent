@@ -1022,6 +1022,19 @@ class PublicationVerifierTests(unittest.TestCase):
             {issue["code"] for issue in check["issues"]},
         )
 
+    def test_missing_rag_manifest_blocks_knowledge_base_release(self) -> None:
+        (self.output / "knowledge_base.rag.json").unlink()
+
+        report = self._verify(report_name="kb-rag-manifest-missing.json")
+        check = self._checks(report)["knowledge_base.structure"]
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(check["status"], "failed")
+        self.assertIn(
+            "knowledge_base_rag_manifest_invalid",
+            {issue["code"] for issue in check["issues"]},
+        )
+
     def test_missing_page_checkpoint_blocks_full_release(self) -> None:
         (self.output / "pages" / "page_0006.json").unlink()
 

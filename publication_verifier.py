@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from xml.etree import ElementTree as ET
 
+import rag_knowledge_base
 from publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
@@ -3634,6 +3635,23 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
             issues=[_issue("knowledge_base_unreadable", str(exc), path=path)],
         )
 
+    rag_embedding_status: str | None = None
+    rag_manifest_path = rag_knowledge_base.manifest_path_for(path)
+    try:
+        rag_manifest = rag_knowledge_base.read_rag_manifest(path)
+        rag_embedding_status = str(
+            rag_manifest["retrieval"]["embedding"]["status"]
+        )
+    except rag_knowledge_base.RagError as exc:
+        issues.append(
+            _issue(
+                "knowledge_base_rag_manifest_invalid",
+                "RAG 清单缺失、过期或与知识库不一致。",
+                path=rag_manifest_path,
+                detail=str(exc),
+            )
+        )
+
     manifest_by_id = {str(item.get("id") or ""): item for item in context.manifest}
     rows_by_chapter: dict[str, list[dict[str, Any]]] = defaultdict(list)
     row_ids: list[str] = []
@@ -3844,6 +3862,11 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
             "covered_chapter_count": sum(bool(rows_by_chapter[key]) for key in manifest_by_id),
             "content_match_chapter_count": content_match_count,
             "chapter_count": len(manifest_by_id),
+            "rag_manifest_path": str(rag_manifest_path),
+            "rag_lexical_status": (
+                "ready" if rag_embedding_status is not None else "invalid"
+            ),
+            "rag_embedding_status": rag_embedding_status or "invalid",
         },
         issues=issues,
     )
