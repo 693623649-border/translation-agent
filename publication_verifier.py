@@ -3411,8 +3411,16 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
             source_markdown = context.chapter_texts.get(chapter_id)
             if source_markdown is None:
                 continue
+            # Mirror the Word publisher's soft-wrap merge so the expected
+            # text is derived from exactly what build_docx renders.
+            from book_pipeline import _normalize_wrapped_markdown_for_docx
+
             expected_text = _canonical_visible_text(
-                _markdown_visible_text(_docx_markdown_body(source_markdown))
+                _markdown_visible_text(
+                    _normalize_wrapped_markdown_for_docx(
+                        _docx_markdown_body(source_markdown)
+                    )
+                )
             )
             canonical_actual = _canonical_visible_text(actual_text)
             if canonical_actual != expected_text:

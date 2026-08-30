@@ -102,7 +102,7 @@ deploy/paddleocr/
 ```bash
 cd deploy/paddleocr
 
-# 基础镜像约 16GB，一次拉取后常驻 D 盘 Docker 数据区
+# 基础镜像约 16GB，一次拉取后常驻 E 盘 Docker 数据区
 docker pull ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.3.0-gpu-cuda12.9-cudnn9.9
 
 # 构建（安装 paddleocr；国内网络走百度 pip 源）
@@ -157,12 +157,12 @@ result = ocr.predict("/workspace/io/images/page.png")
 
 ## Docker 数据盘位置（防 C 盘爆满）
 
-本机 Docker Desktop 已确认全部数据落在 D 盘，机制有两层：
+本机 Docker Desktop 已确认全部数据落在 E 盘，机制有两层：
 
-1. `C:\Users\<user>\AppData\Local\Docker` 是指向 `D:\DockerDesktop\Docker` 的 NTFS junction（安装时配置），WSL 后端的 `docker_data.vhdx`（镜像/容器层）物理上位于 `D:\DockerDesktop\Docker\wsl\disk\`；
-2. Docker Desktop 设置 `DataFolder=D:\DockerDesktop\Docker\vm-data`（`%APPDATA%\Docker\settings-store.json`），Hyper-V 语义下的 VM 数据也固定在 D 盘。
+1. `C:\Users\<user>\AppData\Local\Docker` 是指向 `E:\Deeplearning\DockerDesktop\Docker` 的 NTFS junction，WSL 后端的 `docker_data.vhdx`（镜像/容器层）物理上位于 `E:\Deeplearning\DockerDesktop\Docker\wsl\disk\`；
+2. Docker Desktop 设置 `DataFolder=E:\Deeplearning\DockerDesktop\Docker\vm-data`（`%APPDATA%\Docker\settings-store.json`），Hyper-V 语义下的 VM 数据也固定在 E 盘。
 
-排查方法：`docker pull` 任意镜像后看 `D:\DockerDesktop\Docker\wsl\disk\docker_data.vhdx` 的修改时间是否前进；`fsutil file queryfileid` 两个路径 ID 一致即为同一文件。
+排查方法：`docker pull` 任意镜像后看 `E:\Deeplearning\DockerDesktop\Docker\wsl\disk\docker_data.vhdx` 的修改时间是否前进；`fsutil file queryfileid` 两个路径 ID 一致即为同一文件。
 
 ## 常见问题
 

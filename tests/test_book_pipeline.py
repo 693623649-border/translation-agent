@@ -699,6 +699,7 @@ class UtilityTests(unittest.TestCase):
             with (
                 patch.dict("os.environ", {"GLM_OCR_API_KEY": "standard-key"}, clear=True),
                 patch("book_pipeline.GlmClient", RecordingGlmOCR),
+                patch("book_pipeline.load_env_file", lambda path: None),
                 patch("sys.stderr", stderr),
             ):
                 result = main(
@@ -1129,6 +1130,30 @@ M.E.Sharpe, Inc., 1983.
                 chapter_title="第一章 歌德的《浮士德》：发展的悲剧",
             ),
             "# 第一章 歌德的《浮士德》：发展的悲剧\n\n正文。\n\n后文。\n",
+        )
+
+    def test_epub_subsection_heading_repeating_chapter_title_is_kept(self) -> None:
+        source = """# 第一章 欲望机器
+
+## 1. 欲望机器
+
+正文。
+
+## 2. 无器官身体
+
+后文。
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="反俄狄浦斯",
+                chapter_title="第一章 欲望机器",
+            ),
+            "# 第一章 欲望机器\n\n"
+            "## 1. 欲望机器\n\n"
+            "正文。\n\n"
+            "## 2. 无器官身体\n\n"
+            "后文。\n",
         )
 
     def test_markdown_formatted_short_running_title_is_removed(self) -> None:
@@ -2582,6 +2607,86 @@ class MappingAndCompilationTests(unittest.TestCase):
             if paragraph.text.startswith("English")
         )
         self.assertEqual(paragraph.text, "English emphasized tail.")
+
+    def test_docx_embeds_chapter_images(self) -> None:
+        output = self.root / "docx-image-embed"
+        chapter_dir = output / "chapters"
+        media_dir = output / "media"
+        media_dir.mkdir(parents=True)
+        chapter_dir.mkdir(parents=True)
+        Image.new("RGB", (480, 320), color=(255, 255, 255)).save(
+            media_dir / "fig_small.png"
+        )
+        Image.new("RGB", (2400, 900), color=(0, 0, 0)).save(
+            media_dir / "fig_wide.png"
+        )
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n"
+            "正文段落。\n\n"
+            "![](../media/fig_small.png)\n\n"
+            "![](../media/fig_wide.png)\n\n"
+            "后续段落。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": False,
+            }
+        ]
+        docx_path = output / "figures.docx"
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+
+        from docx import Document
+
+        document = Document(docx_path)
+        self.assertEqual(len(document.inline_shapes), 2)
+        widths = sorted(shape.width.cm for shape in document.inline_shapes)
+        self.assertAlmostEqual(widths[0], 480 / 96 * 2.54, places=2)
+        self.assertAlmostEqual(widths[1], 14.5, places=2)
+        figure_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs
+            if not paragraph.text.strip() and paragraph.runs
+        ]
+        centered = [
+            paragraph
+            for paragraph in figure_paragraphs
+            if paragraph.alignment == WD_ALIGN_PARAGRAPH.CENTER
+        ]
+        self.assertEqual(len(centered), 2)
+        for paragraph in centered:
+            self.assertEqual(paragraph.paragraph_format.first_line_indent, 0)
+
+    def test_docx_missing_image_fails_loudly(self) -> None:
+        output = self.root / "docx-image-missing"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n![](../media/absent.png)\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": False,
+            }
+        ]
+        with self.assertRaises(FileNotFoundError):
+            build_docx(
+                output / "missing-figure.docx",
+                chapter_dir,
+                manifest,
+                book_title="测试书",
+            )
 
     def test_docx_wrap_lines_are_merged(self) -> None:
         output = self.root / "docx-wrap-merge"

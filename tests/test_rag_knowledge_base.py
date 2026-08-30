@@ -264,13 +264,21 @@ class RagKnowledgeBaseTests(unittest.TestCase):
             fingerprints={},
         )
 
-        self.assertTrue(
-            _knowledge_base_is_current(context, {"publication.knowledge_base": saved})
-        )
-        manifest_path_for(self.knowledge_path).unlink()
-        self.assertFalse(
-            _knowledge_base_is_current(context, {"publication.knowledge_base": saved})
-        )
+        # The graph's argument parser loads the repository .env when one
+        # exists, and other tests invoking book_pipeline.main() leak those
+        # values into os.environ; unit tests must run against a clean
+        # environment instead.
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("book_pipeline.load_env_file", lambda path: None),
+        ):
+            self.assertTrue(
+                _knowledge_base_is_current(context, {"publication.knowledge_base": saved})
+            )
+            manifest_path_for(self.knowledge_path).unlink()
+            self.assertFalse(
+                _knowledge_base_is_current(context, {"publication.knowledge_base": saved})
+            )
 
     def test_zhipu_provider_uses_embedding3_and_preserves_response_order(self) -> None:
         endpoint = FakeZhipuEmbeddings()

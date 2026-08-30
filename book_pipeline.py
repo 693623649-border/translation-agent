@@ -4229,12 +4229,17 @@ def strip_publication_metadata(
         stripped = line.strip()
         if not normalized_titles or not stripped:
             return False
-        if stripped.startswith("#"):
+        heading_match = re.match(r"^(#+)\s*", stripped)
+        if heading_match is not None:
             # Keep the generated chapter H1 at the start, but still recognize
             # OCR that spuriously formats a later running header as Markdown.
+            # Real subsection headings (## …) may legitimately repeat chapter
+            # title text, so only H1 lines qualify as running headers.
             if not output:
                 return False
-            stripped = re.sub(r"^#{1,6}\s*", "", stripped)
+            if len(heading_match.group(1)) != 1:
+                return False
+            stripped = stripped[heading_match.end():]
         without_page = re.sub(r"^\s*\d{1,4}\s*", "", stripped)
         without_page = re.sub(r"\s*\d{1,4}\s*$", "", without_page)
         candidate = normalize_match_text(without_page)
@@ -4957,17 +4962,54 @@ def _docx_style_name(
     return preferred
 
 
+_DOCX_MAX_IMAGE_WIDTH_CM = 14.5
+
+
+def _resolve_markdown_image_path(src: str, base_dir: Path | None) -> Path:
+    """Resolve an authored image reference against its chapter directory."""
+
+    if not src.strip():
+        raise ValueError("Markdown references an image without a source path.")
+    candidate = Path(src.strip())
+    if not candidate.is_absolute():
+        if base_dir is None:
+            raise FileNotFoundError(
+                f"Markdown references image {src!r} but no chapter directory "
+                "is available to resolve it."
+            )
+        candidate = base_dir / candidate
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"Markdown references image {src!r} but the file is missing: "
+            f"{candidate}"
+        )
+    return candidate
+
+
+def _docx_image_display_width(path: Path) -> Any:
+    """Return a display width that never upscales or overflows the column."""
+
+    from docx.shared import Cm
+    from PIL import Image
+
+    with Image.open(path) as image:
+        pixel_width = image.width
+    native_cm = pixel_width / 96.0 * 2.54
+    return Cm(min(max(native_cm, 1.0), _DOCX_MAX_IMAGE_WIDTH_CM))
+
+
 def _append_markdown_to_docx(
     document: Any,
     markdown_text: str,
     *,
     body_style: str | None = None,
-    asset_base: Path | None = None,
+    base_dir: Path | None = None,
 ) -> None:
     """Render reader-facing Markdown without flattening its structure."""
 
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
     from docx.enum.text import WD_BREAK  # type: ignore[import-not-found]
-    from docx.shared import Cm  # type: ignore[import-not-found]
+    from docx.shared import Pt  # type: ignore[import-not-found]
 
     fragment = markdown_to_html(_normalize_wrapped_markdown_for_docx(markdown_text))
     # Python-Markdown preserves authored raw HTML verbatim, so ``<br>`` may
@@ -4980,6 +5022,23 @@ def _append_markdown_to_docx(
         flags=re.I,
     )
     root = ET.fromstring(f"<document>{fragment}</document>")
+
+    def embed_image(
+        paragraph: Any,
+        element: ET.Element,
+        *,
+        centered: bool,
+    ) -> None:
+        """Embed an authored image run, resolving it against ``base_dir``."""
+
+        if centered:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.first_line_indent = Pt(0)
+        path = _resolve_markdown_image_path(element.get("src") or "", base_dir)
+        paragraph.add_run().add_picture(
+            str(path),
+            width=_docx_image_display_width(path),
+        )
 
     def append_inline(
         paragraph: Any,
@@ -5024,10 +5083,13 @@ def _append_markdown_to_docx(
             elif tag == "img":
                 source = _resolve_local_publication_image(
                     str(child.get("src") or ""),
-                    asset_base,
+                    base_dir,
                 )
                 if source is not None:
-                    paragraph.add_run().add_picture(str(source), width=Cm(12))
+                    paragraph.add_run().add_picture(
+                        str(source),
+                        width=_docx_image_display_width(source),
+                    )
                 else:
                     add_run(
                         str(child.get("alt") or ""),
@@ -5141,6 +5203,14 @@ def _append_markdown_to_docx(
                 if quote
                 else (body_style or _docx_style_name(document, "Normal"))
             )
+            image_children = [
+                child for child in element if _html_local_name(child) == "img"
+            ]
+            if image_children and not _html_element_text(element):
+                for child in image_children:
+                    figure = document.add_paragraph(style=style)
+                    embed_image(figure, child, centered=True)
+                return
             add_paragraph(element, style=style)
             return
         if tag == "blockquote":
@@ -5675,7 +5745,7 @@ def build_docx(
             document,
             rendered_markdown,
             body_style=_docx_manifest_body_style(item),
-            asset_base=chapter_dir,
+            base_dir=chapter_dir,
         )
     _style_docx_tables(document)
     document.core_properties.title = book_title

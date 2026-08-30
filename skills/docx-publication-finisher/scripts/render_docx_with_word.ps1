@@ -130,8 +130,8 @@ try {
     foreach ($planned in $plannedExports) {
         $document = $null
         try {
-            $document = $word.Documents.Open($planned.docx, $false, $true, $false)
-            $document.ExportAsFixedFormat($planned.pdf, 17)
+            $document = $word.Documents.Open([string]$planned.docx, $false, $true, $false)
+            $document.ExportAsFixedFormat([string]$planned.pdf, 17)
             $exports.Add([ordered]@{
                 docx = $planned.docx
                 pdf = (Get-Item -LiteralPath $planned.pdf).FullName

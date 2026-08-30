@@ -49,7 +49,34 @@ class DocxRenderGateTests(unittest.TestCase):
         self.assertGreaterEqual(report["metrics"]["text_coverage"], 0.9)
 
     def test_missing_renderer_is_a_hard_failure(self) -> None:
-        with patch("docx_render_gate.find_soffice", return_value=None):
+        with patch("docx_render_gate.find_soffice", return_value=None), patch(
+            "docx_render_gate._render_docx_with_word", return_value=None
+        ):
+            report = verify_docx_render("missing.docx")
+
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["issues"][0]["code"], "docx_renderer_missing")
+
+    def test_word_fallback_renders_when_soffice_missing(self) -> None:
+        fallback = {
+            "status": "passed",
+            "issues": [],
+            "warnings": [],
+            "metrics": {"renderer": "microsoft-word-isolated"},
+        }
+        with patch("docx_render_gate.find_soffice", return_value=None), patch(
+            "docx_render_gate._render_docx_with_word", return_value=fallback
+        ) as mocked_fallback:
+            report = verify_docx_render("book.docx")
+
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(report["metrics"]["renderer"], "microsoft-word-isolated")
+        mocked_fallback.assert_called_once()
+
+    def test_word_fallback_needs_windows_and_script(self) -> None:
+        with patch("docx_render_gate.find_soffice", return_value=None), patch(
+            "docx_render_gate._WORD_RENDER_SCRIPT", Path("Z:/absent/render.ps1")
+        ):
             report = verify_docx_render("missing.docx")
 
         self.assertEqual(report["status"], "failed")

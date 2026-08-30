@@ -188,6 +188,31 @@ class TextLayerExtractorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, r"PDF 2 \(empty-text\)"):
                 extract_text_layer(internal, root / "internal-output")
 
+    def test_standalone_stripped_page_number_is_explicit_blank_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root / "number-only-page.pdf"
+            output = root / "output"
+            make_text_pdf(
+                pdf,
+                [
+                    "Front matter text.",
+                    "Chapter body before a source blank.",
+                    "1",
+                    "Chapter body after a source blank.",
+                ],
+            )
+
+            extract_text_layer(
+                pdf,
+                output,
+                strip_leading_page_number_offset=2,
+            )
+            records = PageStore(output).load_all()
+
+            self.assertEqual(records[2].text, "[空白页]")
+            self.assertIn("boundary-blank", records[2].ocr_model)
+
     def test_optional_headings_mark_only_unique_exact_lines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

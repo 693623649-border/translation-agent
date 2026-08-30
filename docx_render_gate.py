@@ -9,6 +9,7 @@ sanity checks.  The temporary PDF is never a publication artifact.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from collections import Counter
 from pathlib import Path
@@ -62,6 +63,102 @@ def find_soffice() -> str | None:
         "/usr/lib/libreoffice/program/soffice",
     ]
     return next((value for value in candidates if value and Path(value).is_file()), None)
+
+
+_WORD_RENDER_SCRIPT = (
+    Path(__file__).resolve().parent
+    / "skills"
+    / "docx-publication-finisher"
+    / "scripts"
+    / "render_docx_with_word.ps1"
+)
+
+
+def _render_docx_with_word(path: Path, *, timeout_seconds: int) -> dict[str, Any] | None:
+    """Render via the isolated Word COM fallback when LibreOffice is absent.
+
+    Returns ``None`` when this Windows-only fallback is unavailable so the
+    caller keeps its renderer-missing diagnostic; otherwise returns the
+    rendered-PDF verdict using the same page inspection as LibreOffice.
+    """
+
+    if os.name != "nt" or not _WORD_RENDER_SCRIPT.is_file():
+        return None
+    with tempfile.TemporaryDirectory(prefix="docx-render-word-") as directory:
+        output_dir = Path(directory) / "output"
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(_WORD_RENDER_SCRIPT),
+            "-DocxPath",
+            str(path),
+            "-OutputDirectory",
+            str(output_dir),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "status": "failed",
+                "issues": [
+                    _issue("docx_render_failed", f"{type(exc).__name__}: {exc}")
+                ],
+                "warnings": [],
+                "metrics": {
+                    "path": str(path),
+                    "renderer": "microsoft-word-isolated",
+                },
+            }
+        # Windows PowerShell writes the console in the OEM code page; decode
+        # tolerantly because success is proven by the exit code and the PDF
+        # artifact, not by parsing the JSON report.
+        stdout_text = (completed.stdout or b"").decode("utf-8", errors="replace")
+        stderr_text = (completed.stderr or b"").decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(stdout_text.strip() or "{}")
+        except ValueError:
+            payload = {}
+        pdf_path = output_dir / f"{path.stem}.pdf"
+        if completed.returncode != 0 or not pdf_path.is_file():
+            return {
+                "status": "failed",
+                "issues": [
+                    _issue(
+                        "docx_render_failed",
+                        "隔离 Word 渲染器未生成有效 PDF。",
+                        returncode=completed.returncode,
+                        stderr=(stderr_text or stdout_text).strip()[-1200:],
+                    )
+                ],
+                "warnings": [],
+                "metrics": {
+                    "path": str(path),
+                    "renderer": "microsoft-word-isolated",
+                    "renderer_report": payload,
+                },
+            }
+        inspected = inspect_rendered_pdf(
+            pdf_path,
+            expected_text=_docx_visible_text(path),
+        )
+        return {
+            "status": "failed" if inspected["issues"] else "passed",
+            "issues": list(inspected["issues"]),
+            "warnings": list(inspected["warnings"]),
+            "metrics": {
+                "path": str(path),
+                "renderer": "microsoft-word-isolated",
+                **inspected["metrics"],
+            },
+        }
 
 
 def _issue(code: str, message: str, **evidence: Any) -> dict[str, Any]:
@@ -551,13 +648,16 @@ def inspect_rendered_pdf(pdf_path: Path, *, expected_text: str) -> dict[str, Any
 def verify_docx_render(
     docx_path: str | os.PathLike[str],
     *,
-    timeout_seconds: int = 300,
+    timeout_seconds: int = 600,
 ) -> dict[str, Any]:
     path = Path(docx_path).expanduser().resolve()
     issues: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     soffice = find_soffice()
     if soffice is None:
+        word_result = _render_docx_with_word(path, timeout_seconds=timeout_seconds)
+        if word_result is not None:
+            return word_result
         return {
             "status": "failed",
             "issues": [

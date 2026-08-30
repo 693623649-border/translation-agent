@@ -20,7 +20,9 @@ from book_pipeline import (
     write_knowledge_base,
 )
 from publication_verifier import (
+    _canonical_visible_text,
     _citation_inventory,
+    _docx_document_payload,
     _docx_markdown_body,
     _docx_positive_footnote_texts,
     _expected_chapter_end_pages,
@@ -59,6 +61,50 @@ class PublicationVerifierTests(unittest.TestCase):
     def test_docx_body_strips_footnote_after_ascii_exclamation(self) -> None:
         source = "# 章节\n\n人心![^note]\n\n[^note]: 注释。\n"
         self.assertEqual(_docx_markdown_body(source), "# 章节\n\n人心!\n")
+
+    def test_docx_expected_text_mirrors_soft_wrap_merge(self) -> None:
+        from book_pipeline import _normalize_wrapped_markdown_for_docx
+
+        source = (
+            "# 章节\n\n"
+            "批评理论仍然把特定的某一方面\n作为诗歌的本原主题。\n\n"
+            "quoted ascii tail.\n"
+        )
+        expected = _canonical_visible_text(
+            _markdown_visible_text(
+                _normalize_wrapped_markdown_for_docx(_docx_markdown_body(source))
+            )
+        )
+        self.assertIn("某一方面作为诗歌的本原主题", expected)
+        self.assertIn("quoted ascii tail.", expected)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chapter_dir = root / "chapters"
+            chapter_dir.mkdir()
+            (chapter_dir / "001_章节.md").write_text(source, encoding="utf-8")
+            docx_path = root / "章节.docx"
+            build_docx(
+                docx_path,
+                chapter_dir,
+                [
+                    {
+                        "sequence": 1,
+                        "id": "chapter",
+                        "display_title": "章节",
+                        "filename": "001_章节.md",
+                        "reviewed_override": False,
+                    }
+                ],
+                book_title="书",
+            )
+            from docx import Document
+
+            _preamble, chapters = _docx_document_payload(Document(str(docx_path)))
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(
+            _canonical_visible_text(str(chapters[0]["text"])), expected
+        )
 
     def test_standard_footnote_inventory_keeps_legacy_markers_out_of_contract(self) -> None:
         inventory = _citation_inventory(
