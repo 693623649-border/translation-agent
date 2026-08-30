@@ -69,3 +69,10 @@ desktop.ini
 venv/
 env/
 .venv/
+
+# 本地辅助工具与一次性脚本（个人工作产物，不入库）
+.omx/
+repair-ocr.toml
+cleanup_wenxue_lilun.py
+scan_fragments.py
+summarize_verify.py
