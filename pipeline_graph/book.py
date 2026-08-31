@@ -797,7 +797,7 @@ def _ocr_segmentation_semantics() -> dict[str, Any]:
 def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
     profile = _selected_model_profiles(args)["ocr"]
     reading_direction = legacy.resolve_ocr_reading_direction(args, profile)
-    backend = profile.adapter if profile is not None else args.ocr_backend
+    backend, _reason = legacy.resolve_ocr_backend_name(args, profile)
     if backend == "coding-plan-mcp":
         identity: dict[str, Any] = {
             "backend": backend,
@@ -830,6 +830,22 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
                 else args.ocr_api_base
             ),
             "model": profile.model if profile is not None else args.ocr_model,
+        }
+        segmentation = None
+    elif backend == "paddleocr-local":
+        identity = {
+            "backend": backend,
+            "model": legacy.paddle_local_model_id(
+                det_variant=args.paddle_det_variant,
+                rec_variant=args.paddle_rec_variant,
+                det_mode=args.paddle_det_mode,
+                rec_mode=args.paddle_rec_mode,
+                rec_batch=args.paddle_rec_batch,
+                det_len=args.paddle_det_len,
+                dpi=args.dpi,
+                max_image_side=args.max_image_side,
+            ),
+            "workers": args.paddle_workers,
         }
         segmentation = None
     else:
@@ -2813,10 +2829,20 @@ def _knowledge_base_handler(context: GraphContext) -> NodeResult:
     path = _publication_target_path(context, ART_KB)
     legacy.write_knowledge_base(path, rows)
     args = _parsed_args(context)
-    rag_knowledge_base.maybe_build_zhipu_embedding_index(
-        path,
-        requested=getattr(args, "rag_embed", None),
-    )
+    # The embedding index is an additive retrieval convenience; a provider
+    # outage or quota limit must not fail the publication itself.
+    try:
+        rag_knowledge_base.maybe_build_zhipu_embedding_index(
+            path,
+            requested=getattr(args, "rag_embed", None),
+        )
+    except rag_knowledge_base.RagError as exc:
+        print(
+            f"[rag] embedding index deferred: {exc} "
+            "(knowledge base stays lexical-only; rerun "
+            "translation-agent-kb register later)",
+            flush=True,
+        )
     _register_managed_publication(context, ART_KB, path)
     artifact = _file_artifact(path)
     rag_manifest = rag_knowledge_base.manifest_path_for(path).resolve()

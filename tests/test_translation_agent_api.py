@@ -365,6 +365,10 @@ translation_profile = "deepseek_pro"
                     "translation_agent_api.output_status",
                     return_value={"translations_profile_fresh": 0},
                 ) as mocked_status,
+                # The selected glm_vision profile is the remote fallback; the
+                # test asserts profile-based identity, so hold the local
+                # PaddleOCR probe off (its availability is host-dependent).
+                patch("book_pipeline.paddle_local_available", return_value=False),
             ):
                 result = run_book(
                     RunRequest(

@@ -660,6 +660,39 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 
 Tesseract OCR 本身不需要 API Key，但自动目录解析仍需要 GLM/Coding Plan Key，把非中文 OCR 翻译为中文则需要独立的 DeepSeek Key。复杂竖排、注音或多栏页面建议抽样复核；可以只对失败页结合 `--start-page`、`--end-page` 和 `--force` 重跑。
 
+### 本地 PaddleOCR（GPU Docker 后端，auto 默认优先）
+
+本机部署的 PaddleOCR（`deploy/paddleocr/`，RTX 5090 GPU）已接为流水线
+一等后端，并设为 `--ocr-backend auto` 的默认优先选择：**本地部署可用时
+一律走本地 GPU 推理**（无内容过滤、不耗 API 配额），不可用时自动回退
+到 OCR profile（云端 coding-plan/glm_vision）。显式 `--ocr-backend
+coding-plan-mcp` 等仍可强制远端；适合整本本地 OCR、续跑失败页，以及云端
+视觉模型内容过滤拒绝的页面：
+
+```bash
+# 默认即本地优先（auto）：可用时走本地 GPU，否则自动回退云端，无需任何参数
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr
+
+# 强制本地（检查点指纹为 paddleocr-local/PP-OCRv5-…，与云端检查点互不混用）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend paddleocr-local
+
+# 强制云端（备用）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend coding-plan-mcp
+
+# 只补失败页（自动按连续页段批量调用 Docker，已匹配指纹的页直接命中缓存）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --start-page 198 --end-page 198 --ocr-backend paddleocr-local
+
+# 或经 Profile 选用（pipeline.toml 已内置 profiles.paddleocr_local）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --config pipeline.toml --ocr-profile paddleocr_local
+```
+
+执行体是 `tools/local_paddleocr_import.py`（渲染 → `docker compose --profile
+gpu` 分片识别 → 导入 PageRecord），参数用 `--paddle-det-variant/--paddle-rec-
+variant/--paddle-det-mode/--paddle-rec-mode/--paddle-rec-batch/--paddle-det-len/
+--paddle-workers` 调整；先决条件：Docker Desktop 已启动、`deploy/paddleocr/
+models/` 权重已下载（见 `deploy/paddleocr/README.md` 实测配置）。空白页沿用
+`[空白页]` 显式标记约定，跨页断句、目录与出版流程与其他后端完全一致。
+
 ### ZIP 图片输入先转为正向 PDF
 
 `book_pipeline.py` 的输入是 PDF，不直接读取 ZIP。图片 ZIP 必须先解压、按自然页序排序，忽略 `__MACOSX`、`.DS_Store` 等元数据文件，对每张图应用 EXIF 方向并确认正文实际朝上，再按“一张图片对应一页”合成 PDF。不要仅凭文件宽高猜方向；日文竖排书页也应保持整页正向，文字栏通常从右向左排列。建议抽查首、中、末页，确认没有 90°/180° 倒置后再运行 OCR：

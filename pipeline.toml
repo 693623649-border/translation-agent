@@ -49,3 +49,13 @@ toc_profile = "glm_toc"
 translation_profile = "deepseek_flash"
 # Optional. When omitted, proofreading safely reuses translation_profile.
 proofread_profile = "deepseek_flash"
+
+[profiles.paddleocr_local]
+adapter = "paddleocr-local"
+provider = "paddleocr"
+base_url = ""
+model = "PP-OCRv5-server"
+credential_env = ""
+timeout = 600
+concurrency = 1
+thinking = "disabled"

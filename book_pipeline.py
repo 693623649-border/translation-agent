@@ -2602,19 +2602,47 @@ def ocr_pdf(
     existing = {record.pdf_page: record for record in load_page_records(output_dir)}
     cache_model_prefixes = parse_model_prefixes(cache_model_prefix)
     pages = list(range(start_page, end_page + 1))
+    # Checkpoints produced by a heterogeneous local backend (PaddleOCR) are
+    # never silently overwritten by a cloud rerun: a mixed-backend book keeps
+    # its local pages unless --force explicitly replaces them.
+    requested_is_paddle_local = bool(
+        (cache_model_exact or "").startswith("paddleocr-local/")
+        or any(
+            (prefix or "").startswith("paddleocr-local/")
+            for prefix in cache_model_prefixes
+        )
+    )
+    protected = [
+        page
+        for page in pages
+        if page in existing
+        and existing[page].ocr_model.startswith("paddleocr-local/")
+        and not requested_is_paddle_local
+    ]
+    if protected:
+        print(
+            f"[ocr] protected-local-pages={protected} (paddleocr-local "
+            "checkpoints kept; use --force to replace with this backend)",
+            flush=True,
+        )
     pending = [
         page
         for page in pages
         if force
-        or page not in existing
-        or not existing[page].text.strip()
         or (
-            cache_model_exact
-            and existing[page].ocr_model != cache_model_exact
-        )
-        or (
-            cache_model_prefixes
-            and not existing[page].ocr_model.startswith(cache_model_prefixes)
+            page not in protected
+            and (
+                page not in existing
+                or not existing[page].text.strip()
+                or (
+                    cache_model_exact
+                    and existing[page].ocr_model != cache_model_exact
+                )
+                or (
+                    cache_model_prefixes
+                    and not existing[page].ocr_model.startswith(cache_model_prefixes)
+                )
+            )
         )
     ]
     print(f"[ocr] total={len(pages)} cached={len(pages) - len(pending)} pending={len(pending)}")
@@ -4254,13 +4282,17 @@ def strip_publication_metadata(
                 return True
             # OCR often changes one or two title glyphs (for example 普遍→普通)
             # and appends the author after a divider.  Keep the threshold strict
-            # enough that ordinary body sentences cannot be mistaken for headers.
+            # enough that ordinary body sentences cannot be mistaken for headers:
+            # a mutated running header keeps the title's length, so lines that
+            # merely START with the title (dialogue attributions like
+            # ``包法利夫人回答道：``) fail the length-similarity guard.
             title_prefix = re.split(r"[|｜]", without_page, maxsplit=1)[0]
             if "〉" in title_prefix:
                 title_prefix = title_prefix.split("〉", maxsplit=1)[0] + "〉"
             comparable = normalize_match_text(title_prefix)
             if (
-                len(comparable) <= len(normalized_title) + 12
+                abs(len(comparable) - len(normalized_title)) <= 2
+                and len(comparable) <= len(normalized_title) + 12
                 and SequenceMatcher(None, normalized_title, comparable).ratio() >= 0.68
             ):
                 return True
@@ -5058,6 +5090,10 @@ def _append_markdown_to_docx(
             if "\n" in text:
                 text = re.sub(r"\n+", " ", text)
             if not text.strip():
+                # Whitespace-only interlude between inline elements (for
+                # example the gaps in a list of links): keep one space so the
+                # rendered text stays aligned with the Markdown source.
+                paragraph.add_run(" ")
                 return
             run = paragraph.add_run(text)
             if run_bold:
@@ -5948,9 +5984,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["coding-plan-mcp", "glm-ocr", "tesseract"],
-        default=os.getenv("OCR_BACKEND", "coding-plan-mcp"),
-        help="Coding Plan vision MCP (recommended) or separately billed standard GLM-OCR API.",
+        choices=["auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local"],
+        default=os.getenv("OCR_BACKEND", "auto"),
+        help=(
+            "auto prefers the local PaddleOCR GPU deployment and falls back to "
+            "the OCR profile/cloud backend when it is unavailable; coding-plan-mcp "
+            "is the cloud vision MCP, glm-ocr the separately billed standard API, "
+            "tesseract the offline engine, paddleocr-local the explicit local GPU "
+            "deployment (no content filtering, no API quota)."
+        ),
     )
     parser.add_argument(
         "--ocr-reading-direction",
@@ -5964,6 +6006,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tesseract-language", default="jpn_vert+eng")
     parser.add_argument("--tesseract-psm", type=int, default=3)
+    parser.add_argument(
+        "--paddle-workers",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Local PaddleOCR Docker shards (1 or 2).",
+    )
+    parser.add_argument(
+        "--paddle-det-variant",
+        choices=("server", "mobile"),
+        default="server",
+        help="Local PaddleOCR detection model variant.",
+    )
+    parser.add_argument(
+        "--paddle-rec-variant",
+        choices=("server", "mobile"),
+        default="server",
+        help="Local PaddleOCR recognition model variant.",
+    )
+    parser.add_argument("--paddle-det-mode", default="paddle_fp32")
+    parser.add_argument("--paddle-rec-mode", default="paddle_fp16")
+    parser.add_argument("--paddle-rec-batch", type=int, default=16)
+    parser.add_argument("--paddle-det-len", type=int, default=736)
     parser.add_argument("--ocr-api-key", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--ocr-api-key-env",
@@ -6538,10 +6603,144 @@ def resolve_expected_ocr_model_prefix(
         return args.required_ocr_model_prefix
     if args.ocr_cache_model_prefix:
         return str(args.ocr_cache_model_prefix)
-    if ocr_profile is not None and ocr_profile.adapter == "coding-plan-mcp":
+    backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
+    if backend == "coding-plan-mcp":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
-        return f"coding-plan/{ocr_profile.model}-vision-mcp/{direction}-v2"
+        model = (
+            ocr_profile.model
+            if ocr_profile is not None
+            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
+        )
+        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
+    if backend == "paddleocr-local":
+        return "paddleocr-local/"
     return None
+
+
+_PADDLE_OCR_IMAGE = "local/paddleocr:3.7.0-gpu"
+_PADDLE_MODELS_DIR = (
+    Path(__file__).resolve().parent / "deploy" / "paddleocr" / "models"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def paddle_local_available() -> bool:
+    """Probe whether the local PaddleOCR Docker deployment can serve OCR.
+
+    The check is deliberately cheap (engine ping + image + weights); it does
+    not launch a GPU container.  Cached per process so every stage in one run
+    sees the same answer.
+    """
+
+    if shutil.which("docker") is None:
+        return False
+    try:
+        engine = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if engine.returncode:
+            return False
+        images = subprocess.run(
+            ["docker", "images", "-q", _PADDLE_OCR_IMAGE],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if images.returncode or not images.stdout.strip():
+            return False
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return all(
+        (_PADDLE_MODELS_DIR / name).is_dir()
+        for name in ("PP-OCRv5_server_det", "PP-OCRv5_server_rec")
+    )
+
+
+def resolve_ocr_backend_name(
+    args: argparse.Namespace,
+    ocr_profile: ModelProfile | None = None,
+) -> tuple[str, str]:
+    """Resolve the effective OCR backend, preferring the local GPU deployment.
+
+    ``--ocr-backend auto`` (the default) selects the local PaddleOCR Docker
+    deployment whenever it is available and keeps the cloud/vision backend as
+    the fallback.  An explicit ``--ocr-backend`` always wins.
+    """
+
+    requested = str(getattr(args, "ocr_backend", "") or "auto").strip()
+    if requested not in {"auto", ""}:
+        return requested, "explicit --ocr-backend"
+    if paddle_local_available():
+        return "paddleocr-local", "auto: local PaddleOCR GPU deployment detected"
+    fallback = (
+        ocr_profile.adapter
+        if ocr_profile is not None and ocr_profile.adapter
+        else "coding-plan-mcp"
+    )
+    return fallback, (
+        "auto: local PaddleOCR GPU deployment unavailable; using "
+        f"{fallback}"
+    )
+
+
+def paddle_local_model_id(
+    *,
+    det_variant: str,
+    rec_variant: str,
+    det_mode: str,
+    rec_mode: str,
+    rec_batch: int,
+    det_len: int,
+    dpi: int,
+    max_image_side: int,
+) -> str:
+    """Deterministic checkpoint identity for the local PaddleOCR backend."""
+
+    return (
+        "paddleocr-local/"
+        f"PP-OCRv5-{det_variant}-det-{det_mode}-"
+        f"{rec_variant}-rec-{rec_mode}-"
+        f"b{rec_batch}-det{det_len}-"
+        f"dpi{dpi}-max{max_image_side}-v1"
+    )
+
+
+def paddle_local_pending_pages(
+    records: Sequence[Any],
+    *,
+    requested: Iterable[int],
+    model_id: str,
+    force: bool = False,
+) -> list[int]:
+    """Pages the local PaddleOCR backend still has to produce.
+
+    A page is cached when its checkpoint carries the exact backend model id;
+    like every other backend, ``force`` bypasses the cache for the range.
+    """
+
+    by_page = {record.pdf_page: record for record in records}
+    return sorted(
+        page
+        for page in requested
+        if force or by_page.get(page) is None
+        or by_page[page].ocr_model != model_id
+    )
+
+
+def contiguous_page_segments(pages: Sequence[int]) -> list[list[int]]:
+    """Split a page set into consecutive runs for batched local OCR calls."""
+
+    segments: list[list[int]] = []
+    for page in sorted(set(pages)):
+        if segments and page == segments[-1][-1] + 1:
+            segments[-1].append(page)
+        else:
+            segments.append([page])
+    return segments
 
 
 def resolve_expected_ocr_model_exact(
@@ -6558,7 +6757,7 @@ def resolve_expected_ocr_model_exact(
         return str(args.ocr_cache_model)
     if args.ocr_cache_model_prefix:
         return None
-    backend = ocr_profile.adapter if ocr_profile is not None else args.ocr_backend
+    backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
     if backend == "coding-plan-mcp":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
         model = (
@@ -6571,6 +6770,17 @@ def resolve_expected_ocr_model_exact(
         return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
+    if backend == "paddleocr-local":
+        return paddle_local_model_id(
+            det_variant=args.paddle_det_variant,
+            rec_variant=args.paddle_rec_variant,
+            det_mode=args.paddle_det_mode,
+            rec_mode=args.paddle_rec_mode,
+            rec_batch=args.paddle_rec_batch,
+            det_len=args.paddle_det_len,
+            dpi=args.dpi,
+            max_image_side=args.max_image_side,
+        )
     return None
 
 
@@ -6812,7 +7022,7 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         parser.error(str(exc))
     effective_ocr_profile = None if explicit_ocr_backend else ocr_profile
-    if explicit_ocr_backend and ocr_profile is not None:
+    if explicit_ocr_backend and ocr_profile is not None and args.ocr_backend != "auto":
         print(
             f"[warning] --ocr-backend={args.ocr_backend} overrides OCR profile "
             f"{ocr_profile.name!r} adapter={ocr_profile.adapter!r}.",
@@ -7069,11 +7279,11 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                 if missing:
                     raise ValueError(f"--skip-ocr was used but cached OCR pages are missing: {missing[:20]}")
             else:
-                ocr_backend_name = (
-                    effective_ocr_profile.adapter
-                    if effective_ocr_profile is not None
-                    else args.ocr_backend
+                ocr_backend_name, backend_reason = resolve_ocr_backend_name(
+                    args, effective_ocr_profile
                 )
+                if str(getattr(args, "ocr_backend", "") or "auto") in {"auto", ""}:
+                    print(f"[ocr-backend] {backend_reason}", flush=True)
                 if ocr_backend_name == "coding-plan-mcp":
                     if not ocr_key:
                         raise ValueError("Coding Plan vision OCR requires GLM_CODING_API_KEY or Z_AI_API_KEY.")
@@ -7132,26 +7342,111 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         language=args.tesseract_language,
                         psm=args.tesseract_psm,
                     )
+                elif ocr_backend_name == "paddleocr-local":
+                    # The local GPU deployment OCRs whole image directories in
+                    # one docker run per consecutive page segment, so it does
+                    # not go through the per-page ocr_pdf loop.  Checkpoint
+                    # caching still uses the same ocr_model identity contract.
+                    model_id = paddle_local_model_id(
+                        det_variant=args.paddle_det_variant,
+                        rec_variant=args.paddle_rec_variant,
+                        det_mode=args.paddle_det_mode,
+                        rec_mode=args.paddle_rec_mode,
+                        rec_batch=args.paddle_rec_batch,
+                        det_len=args.paddle_det_len,
+                        dpi=args.dpi,
+                        max_image_side=args.max_image_side,
+                    )
+                    requested = set(range(args.start_page, end_page + 1))
+                    pending = paddle_local_pending_pages(
+                        records,
+                        requested=requested,
+                        model_id=model_id,
+                        force=args.force,
+                    )
+                    if pending:
+                        import_tool = (
+                            Path(__file__).resolve().parent
+                            / "tools"
+                            / "local_paddleocr_import.py"
+                        )
+                        if not import_tool.is_file():
+                            raise ValueError(
+                                "paddleocr-local backend requires "
+                                "tools/local_paddleocr_import.py"
+                            )
+                        for segment in contiguous_page_segments(pending):
+                            print(
+                                f"[paddleocr-local] pages={segment[0]}-{segment[-1]} "
+                                f"model={model_id}",
+                                flush=True,
+                            )
+                            command = [
+                                sys.executable,
+                                str(import_tool),
+                                str(pdf_path),
+                                "--output-dir",
+                                str(output_dir),
+                                "--start-page",
+                                str(segment[0]),
+                                "--end-page",
+                                str(segment[-1]),
+                                "--workers",
+                                str(args.paddle_workers),
+                                "--det-variant",
+                                args.paddle_det_variant,
+                                "--rec-variant",
+                                args.paddle_rec_variant,
+                                "--det-mode",
+                                args.paddle_det_mode,
+                                "--rec-mode",
+                                args.paddle_rec_mode,
+                                "--rec-batch",
+                                str(args.paddle_rec_batch),
+                                "--det-len",
+                                str(args.paddle_det_len),
+                                "--dpi",
+                                str(args.dpi),
+                                "--max-side",
+                                str(args.max_image_side),
+                                "--jpeg-quality",
+                                str(args.jpeg_quality),
+                            ]
+                            completed = subprocess.run(
+                                command,
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                            )
+                            if completed.returncode:
+                                detail = (completed.stderr or completed.stdout).strip()
+                                raise RuntimeError(
+                                    "paddleocr-local failed for pages "
+                                    f"{segment[0]}-{segment[-1]}: {detail[-1200:]}"
+                                )
+                    records = load_page_records(output_dir)
                 else:
                     raise ValueError(
                         f"Unsupported OCR profile adapter: {ocr_backend_name}"
                     )
-                records = ocr_pdf(
-                    pdf_path,
-                    output_dir,
-                    ocr_backend,
-                    start_page=args.start_page,
-                    end_page=end_page,
-                    concurrency=ocr_workers,
-                    dpi=args.dpi,
-                    max_image_side=args.max_image_side,
-                    jpeg_quality=args.jpeg_quality,
-                    keep_page_images=args.keep_page_images,
-                    force=args.force,
-                    cache_model_prefix=args.ocr_cache_model_prefix,
-                    cache_model_exact=args.ocr_cache_model,
-                    request_delay=args.ocr_delay,
-                )
+                if ocr_backend_name != "paddleocr-local":
+                    records = ocr_pdf(
+                        pdf_path,
+                        output_dir,
+                        ocr_backend,
+                        start_page=args.start_page,
+                        end_page=end_page,
+                        concurrency=ocr_workers,
+                        dpi=args.dpi,
+                        max_image_side=args.max_image_side,
+                        jpeg_quality=args.jpeg_quality,
+                        keep_page_images=args.keep_page_images,
+                        force=args.force,
+                        cache_model_prefix=args.ocr_cache_model_prefix,
+                        cache_model_exact=args.ocr_cache_model,
+                        request_delay=args.ocr_delay,
+                    )
             # Release the model subprocess as soon as its stage finishes so
             # translation/compilation and the publication gate never run
             # while an idle OCR MCP service is still alive.
@@ -7368,12 +7663,24 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
             if not args.no_kb:
                 knowledge_base_path = output_dir / "knowledge_base.jsonl"
                 write_knowledge_base(knowledge_base_path, knowledge_rows)
-                rag_metadata = (
-                    rag_knowledge_base.maybe_build_zhipu_embedding_index(
-                        knowledge_base_path,
-                        requested=args.rag_embed,
+                # The embedding index is an additive retrieval convenience; a
+                # provider outage or quota limit must not fail the publication
+                # itself, whose contract only covers the lexical KB.
+                try:
+                    rag_metadata = (
+                        rag_knowledge_base.maybe_build_zhipu_embedding_index(
+                            knowledge_base_path,
+                            requested=args.rag_embed,
+                        )
                     )
-                )
+                except rag_knowledge_base.RagError as exc:
+                    print(
+                        f"[rag] embedding index deferred: {exc} "
+                        "(knowledge base stays lexical-only; rerun "
+                        "translation-agent-kb register later)",
+                        flush=True,
+                    )
+                    rag_metadata = None
                 if rag_metadata is not None:
                     print(
                         "[rag] embedding index ready "

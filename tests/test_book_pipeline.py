@@ -1132,6 +1132,54 @@ M.E.Sharpe, Inc., 1983.
             "# 第一章 歌德的《浮士德》：发展的悲剧\n\n正文。\n\n后文。\n",
         )
 
+    def test_body_line_starting_with_book_title_is_kept(self) -> None:
+        source = """# 二
+
+包法利夫人回答道：
+
+“汪洋一片，无边无涯。”
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="包法利夫人",
+                chapter_title="二",
+            ),
+            "# 二\n\n包法利夫人回答道：\n\n“汪洋一片，无边无涯。”\n",
+        )
+
+    def test_docx_link_list_keeps_inter_link_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            chapter_dir = output / "chapters"
+            chapter_dir.mkdir(parents=True)
+            filename = "001_目录.md"
+            (chapter_dir / filename).write_text(
+                "# 目录\n\n- [第一部](a.xhtml) [一](b.xhtml) [二](c.xhtml)\n",
+                encoding="utf-8",
+            )
+            manifest = [
+                {
+                    "sequence": 1,
+                    "id": "chapter",
+                    "display_title": "目录",
+                    "filename": filename,
+                    "reviewed_override": False,
+                }
+            ]
+            docx_path = output / "toc.docx"
+            build_docx(docx_path, chapter_dir, manifest, book_title="书")
+
+            from docx import Document
+
+            document = Document(docx_path)
+            paragraph = next(
+                paragraph
+                for paragraph in document.paragraphs
+                if "第一部" in paragraph.text
+            )
+            self.assertEqual(paragraph.text, "第一部 一 二")
+
     def test_epub_subsection_heading_repeating_chapter_title_is_kept(self) -> None:
         source = """# 第一章 欲望机器
 

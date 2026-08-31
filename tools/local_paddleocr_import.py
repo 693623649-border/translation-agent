@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PADDLEOCR_ROOT = REPO_ROOT / "deploy" / "paddleocr"
@@ -131,13 +131,14 @@ def _render_pages(
     args: argparse.Namespace,
     *,
     reuse: bool,
+    pages: Iterable[int],
 ) -> None:
     from book_pipeline import render_pdf_page
 
     params = _render_params(args)
     pending = [
         page
-        for page in range(1, page_count + 1)
+        for page in pages
         if args.force_render or not reuse or not _image_path(images_dir, page).is_file()
     ]
     if not pending:
@@ -169,8 +170,8 @@ def _render_pages(
                 print(f"[render-page] page={page}", flush=True)
 
 
-def _validate_images(images_dir: Path, page_count: int) -> None:
-    missing = [page for page in range(1, page_count + 1) if not _image_path(images_dir, page).is_file()]
+def _validate_images(images_dir: Path, pages: Iterable[int]) -> None:
+    missing = [page for page in pages if not _image_path(images_dir, page).is_file()]
     if missing:
         preview = ", ".join(str(page) for page in missing[:20])
         raise RuntimeError(f"missing rendered page images: {preview}")
@@ -182,12 +183,17 @@ def _docker_path(host_path: Path) -> str:
 
 
 def _model_id(args: argparse.Namespace) -> str:
-    return (
-        "paddleocr-local/"
-        f"PP-OCRv5-{args.det_variant}-det-{args.det_mode}-"
-        f"{args.rec_variant}-rec-{args.rec_mode}-"
-        f"b{args.rec_batch}-det{args.det_len}-"
-        f"dpi{args.dpi}-max{args.max_side}-v1"
+    from book_pipeline import paddle_local_model_id
+
+    return paddle_local_model_id(
+        det_variant=args.det_variant,
+        rec_variant=args.rec_variant,
+        det_mode=args.det_mode,
+        rec_mode=args.rec_mode,
+        rec_batch=args.rec_batch,
+        det_len=args.det_len,
+        dpi=args.dpi,
+        max_image_side=args.max_side,
     )
 
 
@@ -262,9 +268,10 @@ def _load_page_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def _validate_pages(work_dir: Path, page_count: int, model_id: str) -> None:
+def _validate_pages(work_dir: Path, pages: Iterable[int], model_id: str) -> None:
     pages_dir = work_dir / "pages"
-    expected_names = {f"page_{page:04d}.json" for page in range(1, page_count + 1)}
+    page_list = list(pages)
+    expected_names = {f"page_{page:04d}.json" for page in page_list}
     actual_names = {path.name for path in pages_dir.glob("page_*.json")}
     extra_names = sorted(actual_names - expected_names)
     if extra_names:
@@ -273,7 +280,7 @@ def _validate_pages(work_dir: Path, page_count: int, model_id: str) -> None:
     missing: list[int] = []
     mismatched: list[int] = []
     blank: list[int] = []
-    for page in range(1, page_count + 1):
+    for page in page_list:
         path = pages_dir / f"page_{page:04d}.json"
         if not path.is_file():
             missing.append(page)
@@ -296,12 +303,15 @@ def _validate_pages(work_dir: Path, page_count: int, model_id: str) -> None:
         raise RuntimeError("invalid OCR page coverage: " + " ".join(parts))
 
 
-def _import_records(work_dir: Path, output_dir: Path, page_count: int) -> None:
+def _import_records(
+    work_dir: Path, output_dir: Path, pages: Iterable[int]
+) -> None:
     from book_pipeline import import_existing_ocr
 
+    expected = len(list(pages))
     imported = import_existing_ocr(work_dir, output_dir)
-    if imported != page_count:
-        raise RuntimeError(f"imported {imported} pages, expected {page_count}")
+    if imported != expected:
+        raise RuntimeError(f"imported {imported} pages, expected {expected}")
     print(f"[import] pages={imported} output={output_dir}")
 
 
@@ -324,6 +334,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--det-len", type=int, default=736)
     parser.add_argument("--force-render", action="store_true")
     parser.add_argument("--force-ocr", action="store_true")
+    parser.add_argument("--start-page", type=int, default=1)
+    parser.add_argument("--end-page", type=int, default=None)
     parser.add_argument("--render-only", action="store_true")
     parser.add_argument("--ocr-only", action="store_true")
     return parser.parse_args(argv)
@@ -344,11 +356,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         source = _source_info(source_pdf)
-        work_dir = (
+        base_work_dir = (
             _default_work_dir(source_pdf, str(source["sha256"]))
             if args.work_dir is None
             else _resolve_under_io(args.work_dir)
         )
+        if args.work_dir is None:
+            work_dir = base_work_dir / f"range-{args.start_page:04d}-{args.end_page or source['page_count']:04d}"
+        else:
+            work_dir = base_work_dir
         work_dir.mkdir(parents=True, exist_ok=True)
         manifest_path = work_dir / MANIFEST_NAME
         expected_manifest = _expected_manifest(args, source)
@@ -362,25 +378,37 @@ def main(argv: list[str] | None = None) -> int:
         page_count = int(source["page_count"])
         if page_count < 1:
             return _die("PDF has no pages")
+        start_page = int(args.start_page)
+        end_page = int(args.end_page or page_count)
+        if not 1 <= start_page <= end_page <= page_count:
+            return _die(
+                f"--start-page/--end-page must satisfy 1 <= start <= end <= {page_count}"
+            )
+        pages = range(start_page, end_page + 1)
 
         if not args.ocr_only:
-            _render_pages(source_pdf, images_dir, page_count, args, reuse=reuse)
-            _validate_images(images_dir, page_count)
+            _render_pages(
+                source_pdf, images_dir, page_count, args, reuse=reuse, pages=pages
+            )
+            _validate_images(images_dir, pages)
             _atomic_write_json(manifest_path, expected_manifest)
         else:
             if not reuse:
                 return _die(f"--ocr-only requires a matching manifest at {manifest_path}")
-            _validate_images(images_dir, page_count)
+            _validate_images(images_dir, pages)
 
         if args.render_only:
-            print(f"[done] rendered={page_count} work_dir={work_dir}")
+            print(
+                f"[done] rendered={len(pages)} pages={start_page}-{end_page} "
+                f"work_dir={work_dir}"
+            )
             return 0
 
         model_id = _model_id(args)
         _run_ocr(work_dir, args, model_id)
-        _validate_pages(work_dir, page_count, model_id)
-        _import_records(work_dir, args.output_dir.resolve(), page_count)
-        print(f"[done] imported={page_count} model={model_id}")
+        _validate_pages(work_dir, pages, model_id)
+        _import_records(work_dir, args.output_dir.resolve(), pages)
+        print(f"[done] imported={len(pages)} model={model_id}")
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
