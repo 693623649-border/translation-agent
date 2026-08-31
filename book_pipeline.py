@@ -4709,10 +4709,19 @@ def markdown_to_html(markdown_text: str) -> str:
         import markdown  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError("EPUB compilation requires Markdown>=3.6; install requirements.txt.") from exc
-    return markdown.markdown(
+    output = markdown.markdown(
         markdown_text,
         extensions=["extra", "sane_lists", "footnotes"],
         output_format="xhtml",
+    )
+    # python-markdown serializes some mixed content through ElementTree with
+    # an ASCII codec, emitting named entities ("&ldquo;") that ElementTree
+    # itself only accepts for the five XML-predefined ones.  Restore every
+    # HTML named entity to its literal character before downstream parsing.
+    return re.sub(
+        r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+|#x[0-9A-Fa-f]+)([A-Za-z][A-Za-z0-9]+);",
+        lambda match: html.entities.html5.get(f"{match.group(1)};", match.group(0)),
+        output,
     )
 
 

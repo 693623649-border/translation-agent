@@ -644,10 +644,17 @@ def _citation_inventory(text: str) -> dict[str, Any]:
 def _markdown_html(markdown_text: str) -> str:
     import markdown  # type: ignore[import-not-found]
 
-    return markdown.markdown(
+    output = markdown.markdown(
         markdown_text,
         extensions=["extra", "sane_lists", "footnotes"],
         output_format="xhtml",
+    )
+    # Mirrors book_pipeline.markdown_to_html: python-markdown serializes some
+    # mixed content as named entities ElementTree cannot parse; restore them.
+    return re.sub(
+        r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+|#x[0-9A-Fa-f]+)([A-Za-z][A-Za-z0-9]+);",
+        lambda match: html.entities.html5.get(f"{match.group(1)};", match.group(0)),
+        output,
     )
 
 

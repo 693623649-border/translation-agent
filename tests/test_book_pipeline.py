@@ -1132,6 +1132,14 @@ M.E.Sharpe, Inc., 1983.
             "# 第一章 歌德的《浮士德》：发展的悲剧\n\n正文。\n\n后文。\n",
         )
 
+    def test_markdown_to_html_restores_named_entities(self) -> None:
+        from book_pipeline import markdown_to_html
+
+        output = markdown_to_html("“伦敦”①测试")
+        self.assertIn("“伦敦”", output)
+        self.assertNotIn("&ldquo;", output)
+        self.assertNotIn("&#", output)
+
     def test_body_line_starting_with_book_title_is_kept(self) -> None:
         source = """# 二
 
