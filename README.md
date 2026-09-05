@@ -982,6 +982,20 @@ translation-agent-kb retrieve "outputs/合集" "日本思想" --no-auto-route
 主语料的陈旧ID会使状态校验失败，避免错误路由静默生效。
 上下文前缀同步展示 `[KB:id] [书名] 标题 (命中通道)`。
 
+多册合集 EPUB（鲁迅全集、王小波作品大全集等）可用合集拆分构建器按目录
+拆成单独作品后注入知识库；`book_title` 侧表使检索按作品路由、每书上限
+防止大部头淹没短章：
+
+```bash
+python tools/books/epub_collection_kb.py "book/合集.epub" \
+  --output-dir "outputs/知识库_合集" --author 作者 --language zh --sources
+translation-agent-kb register "outputs/知识库_合集"
+```
+
+拆分规则：目录嵌套解析卷→作品→篇目（纯数字续篇归并回前一部作品），
+未编目书脊文件按就近归属并入前一作品（`[n]` 脚注块并入前一篇），长篇
+在段落边界切分为 ≤4000 字块，与合辑库分块契约一致。
+
 ### 发布质量门
 
 `compile` 和 `all` 在生成产物后自动运行一次无模型调用的发布质量门；任何
