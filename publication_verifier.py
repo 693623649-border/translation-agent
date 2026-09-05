@@ -3505,7 +3505,13 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
             for style_name in ("bold", "italic", "underline"):
                 expected_fragments = expected_styles.get(style_name, [])
                 actual_fragments = payload["inline_styles"].get(style_name, [])
-                if actual_fragments != expected_fragments:
+                # The DOCX renderer merges CJK soft-wrapped lines without the
+                # space markdown's itertext keeps; style membership is about
+                # emphasis, not whitespace, so compare space-stripped runs.
+                strip_ws = lambda fragments: [
+                    re.sub(r"\s+", "", fragment) for fragment in fragments
+                ]
+                if strip_ws(actual_fragments) != strip_ws(expected_fragments):
                     issues.append(
                         _issue(
                             "docx_inline_style_mismatch",
