@@ -990,6 +990,10 @@ translation-agent-kb retrieve "outputs/合集" "日本思想" --no-auto-route
 python tools/books/epub_collection_kb.py "book/合集.epub" \
   --output-dir "outputs/知识库_合集" --author 作者 --language zh --sources
 translation-agent-kb register "outputs/知识库_合集"
+
+# 每部作品单独成册的 Word（与知识库同一套目录拆分逻辑）
+python tools/books/epub_collection_docx.py "book/合集.epub" \
+  --output-dir "outputs/合集" --author 作者
 ```
 
 拆分规则：目录嵌套解析卷→作品→篇目（纯数字续篇归并回前一部作品），
