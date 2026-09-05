@@ -947,6 +947,41 @@ translation-agent-kb derive-docx "outputs/Book.docx"
 该命令会自动创建同名产物目录并写入 `knowledge_base.jsonl` 与 RAG 清单；如果
 DOCX 没有可识别的 Heading 1 章节契约，会直接失败而不是生成不可审计的语料。
 
+#### 混合检索、查询路由与每书上限
+
+多书合辑库（语料不均衡、大书淹没小书、单一排序偏差）默认使用
+**BM25＋向量 RRF 融合**（`--mode hybrid` 为默认）：两通道各取
+`--candidate-depth`（默认 30）候选，按 Reciprocal Rank Fusion 合并，命中方式
+（`lexical` / `semantic` / `lexical+semantic`）随每条结果返回；embedding 索引
+不可用时自动降级 lexical。查询会识别明确出现的书名及作者，并在排序前自动
+缩小语料范围；显式 `--book` / `--author` 始终优先，`--no-auto-route` 可关闭
+自动路由。比较型问题中提及的书籍与作者所属书籍取并集，不会被错误地求交集。
+非比较问题同时出现书名和作者时，明确书名优先，以免把该作者的其他著作一并
+混入。RRF 的 `--candidate-depth` 必须不小于 `--top-k`。
+查询路由与结果均衡：
+
+```bash
+# 限定某书 / 某作者 / 某语言（元数据侧表 knowledge_base.meta.jsonl 提供）
+translation-agent-kb retrieve "outputs/合集" "共同幻想与国家" --book 共同幻想論
+translation-agent-kb retrieve "outputs/合集" "奥姆之后的日常" --author 宮台真司
+translation-agent-kb retrieve "outputs/合集" "幻想論" --language ja
+
+# 每书结果上限（默认 3，防止 542 块的大书淹没 23 块的小书；0 关闭）
+translation-agent-kb retrieve "outputs/合集" "丸山真男" --per-book-cap 2
+
+# 查看未路由的全库结果
+translation-agent-kb retrieve "outputs/合集" "日本思想" --no-auto-route
+```
+
+过滤后只有一本书时，每书上限自动取消，`--top-k` 因此仍可返回该书的完整候选。
+
+侧表是可选的 `knowledge_base.meta.jsonl`（每行 `id` + `book_id`/`book_title`/
+`author`/`language`/…），不破坏五字段主语料契约；没有侧表时按合辑惯例从
+`chapter_id` 的书名前缀（`01_书名:章`）或 `[书名]` 标题前缀推导书身份。
+`translation-agent-kb status` 会报告侧表行数和覆盖率；重复ID或已不属于当前
+主语料的陈旧ID会使状态校验失败，避免错误路由静默生效。
+上下文前缀同步展示 `[KB:id] [书名] 标题 (命中通道)`。
+
 ### 发布质量门
 
 `compile` 和 `all` 在生成产物后自动运行一次无模型调用的发布质量门；任何

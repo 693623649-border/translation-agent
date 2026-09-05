@@ -390,3 +390,50 @@ translation_profile = "deepseek_pro"
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
+    def test_retrieval_tuning_arguments_forward_to_knowledge_base(self) -> None:
+        from unittest.mock import MagicMock
+        import translation_agent_api as api
+
+        knowledge_base = MagicMock()
+        with patch.object(api, "RagKnowledgeBase") as open_cls:
+            open_cls.open.return_value = knowledge_base
+            api.retrieve_knowledge_base_context(
+                "outputs/book",
+                "查询",
+                auto_route=True,
+                mode="hybrid",
+                book_ids=("呐喊",),
+                authors=("鲁迅",),
+                languages=("zh",),
+                per_book_cap=2,
+                candidate_depth=48,
+            )
+
+        kwargs = knowledge_base.retrieve_context.call_args.kwargs
+        self.assertEqual(kwargs["mode"], "hybrid")
+        self.assertEqual(kwargs["book_ids"], {"呐喊"})
+        self.assertEqual(kwargs["authors"], {"鲁迅"})
+        self.assertEqual(kwargs["languages"], {"zh"})
+        self.assertEqual(kwargs["per_book_cap"], 2)
+        self.assertEqual(kwargs["candidate_depth"], 48)
+        self.assertTrue(kwargs["auto_route"])
+
+    def test_retrieval_defaults_keep_hybrid_parity_with_cli(self) -> None:
+        from unittest.mock import MagicMock
+        import translation_agent_api as api
+
+        knowledge_base = MagicMock()
+        with patch.object(api, "RagKnowledgeBase") as open_cls:
+            open_cls.open.return_value = knowledge_base
+            api.retrieve_knowledge_base_context("outputs/book", "查询")
+
+        kwargs = knowledge_base.retrieve_context.call_args.kwargs
+        self.assertIsNone(kwargs["mode"])
+        self.assertIsNone(kwargs["book_ids"])
+        self.assertIsNone(kwargs["authors"])
+        self.assertIsNone(kwargs["languages"])
+        self.assertIsNone(kwargs["per_book_cap"])
+        self.assertEqual(kwargs["candidate_depth"], 30)

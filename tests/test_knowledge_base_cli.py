@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from book_pipeline import write_knowledge_base
 from knowledge_base_cli import main
-from rag_knowledge_base import vector_index_path_for
+from rag_knowledge_base import metadata_sidecar_path_for, vector_index_path_for
 
 
 ROWS = [
@@ -135,6 +135,82 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         self.assertTrue(payload["current"])
         self.assertEqual(payload["chunk_count"], 2)
         self.assertEqual(payload["embedding"]["status"], "awaiting_provider")
+        self.assertFalse(payload["metadata"]["exists"])
+        self.assertEqual(payload["metadata"]["coverage"], 0.0)
+
+    def test_status_reports_metadata_coverage(self) -> None:
+        metadata_sidecar_path_for(self.kb).write_text(
+            json.dumps(
+                {
+                    "id": "a" * 40,
+                    "book_id": "book-japan",
+                    "book_title": "日本的思想",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        code = main(["status", str(self.output)], stdout)
+
+        payload = _json(stdout)
+        self.assertEqual(code, 0)
+        self.assertTrue(payload["metadata"]["exists"])
+        self.assertEqual(payload["metadata"]["row_count"], 1)
+        self.assertEqual(payload["metadata"]["coverage"], 0.5)
+
+    def test_retrieve_auto_routes_explicit_book_mention(self) -> None:
+        sidecar = metadata_sidecar_path_for(self.kb)
+        sidecar.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "id": "a" * 40,
+                            "book_id": "book-japan",
+                            "book_title": "日本的思想",
+                            "author": "丸山真男",
+                            "language": "zh",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "id": "b" * 40,
+                            "book_id": "book-history",
+                            "book_title": "历史方法论",
+                            "author": "作者乙",
+                            "language": "zh",
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        stdout = io.StringIO()
+
+        code = main(
+            [
+                "retrieve",
+                str(self.output),
+                "丸山真男如何理解日本思想中的量子理论",
+                "--mode",
+                "lexical",
+                "--top-k",
+                "2",
+            ],
+            stdout,
+        )
+
+        payload = _json(stdout)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["routing"]["inferred_books"], ["日本的思想"])
+        self.assertEqual(payload["routing"]["matched_authors"], ["丸山真男"])
+        self.assertEqual([hit["id"] for hit in payload["hits"]], ["a" * 40])
 
     def test_derive_docx_creates_artifact_directory_and_jsonl(self) -> None:
         from docx import Document

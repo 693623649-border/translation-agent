@@ -372,8 +372,20 @@ def retrieve_knowledge_base_context(
     max_chars: int = 12_000,
     chapter_ids: tuple[str, ...] = (),
     embedding_provider: EmbeddingProvider | None = None,
+    auto_route: bool = False,
+    mode: str | None = None,
+    book_ids: tuple[str, ...] = (),
+    authors: tuple[str, ...] = (),
+    languages: tuple[str, ...] = (),
+    per_book_cap: int | None = None,
+    candidate_depth: int = 30,
 ) -> RagContext:
-    """Retrieve citation-labelled chunks for downstream prompt augmentation."""
+    """Retrieve citation-labelled chunks for downstream prompt augmentation.
+
+    Retrieval-tuning arguments (mode/routing/caps) forward to
+    ``RagKnowledgeBase.retrieve_context`` so the high-level API keeps parity
+    with the ``translation-agent-kb retrieve`` CLI.
+    """
 
     knowledge_base_path = (
         Path(output_dir).expanduser().resolve() / "knowledge_base.jsonl"
@@ -385,4 +397,11 @@ def retrieve_knowledge_base_context(
         max_chars=max_chars,
         chapter_ids=(set(chapter_ids) if chapter_ids else None),
         embedding_provider=embedding_provider,
+        auto_route=auto_route,
+        mode=mode,
+        book_ids=set(book_ids) if book_ids else None,
+        authors=set(authors) if authors else None,
+        languages=set(languages) if languages else None,
+        per_book_cap=per_book_cap,
+        candidate_depth=candidate_depth,
     )

@@ -282,6 +282,8 @@ class RagHit:
     content: str
     score: float
     retrieval_mode: str
+    book: str = ""
+    channels: str = ""
 
 
 @dataclass(frozen=True)
@@ -299,6 +301,59 @@ def manifest_path_for(knowledge_base_path: Path | str) -> Path:
 def vector_index_path_for(knowledge_base_path: Path | str) -> Path:
     path = Path(knowledge_base_path)
     return path.with_suffix(".vectors.jsonl")
+
+
+def metadata_sidecar_path_for(knowledge_base_path: Path | str) -> Path:
+    """Optional per-chunk metadata sidecar path (book/author/language)."""
+
+    path = Path(knowledge_base_path)
+    return path.with_suffix(".meta.jsonl")
+
+
+def load_metadata_sidecar(
+    knowledge_base_path: Path | str,
+) -> dict[str, dict[str, str]]:
+    """Load the optional ``knowledge_base.meta.jsonl`` sidecar.
+
+    The five-field corpus contract stays untouched; routing metadata
+    (``book_id``, ``book_title``, ``author``, ``language``, ...) lives beside
+    it keyed by chunk id.  Unknown fields are preserved; a missing file is a
+    valid empty sidecar.
+    """
+
+    path = metadata_sidecar_path_for(knowledge_base_path)
+    if not path.is_file():
+        return {}
+    sidecar: dict[str, dict[str, str]] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise RagFormatError(f"Cannot read metadata sidecar {path}: {exc}") from exc
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RagFormatError(
+                f"Invalid JSON at {path}:{line_number}: {exc}"
+            ) from exc
+        if not isinstance(raw, dict) or not str(raw.get("id") or "").strip():
+            raise RagFormatError(
+                f"Invalid sidecar row at {path}:{line_number}; "
+                "expected an object with a non-empty 'id'"
+            )
+        row_id = str(raw["id"])
+        if _ROW_ID.fullmatch(row_id) is None:
+            raise RagFormatError(f"Invalid sidecar row id at {path}:{line_number}")
+        if row_id in sidecar:
+            raise RagFormatError(
+                f"Duplicate sidecar row id at {path}:{line_number}: {row_id}"
+            )
+        sidecar[row_id] = {
+            str(key): str(value) for key, value in raw.items()
+        }
+    return sidecar
 
 
 def _sha256_file(path: Path) -> str:
@@ -817,6 +872,49 @@ def _normalized_text(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold()
 
 
+_ROUTING_VARIANTS = str.maketrans(
+    {
+        "與": "与",
+        "國": "国",
+        "學": "学",
+        "體": "体",
+        "書": "书",
+        "臺": "台",
+        "宮": "宫",
+        "終": "终",
+        "爭": "争",
+        "論": "论",
+    }
+)
+
+
+def _normalized_route_text(value: str) -> str:
+    """Normalize stable book/author labels for conservative query routing."""
+
+    normalized = _normalized_text(value).translate(_ROUTING_VARIANTS)
+    return re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
+
+
+def _book_route_aliases(value: str) -> set[str]:
+    normalized = _normalized_route_text(value)
+    aliases = {normalized} if len(normalized) >= 4 else set()
+    if normalized.endswith("论") and len(normalized) > 4:
+        aliases.add(normalized[:-1])
+    without_particle = normalized.replace("的", "")
+    if len(without_particle) >= 4:
+        aliases.add(without_particle)
+    return aliases
+
+
+def _author_route_aliases(value: str) -> set[str]:
+    names = re.split(r"[、,，;/；&]+", value)
+    return {
+        normalized
+        for name in names
+        if len(normalized := _normalized_route_text(name)) >= 2
+    }
+
+
 def _tokens(value: str) -> list[str]:
     output: list[str] = []
     for match in _TOKEN_PART.finditer(_normalized_text(value)):
@@ -913,6 +1011,7 @@ class RagKnowledgeBase:
         manifest: Mapping[str, Any],
         embedding_metadata: RagEmbeddingMetadata | None,
         vectors: Mapping[str, Sequence[float]],
+        metadata_sidecar: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         self.knowledge_base_path = knowledge_base_path
         self._rows = tuple(dict(row) for row in rows)
@@ -922,12 +1021,23 @@ class RagKnowledgeBase:
             row_id: tuple(vector)
             for row_id, vector in vectors.items()
         }
+        self._sidecar = dict(metadata_sidecar or {})
 
     @classmethod
     def open(cls, knowledge_base_path: Path | str) -> "RagKnowledgeBase":
         source = Path(knowledge_base_path)
         rows = load_knowledge_rows(source)
         manifest = read_rag_manifest(source)
+        metadata_sidecar = load_metadata_sidecar(source)
+        unknown_metadata_ids = set(metadata_sidecar) - {
+            str(row["id"]) for row in rows
+        }
+        if unknown_metadata_ids:
+            preview = ", ".join(sorted(unknown_metadata_ids)[:5])
+            raise RagIndexStaleError(
+                "Metadata sidecar contains ids absent from the knowledge base: "
+                f"{preview}"
+            )
         embedding = manifest["retrieval"]["embedding"]
         metadata: RagEmbeddingMetadata | None = None
         vectors: dict[str, tuple[float, ...]] = {}
@@ -943,6 +1053,7 @@ class RagKnowledgeBase:
             manifest=manifest,
             embedding_metadata=metadata,
             vectors=vectors,
+            metadata_sidecar=metadata_sidecar,
         )
 
     @property
@@ -953,6 +1064,119 @@ class RagKnowledgeBase:
     def embedding_ready(self) -> bool:
         return self.embedding_metadata is not None
 
+    def chunk_metadata(self, row_id: str) -> dict[str, str]:
+        """Return the sidecar metadata row for a chunk (empty when absent)."""
+
+        return dict(self._sidecar.get(str(row_id), {}))
+
+    def infer_query_routes(
+        self,
+        query: str,
+    ) -> dict[str, frozenset[str]]:
+        """Infer conservative book routes from explicit title/author mentions.
+
+        Author matches are converted to their associated books. This keeps
+        comparative queries inclusive: a query naming one book and a different
+        author searches both source sets instead of intersecting them to zero.
+        """
+
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query must be a non-empty string")
+        normalized_query = _normalized_route_text(query)
+        matched_title_books: set[str] = set()
+        matched_authors: set[str] = set()
+        books_by_author: dict[str, set[str]] = {}
+        seen_books: set[tuple[str, str]] = set()
+        for row in self._rows:
+            row_id = str(row["id"])
+            metadata = self._sidecar.get(row_id, {})
+            book = self._book_key(row)
+            book_title = str(metadata.get("book_title") or book).strip()
+            identity = (book, book_title)
+            if identity not in seen_books:
+                seen_books.add(identity)
+                if any(
+                    alias in normalized_query
+                    for alias in _book_route_aliases(book_title)
+                ):
+                    matched_title_books.add(book)
+            author = str(metadata.get("author") or "").strip()
+            for alias in _author_route_aliases(author):
+                books_by_author.setdefault(alias, set()).add(book)
+
+        author_books: set[str] = set()
+        for author_alias, books in books_by_author.items():
+            if author_alias in normalized_query:
+                matched_authors.add(author_alias)
+                author_books.update(books)
+        comparison_query = any(
+            marker in normalized_query
+            for marker in ("比较", "对比", "对照", "异同", "versus", "vs")
+        )
+        matched_books = set(matched_title_books)
+        if not matched_title_books or comparison_query:
+            matched_books.update(author_books)
+        return {
+            "book_ids": frozenset(matched_books),
+            "authors": frozenset(matched_authors),
+        }
+
+    def _book_key(self, row: Mapping[str, Any]) -> str:
+        """Resolve the owning book label used for routing and result caps.
+
+        Sidecar ``book_title`` (or ``book_id``) wins; otherwise fall back to
+        the aggregate convention of a ``chapter_id`` book prefix or a
+        ``[书名]`` title prefix.
+        """
+
+        meta = self._sidecar.get(str(row["id"]), {})
+        for field in ("book_title", "book_id"):
+            value = str(meta.get(field) or "").strip()
+            if value:
+                return value
+        chapter_id = str(row.get("chapter_id") or "")
+        if ":" in chapter_id:
+            prefix = chapter_id.split(":", 1)[0].strip()
+            if prefix:
+                return prefix
+        title = str(row.get("title") or "")
+        bracket = re.match(r"^\[([^\]]+)\]", title)
+        if bracket:
+            return bracket.group(1).strip()
+        return chapter_id or "unknown-book"
+
+    def _routing_allows(
+        self,
+        row: Mapping[str, Any],
+        *,
+        book_ids: set[str] | None,
+        authors: set[str] | None,
+        languages: set[str] | None,
+    ) -> bool:
+        if book_ids is not None:
+            meta = self._sidecar.get(str(row["id"]), {})
+            keys = {
+                self._book_key(row),
+                str(meta.get("book_id") or "").strip(),
+                str(meta.get("book_title") or "").strip(),
+            } - {""}
+            if not keys & book_ids:
+                return False
+        if authors is not None or languages is not None:
+            meta = self._sidecar.get(str(row["id"]), {})
+            if authors is not None:
+                author = str(meta.get("author") or "").strip()
+                if not any(
+                    wanted == author or wanted in author or author in wanted
+                    for wanted in authors
+                ):
+                    return False
+            if languages is not None:
+                language = str(meta.get("language") or "").strip()
+                if language not in languages:
+                    return False
+        return True
+
     def retrieve(
         self,
         query: str,
@@ -960,80 +1184,238 @@ class RagKnowledgeBase:
         top_k: int = 5,
         chapter_ids: set[str] | frozenset[str] | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        mode: str | None = None,
+        book_ids: set[str] | frozenset[str] | None = None,
+        authors: set[str] | frozenset[str] | None = None,
+        languages: set[str] | frozenset[str] | None = None,
+        per_book_cap: int | None = None,
+        candidate_depth: int = 30,
+        auto_route: bool = False,
     ) -> list[RagHit]:
-        """Return ranked chunks, using BM25 until an embedding API is attached."""
+        """Return ranked chunks using lexical, semantic, or hybrid ranking.
+
+        ``mode=None`` keeps the legacy contract: BM25 without a provider and
+        cosine similarity with one.  ``mode="hybrid"`` runs both channels,
+        fuses them with Reciprocal Rank Fusion, labels each hit with the
+        channels that recalled it, and degrades gracefully to pure lexical
+        retrieval when no embedding index/provider is available.
+        """
 
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
             raise ValueError("top_k must be a positive integer")
+        if mode not in (None, "lexical", "semantic", "hybrid"):
+            raise ValueError("mode must be 'lexical', 'semantic', or 'hybrid'")
+        if candidate_depth <= 0:
+            raise ValueError("candidate_depth must be positive")
+        if auto_route and book_ids is None and authors is None:
+            inferred = self.infer_query_routes(query)
+            if inferred["book_ids"]:
+                book_ids = inferred["book_ids"]
         rows = [
             row
             for row in self._rows
             if chapter_ids is None or row["chapter_id"] in chapter_ids
         ]
+        if book_ids is not None or authors is not None or languages is not None:
+            rows = [
+                row
+                for row in rows
+                if self._routing_allows(
+                    row,
+                    book_ids=set(book_ids) if book_ids is not None else None,
+                    authors=set(authors) if authors is not None else None,
+                    languages=set(languages) if languages is not None else None,
+                )
+            ]
         if not rows:
             return []
+        if per_book_cap and len({self._book_key(row) for row in rows}) <= 1:
+            per_book_cap = None
 
-        retrieval_mode = "lexical"
-        if embedding_provider is None:
-            scores = _lexical_scores(rows, query)
-        else:
-            metadata = self.embedding_metadata
-            if metadata is None:
+        effective_mode = mode
+        if effective_mode is None:
+            effective_mode = "semantic" if embedding_provider is not None else "lexical"
+
+        semantic_scores: list[float] | None = None
+        if effective_mode in ("semantic", "hybrid"):
+            if embedding_provider is None:
+                # Legacy graceful degradation: requesting semantic ranking
+                # without an attached provider keeps keyword recall.
+                effective_mode = "lexical"
+            elif self.embedding_metadata is None:
                 raise RagEmbeddingUnavailableError(
-                    "Embedding index is not ready; call build_embedding_index() "
-                    "after attaching an EmbeddingProvider"
+                    "Semantic retrieval requires an embedding index; "
+                    "attach an EmbeddingProvider and build the index first"
                 )
-            provider_name, model = _provider_identity(embedding_provider)
-            if (
-                provider_name != metadata.provider_name
-                or model != metadata.model
-            ):
-                raise RagProviderError(
-                    "Query embedding provider/model does not match the stored index: "
-                    f"expected {metadata.provider_name}/{metadata.model}, "
-                    f"got {provider_name}/{model}"
+            else:
+                metadata = self.embedding_metadata
+                provider_name, model = _provider_identity(embedding_provider)
+                if (
+                    provider_name != metadata.provider_name
+                    or model != metadata.model
+                ):
+                    raise RagProviderError(
+                        "Query embedding provider/model does not match the stored index: "
+                        f"expected {metadata.provider_name}/{metadata.model}, "
+                        f"got {provider_name}/{model}"
+                    )
+                try:
+                    raw_query_vector = embedding_provider.embed_query(query)
+                except Exception as exc:
+                    raise RagProviderError(f"Embedding provider failed for query: {exc}") from exc
+                query_vector = _validate_vector(
+                    raw_query_vector,
+                    expected_dimensions=metadata.dimensions,
+                    label="query embedding",
                 )
-            try:
-                raw_query_vector = embedding_provider.embed_query(query)
-            except Exception as exc:
-                raise RagProviderError(f"Embedding provider failed for query: {exc}") from exc
-            query_vector = _validate_vector(
-                raw_query_vector,
-                expected_dimensions=metadata.dimensions,
-                label="query embedding",
-            )
-            scores = [
-                _cosine_similarity(query_vector, self._vectors[str(row["id"])])
-                for row in rows
-            ]
-            retrieval_mode = "semantic"
+                semantic_scores = [
+                    _cosine_similarity(query_vector, self._vectors[str(row["id"])])
+                    for row in rows
+                ]
 
-        ranked = sorted(
+        if effective_mode == "hybrid" and semantic_scores is not None:
+            if candidate_depth < top_k:
+                raise ValueError(
+                    "candidate_depth must be greater than or equal to top_k "
+                    "for hybrid retrieval"
+                )
+            hits = self._hybrid_rank(
+                rows,
+                query,
+                semantic_scores,
+                top_k=top_k,
+                candidate_depth=candidate_depth,
+                per_book_cap=per_book_cap,
+            )
+        else:
+            scores = (
+                semantic_scores
+                if semantic_scores is not None
+                else _lexical_scores(rows, query)
+            )
+            ranked = sorted(
+                (
+                    (score, row)
+                    for score, row in zip(scores, rows, strict=True)
+                    if semantic_scores is not None or score > 0.0
+                ),
+                key=lambda item: (
+                    -item[0],
+                    int(item[1]["chapter_order"]),
+                    str(item[1]["id"]),
+                ),
+            )
+            if per_book_cap:
+                ranked = self._apply_per_book_cap(ranked, top_k, per_book_cap)
+            else:
+                ranked = ranked[:top_k]
+            hits = [
+                RagHit(
+                    id=str(row["id"]),
+                    title=str(row["title"]),
+                    chapter_id=str(row["chapter_id"]),
+                    chapter_order=int(row["chapter_order"]),
+                    content=str(row["content"]),
+                    score=float(score),
+                    retrieval_mode=effective_mode,
+                    book=self._book_key(row),
+                )
+                for score, row in ranked
+            ]
+        return hits
+
+    def _hybrid_rank(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        query: str,
+        semantic_scores: Sequence[float],
+        *,
+        top_k: int,
+        candidate_depth: int,
+        per_book_cap: int | None,
+    ) -> list[RagHit]:
+        """Fuse lexical and semantic candidate lists with RRF."""
+
+        lexical_ranked = sorted(
             (
-                (score, row)
-                for score, row in zip(scores, rows, strict=True)
-                if retrieval_mode == "semantic" or score > 0.0
+                (score, index)
+                for index, score in enumerate(_lexical_scores(rows, query))
+                if score > 0.0
             ),
-            key=lambda item: (
-                -item[0],
-                int(item[1]["chapter_order"]),
-                str(item[1]["id"]),
+            key=lambda item: (-item[0], int(rows[item[1]]["chapter_order"]), str(rows[item[1]]["id"])),
+        )[:candidate_depth]
+        semantic_ranked = sorted(
+            range(len(rows)),
+            key=lambda index: (
+                -semantic_scores[index],
+                int(rows[index]["chapter_order"]),
+                str(rows[index]["id"]),
             ),
-        )[:top_k]
+        )[:candidate_depth]
+        rrf_k = 60.0
+        fused: dict[int, float] = {}
+        channels: dict[int, set[str]] = {}
+        for rank, (_score, index) in enumerate(lexical_ranked, start=1):
+            fused[index] = fused.get(index, 0.0) + 1.0 / (rrf_k + rank)
+            channels.setdefault(index, set()).add("lexical")
+        for rank, index in enumerate(semantic_ranked, start=1):
+            fused[index] = fused.get(index, 0.0) + 1.0 / (rrf_k + rank)
+            channels.setdefault(index, set()).add("semantic")
+        ordered = sorted(
+            fused,
+            key=lambda index: (
+                -fused[index],
+                int(rows[index]["chapter_order"]),
+                str(rows[index]["id"]),
+            ),
+        )
+        picked: list[int] = []
+        if per_book_cap:
+            book_counts: dict[str, int] = {}
+            for index in ordered:
+                book = self._book_key(rows[index])
+                if book_counts.get(book, 0) >= per_book_cap:
+                    continue
+                book_counts[book] = book_counts.get(book, 0) + 1
+                picked.append(index)
+                if len(picked) >= top_k:
+                    break
+        else:
+            picked = ordered[:top_k]
         return [
             RagHit(
-                id=str(row["id"]),
-                title=str(row["title"]),
-                chapter_id=str(row["chapter_id"]),
-                chapter_order=int(row["chapter_order"]),
-                content=str(row["content"]),
-                score=float(score),
-                retrieval_mode=retrieval_mode,
+                id=str(rows[index]["id"]),
+                title=str(rows[index]["title"]),
+                chapter_id=str(rows[index]["chapter_id"]),
+                chapter_order=int(rows[index]["chapter_order"]),
+                content=str(rows[index]["content"]),
+                score=float(fused[index]),
+                retrieval_mode="hybrid",
+                book=self._book_key(rows[index]),
+                channels="+".join(sorted(channels.get(index, set()))),
             )
-            for score, row in ranked
+            for index in picked
         ]
+
+    def _apply_per_book_cap(
+        self,
+        ranked: list[tuple[float, Mapping[str, Any]]],
+        top_k: int,
+        per_book_cap: int,
+    ) -> list[tuple[float, Mapping[str, Any]]]:
+        picked: list[tuple[float, Mapping[str, Any]]] = []
+        book_counts: dict[str, int] = {}
+        for item in ranked:
+            book = self._book_key(item[1])
+            if book_counts.get(book, 0) >= per_book_cap:
+                continue
+            book_counts[book] = book_counts.get(book, 0) + 1
+            picked.append(item)
+            if len(picked) >= top_k:
+                break
+        return picked
 
     def retrieve_context(
         self,
@@ -1043,6 +1425,13 @@ class RagKnowledgeBase:
         max_chars: int = 12_000,
         chapter_ids: set[str] | frozenset[str] | None = None,
         embedding_provider: EmbeddingProvider | None = None,
+        mode: str | None = None,
+        book_ids: set[str] | frozenset[str] | None = None,
+        authors: set[str] | frozenset[str] | None = None,
+        languages: set[str] | frozenset[str] | None = None,
+        per_book_cap: int | None = None,
+        candidate_depth: int = 30,
+        auto_route: bool = False,
     ) -> RagContext:
         """Return citation-labelled text ready to augment a generation prompt."""
 
@@ -1053,12 +1442,25 @@ class RagKnowledgeBase:
             top_k=top_k,
             chapter_ids=chapter_ids,
             embedding_provider=embedding_provider,
+            mode=mode,
+            book_ids=book_ids,
+            authors=authors,
+            languages=languages,
+            per_book_cap=per_book_cap,
+            candidate_depth=candidate_depth,
+            auto_route=auto_route,
         )
         included: list[RagHit] = []
         blocks: list[str] = []
         used = 0
         for hit in hits:
-            prefix = f"[KB:{hit.id}] {hit.title}\n"
+            label_parts = [f"[KB:{hit.id}]"]
+            if hit.book:
+                label_parts.append(f"[{hit.book}]")
+            label_parts.append(hit.title)
+            if hit.channels:
+                label_parts.append(f"({hit.channels})")
+            prefix = " ".join(label_parts) + "\n"
             separator = "\n\n" if blocks else ""
             available = max_chars - used - len(separator) - len(prefix)
             if available <= 0:
@@ -1094,8 +1496,10 @@ __all__ = [
     "build_embedding_index",
     "initialize_rag_manifest",
     "load_knowledge_rows",
+    "load_metadata_sidecar",
     "manifest_path_for",
     "maybe_build_zhipu_embedding_index",
+    "metadata_sidecar_path_for",
     "rag_manifest_is_current",
     "read_rag_manifest",
     "vector_index_path_for",

@@ -17,8 +17,9 @@ from rag_knowledge_base import (
     ZhipuEmbeddingProvider,
     build_embedding_index,
     initialize_rag_manifest,
-    load_knowledge_rows,
+    load_metadata_sidecar,
     manifest_path_for,
+    metadata_sidecar_path_for,
     read_rag_manifest,
     vector_index_path_for,
 )
@@ -79,8 +80,9 @@ def _status_payload(knowledge_base_path: Path) -> dict[str, Any]:
         payload["error"] = "knowledge_base_missing"
         return payload
     try:
-        rows = load_knowledge_rows(knowledge_base_path)
-        manifest = read_rag_manifest(knowledge_base_path)
+        knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
+        manifest = knowledge_base.manifest
+        metadata = load_metadata_sidecar(knowledge_base_path)
     except RagError as exc:
         payload["current"] = False
         payload["error"] = exc.__class__.__name__
@@ -91,9 +93,18 @@ def _status_payload(knowledge_base_path: Path) -> dict[str, Any]:
     payload.update(
         {
             "current": True,
-            "chunk_count": len(rows),
+            "chunk_count": knowledge_base.chunk_count,
             "manifest": str(manifest_path_for(knowledge_base_path)),
             "lexical": manifest["retrieval"]["lexical"]["status"],
+            "metadata": {
+                "path": str(metadata_sidecar_path_for(knowledge_base_path)),
+                "exists": metadata_sidecar_path_for(knowledge_base_path).is_file(),
+                "row_count": len(metadata),
+                "coverage": round(
+                    len(metadata) / max(knowledge_base.chunk_count, 1),
+                    6,
+                ),
+            },
             "embedding": {
                 "status": embedding["status"],
                 "provider": embedding.get("provider"),
@@ -146,6 +157,8 @@ def _hits_payload(hits: Sequence[Any]) -> list[dict[str, Any]]:
             "chapter_order": hit.chapter_order,
             "score": hit.score,
             "retrieval_mode": hit.retrieval_mode,
+            "book": getattr(hit, "book", ""),
+            "channels": getattr(hit, "channels", ""),
             "content": hit.content,
         }
         for hit in hits
@@ -159,11 +172,28 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
     except RagFormatError:
         initialize_rag_manifest(knowledge_base_path)
         knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
+    # Explicit --mode wins; the legacy --semantic flag keeps its meaning;
+    # otherwise default to hybrid ranking per the retrieval plan.
+    mode = getattr(args, "mode", None) or ("semantic" if args.semantic else "hybrid")
     provider = (
         _provider_from_manifest(knowledge_base_path, args)
-        if args.semantic
+        if mode in ("semantic", "hybrid")
         else None
     )
+    per_book_cap = max(0, int(getattr(args, "per_book_cap", 3) or 0)) or None
+    inferred_routes = {"book_ids": frozenset(), "authors": frozenset()}
+    auto_route = bool(getattr(args, "auto_route", True))
+    if auto_route and not args.book and not args.author:
+        inferred_routes = knowledge_base.infer_query_routes(args.query)
+    filters = {
+        "book_ids": (
+            set(args.book)
+            if getattr(args, "book", None)
+            else set(inferred_routes["book_ids"]) or None
+        ),
+        "authors": set(getattr(args, "author", None) or []) or None,
+        "languages": set(getattr(args, "language", None) or []) or None,
+    }
     semantic_error: str | None = None
     try:
         context = knowledge_base.retrieve_context(
@@ -172,6 +202,10 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             max_chars=args.max_chars,
             chapter_ids=set(args.chapter_id) if args.chapter_id else None,
             embedding_provider=provider,
+            mode=mode,
+            per_book_cap=per_book_cap,
+            candidate_depth=int(getattr(args, "candidate_depth", 30) or 30),
+            **filters,
         )
     except RagError as exc:
         if provider is None:
@@ -183,15 +217,26 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             max_chars=args.max_chars,
             chapter_ids=set(args.chapter_id) if args.chapter_id else None,
             embedding_provider=None,
+            mode="lexical",
+            per_book_cap=per_book_cap,
+            **filters,
         )
     _json_line(
         {
             "query": args.query,
             "retrieval_mode": (
-                context.hits[0].retrieval_mode if context.hits else "semantic" if provider else "lexical"
+                context.hits[0].retrieval_mode if context.hits else mode
             ),
-            "semantic_requested": bool(args.semantic),
-            "semantic_used": bool(context.hits and context.hits[0].retrieval_mode == "semantic"),
+            "requested_mode": mode,
+            "books": sorted(set(args.book)) if getattr(args, "book", None) else [],
+            "routing": {
+                "automatic": auto_route,
+                "inferred_books": sorted(inferred_routes["book_ids"]),
+                "matched_authors": sorted(inferred_routes["authors"]),
+            },
+            "per_book_cap": per_book_cap,
+            "semantic_requested": mode in ("semantic", "hybrid"),
+            "semantic_used": bool(context.hits and context.hits[0].retrieval_mode in ("semantic", "hybrid")),
             "semantic_error": semantic_error,
             "hits": _hits_payload(context.hits),
             "context": context.text,
@@ -300,6 +345,62 @@ def build_parser() -> argparse.ArgumentParser:
     retrieve.add_argument("--top-k", type=int, default=5)
     retrieve.add_argument("--max-chars", type=int, default=12_000)
     retrieve.add_argument("--chapter-id", action="append", default=[])
+    retrieve.add_argument(
+        "--mode",
+        choices=("hybrid", "lexical", "semantic"),
+        default=None,
+        help=(
+            "Retrieval ranking: hybrid (BM25+vector RRF fusion, default), "
+            "lexical (BM25 only), or semantic (cosine only)."
+        ),
+    )
+    retrieve.add_argument(
+        "--book",
+        action="append",
+        default=[],
+        help="Restrict retrieval to a book title/id (repeatable).",
+    )
+    retrieve.add_argument(
+        "--author",
+        action="append",
+        default=[],
+        help="Restrict retrieval to an author via the metadata sidecar (repeatable).",
+    )
+    retrieve.add_argument(
+        "--language",
+        action="append",
+        default=[],
+        help="Restrict retrieval to a language via the metadata sidecar (repeatable).",
+    )
+    retrieve.add_argument(
+        "--per-book-cap",
+        type=int,
+        default=3,
+        help=(
+            "Maximum results per book so large books cannot flood the answer; "
+            "0 disables the cap (default 3)."
+        ),
+    )
+    retrieve.add_argument(
+        "--candidate-depth",
+        type=int,
+        default=30,
+        help="Per-channel candidate pool before RRF fusion.",
+    )
+    auto_route = retrieve.add_mutually_exclusive_group()
+    auto_route.add_argument(
+        "--auto-route",
+        dest="auto_route",
+        action="store_true",
+        help="Route explicit book/author mentions before ranking (default).",
+    )
+    auto_route.add_argument(
+        "--no-auto-route",
+        dest="auto_route",
+        action="store_false",
+        help="Disable automatic query routing.",
+    )
+    retrieve.set_defaults(auto_route=True)
     retrieve.set_defaults(func=_command_retrieve)
 
     status = subparsers.add_parser("status")
