@@ -124,6 +124,95 @@ def _command_status(args: argparse.Namespace, stdout: TextIO) -> int:
     return 0 if payload.get("exists") else 1
 
 
+def _command_evaluate(args: argparse.Namespace, stdout: TextIO) -> int:
+    from collections import defaultdict
+
+    from rag_evaluation import evaluate_retrieval, load_evaluation_cases
+    from rag_knowledge_base import RagKnowledgeBase, ZhipuEmbeddingProvider
+
+    cases = load_evaluation_cases(args.cases)
+    by_corpus: dict[str, list[dict]] = defaultdict(list)
+    for case in cases:
+        corpus = case.get("source_corpus")
+        if not corpus:
+            raise SystemExit("evaluate requires cases with source_corpus fields")
+        by_corpus[str(corpus)].append(case)
+
+    embedding_provider = None
+    if args.mode in {"hybrid", "semantic"}:
+        embedding_provider = ZhipuEmbeddingProvider(
+            api_key_env=args.api_key_env,
+            base_url=args.base_url,
+            model=args.embedding_model,
+            dimensions=args.dimensions,
+        )
+    reranker = None
+    if args.rerank:
+        from rag_reranking import OpenAICompatibleReranker
+
+        if not args.rerank_model:
+            raise SystemExit("--rerank requires --rerank-model")
+        reranker = OpenAICompatibleReranker(
+            model=args.rerank_model,
+            base_url=args.base_url,
+            api_key_env=args.api_key_env,
+        )
+
+    rows: list[dict] = []
+    for corpus, group in sorted(by_corpus.items()):
+        report = evaluate_retrieval(
+            RagKnowledgeBase.open(corpus),
+            group,
+            mode=args.mode,
+            embedding_provider=embedding_provider,
+            reranker=reranker,
+            candidate_depth=args.candidate_depth,
+            top_k=args.top_k,
+            max_chars=args.max_chars,
+        )
+        rows.extend(report["queries"])
+        _json_line(
+            {
+                "corpus": corpus,
+                "cases": len(group),
+                "final_hit_at_k": report["summary"]["metrics"]["final_hit_at_k"],
+            },
+            stdout,
+        )
+
+    answerable = [row for row in rows if not row["unanswerable"]]
+    unanswerable = [row for row in rows if row["unanswerable"]]
+
+    def _rate(key: str, subset: list[dict]) -> float | None:
+        values = [row[key] for row in subset if row.get(key) is not None]
+        return sum(values) / len(values) if values else None
+
+    summary = {
+        "schema_version": 1,
+        "cases": args.cases,
+        "mode": args.mode,
+        "rerank_model": args.rerank_model if reranker else None,
+        "candidate_depth": args.candidate_depth,
+        "top_k": args.top_k,
+        "answerable": len(answerable),
+        "unanswerable": len(unanswerable),
+        "candidate_hit_at_n": _rate("candidate_hit_at_n", answerable),
+        "final_hit_at_k": _rate("final_hit_at_k", answerable),
+        "mrr": _rate("mrr", answerable),
+        "context_evidence_coverage": _rate("context_evidence_coverage", answerable),
+        "unanswerable_returned_any_rate": _rate("returned_any", unanswerable),
+        "queries": rows,
+    }
+    if args.output:
+        Path(args.output).write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _json_line({"report": args.output}, stdout)
+    _json_line({k: v for k, v in summary.items() if k != "queries"}, stdout)
+    return 0
+
+
 def _command_register(args: argparse.Namespace, stdout: TextIO) -> int:
     knowledge_base_path = _knowledge_base_path(args.path)
     initialize_rag_manifest(knowledge_base_path)
@@ -406,6 +495,29 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     status.add_argument("path", help="knowledge_base.jsonl path or artifact directory")
     status.set_defaults(func=_command_status)
+
+    evaluate = subparsers.add_parser(
+        "evaluate",
+        parents=[provider],
+        description="Run labelled three-layer retrieval evaluation.",
+    )
+    evaluate.add_argument(
+        "cases",
+        help="evaluation cases JSONL (e.g. tests/fixtures/retrieval_eval.jsonl)",
+    )
+    evaluate.add_argument(
+        "--mode", choices=("hybrid", "lexical", "semantic"), default="hybrid"
+    )
+    evaluate.add_argument("--rerank", action="store_true")
+    evaluate.add_argument("--rerank-model", default=None)
+    evaluate.add_argument("--embedding-model", default=None)
+    evaluate.add_argument("--top-k", type=int, default=5)
+    evaluate.add_argument("--candidate-depth", type=int, default=60)
+    evaluate.add_argument("--max-chars", type=int, default=12_000)
+    evaluate.add_argument(
+        "--output", default=None, help="write the full report JSON here"
+    )
+    evaluate.set_defaults(func=_command_evaluate)
 
     derive_docx = subparsers.add_parser("derive-docx")
     derive_docx.add_argument("docx")

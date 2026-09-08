@@ -13,6 +13,23 @@ from typing import Any
 from rag_knowledge_base import RagHit, RagProviderError
 
 
+def _parse_reranker_json(raw: str) -> Any:
+    """Parse a rubric response, tolerating bare arrays and code fences.
+
+    Some chat models omit the wrapping object or wrap JSON in markdown
+    fences despite the fixed prompt; both shapes still name every input
+    identifier, and identifier validation happens after parsing.
+    """
+
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.strip("`").strip()
+        if text[:4].lower() == "json":
+            text = text[4:]
+        text = text.strip()
+    return json.loads(text)
+
+
 class OpenAICompatibleReranker:
     def __init__(self, *, model: str, base_url: str | None = None,
                  api_key_env: str = "RAG_RERANK_API_KEY", timeout: float = 60,
@@ -65,8 +82,14 @@ class OpenAICompatibleReranker:
                     ],
                 )
                 raw = response.choices[0].message.content
-                result = json.loads(raw)
-                entries = result["scores"]
+                result = _parse_reranker_json(raw)
+                entries = (
+                    result
+                    if isinstance(result, list)
+                    else result.get("scores")
+                )
+                if not isinstance(entries, list):
+                    raise ValueError("Reranking response has no scores array")
                 expected = {hit.id for hit in batch}
                 actual: dict[str, float] = {}
                 for entry in entries:

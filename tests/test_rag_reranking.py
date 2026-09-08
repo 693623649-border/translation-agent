@@ -33,6 +33,32 @@ def _response(scores: Sequence[dict]) -> SimpleNamespace:
     )
 
 
+def _response_id_only(entries: Sequence[dict]) -> SimpleNamespace:
+    """A model that returns the bare array without the wrapping object."""
+
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(message=SimpleNamespace(content=json.dumps(list(entries))))
+        ]
+    )
+
+
+class _FencedClient:
+    """A model that wraps the JSON object in markdown fences."""
+
+    def __init__(self) -> None:
+        class _Chat:
+            completions = SimpleNamespace(create=self._create)
+
+        self.chat = _Chat
+
+    def _create(self, **kwargs: object) -> object:
+        content = "```json\n" + json.dumps({"scores": [{"id": "a", "score": 3}]}) + "\n```"
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+
 class _ScriptedClient:
     def __init__(self, responses: Sequence) -> None:
         self.responses = list(responses)
@@ -98,6 +124,17 @@ class OpenAICompatibleRerankerTests(unittest.TestCase):
         reranker.rerank("问题", [_hit("a", content="x" * 500)])
         payload = json.loads(client.requests[0]["messages"][1]["content"])
         self.assertEqual(len(payload["documents"][0]["text"]), 10)
+
+    def test_bare_array_and_fenced_responses_are_parsed(self) -> None:
+        bare = _ScriptedClient([_response_id_only([{"id": "a", "score": 2}])])
+        reranker = OpenAICompatibleReranker(model="m", client=bare)
+        hits = reranker.rerank("问题", [_hit("a")])
+        self.assertEqual([h.id for h in hits], ["a"])
+
+        fenced_client = _FencedClient()
+        reranker = OpenAICompatibleReranker(model="m", client=fenced_client)
+        hits = reranker.rerank("问题", [_hit("a")])
+        self.assertEqual([h.id for h in hits], ["a"])
 
     def test_untrusted_identifiers_are_rejected(self) -> None:
         for bad in (

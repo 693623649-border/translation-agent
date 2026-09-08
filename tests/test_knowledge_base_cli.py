@@ -55,7 +55,8 @@ class MissingKeyProvider(FakeZhipuProvider):
 
 
 def _json(stdout: io.StringIO) -> dict[str, object]:
-    return json.loads(stdout.getvalue())
+    lines = [line for line in stdout.getvalue().splitlines() if line.strip()]
+    return json.loads(lines[-1])
 
 
 class KnowledgeBaseCliTests(unittest.TestCase):
@@ -66,6 +67,116 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         self.output = self.root / "book"
         self.kb = self.output / "knowledge_base.jsonl"
         write_knowledge_base(self.kb, ROWS)
+
+    def test_evaluate_runs_lexical_cases_and_writes_report(self) -> None:
+        cases = self.root / "cases.jsonl"
+        cases.write_text(
+            "\n".join(
+                json.dumps(entry, ensure_ascii=False)
+                for entry in (
+                    {
+                        "id": "q1",
+                        "query": "量子叠加",
+                        "category": "terminology",
+                        "relevant_ids": ["a" * 40],
+                        "evidence_substrings": ["量子叠加"],
+                        "source_corpus": str(self.kb),
+                    },
+                    {
+                        "id": "q2",
+                        "query": "板块构造",
+                        "category": "unanswerable",
+                        "unanswerable": True,
+                        "source_corpus": str(self.kb),
+                    },
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        report = self.root / "report.json"
+        stdout = io.StringIO()
+
+        code = main(
+            [
+                "evaluate",
+                str(cases),
+                "--mode",
+                "lexical",
+                "--output",
+                str(report),
+            ],
+            stdout,
+        )
+
+        self.assertEqual(code, 0)
+        summary = _json(stdout)
+        self.assertEqual(summary["answerable"], 1)
+        self.assertEqual(summary["unanswerable"], 1)
+        self.assertEqual(summary["final_hit_at_k"], 1.0)
+        saved = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(saved["mode"], "lexical")
+        self.assertEqual(len(saved["queries"]), 2)
+
+    def test_evaluate_hybrid_uses_provider_and_reranker(self) -> None:
+        cases = self.root / "cases.jsonl"
+        cases.write_text(
+            json.dumps(
+                {
+                    "id": "q1",
+                    "query": "量子叠加",
+                    "category": "terminology",
+                    "relevant_ids": ["a" * 40],
+                    "evidence_substrings": ["量子叠加"],
+                    "source_corpus": str(self.kb),
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        reranker_calls: list[tuple[str, tuple]] = []
+
+        class FakeReranker:
+            def rerank(self, query: str, hits: Sequence[object]) -> Sequence[object]:
+                reranker_calls.append((query, tuple(hits)))
+                return list(hits)
+
+        import rag_reranking
+
+        with (
+            patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider),
+            patch.object(rag_reranking, "OpenAICompatibleReranker", return_value=FakeReranker()),
+        ):
+            stdout = io.StringIO()
+            code = main(
+                [
+                    "evaluate",
+                    str(cases),
+                    "--mode",
+                    "hybrid",
+                    "--rerank",
+                    "--rerank-model",
+                    "test-reranker",
+                ],
+                stdout,
+            )
+
+        self.assertEqual(code, 0)
+        self.assertGreaterEqual(len(reranker_calls), 1)
+
+    def test_evaluate_rejects_rerank_without_model(self) -> None:
+        cases = self.root / "cases.jsonl"
+        cases.write_text(
+            json.dumps(
+                {"id": "q1", "query": "量子", "source_corpus": str(self.kb)},
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(SystemExit):
+            main(["evaluate", str(cases), "--rerank"], io.StringIO())
 
     def test_register_builds_zhipu_embedding_index_without_network(self) -> None:
         stdout = io.StringIO()
