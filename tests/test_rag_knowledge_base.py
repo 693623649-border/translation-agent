@@ -105,6 +105,50 @@ class RagKnowledgeBaseTests(unittest.TestCase):
     def _write(self, rows: list[dict[str, object]] | None = None) -> None:
         write_knowledge_base(self.knowledge_path, rows or ROWS)
 
+    def test_runtime_diagnostics_alias_cache_and_author_filter(self):
+        self._write()
+        kb = RagKnowledgeBase.open(self.knowledge_path)
+        self.assertEqual(kb.retrieve("量子", authors={"不存在"}), [])
+        with patch("rag_knowledge_base._tokens", wraps=__import__("rag_knowledge_base")._tokens) as tokenize:
+            context = kb.retrieve_context("quantum", aliases={"quantum": ["量子"]})
+            self.assertEqual(context.hits[0].id, ROWS[0]["id"])
+            self.assertTrue(all(len(call.args[0]) < 30 for call in tokenize.call_args_list))
+        self.assertEqual(context.diagnostics["effective_mode"], "lexical")
+        self.assertEqual(context.diagnostics["fallback_reason"], "embedding_provider_unavailable")
+        self.assertEqual(context.diagnostics["query_variants"], ["quantum", "量子"])
+
+    def test_context_shares_budget_and_returns_actual_excerpts(self):
+        rows = [dict(row, content="前文。" * 800 + "量子关键证据。" + str(i)) for i, row in enumerate(ROWS)]
+        self._write(rows)
+        context = RagKnowledgeBase.open(self.knowledge_path).retrieve_context("量子", max_chars=600)
+        self.assertEqual(len(context.hits), 2)
+        self.assertLessEqual(len(context.text), 600)
+        for hit in context.hits:
+            self.assertIn("量子关键证据", hit.content)
+            self.assertIn(hit.content, context.text)
+            self.assertGreater(len(hit.source_content), len(hit.content))
+
+    def test_reranker_sees_candidates_before_top_k(self):
+        self._write()
+        class Reverse:
+            def rerank(self, query, hits):
+                return list(reversed(hits))
+        kb = RagKnowledgeBase.open(self.knowledge_path)
+        before = kb.retrieve("量子 历史", top_k=2)
+        after = kb.retrieve("量子 历史", top_k=1, reranker=Reverse())
+        self.assertEqual(after[0].id, before[-1].id)
+
+    def test_incremental_embeddings_reuse_content_not_ids(self):
+        self._write()
+        provider = FakeEmbeddingProvider()
+        build_embedding_index(self.knowledge_path, provider, batch_size=1)
+        changed = [dict(row) for row in ROWS]
+        changed[0]["content"] = "量子变化"
+        self._write(changed)
+        build_embedding_index(self.knowledge_path, provider, batch_size=1)
+        self.assertEqual(provider.document_calls, 3)
+        self.assertTrue(RagKnowledgeBase.open(self.knowledge_path).embedding_ready)
+
     def test_publisher_creates_rag_manifest_and_lexical_retrieval(self) -> None:
         self._write()
 
@@ -151,9 +195,10 @@ class RagKnowledgeBaseTests(unittest.TestCase):
         )
 
         self.assertEqual(hits[0].id, "a" * 40)
-        self.assertEqual(hits[0].retrieval_mode, "semantic")
+        self.assertEqual(hits[0].retrieval_mode, "hybrid")
         self.assertIn(f"[KB:{'a' * 40}]", context.text)
-        self.assertEqual(context.hits, tuple(hits))
+        self.assertEqual([hit.id for hit in context.hits], [hit.id for hit in hits])
+        self.assertEqual(context.hits[0].source_content, hits[0].content)
 
     def test_unchanged_ready_index_skips_repeat_embedding_cost(self) -> None:
         self._write()
@@ -185,6 +230,7 @@ class RagKnowledgeBaseTests(unittest.TestCase):
         with self.assertRaises(RagEmbeddingUnavailableError):
             knowledge_base.retrieve(
                 "量子",
+                mode="semantic",
                 embedding_provider=provider,
             )
 
@@ -442,7 +488,8 @@ class HybridRoutingTests(unittest.TestCase):
             book_ids={"01_大书"},
             per_book_cap=2,
         )
-        self.assertEqual(len(hits), 5)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(len(hits[0].duplicate_sources), 4)
         self.assertTrue(all(hit.book == "01_大书" for hit in hits))
 
     def test_auto_route_matches_title_variants_and_author_books(self) -> None:
@@ -484,7 +531,8 @@ class HybridRoutingTests(unittest.TestCase):
             auto_route=True,
         )
         self.assertEqual(len(hits), 2)
-        self.assertTrue(all(hit.book == "共同幻想論" for hit in hits))
+        self.assertTrue(any(hit.book == "共同幻想論" for hit in hits))
+        self.assertTrue(any(hit.book != "共同幻想論" for hit in hits))
 
         title_wins = knowledge_base.infer_query_routes(
             "丸山真男如何理解日本思想的结构"

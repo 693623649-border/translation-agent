@@ -76,3 +76,4 @@ repair-ocr.toml
 cleanup_wenxue_lilun.py
 scan_fragments.py
 summarize_verify.py
+tmp/

@@ -21,7 +21,7 @@ import tempfile
 import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -284,6 +284,8 @@ class RagHit:
     retrieval_mode: str
     book: str = ""
     channels: str = ""
+    source_content: str = ""
+    duplicate_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -291,6 +293,11 @@ class RagContext:
     query: str
     hits: tuple[RagHit, ...]
     text: str
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+class Reranker(Protocol):
+    def rerank(self, query: str, hits: Sequence[RagHit]) -> Sequence[RagHit]: ...
 
 
 def manifest_path_for(knowledge_base_path: Path | str) -> Path:
@@ -763,31 +770,44 @@ def build_embedding_index(
             expected_ids=[str(row["id"]) for row in rows],
         )
         return metadata
-    vectors: list[tuple[float, ...]] = []
-    dimensions: int | None = None
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start : start + batch_size]
-        texts = [_embedding_document(row) for row in batch]
+    cache_path = source.with_suffix(".embedding-cache.json")
+    cache: dict[str, Any] = {}
+    try:
+        loaded_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        if loaded_cache.get("provider") == provider_name and loaded_cache.get("model") == model and isinstance(loaded_cache.get("dimensions"), int) and (requested_dimensions is None or loaded_cache["dimensions"] == requested_dimensions):
+            payload = loaded_cache.get("vectors", {})
+            digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+            if digest == loaded_cache.get("sha256"):
+                cache = loaded_cache
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    dimensions: int | None = requested_dimensions or cache.get("dimensions")
+    by_digest: dict[str, tuple[float, ...]] = {}
+    for digest, vector in cache.get("vectors", {}).items():
         try:
-            raw_vectors = list(provider.embed_documents(texts))
+            by_digest[digest] = _validate_vector(vector, expected_dimensions=dimensions, label="cached embedding")
+        except RagError:
+            continue
+    texts = [_embedding_document(row) for row in rows]
+    digests = [hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts]
+    missing = list(dict.fromkeys(digest for digest in digests if digest not in by_digest))
+    text_by_digest = dict(zip(digests, texts))
+    for start in range(0, len(missing), batch_size):
+        batch = missing[start:start + batch_size]
+        try:
+            raw_vectors = list(provider.embed_documents([text_by_digest[digest] for digest in batch]))
         except Exception as exc:
-            raise RagProviderError(
-                f"Embedding provider failed for document batch {start // batch_size + 1}: {exc}"
-            ) from exc
+            raise RagProviderError(f"Embedding provider failed for document batch {start // batch_size + 1}: {exc}") from exc
         if len(raw_vectors) != len(batch):
-            raise RagProviderError(
-                "Embedding provider returned "
-                f"{len(raw_vectors)} vectors for {len(batch)} documents"
-            )
-        for offset, raw_vector in enumerate(raw_vectors):
-            vector = _validate_vector(
-                raw_vector,
-                expected_dimensions=dimensions,
-                label=f"document embedding {start + offset + 1}",
-            )
+            raise RagProviderError(f"Embedding provider returned {len(raw_vectors)} vectors for {len(batch)} documents")
+        for digest, raw_vector in zip(batch, raw_vectors, strict=True):
+            vector = _validate_vector(raw_vector, expected_dimensions=dimensions, label="document embedding")
             if dimensions is None:
                 dimensions = len(vector)
-            vectors.append(vector)
+            by_digest[digest] = vector
+    vectors = [by_digest[digest] for digest in digests]
+    cache_vectors = {digest: list(by_digest[digest]) for digest in set(digests)}
+    _atomic_write_text(cache_path, _json_text({"provider": provider_name, "model": model, "dimensions": dimensions, "vectors": cache_vectors, "sha256": hashlib.sha256(json.dumps(cache_vectors, sort_keys=True).encode()).hexdigest()}))
     if dimensions is None:
         raise RagProviderError("Embedding provider produced no vectors")
 
@@ -934,20 +954,28 @@ def _tokens(value: str) -> list[str]:
 def _lexical_scores(
     rows: Sequence[Mapping[str, Any]],
     query: str,
+    cached_terms: Mapping[str, Counter] | None = None,
+    statistics_cache: dict | None = None,
 ) -> list[float]:
     query_terms = Counter(_tokens(query))
     if not query_terms:
         return [0.0] * len(rows)
     document_terms = [
-        Counter(_tokens(f"{row['title']} {row['title']} {row['content']}"))
+        cached_terms[str(row["id"])] if cached_terms is not None else Counter(_tokens(f"{row['title']} {row['title']} {row['content']}"))
         for row in rows
     ]
-    document_lengths = [sum(terms.values()) for terms in document_terms]
-    average_length = sum(document_lengths) / max(len(document_lengths), 1)
-    document_frequency = {
-        term: sum(term in terms for terms in document_terms)
-        for term in query_terms
-    }
+    cache_key = tuple(str(row["id"]) for row in rows)
+    statistics = statistics_cache.get(cache_key) if statistics_cache is not None else None
+    if statistics is None:
+        document_lengths = [sum(terms.values()) for terms in document_terms]
+        average_length = sum(document_lengths) / max(len(document_lengths), 1)
+        document_frequency = Counter(term for terms in document_terms for term in terms)
+        statistics = (document_lengths, average_length, document_frequency)
+        if statistics_cache is not None:
+            if len(statistics_cache) >= 16:
+                statistics_cache.clear()
+            statistics_cache[cache_key] = statistics
+    document_lengths, average_length, document_frequency = statistics
     document_count = len(rows)
     k1 = 1.5
     b = 0.75
@@ -1022,6 +1050,8 @@ class RagKnowledgeBase:
             for row_id, vector in vectors.items()
         }
         self._sidecar = dict(metadata_sidecar or {})
+        self._lexical_statistics: dict = {}
+        self._lexical_terms = {str(row["id"]): Counter(_tokens(f"{row['title']} {row['title']} {row['content']}")) for row in self._rows}
 
     @classmethod
     def open(cls, knowledge_base_path: Path | str) -> "RagKnowledgeBase":
@@ -1166,8 +1196,8 @@ class RagKnowledgeBase:
             meta = self._sidecar.get(str(row["id"]), {})
             if authors is not None:
                 author = str(meta.get("author") or "").strip()
-                if not any(
-                    wanted == author or wanted in author or author in wanted
+                if not author or not any(
+                    wanted and (wanted == author or wanted in author or author in wanted)
                     for wanted in authors
                 ):
                     return False
@@ -1184,13 +1214,16 @@ class RagKnowledgeBase:
         top_k: int = 5,
         chapter_ids: set[str] | frozenset[str] | None = None,
         embedding_provider: EmbeddingProvider | None = None,
-        mode: str | None = None,
+        mode: str | None = "hybrid",
         book_ids: set[str] | frozenset[str] | None = None,
         authors: set[str] | frozenset[str] | None = None,
         languages: set[str] | frozenset[str] | None = None,
-        per_book_cap: int | None = None,
-        candidate_depth: int = 30,
-        auto_route: bool = False,
+        per_book_cap: int | None = 3,
+        candidate_depth: int = 60,
+        auto_route: bool = True,
+        aliases: Mapping[str, Sequence[str]] | None = None,
+        reranker: Reranker | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> list[RagHit]:
         """Return ranked chunks using lexical, semantic, or hybrid ranking.
 
@@ -1209,10 +1242,23 @@ class RagKnowledgeBase:
             raise ValueError("mode must be 'lexical', 'semantic', or 'hybrid'")
         if candidate_depth <= 0:
             raise ValueError("candidate_depth must be positive")
-        if auto_route and book_ids is None and authors is None:
-            inferred = self.infer_query_routes(query)
-            if inferred["book_ids"]:
-                book_ids = inferred["book_ids"]
+        diag = diagnostics if diagnostics is not None else {}
+        diag.clear()
+        expansions = [query]
+        for term, alternatives in (aliases or {}).items():
+            if term and _normalized_text(term) in _normalized_text(query):
+                for alternative in alternatives:
+                    if isinstance(alternative, str) and alternative.strip():
+                        expanded = re.sub(re.escape(term), lambda _: alternative.strip(), query, flags=re.IGNORECASE)
+                        if expanded not in expansions and len(expansions) < 5:
+                            expansions.append(expanded)
+        lexical_query = " ".join(expansions)
+        inferred = self.infer_query_routes(query) if auto_route and book_ids is None and authors is None else {"book_ids": frozenset()}
+        diag.update(requested_mode=mode, query_variants=expansions, routing={"policy": "soft" if inferred["book_ids"] else "explicit" if book_ids is not None or authors is not None else "global", "preferred_books": sorted(inferred["book_ids"])}, fallback_reason=None)
+        requested_top_k = top_k
+        final_cap = per_book_cap
+        top_k = max(top_k, candidate_depth)
+        per_book_cap = None
         rows = [
             row
             for row in self._rows
@@ -1229,7 +1275,9 @@ class RagKnowledgeBase:
                     languages=set(languages) if languages is not None else None,
                 )
             ]
+        diag["filtered_count"] = len(rows)
         if not rows:
+            diag.update(effective_mode="lexical" if embedding_provider is None else mode, candidate_count=0, result_count=0)
             return []
         if per_book_cap and len({self._book_key(row) for row in rows}) <= 1:
             per_book_cap = None
@@ -1244,6 +1292,10 @@ class RagKnowledgeBase:
                 # Legacy graceful degradation: requesting semantic ranking
                 # without an attached provider keeps keyword recall.
                 effective_mode = "lexical"
+                diag["fallback_reason"] = "embedding_provider_unavailable"
+            elif self.embedding_metadata is None and effective_mode == "hybrid":
+                effective_mode = "lexical"
+                diag["fallback_reason"] = "embedding_index_unavailable"
             elif self.embedding_metadata is None:
                 raise RagEmbeddingUnavailableError(
                     "Semantic retrieval requires an embedding index; "
@@ -1283,7 +1335,7 @@ class RagKnowledgeBase:
                 )
             hits = self._hybrid_rank(
                 rows,
-                query,
+                lexical_query,
                 semantic_scores,
                 top_k=top_k,
                 candidate_depth=candidate_depth,
@@ -1293,7 +1345,7 @@ class RagKnowledgeBase:
             scores = (
                 semantic_scores
                 if semantic_scores is not None
-                else _lexical_scores(rows, query)
+                else _lexical_scores(rows, lexical_query, self._lexical_terms, self._lexical_statistics)
             )
             ranked = sorted(
                 (
@@ -1324,7 +1376,42 @@ class RagKnowledgeBase:
                 )
                 for score, row in ranked
             ]
-        return hits
+        diag.update(effective_mode=effective_mode, candidate_count=len(hits), reranker=type(reranker).__name__ if reranker else None)
+        deduplicated: dict[str, RagHit] = {}
+        for hit in hits:
+            key = re.sub(r"\s+", "", _normalized_text(hit.content))
+            if key in deduplicated:
+                first = deduplicated[key]
+                deduplicated[key] = replace(first, duplicate_sources=first.duplicate_sources + (hit.id,))
+            else:
+                deduplicated[key] = hit
+        hits = list(deduplicated.values())
+        preferred = inferred["book_ids"]
+        if preferred:
+            hits.sort(key=lambda hit: -(hit.score * (1.15 if hit.book in preferred else 1.0)))
+        if reranker is not None:
+            original = {hit.id: hit for hit in hits}
+            try:
+                reordered = list(reranker.rerank(query, tuple(hits)))
+            except Exception as exc:
+                diag["reranker_fallback_reason"] = f"{type(exc).__name__}: {exc}"
+                reordered = hits
+            if len(reordered) != len(original) or {hit.id for hit in reordered} != set(original):
+                raise RagProviderError("Reranker must return every candidate exactly once")
+            hits = [replace(original[hit.id], score=float(hit.score)) for hit in reordered]
+        if len({self._book_key(row) for row in rows}) <= 1:
+            final_cap = None
+        selected: list[RagHit] = []
+        counts: Counter = Counter()
+        for hit in hits:
+            if final_cap and counts[hit.book] >= final_cap:
+                continue
+            selected.append(hit)
+            counts[hit.book] += 1
+            if len(selected) >= requested_top_k:
+                break
+        diag.update(deduplicated_count=len(hits), candidate_ids=[hit.id for hit in hits], result_count=len(selected), result_ids=[hit.id for hit in selected])
+        return selected
 
     def _hybrid_rank(
         self,
@@ -1341,7 +1428,7 @@ class RagKnowledgeBase:
         lexical_ranked = sorted(
             (
                 (score, index)
-                for index, score in enumerate(_lexical_scores(rows, query))
+                for index, score in enumerate(_lexical_scores(rows, query, self._lexical_terms, self._lexical_statistics))
                 if score > 0.0
             ),
             key=lambda item: (-item[0], int(rows[item[1]]["chapter_order"]), str(rows[item[1]]["id"])),
@@ -1425,18 +1512,22 @@ class RagKnowledgeBase:
         max_chars: int = 12_000,
         chapter_ids: set[str] | frozenset[str] | None = None,
         embedding_provider: EmbeddingProvider | None = None,
-        mode: str | None = None,
+        mode: str | None = "hybrid",
         book_ids: set[str] | frozenset[str] | None = None,
         authors: set[str] | frozenset[str] | None = None,
         languages: set[str] | frozenset[str] | None = None,
-        per_book_cap: int | None = None,
-        candidate_depth: int = 30,
-        auto_route: bool = False,
+        per_book_cap: int | None = 3,
+        candidate_depth: int = 60,
+        auto_route: bool = True,
+        aliases: Mapping[str, Sequence[str]] | None = None,
+        reranker: Reranker | None = None,
+        diagnostics: dict[str, Any] | None = None,
     ) -> RagContext:
         """Return citation-labelled text ready to augment a generation prompt."""
 
         if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
             raise ValueError("max_chars must be a positive integer")
+        diag = diagnostics if diagnostics is not None else {}
         hits = self.retrieve(
             query,
             top_k=top_k,
@@ -1449,40 +1540,40 @@ class RagKnowledgeBase:
             per_book_cap=per_book_cap,
             candidate_depth=candidate_depth,
             auto_route=auto_route,
+            aliases=aliases,
+            reranker=reranker,
+            diagnostics=diag,
         )
         included: list[RagHit] = []
         blocks: list[str] = []
-        used = 0
-        for hit in hits:
-            label_parts = [f"[KB:{hit.id}]"]
-            if hit.book:
-                label_parts.append(f"[{hit.book}]")
-            label_parts.append(hit.title)
-            if hit.channels:
-                label_parts.append(f"({hit.channels})")
-            prefix = " ".join(label_parts) + "\n"
-            separator = "\n\n" if blocks else ""
-            available = max_chars - used - len(separator) - len(prefix)
-            if available <= 0:
-                break
+        prefixes = [" ".join([f"[KB:{hit.id}]", *([f"[{hit.book}]"] if hit.book else []), hit.title, *([f"({hit.channels})"] if hit.channels else [])]) + "\n" for hit in hits]
+        while hits and sum(map(len, prefixes)) + 2 * (len(hits) - 1) + len(hits) > max_chars:
+            hits.pop()
+            prefixes.pop()
+        remaining = max_chars - sum(map(len, prefixes)) - max(0, 2 * (len(hits) - 1))
+        truncated: list[str] = []
+        for index, (hit, prefix) in enumerate(zip(hits, prefixes)):
+            allowance = remaining // (len(hits) - index)
             content = hit.content
-            if len(content) > available:
-                if blocks:
-                    break
-                content = content[: max(available - 1, 0)].rstrip() + "…"
-            block = prefix + content
-            blocks.append(block)
-            included.append(hit)
-            used += len(separator) + len(block)
-        return RagContext(
-            query=query,
-            hits=tuple(included),
-            text="\n\n".join(blocks),
-        )
+            if len(content) > allowance:
+                terms = sorted(set(_tokens(query)), key=len, reverse=True)
+                location = next((content.lower().find(term) for term in terms if term in content.lower()), 0)
+                start = max(0, location - allowance // 3)
+                content = content[start:start + max(0, allowance - 2)]
+                content = ("…" if start else "") + content + "…"
+                content = content[:allowance]
+                truncated.append(hit.id)
+            remaining -= len(content)
+            blocks.append(prefix + content)
+            included.append(replace(hit, content=content, source_content=hit.source_content or hit.content))
+        diag.update(context_included_ids=[hit.id for hit in included], context_truncated_ids=truncated, context_chars=len("\n\n".join(blocks)), context_omitted_count=diag.get("result_count", 0)-len(included))
+        return RagContext(query=query, hits=tuple(included), text="\n\n".join(blocks), diagnostics=dict(diag))
+
 
 
 __all__ = [
     "EmbeddingProvider",
+    "Reranker",
     "RagContext",
     "RagEmbeddingMetadata",
     "RagEmbeddingUnavailableError",
