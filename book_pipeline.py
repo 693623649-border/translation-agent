@@ -4936,7 +4936,18 @@ def markdown_inline_to_plain_text(value: str) -> str:
     cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.I)
     cleaned = re.sub(r"<[^>]+>", "", cleaned)
     cleaned = html.unescape(cleaned)
-    return re.sub(r"[`*_]{1,3}", "", cleaned).strip()
+    # Emphasis stripping must not eat underscores inside bare URLs
+    # (``.../apm_papers/...``), so stash the link targets first.
+    links: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        links.append(match.group(0))
+        return f"\x00{len(links) - 1}\x00"
+
+    cleaned = re.sub(r"(?:https?|ftp)://\S+", stash, cleaned)
+    cleaned = re.sub(r"[`*_]{1,3}", "", cleaned)
+    cleaned = re.sub(r"\x00(\d+)\x00", lambda m: links[int(m.group(1))], cleaned)
+    return cleaned.strip()
 
 
 def _html_local_name(element: ET.Element) -> str:
