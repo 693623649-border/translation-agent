@@ -22,9 +22,9 @@ from pathlib import Path
 
 import book_pipeline as legacy
 
-ABSTRACT = re.compile(r"^摘\s*要")
-NUMBERED = re.compile(r"^[一二三四五六七八九十]+、\s*\S")
-EPILOGUE = re.compile(r"^余论[：:]")
+ABSTRACT = re.compile(r"^(?:摘\s*要|内容提要)\s*$")
+NUMBERED = re.compile(r"^[一二三四五六七八九十]+(?:、|\s{2,})\S")
+EPILOGUE = re.compile(r"^余论[：:]|^(?:结论|结语)[\s：:]")
 
 
 def _slug(text: str) -> str:
