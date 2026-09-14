@@ -33,7 +33,10 @@ def _slug(text: str) -> str:
     return re.sub(r"-{2,}", "-", text).strip("-")[:48] or "sec"
 
 
-def parse_sections(text: str) -> list[tuple[str, str]]:
+def parse_sections(
+    text: str,
+    extra_headings: frozenset[str] = frozenset(),
+) -> list[tuple[str, str]]:
     """Return [(section_title, body)] in document order."""
 
     lines = text.splitlines()
@@ -42,6 +45,8 @@ def parse_sections(text: str) -> list[tuple[str, str]]:
         stripped = line.strip()
         if ABSTRACT.match(stripped):
             headings.append((index, "摘要"))
+        elif stripped in extra_headings:
+            headings.append((index, stripped))
         elif NUMBERED.match(stripped) or EPILOGUE.match(stripped):
             headings.append((index, stripped))
     if not headings:
@@ -51,14 +56,12 @@ def parse_sections(text: str) -> list[tuple[str, str]]:
     preamble = "\n".join(lines[: headings[0][0]]).strip()
     sections: list[tuple[str, str]] = []
     for position, (index, title) in enumerate(headings):
-        start = index + 1 if title != "摘要" else index
+        start = index + 1
         end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
         body = "\n".join(lines[start:end]).strip()
-        if title == "摘要":
-            body = "\n".join(lines[index:end]).strip()
-            if preamble:
-                body = f"{preamble}\n\n{body}"
-        elif body:
+        if position == 0 and preamble:
+            body = f"{preamble}\n\n{body}"
+        if body:
             body = f"{title}\n{body}"
         if body:
             sections.append((title, body))
@@ -72,9 +75,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--title", required=True)
     parser.add_argument("--author", default="")
     parser.add_argument("--language", default="zh")
+    parser.add_argument(
+        "--split-heading",
+        action="append",
+        default=[],
+        help="Extra exact-match standalone lines treated as section headings.",
+    )
     args = parser.parse_args(argv)
 
-    sections = parse_sections(args.article.read_text(encoding="utf-8"))
+    sections = parse_sections(
+        args.article.read_text(encoding="utf-8"),
+        frozenset(args.split_heading),
+    )
     rows: list[dict] = []
     sidecar: list[dict] = []
     book_id = f"01_{_slug(args.title)}"
