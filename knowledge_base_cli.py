@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
-from book_pipeline import split_text, write_knowledge_base
+from book_pipeline import load_env_file, split_text, write_knowledge_base
 from rag_knowledge_base import (
     RagError,
     RagFormatError,
@@ -169,6 +169,7 @@ def _command_evaluate(args: argparse.Namespace, stdout: TextIO) -> int:
             candidate_depth=args.candidate_depth,
             top_k=args.top_k,
             max_chars=args.max_chars,
+            apparatus_weight=args.apparatus_weight,
         )
         rows.extend(report["queries"])
         _json_line(
@@ -237,6 +238,50 @@ def _command_register(args: argparse.Namespace, stdout: TextIO) -> int:
     return 0
 
 
+def _command_annotate_apparatus(args: argparse.Namespace, stdout: TextIO) -> int:
+    from rag_apparatus import annotate_apparatus
+    root = Path(args.path).expanduser().resolve()
+    paths = sorted(root.rglob(DEFAULT_KNOWLEDGE_BASE)) if args.recursive else [_knowledge_base_path(root)]
+    if not paths:
+        raise ValueError("No knowledge bases found")
+    results = [annotate_apparatus(path) for path in paths]
+    _json_line({"libraries": len(results), "affected_libraries": sum(row["tagged_count"] > 0 for row in results),
+                "tagged_chunks": sum(row["tagged_count"] for row in results), "results": results}, stdout)
+    return 0
+
+
+def _command_translate_kb(args: argparse.Namespace, stdout: TextIO) -> int:
+    from kb_translation import DeepSeekTranslator, normalise_corpus_file
+
+    root = Path(args.path).expanduser().resolve()
+    paths = (
+        sorted(root.rglob(DEFAULT_KNOWLEDGE_BASE))
+        if args.recursive and root.is_dir()
+        else [_knowledge_base_path(root)]
+    )
+    if not paths:
+        raise ValueError("No knowledge bases found")
+    translator = None if args.dry_run else DeepSeekTranslator(
+        api_key_env=args.api_key_env,
+        base_url=args.api_base,
+        model=args.model,
+    )
+    results = [
+        normalise_corpus_file(path, translator, batch_chars=args.batch_chars, dry_run=args.dry_run)
+        for path in paths
+    ]
+    _json_line(
+        {
+            "libraries": len(results),
+            "translate_total": sum(int(row.get("translate_count") or 0) for row in results),
+            "written": sum(bool(row.get("written")) for row in results),
+            "results": results,
+        },
+        stdout,
+    )
+    return 0
+
+
 def _hits_payload(hits: Sequence[Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -294,6 +339,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             mode=mode,
             per_book_cap=per_book_cap,
             candidate_depth=int(getattr(args, "candidate_depth", 30) or 30),
+            apparatus_weight=args.apparatus_weight,
             **filters,
         )
     except RagError as exc:
@@ -308,6 +354,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             embedding_provider=None,
             mode="lexical",
             per_book_cap=per_book_cap,
+            apparatus_weight=args.apparatus_weight,
             **filters,
         )
     _json_line(
@@ -327,6 +374,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             "semantic_requested": mode in ("semantic", "hybrid"),
             "semantic_used": bool(context.hits and context.hits[0].retrieval_mode in ("semantic", "hybrid")),
             "semantic_error": semantic_error,
+            "apparatus": context.diagnostics.get("apparatus", {}),
             "hits": _hits_payload(context.hits),
             "context": context.text,
         },
@@ -427,10 +475,30 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("--lexical-only", action="store_true")
     register.set_defaults(func=_command_register)
 
+    annotate = subparsers.add_parser("annotate-apparatus", help="Annotate document roles without rebuilding vectors")
+    annotate.add_argument("path")
+    annotate.add_argument("--recursive", action="store_true", help="Annotate every knowledge_base.jsonl below path")
+    annotate.set_defaults(func=_command_annotate_apparatus)
+
+    translate_kb = subparsers.add_parser(
+        "translate-kb",
+        help="Translate non-Chinese chunks to Chinese before they stay in the corpus",
+    )
+    translate_kb.add_argument("path")
+    translate_kb.add_argument("--recursive", action="store_true", help="Process every knowledge_base.jsonl below path")
+    translate_kb.add_argument("--dry-run", action="store_true", help="Report what would be translated without calling a model")
+    translate_kb.add_argument("--batch-chars", type=int, default=8000)
+    translate_kb.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    translate_kb.add_argument("--api-base", default="https://api.deepseek.com")
+    translate_kb.add_argument("--model", default="deepseek-chat")
+    translate_kb.set_defaults(func=_command_translate_kb)
+
     retrieve = subparsers.add_parser("retrieve", parents=[provider])
     retrieve.add_argument("path", help="knowledge_base.jsonl path or artifact directory")
     retrieve.add_argument("query")
     retrieve.add_argument("--semantic", action="store_true")
+    retrieve.add_argument("--apparatus-weight", type=float, default=None,
+                          help="Override marked section weight (0 excludes, 1 disables; default .25 structural/.7 explanatory)")
     retrieve.add_argument("--top-k", type=int, default=5)
     retrieve.add_argument("--max-chars", type=int, default=12_000)
     retrieve.add_argument("--chapter-id", action="append", default=[])
@@ -514,6 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--top-k", type=int, default=5)
     evaluate.add_argument("--candidate-depth", type=int, default=60)
     evaluate.add_argument("--max-chars", type=int, default=12_000)
+    evaluate.add_argument("--apparatus-weight", type=float, default=None)
     evaluate.add_argument(
         "--output", default=None, help="write the full report JSON here"
     )
@@ -528,6 +597,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None, stdout: TextIO | None = None) -> int:
     stdout = stdout or sys.stdout
+    # Secrets live in the repo-local .env; loading it here matches every other
+    # CLI entrypoint so the semantic channel does not silently fall back to BM25
+    # just because the caller's shell never exported ZHIPU_API_KEY.
+    load_env_file(Path(__file__).with_name(".env"))
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

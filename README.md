@@ -947,6 +947,32 @@ translation-agent-kb derive-docx "outputs/Book.docx"
 该命令会自动创建同名产物目录并写入 `knowledge_base.jsonl` 与 RAG 清单；如果
 DOCX 没有可识别的 Heading 1 章节契约，会直接失败而不是生成不可审计的语料。
 
+#### 装置内容标注与降权
+
+建库和 `register` 自动生成独立的 `knowledge_base.apparatus.json`，记录各块的
+`is_apparatus`、`apparatus_kind`、识别依据和默认权重，并绑定正文哈希与来源标题。
+原五字段 JSONL、向量内容及其哈希契约不变。旧库补标注无需调用 embedding API：
+
+```bash
+translation-agent-kb annotate-apparatus outputs --recursive
+translation-agent-kb retrieve "outputs/某书" "欲望机器如何运作？" --mode hybrid
+# 查目录、索引或出版信息时可关闭降权；0 则仅排除已经标记的块
+translation-agent-kb retrieve "outputs/某书" "目录" --apparatus-weight 1
+```
+
+目录、索引、版权页、书目、封底等结构性装置默认权重 **0.25**；出版说明、作者介绍、
+译者介绍和译者名词简释默认 **0.7**，保留其中的解释性证据；普通正文始终为 **1**。
+这些权重是可调的工程初值，不代表已经测得的最优值。标题使用完整标签匹配（支持编号、
+书名前缀和部分简繁变体），另识别占多数的点线＋页码条目；不会仅因正文提及“索引”就标记。
+未标注的旧库继续按原权重工作；CLI 返回 `apparatus.annotation_available` 可检查标注是否存在。
+
+三种检索模式均使用标注。BM25 和余弦分数在候选截断前施加降权，负余弦不会因乘小数而
+被提升；hybrid 在各通道候选排序以及 RRF 融合排序时使用装置先验，防止它们占满候选池。
+后续显式配置的模型重排仍可根据内容相关性重新排序。诊断包含被降权的 ID 和覆盖参数。
+API `retrieve_knowledge_base_context`、`retrieve`、`retrieve_context` 和 CLI `evaluate`
+均支持 `apparatus_weight` / `--apparatus-weight`（默认按类型、1 关闭、0 排除）。
+修改正文或派生块来源标题后应重新建库或补标注；陈旧侧表会被拒绝使用。
+
 #### 混合检索、查询路由与每书上限
 
 多书合辑库（语料不均衡、大书淹没小书、单一排序偏差）默认使用

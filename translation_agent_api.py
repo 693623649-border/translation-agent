@@ -379,6 +379,7 @@ def retrieve_knowledge_base_context(
     languages: tuple[str, ...] = (),
     per_book_cap: int | None = None,
     candidate_depth: int = 30,
+    apparatus_weight: float | None = None,
 ) -> RagContext:
     """Retrieve citation-labelled chunks for downstream prompt augmentation.
 
@@ -404,4 +405,5 @@ def retrieve_knowledge_base_context(
         languages=set(languages) if languages else None,
         per_book_cap=per_book_cap,
         candidate_depth=candidate_depth,
+        apparatus_weight=apparatus_weight,
     )

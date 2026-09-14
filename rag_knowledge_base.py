@@ -244,11 +244,13 @@ class ZhipuEmbeddingProvider:
         try:
             return self._embed_request(values)
         except RagProviderError as exc:
-            # One oversized document poisons the whole batch (e.g. an
-            # ASCII-heavy index chunk over the token budget); embed the
-            # remainder individually so a single bad chunk cannot fail
-            # an otherwise valid batch.
-            if len(values) == 1 or not _is_embedding_param_error(exc):
+            # One oversized document poisons the whole request.  Route every
+            # payload rejection through the per-document path so a single bad
+            # chunk cannot fail an otherwise valid batch.  This must also cover
+            # a batch of exactly one: an incremental rebuild that only needs the
+            # newly added oversized chunk embedded would otherwise never reach
+            # the shrink retry and would fail permanently.
+            if not _is_embedding_param_error(exc):
                 raise
         return [self._embed_single(text) for text in values]
 
@@ -719,6 +721,8 @@ def initialize_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
     source = Path(knowledge_base_path)
     rows = load_knowledge_rows(source)
     documents_sha256 = _sha256_file(source)
+    from rag_apparatus import annotate_apparatus
+    annotate_apparatus(source)
     try:
         current = read_rag_manifest(source)
     except RagError:
@@ -1050,6 +1054,11 @@ class RagKnowledgeBase:
             for row_id, vector in vectors.items()
         }
         self._sidecar = dict(metadata_sidecar or {})
+        from rag_apparatus import load_apparatus
+        try:
+            self._apparatus = load_apparatus(knowledge_base_path, self._rows)
+        except ValueError as exc:
+            raise RagIndexStaleError(str(exc)) from exc
         self._lexical_statistics: dict = {}
         self._lexical_terms = {str(row["id"]): Counter(_tokens(f"{row['title']} {row['title']} {row['content']}")) for row in self._rows}
 
@@ -1224,6 +1233,7 @@ class RagKnowledgeBase:
         aliases: Mapping[str, Sequence[str]] | None = None,
         reranker: Reranker | None = None,
         diagnostics: dict[str, Any] | None = None,
+        apparatus_weight: float | None = None,
     ) -> list[RagHit]:
         """Return ranked chunks using lexical, semantic, or hybrid ranking.
 
@@ -1240,6 +1250,8 @@ class RagKnowledgeBase:
             raise ValueError("top_k must be a positive integer")
         if mode not in (None, "lexical", "semantic", "hybrid"):
             raise ValueError("mode must be 'lexical', 'semantic', or 'hybrid'")
+        if apparatus_weight is not None and (isinstance(apparatus_weight, bool) or not isinstance(apparatus_weight, (int, float)) or not 0 <= apparatus_weight <= 1):
+            raise ValueError("apparatus_weight must be between 0 and 1")
         if candidate_depth <= 0:
             raise ValueError("candidate_depth must be positive")
         diag = diagnostics if diagnostics is not None else {}
@@ -1275,6 +1287,14 @@ class RagKnowledgeBase:
                     languages=set(languages) if languages is not None else None,
                 )
             ]
+        weights = {
+            str(row["id"]): (apparatus_weight if apparatus_weight is not None else self._apparatus[str(row["id"])]["default_weight"])
+            for row in rows if self._apparatus.get(str(row["id"]), {}).get("is_apparatus")
+        }
+        diag["apparatus"] = {"tagged_count": len(weights), "weight_override": apparatus_weight,
+                             "penalized_ids": [identifier for identifier, weight in weights.items() if weight < 1],
+                             "annotation_available": bool(self._apparatus)}
+        rows = [row for row in rows if weights.get(str(row["id"]), 1) > 0]
         diag["filtered_count"] = len(rows)
         if not rows:
             diag.update(effective_mode="lexical" if embedding_provider is None else mode, candidate_count=0, result_count=0)
@@ -1340,6 +1360,7 @@ class RagKnowledgeBase:
                 top_k=top_k,
                 candidate_depth=candidate_depth,
                 per_book_cap=per_book_cap,
+                apparatus_weights=weights,
             )
         else:
             scores = (
@@ -1347,6 +1368,10 @@ class RagKnowledgeBase:
                 if semantic_scores is not None
                 else _lexical_scores(rows, lexical_query, self._lexical_terms, self._lexical_statistics)
             )
+            # Subtract an absolute-score penalty: multiplying a negative cosine
+            # by a fraction would incorrectly promote it.
+            scores = [score - (1 - weights.get(str(row["id"]), 1)) * abs(score)
+                      for row, score in zip(rows, scores)]
             ranked = sorted(
                 (
                     (score, row)
@@ -1422,12 +1447,17 @@ class RagKnowledgeBase:
         top_k: int,
         candidate_depth: int,
         per_book_cap: int | None,
+        apparatus_weights: Mapping[str, float] | None = None,
     ) -> list[RagHit]:
         """Fuse lexical and semantic candidate lists with RRF."""
 
+        def adjusted(score: float, index: int) -> float:
+            weight = (apparatus_weights or {}).get(str(rows[index]["id"]), 1)
+            return score - (1 - weight) * abs(score)
+
         lexical_ranked = sorted(
             (
-                (score, index)
+                (adjusted(score, index), index)
                 for index, score in enumerate(_lexical_scores(rows, query, self._lexical_terms, self._lexical_statistics))
                 if score > 0.0
             ),
@@ -1436,7 +1466,7 @@ class RagKnowledgeBase:
         semantic_ranked = sorted(
             range(len(rows)),
             key=lambda index: (
-                -semantic_scores[index],
+                -adjusted(semantic_scores[index], index),
                 int(rows[index]["chapter_order"]),
                 str(rows[index]["id"]),
             ),
@@ -1450,6 +1480,10 @@ class RagKnowledgeBase:
         for rank, index in enumerate(semantic_ranked, start=1):
             fused[index] = fused.get(index, 0.0) + 1.0 / (rrf_k + rank)
             channels.setdefault(index, set()).add("semantic")
+        # RRF is rank-based: apply the document-role prior to fused scores,
+        # not cosine alone, and do so before the fused candidate pool is cut.
+        for index in fused:
+            fused[index] *= (apparatus_weights or {}).get(str(rows[index]["id"]), 1)
         ordered = sorted(
             fused,
             key=lambda index: (
@@ -1522,6 +1556,7 @@ class RagKnowledgeBase:
         aliases: Mapping[str, Sequence[str]] | None = None,
         reranker: Reranker | None = None,
         diagnostics: dict[str, Any] | None = None,
+        apparatus_weight: float | None = None,
     ) -> RagContext:
         """Return citation-labelled text ready to augment a generation prompt."""
 
@@ -1543,6 +1578,7 @@ class RagKnowledgeBase:
             aliases=aliases,
             reranker=reranker,
             diagnostics=diag,
+            apparatus_weight=apparatus_weight,
         )
         included: list[RagHit] = []
         blocks: list[str] = []

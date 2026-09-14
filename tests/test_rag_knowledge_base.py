@@ -362,6 +362,49 @@ class RagKnowledgeBaseTests(unittest.TestCase):
             with self.assertRaisesRegex(RagProviderError, "ZHIPU_API_KEY"):
                 provider.embed_query("测试")
 
+    def test_oversized_single_document_still_reaches_shrink_retry(self) -> None:
+        """A batch of exactly one must also degrade, not raise.
+
+        Incremental rebuilds embed only the chunks whose text changed, so a
+        single oversized chunk arrives as a one-item batch.  Raising there made
+        such a library permanently un-registrable.
+        """
+
+        class FakePayloadRejection(Exception):
+            status_code = 400
+            code = "1210"
+
+        class OversizedThenShrunk:
+            # Above the adapter's 256-character shrink floor, so the ladder can
+            # actually reach a size this fake accepts.
+            limit = 300
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def create(self, **kwargs: object) -> SimpleNamespace:
+                self.calls.append(dict(kwargs))
+                text = list(kwargs["input"])[0]  # type: ignore[arg-type]
+                if len(text) > self.limit:
+                    raise FakePayloadRejection("API 调用参数有误，请检查文档。")
+                return SimpleNamespace(
+                    data=[SimpleNamespace(index=0, embedding=[1.0] * int(kwargs["dimensions"]))]  # type: ignore[arg-type]
+                )
+
+        endpoint = OversizedThenShrunk()
+        provider = ZhipuEmbeddingProvider(
+            client=SimpleNamespace(embeddings=endpoint),
+            dimensions=256,
+        )
+
+        vectors = provider.embed_documents(["超" * 400])
+
+        self.assertEqual(len(vectors), 1)
+        self.assertEqual(len(vectors[0]), 256)
+        # One oversized attempt, then shrink retries until the text fits.
+        self.assertGreater(len(endpoint.calls), 1)
+        self.assertLessEqual(len(list(endpoint.calls[-1]["input"])[0]), endpoint.limit)  # type: ignore[arg-type]
+
     def test_zhipu_auto_activation_honors_explicit_override(self) -> None:
         with patch.dict(os.environ, {"ZHIPU_API_KEY": "test-key"}, clear=True):
             self.assertTrue(zhipu_embedding_enabled(None))
