@@ -62,6 +62,10 @@ _NON_PROSE_RE = re.compile(
 )
 _MIN_PROSE_MASS = 24
 _HAN_RE = re.compile(r"[\u3400-\u9fff]")
+# An index/bibliography line ends in a page reference: "42–44, 407, 408".
+_PAGE_REFERENCE_RE = re.compile(
+    r"\d{1,4}\s*(?:[–—-]\s*\d{1,4})?(?:\s*[,，、]\s*\d{1,4}\s*(?:[–—-]\s*\d{1,4})?)*\s*$"
+)
 
 _MARKER = "<<<SEG {index:04d}>>>"
 _MARKER_SCAN_RE = re.compile(r"<<<SEG (\d{4})>>>")
@@ -156,6 +160,57 @@ def _prose_mass(text: str) -> int:
     return len(re.sub(r"\s+", "", _NON_PROSE_RE.sub(" ", text)))
 
 
+def _is_listing_line(line: str) -> bool:
+    """A listing line is dominated by page references rather than prose.
+
+    Counts digits and the separators an index or bibliography uses between them
+    ("42–44, 407, 408").  A prose sentence may contain a year or a number, but
+    the numeric share of the line stays small.
+    """
+
+    if len(line) > 120:
+        return False
+    numeric = len(re.findall(r"[\d\s,，、;；:：\-–—.．()（）]", line))
+    return numeric / max(1, len(line)) >= 0.3
+
+
+def _looks_like_listing(content: str) -> bool:
+    """Detect an index or bibliography continuation by its line shape.
+
+    Apparatus is often split across chunks, so only the first one carries the
+    chapter label ("索引"); its continuations are titled with a bare letter.
+    Those listings are bilingual by construction (Chinese name + original name
+    + page numbers), so translating them mangles the mapping instead of making
+    it searchable.
+    """
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines:
+        return False
+    # An isolated index entry ("恩格斯 (Engels, Frederick) 264, 387") arrives as
+    # a one-line chunk and would never reach the ratio test below.
+    if len(content) < 200 and _PAGE_REFERENCE_RE.search(content.strip()):
+        return True
+    ratio = sum(1 for line in lines if _is_listing_line(line)) / len(lines)
+    if len(lines) >= 5:
+        return ratio >= 0.5
+    return len(lines) >= 3 and ratio >= 0.8
+
+
+def _is_reference_material(title: str, content: str) -> bool:
+    label = str(title or "").casefold()
+    if any(marker in label for marker in _REFERENCE_MARKERS):
+        return True
+    try:
+        from rag_apparatus import classify_apparatus
+
+        if classify_apparatus(title, content)["is_apparatus"]:
+            return True
+    except (ImportError, ValueError):
+        pass
+    return _looks_like_listing(content)
+
+
 def classify_row(title: str, content: str) -> dict[str, Any]:
     """Decide whether one chunk must be translated before publication.
 
@@ -166,10 +221,9 @@ def classify_row(title: str, content: str) -> dict[str, Any]:
     """
 
     language = detect_language(content)
-    label = str(title or "")
     if language == CHINESE:
         return {"language": language, "needs_translation": False, "reason": "already_chinese"}
-    if any(marker in label.casefold() for marker in _REFERENCE_MARKERS):
+    if _is_reference_material(title, content):
         return {"language": language, "needs_translation": False, "reason": "reference_material"}
     stripped = _NON_PROSE_RE.sub(" ", content)
     if language == "unknown" and _HAN_RE.search(stripped):
@@ -336,7 +390,9 @@ def ensure_chinese_rows(
         if entry["needs_translation"]
     ]
     if not pending:
-        return [dict(row) for row in rows], _finalise_report(plan, translator, translated=[])
+        return [dict(row) for row in rows], _finalise_report(
+            plan, translator, translated=[], unchanged=[]
+        )
     translated = translate_texts(
         [str(rows[index]["content"]) for index in pending],
         translator,
@@ -347,22 +403,28 @@ def ensure_chinese_rows(
     translated_by_index = dict(zip(pending, translated, strict=True))
     output: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
+    no_ops: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
         updated = dict(row)
         if index in translated_by_index:
             original = str(row.get("content") or "")
             updated["content"] = translated_by_index[index]
-            records.append(
-                {
-                    "id": str(row.get("id") or ""),
-                    "title": str(row.get("title") or ""),
-                    "chapter_id": str(row.get("chapter_id") or ""),
-                    "source_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
-                    "source_characters": len(original),
-                }
-            )
+            entry = {
+                "id": str(row.get("id") or ""),
+                "title": str(row.get("title") or ""),
+                "chapter_id": str(row.get("chapter_id") or ""),
+                "source_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                "source_characters": len(original),
+            }
+            # A chunk that is already mostly Chinese (OCR reading annotations,
+            # or a Chinese body citing Japanese) comes back unchanged.  Record
+            # that honestly instead of booking it as a translation.
+            if str(translated_by_index[index]).strip() == original.strip():
+                no_ops.append({**entry, "reason": "model_returned_source"})
+            else:
+                records.append(entry)
         output.append(updated)
-    return output, _finalise_report(plan, translator, translated=records)
+    return output, _finalise_report(plan, translator, translated=records, unchanged=no_ops)
 
 
 def _finalise_report(
@@ -370,6 +432,7 @@ def _finalise_report(
     translator: Translator,
     *,
     translated: Sequence[dict[str, Any]],
+    unchanged: Sequence[dict[str, Any]] = (),
 ) -> dict[str, Any]:
     report = dict(plan)
     report.update(
@@ -377,7 +440,9 @@ def _finalise_report(
             "provider": getattr(translator, "provider_name", ""),
             "model": getattr(translator, "model", ""),
             "translated_count": len(translated),
+            "unchanged_count": len(unchanged),
             "translated": list(translated),
+            "unchanged": list(unchanged),
         }
     )
     return report
@@ -444,9 +509,11 @@ def write_translation_sidecar(corpus_path: Path | str, report: dict[str, Any]) -
         "model": report.get("model", ""),
         "chunk_count": report.get("chunk_count", 0),
         "translated_count": report.get("translated_count", 0),
+        "unchanged_count": report.get("unchanged_count", 0),
         "skipped": report.get("skipped", {}),
         "languages": report.get("languages", {}),
         "translated": report.get("translated", []),
+        "unchanged": report.get("unchanged", []),
     }
     target = sidecar_path_for(corpus)
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
@@ -525,6 +592,7 @@ def normalise_corpus_file(
         "status": "passed",
         "written": True,
         "translate_count": report["translated_count"],
+        "unchanged_count": report.get("unchanged_count", 0),
         "skipped": report["skipped"],
         "languages": report["languages"],
         "provider": report["provider"],

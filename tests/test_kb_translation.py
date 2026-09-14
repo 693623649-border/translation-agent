@@ -50,6 +50,14 @@ class _FlakyBatchTranslator(_FakeTranslator):
         return super().translate(prompt)
 
 
+class _EchoTranslator(_FakeTranslator):
+    """Returns the segment unchanged, like a model that judges it already Chinese."""
+
+    def translate(self, prompt: str) -> str:
+        segments = prompt.split("\n\n")[1:]
+        return "\n\n".join(segment.strip() for segment in segments if segment.strip())
+
+
 class ClassificationTests(unittest.TestCase):
     def test_chinese_body_passes_through(self) -> None:
         verdict = classify_row("第一章 欲望机器", "它在各处发挥着自己的功能，时而不停歇，时而断断续续。")
@@ -87,6 +95,37 @@ class ClassificationTests(unittest.TestCase):
         verdict = classify_row("封面", "![cover](../Images/cover.jpg)")
         self.assertFalse(verdict["needs_translation"])
         self.assertEqual(verdict["reason"], "not_prose")
+
+    def test_index_continuation_is_exempt_by_content(self) -> None:
+        """Only the first index chunk carries the label; continuations are lettered."""
+
+        verdict = classify_row(
+            "A",
+            "Ellison, Ralph 54, 100, 406\n"
+            "Adorno, T.W. 42-44, 407, 408\n"
+            "Austin, Jane 214, 6, 13, 21, 31\n"
+            "Aron, Raymond 216, 217, 221\n"
+            "Arendt, Hannah 282\n",
+        )
+        self.assertFalse(verdict["needs_translation"], verdict)
+        self.assertEqual(verdict["reason"], "reference_material")
+
+    def test_isolated_index_entry_is_exempt(self) -> None:
+        verdict = classify_row("E", "恩格斯 (Engels, Frederick) 264, 387")
+        self.assertFalse(verdict["needs_translation"], verdict)
+        self.assertEqual(verdict["reason"], "reference_material")
+
+    def test_prose_with_numbers_is_still_translated(self) -> None:
+        """A guard against over-exempting: prose citing page numbers is content."""
+
+        verdict = classify_row(
+            "Chapter 7",
+            "The argument turns on the distinction between the two editions. In 1901 he "
+            "published the second volume, and by 1905 the third had appeared in Paris. "
+            "Readers who followed the debate will recognize the same claim restated here.",
+        )
+        self.assertTrue(verdict["needs_translation"], verdict)
+        self.assertEqual(verdict["reason"], "non_chinese_body")
 
     def test_plan_counts_reasons(self) -> None:
         rows = [
@@ -168,6 +207,24 @@ class EnsureChineseRowsTests(unittest.TestCase):
     def test_untouched_row_keeps_exact_content(self) -> None:
         rows, _ = ensure_chinese_rows(self._rows(), _FakeTranslator())
         self.assertEqual(rows[0]["content"], "这是一段中文正文，不需要翻译。")
+
+    def test_model_returning_source_is_recorded_as_unchanged(self) -> None:
+        """A no-op translation must not be booked as a translation."""
+
+        rows = [
+            {
+                "id": "b" * 40,
+                "title": "序",
+                "chapter_id": "c2",
+                "chapter_order": 2,
+                "content": "早いもので、この本の初版が刊行されてから、すでに十五年の歳月がたった。",
+            }
+        ]
+        translated, report = ensure_chinese_rows(rows, _EchoTranslator())
+        self.assertEqual(translated[0]["content"], rows[0]["content"])
+        self.assertEqual(report["translated_count"], 0)
+        self.assertEqual(report["unchanged_count"], 1)
+        self.assertEqual(report["unchanged"][0]["reason"], "model_returned_source")
 
     def test_duplicate_ids_do_not_misalign(self) -> None:
         """A repeated id must not make a Chinese row absorb another row's translation."""
