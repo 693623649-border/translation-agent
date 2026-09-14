@@ -69,11 +69,23 @@ _PAGE_REFERENCE_RE = re.compile(
 
 _MARKER = "<<<SEG {index:04d}>>>"
 _MARKER_SCAN_RE = re.compile(r"<<<SEG (\d{4})>>>")
+# A model occasionally echoes a marker twice; one more attempt usually settles it
+# before the batch has to be split into single segments.
+_BATCH_ATTEMPTS = 2
+# OCR sometimes merges a whole chapter into one paragraph.  A segment this large
+# makes the model truncate or re-emit markers, so it is split at sentence
+# boundaries and the pieces are rejoined after translation.
+_MAX_SEGMENT_CHARS = 3000
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?；;])")
+_INVENTED_TOKEN_RE = re.compile(r"⟦SEMANTIC_TOKEN_\d{4}⟧")
 
 _SYSTEM_PROMPT = (
     "你是严谨的学术图书译者，把用户给出的文本逐段译为简体中文。"
     "必须原样保留每段的 <<<SEG nnnn>>> 标记与顺序，不得合并、拆分、增删段落。"
     "保留 ⟦SEMANTIC_TOKEN_xxxx⟧ 占位符、专名、数字与文献信息。"
+    "书中的引文——包括日语、英语、法语等任何原文引文——同样要译成中文，"
+    "不要原样保留外文引文；译文之后可用括号附上原文作者的通行中文译名。"
+    "版权声明、书刊名与卷期页码保持原样。"
     "只输出段落与标记，不要任何解释或代码围栏。"
 )
 
@@ -290,6 +302,28 @@ def _build_prompt(segments: Sequence[str]) -> str:
     )
 
 
+def _split_oversized(text: str, max_chars: int) -> list[str]:
+    """Split a paragraph too large for one request, keeping sentences intact."""
+
+    if len(text) <= max_chars:
+        return [text]
+    pieces: list[str] = []
+    current = ""
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        if current and len(current) + len(sentence) > max_chars:
+            pieces.append(current)
+            current = sentence
+        else:
+            current += sentence
+        while len(current) > max_chars:
+            # A single sentence longer than the budget (no punctuation at all).
+            pieces.append(current[:max_chars])
+            current = current[max_chars:]
+    if current:
+        pieces.append(current)
+    return [piece for piece in pieces if piece] or [text]
+
+
 def _parse_response(text: str, expected: int) -> list[str]:
     matches = list(_MARKER_SCAN_RE.finditer(text))
     found = [int(match.group(1)) for match in matches]
@@ -328,10 +362,16 @@ def translate_texts(
     for text in texts:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("translation inputs must be non-empty strings")
+    # Oversized paragraphs are split first; each piece is translated on its own
+    # and the pieces are rejoined, so one impossible segment cannot fail a book.
+    pieces_by_parent: list[list[str]] = [
+        _split_oversized(text, _MAX_SEGMENT_CHARS) for text in texts
+    ]
+    flat: list[str] = [piece for pieces in pieces_by_parent for piece in pieces]
     batches: list[list[str]] = []
     current: list[str] = []
     size = 0
-    for text in texts:
+    for text in flat:
         if current and size + len(text) > batch_chars:
             batches.append(current)
             current, size = [], 0
@@ -343,29 +383,60 @@ def translate_texts(
     def run_batch(batch: list[str]) -> list[str]:
         protected = [_protect(segment) for segment in batch]
         response = translator.translate(_build_prompt([item[0] for item in protected]))
-        return [
-            _restore(segment, item[1])
-            for segment, item in zip(_parse_response(response, len(batch)), protected, strict=True)
-        ]
+        segments = _parse_response(response, len(batch))
+        output: list[str] = []
+        for segment, (_, tokens) in zip(segments, protected, strict=True):
+            # With nothing protected, any placeholder is the model's invention
+            # and must not reach the document.
+            if not tokens:
+                segment = _INVENTED_TOKEN_RE.sub("", segment)
+            output.append(_restore(segment, tokens))
+        return output
 
     def run(batch: list[str]) -> list[str]:
-        try:
-            return run_batch(batch)
-        except KbTranslationError:
-            if len(batch) == 1:
-                raise
-            # One flaky response must not fail a whole book: retry the batch as
-            # single-segment calls, where the marker contract is trivially met.
-            return [segment for single in batch for segment in run_batch([single])]
+        last: KbTranslationError | None = None
+        for _attempt in range(_BATCH_ATTEMPTS):
+            try:
+                output = run_batch(batch)
+            except KbTranslationError as exc:
+                last = exc
+                continue
+            if len(batch) > 1 and all(
+                produced.strip() == source.strip()
+                for produced, source in zip(output, batch, strict=True)
+            ):
+                # A batch made up entirely of quotations comes back untouched:
+                # the model reads a run of citations as material to preserve.
+                # Ask again one segment at a time, where each reads as content.
+                return [segment for single in batch for segment in run_batch([single])]
+            return output
+        if last is None:  # pragma: no cover - the loop always sets it
+            raise KbTranslationError("batch retry loop produced no result")
+        if len(batch) == 1:
+            # A single segment cannot be degraded further, but it has already
+            # been retried; surface the marker contract failure.
+            raise last
+        # One flaky response must not fail a whole book: retry the batch as
+        # single-segment calls, where the marker contract is trivially met.
+        return [segment for single in batch for segment in run_batch([single])]
 
     if len(batches) == 1 or concurrency == 1:
-        results = [segment for batch in batches for segment in run(batch)]
+        translated_pieces = [segment for batch in batches for segment in run(batch)]
     else:
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=min(concurrency, len(batches))) as pool:
             batches_of_segments = list(pool.map(run, batches))
-        results = [segment for batch in batches_of_segments for segment in batch]
+        translated_pieces = [segment for batch in batches_of_segments for segment in batch]
+    if len(translated_pieces) != len(flat):
+        raise KbTranslationError(
+            f"translated {len(translated_pieces)} segments for {len(flat)} request pieces"
+        )
+    results: list[str] = []
+    cursor = 0
+    for pieces in pieces_by_parent:
+        results.append("".join(translated_pieces[cursor:cursor + len(pieces)]))
+        cursor += len(pieces)
     if len(results) != len(texts):
         raise KbTranslationError(f"translated {len(results)} segments for {len(texts)} chunks")
     return results

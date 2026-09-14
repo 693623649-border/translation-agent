@@ -41,6 +41,7 @@ py-modules = [
   "doctor",
   "docx_footnotes",
   "docx_render_gate",
+  "docx_translation",
   "docx_semantic_migration",
   "epub_semantic_import",
   "extract_textbook_layer",

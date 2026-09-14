@@ -160,6 +160,36 @@ class TranslateTextsTests(unittest.TestCase):
         with self.assertRaises(KbTranslationError):
             translate_texts(["一段日文", "第二段"], _MarkerBreakingTranslator())
 
+    def test_oversized_segment_is_split_and_rejoined(self) -> None:
+        """A chapter dumped into one paragraph must not be sent whole."""
+
+        class _RecordingTranslator(_FakeTranslator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prompts: list[str] = []
+
+            def translate(self, prompt: str) -> str:
+                self.prompts.append(prompt)
+                return super().translate(prompt)
+
+        translator = _RecordingTranslator()
+        # Longer than the per-request segment ceiling, with sentence enders.
+        long_text = "这是一段很长的日文。" * 400
+        result = translate_texts([long_text], translator, batch_chars=100_000)
+        markers = [line for line in translator.prompts[0].splitlines() if line.startswith("<<<SEG")]
+        self.assertGreater(len(markers), 1, "oversized segment was not split")
+        self.assertEqual(len(result), 1)
+        self.assertTrue(result[0])
+
+    def test_invented_placeholder_is_stripped(self) -> None:
+        class _TokenInventingTranslator(_FakeTranslator):
+            def translate(self, prompt: str) -> str:
+                markers = [line for line in prompt.splitlines() if line.startswith("<<<SEG")]
+                return "\n".join(f"{marker}\n[译]中文⟦SEMANTIC_TOKEN_0007⟧段落" for marker in markers)
+
+        result = translate_texts(["一段日文"], _TokenInventingTranslator())
+        self.assertEqual(result, ["[译]中文段落"])
+
     def test_flaky_batch_degrades_to_single_segments(self) -> None:
         """A duplicated marker on a batch must be retried per segment, not fail the book."""
 
