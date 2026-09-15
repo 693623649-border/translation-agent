@@ -8,7 +8,9 @@ from pathlib import Path
 from docx import Document
 from docx_translation import (
     DocxTranslationError,
+    clean_running_heads,
     needs_translation,
+    strip_running_heads,
     translate_docx,
     verify_translated_docx,
 )
@@ -27,6 +29,62 @@ class _FakeTranslator:
         self.calls += 1
         markers = [line for line in prompt.splitlines() if line.startswith("<<<SEG")]
         return "\n".join(f"{marker}\n[译]中文段落" for marker in markers)
+
+
+class RunningHeadTests(unittest.TestCase):
+    def test_running_head_with_title_and_year_range_is_removed(self) -> None:
+        text = "…如下写道。29 第1章 在世界中心呼喊爱的人 1995年—99年。全4部作预定中的第2作…"
+        cleaned, count = strip_running_heads(text)
+        self.assertEqual(count, 1)
+        self.assertNotIn("第1章", cleaned)
+        self.assertIn("全4部作预定中的第2作", cleaned)
+
+    def test_folio_and_section_label_is_removed(self) -> None:
+        cleaned, count = strip_running_heads("…发挥着功能。7 序文 世界系这一亡灵……12日在其网站上…")
+        self.assertEqual(count, 1)
+        self.assertNotIn("序文", cleaned)
+        self.assertIn("12日在其网站上", cleaned)
+
+    def test_folio_before_prose_is_not_swallowed(self) -> None:
+        """A page number followed by ordinary prose must not eat the prose."""
+
+        text = "…参考文献 251 后记 面向新的世界系的诞生 Niconico动画 作为交流"
+        cleaned, count = strip_running_heads(text)
+        self.assertEqual(count, 1)
+        self.assertIn("Niconico动画 作为交流", cleaned)
+
+    def test_plain_chapter_reference_is_left_alone(self) -> None:
+        text = "正如第1章所述，这个问题在第2章还会出现。"
+        cleaned, count = strip_running_heads(text)
+        self.assertEqual(count, 0)
+        self.assertEqual(cleaned, text)
+
+
+class CleanRunningHeadsTests(unittest.TestCase):
+    def test_cleans_every_paragraph_without_a_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "book.docx"
+            document = Document()
+            document.add_heading("序章", level=1)
+            document.add_paragraph("正文。7 序文 世界系这一亡灵……接下来的内容。")
+            document.add_paragraph("这一段没有页眉。")
+            document.save(str(path))
+
+            report = clean_running_heads(path)
+
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["heads_removed"], 1)
+            body = [p.text for p in Document(str(path)).paragraphs]
+            self.assertNotIn("序文", "".join(body))
+            self.assertIn("这一段没有页眉。", body)
+
+    def test_reports_nothing_to_do(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "book.docx"
+            document = Document()
+            document.add_paragraph("干净的正文，没有页眉。")
+            document.save(str(path))
+            self.assertEqual(clean_running_heads(path)["status"], "nothing_to_do")
 
 
 class NeedsTranslationTests(unittest.TestCase):
