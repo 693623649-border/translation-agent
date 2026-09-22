@@ -102,6 +102,7 @@ def run_doctor(
     source: Path | None = None,
     require_web: bool = False,
     require_render: bool = False,
+    require_native: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Return a JSON-safe preflight report without exposing secret values."""
@@ -122,6 +123,10 @@ def run_doctor(
     checks.append(_module_check("streamlit", "streamlit", required=require_web))
     checks.append(_soffice_check(required=require_render))
     checks.append(_command_check("tesseract", required=False))
+    if require_native:
+        from paddle_native import NativeOptions, readiness
+        ready, detail = readiness(NativeOptions())
+        checks.append(DoctorCheck("ocr:paddle-native", ready, True, detail))
 
     required_commands: set[str] = set()
     credential_names: set[str] = set()
@@ -181,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--source", type=Path)
     parser.add_argument("--web", action="store_true", help="require Streamlit")
+    parser.add_argument("--paddle-native", action="store_true", help="require native CPU OCR and mobile models")
     parser.add_argument(
         "--render", action="store_true", help="require LibreOffice/soffice"
     )
@@ -204,6 +210,7 @@ def main(argv: list[str] | None = None) -> int:
         source=args.source,
         require_web=args.web,
         require_render=args.render,
+        require_native=args.paddle_native,
     )
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))

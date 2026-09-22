@@ -117,7 +117,8 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
         exact = resolve_expected_ocr_model_exact(args, profile)
         self.assertTrue(exact.startswith("paddleocr-local/PP-OCRv5-server-det-"))
 
-    def test_auto_backend_prefers_local_then_falls_back(self) -> None:
+    @patch("book_pipeline.paddle_native_available", return_value=False)
+    def test_auto_backend_prefers_local_then_falls_back(self, _native_probe) -> None:
         args = _book_parser().parse_args([])
         self.assertEqual(args.ocr_backend, "auto")
         remote_profile = ModelProfile(

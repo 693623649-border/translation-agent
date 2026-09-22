@@ -13,7 +13,7 @@ from product_contracts import RunSpec
 from product_paths import default_profile_path
 
 
-OCR_ADAPTERS = frozenset({"coding-plan-mcp", "glm-ocr", "tesseract"})
+OCR_ADAPTERS = frozenset({"coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"})
 TEXT_ADAPTERS = frozenset({"openai-chat", "glm-chat"})
 
 

@@ -716,7 +716,7 @@ def _selected_model_profiles(args: Any) -> dict[str, Any]:
     if not args.config:
         return {stage: None for stage in ("ocr", "toc", "proofread", "translation")}
     profiles = load_pipeline_profiles(args.config)
-    return {
+    selected = {
         "ocr": profiles.for_stage("ocr", args.ocr_profile),
         "toc": profiles.for_stage("toc", args.toc_profile),
         "proofread": profiles.for_stage("proofread", args.proofread_profile),
@@ -724,6 +724,11 @@ def _selected_model_profiles(args: Any) -> dict[str, Any]:
             "translation", args.translation_profile
         ),
     }
+
+    if (args.ocr_backend != "auto" and selected["ocr"] is not None
+            and selected["ocr"].adapter != args.ocr_backend):
+        selected["ocr"] = None
+    return selected
 
 
 def _profile_model_semantics(profile: Any) -> dict[str, Any] | None:
@@ -831,6 +836,10 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
             ),
             "model": profile.model if profile is not None else args.ocr_model,
         }
+        segmentation = None
+    elif backend == "paddleocr-native":
+        from paddle_native import identity_from_args
+        identity = {"backend": backend, "model": identity_from_args(args, profile)}
         segmentation = None
     elif backend == "paddleocr-local":
         identity = {

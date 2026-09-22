@@ -5,6 +5,11 @@ EPUB 通过显式 Source Adapter 进入同一语义、清洗与发布契约；DA
 断点缓存和产物身份；已接入对应 verification profile 的文件必须通过发布门后才
 可以正式交付。
 
+## 本机 PaddleOCR（Mac CPU）
+
+新增原生 `paddleocr-native` 后端，支持本机识别、模型复用、页级缓存和 Web“仅 OCR”任务。
+安装、使用和资源限制见 [本机 CPU PaddleOCR](docs/paddleocr-native.md)。
+
 ## 五分钟开始
 
 需要 Python 3.11+（推荐 3.12）：

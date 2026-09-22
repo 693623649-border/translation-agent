@@ -369,6 +369,7 @@ translation_profile = "deepseek_pro"
                 # test asserts profile-based identity, so hold the local
                 # PaddleOCR probe off (its availability is host-dependent).
                 patch("book_pipeline.paddle_local_available", return_value=False),
+                patch("book_pipeline.paddle_native_available", return_value=False),
             ):
                 result = run_book(
                     RunRequest(

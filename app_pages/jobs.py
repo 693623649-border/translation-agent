@@ -71,11 +71,15 @@ if cancel:
     st.rerun()
 
 if job.status in {"failed", "cancelled", "interrupted"}:
-    _config, profiles, _error = load_profiles_for_ui()
     credential_names: set[str | None] = set()
-    if profiles is not None:
-        for profile in profiles.profiles.values():
-            credential_names.add(profile.credential_env)
+    local_ocr_only = job.spec.phase == "ocr" and job.spec.options.get("ocr_backend") in {
+        "paddleocr-native", "paddleocr-local",
+    }
+    if not local_ocr_only:
+        _config, profiles, _error = load_profiles_for_ui()
+        if profiles is not None:
+            for profile in profiles.profiles.values():
+                credential_names.add(profile.credential_env)
     with st.expander("恢复任务", icon=":material/restart_alt:"):
         st.caption("仅需重新提供本次运行所需密钥；已完成节点将从 Graph 缓存恢复。")
         resume_credentials = credential_inputs(
@@ -95,6 +99,19 @@ if job.status in {"failed", "cancelled", "interrupted"}:
 
 if job.error:
     st.error(job.error, icon=":material/error:")
+
+pages = service.ocr_pages(job.id)
+if pages:
+    with st.expander("逐页 OCR 结果", icon=":material/article:"):
+        page_number = st.selectbox("PDF 页码", pages, key=f"ocr_page_{job.id}")
+        page_record = service.ocr_page(job.id, page_number)
+        text = str(page_record.get("text", ""))
+        st.caption(f"识别模型：{page_record.get('ocr_model', '未知')} · 原始 OCR，尚未人工校对")
+        st.text_area("识别文本", value=text, height=320, disabled=True,
+                     key=f"ocr_text_{job.id}_{page_number}")
+        st.download_button("下载本页 OCR 文本", text,
+                           file_name=f"page_{page_number:04d}.txt", mime="text/plain",
+                           key=f"ocr_download_{job.id}_{page_number}")
 
 with st.container(border=True):
     st.subheader("最近日志")

@@ -42,6 +42,11 @@ class RunRequest:
     phase: str = "all"
     config: Path | str | None = None
     ocr_profile: str | None = None
+    ocr_backend: str | None = None
+    paddle_native_variant: str | None = None
+    paddle_native_models_dir: Path | str | None = None
+    paddle_native_threads: int = 4
+    paddle_native_det_limit: int = 960
     toc_profile: str | None = None
     proofread_profile: str | None = None
     translation_profile: str | None = None
@@ -96,6 +101,11 @@ class RunRequest:
         pairs = (
             ("--config", self.config),
             ("--ocr-profile", self.ocr_profile),
+            ("--ocr-backend", self.ocr_backend),
+            ("--paddle-native-variant", self.paddle_native_variant),
+            ("--paddle-native-models-dir", self.paddle_native_models_dir),
+            ("--paddle-native-threads", self.paddle_native_threads),
+            ("--paddle-native-det-limit", self.paddle_native_det_limit),
             ("--toc-profile", self.toc_profile),
             ("--proofread-profile", self.proofread_profile),
             ("--translation-profile", self.translation_profile),

@@ -11,6 +11,19 @@ st.caption("设置只控制 Web UI 产品壳；模型密钥不会保存在这里
 
 service = application_service()
 
+with st.container(border=True):
+    st.subheader("本机 PaddleOCR")
+    from paddle_native import NativeOptions, readiness
+
+    for variant in ("mobile", "server"):
+        ready, detail = readiness(NativeOptions(variant=variant))
+        if ready:
+            st.success(detail)
+        else:
+            st.info(detail)
+    st.caption("使用 CPU；每次只运行一个本机 OCR 任务，模型在整个 OCR 阶段复用。")
+    st.code('python -m pip install ".[web,paddle]"\ntranslation-agent-paddle setup --variant mobile', language="bash")
+
 with st.form("frontend_settings"):
     profile_path = st.text_input(
         "Profile 配置文件",

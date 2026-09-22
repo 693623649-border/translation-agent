@@ -2605,10 +2605,12 @@ def ocr_pdf(
     # Checkpoints produced by a heterogeneous local backend (PaddleOCR) are
     # never silently overwritten by a cloud rerun: a mixed-backend book keeps
     # its local pages unless --force explicitly replaces them.
+    local_prefixes = ("paddleocr-local/", "paddleocr-native/")
     requested_is_paddle_local = bool(
-        (cache_model_exact or "").startswith("paddleocr-local/")
+        str(getattr(client, "ocr_model", "")).startswith(local_prefixes)
+        or (cache_model_exact or "").startswith(local_prefixes)
         or any(
-            (prefix or "").startswith("paddleocr-local/")
+            (prefix or "").startswith(local_prefixes)
             for prefix in cache_model_prefixes
         )
     )
@@ -2616,7 +2618,7 @@ def ocr_pdf(
         page
         for page in pages
         if page in existing
-        and existing[page].ocr_model.startswith("paddleocr-local/")
+        and existing[page].ocr_model.startswith(local_prefixes)
         and not requested_is_paddle_local
     ]
     if protected:
@@ -2701,7 +2703,8 @@ def ocr_pdf(
             ocr_model = client.ocr_model
             if visually_blank:
                 notes += f"; visual_blank=true; ink_ratio={ink_ratio:.6f}"
-                ocr_model = "manual/visually-confirmed-blank"
+                if not ocr_model.startswith("paddleocr-native/"):
+                    ocr_model = "manual/visually-confirmed-blank"
             record = PageRecord(
                 pdf_page=pdf_page,
                 text=text,
@@ -6004,10 +6007,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local"],
+        choices=["auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"],
         default=os.getenv("OCR_BACKEND", "auto"),
         help=(
-            "auto prefers the local PaddleOCR GPU deployment and falls back to "
+            "auto prefers local PaddleOCR GPU, then native CPU, and falls back to "
             "the OCR profile/cloud backend when it is unavailable; coding-plan-mcp "
             "is the cloud vision MCP, glm-ocr the separately billed standard API, "
             "tesseract the offline engine, paddleocr-local the explicit local GPU "
@@ -6045,6 +6048,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="server",
         help="Local PaddleOCR recognition model variant.",
     )
+    from paddle_native import add_native_arguments
+    add_native_arguments(parser)
     parser.add_argument("--paddle-det-mode", default="paddle_fp32")
     parser.add_argument("--paddle-rec-mode", default="paddle_fp16")
     parser.add_argument("--paddle-rec-batch", type=int, default=16)
@@ -6632,8 +6637,8 @@ def resolve_expected_ocr_model_prefix(
             else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
         )
         return f"coding-plan/{model}-vision-mcp/{direction}-v2"
-    if backend == "paddleocr-local":
-        return "paddleocr-local/"
+    if backend in {"paddleocr-local", "paddleocr-native"}:
+        return backend + "/"
     return None
 
 
@@ -6680,6 +6685,11 @@ def paddle_local_available() -> bool:
     )
 
 
+def paddle_native_available(args, profile=None) -> bool:
+    from paddle_native import options_from_args, readiness
+    return readiness(options_from_args(args, profile))[0]
+
+
 def resolve_ocr_backend_name(
     args: argparse.Namespace,
     ocr_profile: ModelProfile | None = None,
@@ -6694,8 +6704,12 @@ def resolve_ocr_backend_name(
     requested = str(getattr(args, "ocr_backend", "") or "auto").strip()
     if requested not in {"auto", ""}:
         return requested, "explicit --ocr-backend"
+    if ocr_profile is not None and ocr_profile.adapter in {"paddleocr-native", "paddleocr-local"}:
+        return ocr_profile.adapter, "selected local OCR profile"
     if paddle_local_available():
         return "paddleocr-local", "auto: local PaddleOCR GPU deployment detected"
+    if paddle_native_available(args, ocr_profile):
+        return "paddleocr-native", "auto: native PaddleOCR CPU models detected"
     fallback = (
         ocr_profile.adapter
         if ocr_profile is not None and ocr_profile.adapter
@@ -6790,6 +6804,9 @@ def resolve_expected_ocr_model_exact(
         return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
+    if backend == "paddleocr-native":
+        from paddle_native import identity_from_args
+        return identity_from_args(args, ocr_profile)
     if backend == "paddleocr-local":
         return paddle_local_model_id(
             det_variant=args.paddle_det_variant,
@@ -7041,8 +7058,12 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         parser.error(str(exc))
-    effective_ocr_profile = None if explicit_ocr_backend else ocr_profile
-    if explicit_ocr_backend and ocr_profile is not None and args.ocr_backend != "auto":
+    effective_ocr_profile = ocr_profile
+    if (explicit_ocr_backend and args.ocr_backend != "auto"
+            and (ocr_profile is None or ocr_profile.adapter != args.ocr_backend)):
+        effective_ocr_profile = None
+    if (explicit_ocr_backend and ocr_profile is not None and args.ocr_backend != "auto"
+            and ocr_profile.adapter != args.ocr_backend):
         print(
             f"[warning] --ocr-backend={args.ocr_backend} overrides OCR profile "
             f"{ocr_profile.name!r} adapter={ocr_profile.adapter!r}.",
@@ -7362,6 +7383,18 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         language=args.tesseract_language,
                         psm=args.tesseract_psm,
                     )
+                elif ocr_backend_name == "paddleocr-native":
+                    from paddle_native import PaddleNativeOCR, options_from_args, identity_from_args
+                    ocr_backend = PaddleNativeOCR(
+                        options_from_args(args, effective_ocr_profile),
+                        model_id=identity_from_args(args, effective_ocr_profile),
+                    )
+                    # Bound rendering as well as inference; cloud concurrency
+                    # and delays must not inflate a local CPU job.
+                    ocr_workers = 1
+                    args.ocr_delay = 0.0
+                    if not args.ocr_cache_model and not args.ocr_cache_model_prefix:
+                        args.ocr_cache_model = ocr_backend.ocr_model
                 elif ocr_backend_name == "paddleocr-local":
                     # The local GPU deployment OCRs whole image directories in
                     # one docker run per consecutive page segment, so it does

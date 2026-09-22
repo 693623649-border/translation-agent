@@ -240,6 +240,20 @@ class ApplicationService:
         self.registry.reconcile_workers()
         return self.registry.list(limit=limit)
 
+    def ocr_pages(self, job_id: str) -> tuple[int, ...]:
+        job = self.registry.get(job_id)
+        directory = job.workspace / "output" / "pages"
+        return tuple(sorted(int(path.stem[5:]) for path in directory.glob("page_*.json")
+                            if path.stem[5:].isdigit() and not path.is_symlink()))
+
+    def ocr_page(self, job_id: str, page: int) -> dict:
+        if page < 1:
+            raise ValueError("page must be positive")
+        job = self.registry.get(job_id)
+        path = job.workspace / "output" / "pages" / f"page_{page:04d}.json"
+        path.resolve(strict=True).relative_to(job.workspace.resolve())
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def cancel(self, job_id: str) -> JobRecord:
         return cancel_job(self.registry, job_id)
 
