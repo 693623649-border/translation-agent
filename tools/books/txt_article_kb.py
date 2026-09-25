@@ -55,16 +55,23 @@ def parse_sections(
     # belong with the first section rather than being dropped.
     preamble = "\n".join(lines[: headings[0][0]]).strip()
     sections: list[tuple[str, str]] = []
+    pending_parents: list[str] = []
     for position, (index, title) in enumerate(headings):
         start = index + 1
         end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
         body = "\n".join(lines[start:end]).strip()
         if position == 0 and preamble:
             body = f"{preamble}\n\n{body}"
-        if body:
-            body = f"{title}\n{body}"
-        if body:
-            sections.append((title, body))
+        if not body:
+            # A heading with no prose of its own is a container for the section
+            # that follows; fold its name into that title so the child chunk
+            # keeps its parent context instead of losing it.
+            pending_parents.append(title)
+            continue
+        if pending_parents:
+            title = "／".join([*pending_parents, title])
+            pending_parents = []
+        sections.append((title, f"{title}\n{body}"))
     return sections
 
 
@@ -81,11 +88,23 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Extra exact-match standalone lines treated as section headings.",
     )
+    parser.add_argument(
+        "--split-heading-file",
+        type=Path,
+        help="File with one extra section heading per line (for long articles).",
+    )
     args = parser.parse_args(argv)
 
+    headings = list(args.split_heading)
+    if args.split_heading_file:
+        headings.extend(
+            line.strip()
+            for line in args.split_heading_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
     sections = parse_sections(
         args.article.read_text(encoding="utf-8"),
-        frozenset(args.split_heading),
+        frozenset(headings),
     )
     rows: list[dict] = []
     sidecar: list[dict] = []
