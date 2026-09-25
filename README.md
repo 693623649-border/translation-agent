@@ -1021,6 +1021,53 @@ outputs/my_book/
 └── 书名_带目录.pdf            # 原版外观 + 可复制层（若原有）+ 书签
 ```
 
+### 本机跨书知识库
+
+历史分支曾提供 `rag_indexing.py`，可以把显式指定的五字段 JSONL
+汇成派生检索语料；它没有固定的仓库级索引。当前可将 `outputs/` 下的全部
+成品工作区同步到仓库根目录的 `global_knowledge_base.sqlite3`（已被 Git 忽略）：
+
+```mermaid
+flowchart LR
+  A[outputs/*/knowledge_base.jsonl] --> D[本地同步器]
+  B[缺失 KB 的章节 Markdown] --> D
+  C[原页 OCR / 逐页译文 / 章节存档] --> D
+  D --> E[(仓库级 SQLite + FTS5)]
+  F[DOCX / EPUB / PDF / 图片] --> G[文件清单与 SHA-256]
+  G --> E
+  E --> H[跨书检索 / 来源定位 / 验收状态过滤]
+```
+
+```bash
+python global_knowledge_base.py sync
+python global_knowledge_base.py status
+python global_knowledge_base.py verify
+python global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrieval_cases.json
+python global_knowledge_base.py search '自然主义' --limit 5
+python global_knowledge_base.py search '私小説' --scope pages --workspace 私小説論
+```
+
+`sync` 只读取各工作区，不修改各书的 `knowledge_base.jsonl` 或发布报告。
+五字段和旧版带页码字段的 JSONL 都可导入；没有 JSONL 的工作区从
+`chapters.json` 所列的 Markdown 章节补入。已由 JSONL 覆盖的章节 Markdown 独立版本
+也存入 `archive` 层，原页 OCR、校对文本和逐页译文存入 `pages` 层；
+DOCX、EPUB、PDF 和图片以可追溯的文件路径及哈希登记。默认 `search` 只检索书目
+JSONL 和缺失章节的补入文本，`--scope pages|archive|all` 可切换范围。
+结果会显示工作区、来源文件、章节、验收报告状态和内容哈希；跨书正文检索
+默认每本最多返回一条，以免同一本书占满结果页，可用 `--per-book-cap`
+调整，或用 `--workspace` 检索指定书的更多段落。
+检索索引用项目已声明的 OpenCC 依赖统一繁简字形；请在安装了项目依赖的
+Python 环境中运行上述命令。`evaluate` 使用固定的 17 道跨书问题和 18 道
+书内章节问题，报告写入 `work/global_kb_evaluation.json`；质量门要求两组
+Hit@5 ≥ 95%、跨书 Hit@1 ≥ 75%、章节 Hit@1 ≥ 70%，并检查 18 个工作区
+及来源哈希都仍然有效。题集见 `tests/fixtures/global_kb_retrieval_cases.json`。
+命中率衡量的是检索定位，不代表原书 OCR、翻译或校对已经通过质量门。
+`--verified-only` 只返回目前具有未过期、通过的完整发布报告的工作区。
+原页及旧版语料可能未经当前质量门验收，入库不等于已校对通过。
+`verify` 可检查来源有无新增、删除或改动。工作区内容发生变化后重新运行
+`sync`；数据库在完整构建并通过 SQLite
+完整性检查后才会替换旧索引。
+
 ## 常用参数
 
 ```text
