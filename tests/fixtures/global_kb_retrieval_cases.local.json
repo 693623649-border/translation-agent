@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "description": "Machine-local corpus queries for the 61 workspaces indexed from this machine's outputs tree: cross-book topical discovery and within-book chapter finding. Every expected anchor was verified against the real chapter text before being recorded -- a case whose query terms do not occur in the expected document is an authoring error, not a retrieval weakness. Thresholds are regression floors set just below the measured baseline, not targets. This fixture is machine-local; the upstream global-knowledge-base branch keeps its own smaller corpus file.",
+  "expected_workspaces": 61,
+  "top_k": 5,
+  "known_gaps": [
+    "chapter-09: the query spans a quotation mark inside the target chapter title (所谓“世界系”这个词), so the trigram index cannot match across it and the chapter lands at rank 6. Search normalization is punctuation-preserving by contract (nfkc+t2s); making the index punctuation-insensitive is a separate design change.",
+    "chapter-16 is the apparatus-demotion regression detector: without the knowledge_base.apparatus.json weight, the index chapter (docx-0011-索-引, weight 0.25) takes rank 1 because an index repeats every concept term. Do not 'fix' this case by retargeting it at the index."
+  ],
+  "thresholds": {
+    "cross_book": {
+      "hit_at_1": 0.8,
+      "hit_at_5": 0.95
+    },
+    "chapter": {
+      "hit_at_1": 0.85,
+      "hit_at_5": 0.9
+    }
+  },
+  "cases": [
+    {"id": "cross-01", "group": "cross_book", "query": "无器官身体与资本主义的关系", "expected_workspace": "反俄狄浦斯 (吉尔·德勒兹) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-02", "group": "cross_book", "query": "欲望机器 部分客体 流与截断", "expected_workspace": "反俄狄浦斯 (吉尔·德勒兹) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-03", "group": "cross_book", "query": "言文一致运动与内面的发现", "expected_workspace": "日本现代文学的起源 (柄谷行人文集) (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-04", "group": "cross_book", "query": "自白制度 基督教 主体", "expected_workspace": "日本现代文学的起源 (柄谷行人文集) (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-05", "group": "cross_book", "query": "陀思妥耶夫斯基复调小说主人公的独立性", "expected_workspace": "陀思妥耶夫斯基的诗学问题 (（俄）米哈伊尔·巴赫金著, M. M Bakhtin) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-06", "group": "cross_book", "query": "索绪尔能指所指的差异系统", "expected_workspace": "文学理论 (耶鲁大学公开课) = Theory of Literature (Open Yale Courses) ([美] 保罗・H・弗莱 (Paul H. Fry) 著  吕黎 译) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-07", "group": "cross_book", "query": "交换样式D 普世宗教 世界共和国", "expected_workspace": "世界史的构造（《跨越性批判——康德与马克思》十年之后，又一部达到全新思想高度的理论杰作） (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-08", "group": "cross_book", "query": "发达工业社会单向度的幸福意识", "expected_workspace": "单向度的人：发达工业社会意识形态研究 ([美]赫伯特·马尔库塞 刘继(译)) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-09", "group": "cross_book", "query": "全景敞视主义监狱的规训", "expected_workspace": "规训与惩罚 (福柯 [福柯]) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-10", "group": "cross_book", "query": "阿Q的精神胜利法", "expected_workspace": "知识库_鲁迅全集"},
+    {"id": "cross-11", "group": "cross_book", "query": "王小波沉默的大多数思维的乐趣", "expected_workspace": "知识库_王小波"},
+    {"id": "cross-12", "group": "cross_book", "query": "60年代中产阶级孩子的反文化享乐主义", "expected_workspace": "中产阶级的孩子们"},
+    {"id": "cross-13", "group": "cross_book", "query": "浪漫主义批评中镜与灯的隐喻", "expected_workspace": "镜与灯：浪漫主义文论及批评传统（修订译本） ([美]艾布拉姆斯) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-14", "group": "cross_book", "query": "日本的历史周期性反复", "expected_workspace": "历史与反复 ([日]柄谷行人 著 王成 译) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-15", "group": "cross_book", "query": "台湾儿少NGO与性工作的规训治理", "expected_workspace": "性别治理 (何春蕤) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-16", "group": "cross_book", "query": "世界系这个词在2000年代的用法", "expected_workspace": "セカイ系とは何か"},
+    {"id": "cross-17", "group": "cross_book", "query": "爱玛包法利的婚姻与债务", "expected_workspace": "包法利夫人（名著名译丛书） (福楼拜) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-18", "group": "cross_book", "query": "布尔乔亚散文的填充物风格", "expected_workspace": "布尔乔亚：在历史与文学之间 (【意】弗朗哥·莫莱蒂) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-19", "group": "cross_book", "query": "马克思剩余价值与价值形态", "expected_workspace": "跨越性批判：康德与马克思 (（日）柄谷行人著, 赵京华译) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-20", "group": "cross_book", "query": "性经验史中权力的生命管理", "expected_workspace": "性经验史 = Histoire de la Sexualité ([法] 米歇尔 · 福柯 (Michel Foucault) 著  佘碧平 译) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-21", "group": "cross_book", "query": "弗洛伊德爱欲与文明压抑理论", "expected_workspace": "爱欲与文明：对弗洛伊德思想的哲学探讨 ([美]赫伯特·马尔库塞 黄勇(译) 薛民(译)) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-22", "group": "cross_book", "query": "新左派学生运动与文化革命", "expected_workspace": "马尔库塞文集第三卷 新左派与20世纪60年代 ([美] 赫伯特·马尔库塞(Herbert Marcuse)) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-23", "group": "cross_book", "query": "词与物人文科学的知识型", "expected_workspace": "词与物 (福柯) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-24", "group": "cross_book", "query": "柄谷论漱石意识与自然", "expected_workspace": "漱石論集成"},
+    {"id": "cross-25", "group": "cross_book", "query": "力比多与交换模式A的灵力", "expected_workspace": "力與交換模式 = 力と交換様式 (柄谷行人 著  林暉鈞 譯) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-26", "group": "cross_book", "query": "康德 鉴赏判断 合目的性", "expected_workspace": "判断力批判（上） (康德) (汉译世界学术名著丛书)"},
+    {"id": "cross-27", "group": "cross_book", "query": "波德莱尔巴黎的游荡者诗人", "expected_workspace": "发达资本主义时代的抒情诗人 论波德莱尔 ([德] 瓦尔特·本雅明 著 张旭东  魏文生 译) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-28", "group": "cross_book", "query": "现代性的性别与商品消费情色", "expected_workspace": "现代性的性别 = The Gender of Modernity ( etc.) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "cross-29", "group": "cross_book", "query": "黑暗之魂末法意识与传火", "expected_workspace": "The Downward Spiral_ Postmodern Consciousness as Buddhist Metaphy"},
+    {"id": "cross-30", "group": "cross_book", "query": "德里达声音与现象的在场形而上学", "expected_workspace": "声音与现象 (汉译世界学术名著丛书) (雅克·德里达) (z-library.sk, 1lib.sk, z-lib.sk)"},
+    {"id": "chapter-01", "group": "chapter", "query": "无器官身体 斥力 引力 奇迹化机器", "workspace_filter": "反俄狄浦斯 (吉尔·德勒兹) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "反俄狄浦斯 (吉尔·德勒兹) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0023"},
+    {"id": "chapter-02", "group": "chapter", "query": "自白制度 透谷 风流与恋爱", "workspace_filter": "日本现代文学的起源 (柄谷行人文集) (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "日本现代文学的起源 (柄谷行人文集) (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "epub-0007"},
+    {"id": "chapter-03", "group": "chapter", "query": "符号学和结构主义 列维斯特劳斯", "workspace_filter": "文学理论 (耶鲁大学公开课) = Theory of Literature (Open Yale Courses) ([美] 保罗・H・弗莱 (Paul H. Fry) 著  吕黎 译) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "文学理论 (耶鲁大学公开课) = Theory of Literature (Open Yale Courses) ([美] 保罗・H・弗莱 (Paul H. Fry) 著  吕黎 译) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0011"},
+    {"id": "chapter-04", "group": "chapter", "query": "交换样式论 绪论 微型世界体系", "workspace_filter": "世界史的构造（《跨越性批判——康德与马克思》十年之后，又一部达到全新思想高度的理论杰作） (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "世界史的构造（《跨越性批判——康德与马克思》十年之后，又一部达到全新思想高度的理论杰作） (柄谷行人) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "epub-0005"},
+    {"id": "chapter-05", "group": "chapter", "query": "压抑性的俗化趋势 性解放", "workspace_filter": "单向度的人：发达工业社会意识形态研究 ([美]赫伯特·马尔库塞 刘继(译)) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "单向度的人：发达工业社会意识形态研究 ([美]赫伯特·马尔库塞 刘继(译)) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0006"},
+    {"id": "chapter-06", "group": "chapter", "query": "享乐主义的经济学阐释 消费", "workspace_filter": "中产阶级的孩子们", "expected_workspace": "中产阶级的孩子们", "expected_chapter_id": "docx-0035"},
+    {"id": "chapter-07", "group": "chapter", "query": "全景敞视主义 规训机构", "workspace_filter": "规训与惩罚 (福柯 [福柯]) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "规训与惩罚 (福柯 [福柯]) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0009-第三章-全景敞视主义"},
+    {"id": "chapter-08", "group": "chapter", "query": "阿Q正传 优胜记略 精神上的胜利", "workspace_filter": "知识库_鲁迅全集", "expected_workspace": "知识库_鲁迅全集", "expected_chapter_id": "04_呐喊:阿Ｑ正传"},
+    {"id": "chapter-09", "group": "chapter", "query": "所谓世界系这个词的诞生", "workspace_filter": "セカイ系とは何か", "expected_workspace": "セカイ系とは何か", "expected_chapter_id": "toc-0003"},
+    {"id": "chapter-10", "group": "chapter", "query": "日本的历史与反复 昭和明治", "workspace_filter": "历史与反复 ([日]柄谷行人 著 王成 译) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "历史与反复 ([日]柄谷行人 著 王成 译) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "toc-0010"},
+    {"id": "chapter-11", "group": "chapter", "query": "台湾法律中的儿少主体建构", "workspace_filter": "性别治理 (何春蕤) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "性别治理 (何春蕤) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0005-台湾法律中的儿少主体"},
+    {"id": "chapter-12", "group": "chapter", "query": "忠实于自然的标准 罗曼司神话", "workspace_filter": "镜与灯：浪漫主义文论及批评传统（修订译本） ([美]艾布拉姆斯) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "镜与灯：浪漫主义文论及批评传统（修订译本） ([美]艾布拉姆斯) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0013"},
+    {"id": "chapter-13", "group": "chapter", "query": "陀思妥耶夫斯基的复调小说 评论界的阐述", "workspace_filter": "陀思妥耶夫斯基的诗学问题 (（俄）米哈伊尔·巴赫金著, M. M Bakhtin) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "陀思妥耶夫斯基的诗学问题 (（俄）米哈伊尔·巴赫金著, M. M Bakhtin) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "toc-0004"},
+    {"id": "chapter-14", "group": "chapter", "query": "布尔乔亚 填充物 威廉·麦斯特", "workspace_filter": "布尔乔亚：在历史与文学之间 (【意】弗朗哥·莫莱蒂) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "布尔乔亚：在历史与文学之间 (【意】弗朗哥·莫莱蒂) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "docx-0017"},
+    {"id": "chapter-15", "group": "chapter", "query": "漱石神话与则天去私", "workspace_filter": "夏目漱石 (江藤淳) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_workspace": "夏目漱石 (江藤淳) (z-library.sk, 1lib.sk, z-lib.sk)", "expected_chapter_id": "epub-0003"},
+    {"id": "chapter-16", "group": "chapter", "query": "实践理性批判 至善 道德法则", "workspace_filter": "实践理性批判 (康德) (汉译世界学术名著丛书)", "expected_workspace": "实践理性批判 (康德) (汉译世界学术名著丛书)", "expected_chapter_id": "docx-0007-第一卷-纯粹实践理性分析论"}
+  ]
+}

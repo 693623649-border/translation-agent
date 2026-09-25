@@ -1214,6 +1214,69 @@ outputs/my_book/
 └── 书名_带目录.pdf            # 原版外观 + 可复制层（若原有）+ 书签
 ```
 
+### 本机跨书知识库
+
+历史分支曾提供 `rag_indexing.py`，可以把显式指定的五字段 JSONL
+汇成派生检索语料；它没有固定的仓库级索引。当前可将 `outputs/` 下的全部
+成品工作区同步到仓库根目录的 `global_knowledge_base.sqlite3`（已被 Git 忽略）：
+
+```mermaid
+flowchart LR
+  A[outputs/*/knowledge_base.jsonl] --> D[本地同步器]
+  B[缺失 KB 的章节 Markdown] --> D
+  C[原页 OCR / 逐页译文 / 章节存档] --> D
+  P[knowledge_base.apparatus.json] --> D
+  D --> E[(仓库级 SQLite + FTS5)]
+  F[DOCX / EPUB / PDF / 图片] --> G[文件清单与 SHA-256]
+  G --> E
+  E --> H[跨书检索 / 来源定位 / 验收状态过滤]
+```
+
+```bash
+python global_knowledge_base.py sync
+python global_knowledge_base.py status
+python global_knowledge_base.py verify
+python global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrieval_cases.local.json
+python global_knowledge_base.py search '自然主义' --limit 5
+python global_knowledge_base.py search '校正後' --scope pages --workspace 私小説論
+```
+
+`sync` 只读取各工作区，不修改各书的 `knowledge_base.jsonl` 或发布报告。
+五字段和旧版带页码字段的 JSONL 都可导入；没有 JSONL 的工作区从
+`chapters.json` 所列的 Markdown 章节补入。已由 JSONL 覆盖的章节 Markdown 独立版本
+也存入 `archive` 层，原页 OCR、校对文本和逐页译文存入 `pages` 层；
+DOCX、EPUB、PDF 和图片以可追溯的文件路径及哈希登记。默认 `search` 只检索书目
+JSONL 和缺失章节的补入文本，`--scope pages|archive|all` 可切换范围。
+结果会显示工作区、来源文件、章节、验收报告状态和内容哈希；跨书正文检索
+默认每本最多返回一条，以免同一本书占满结果页，可用 `--per-book-cap`
+调整，或用 `--workspace` 检索指定书的更多段落。
+
+工作区如果带 `knowledge_base.apparatus.json`（由 `rag_apparatus.py` 生成），
+其 `default_weight` 会在写入 `chunks.apparatus_weight` 时随块入库：结构性装置
+（目录、索引、版权页）为 0.25，说明性装置为 0.7，正文为 1.0。检索按
+`score + (1 - weight) * |score|` 在 `ORDER BY` 内降权，因此索引、目录这类
+"重复每个词条"的块不会挤掉讨论同一概念的正文；降权必须发生在取数之前，
+否则超出 `LIMIT` 的正文块已经被丢弃。本机 61 个工作区里有 130 个结构性装置块、
+9 个说明性装置块，`tests/test_global_knowledge_base.py::ApparatusDemotionTests`
+用合成库双向验证该机制（无 sidecar 时索引块确实会排到第一位）。
+
+检索索引用项目已声明的 OpenCC 依赖统一繁简字形；请在安装了项目依赖的
+Python 环境中运行上述命令。`evaluate` 使用固定的 30 道跨书问题和 16 道
+书内章节问题，报告写入 `work/global_kb_evaluation.json`。本机 61 个工作区
+（6932 个阅读块、2219 个页面块、1275 个存档块）的实测基线是：跨书
+Hit@1 0.867 / Hit@5 1.000 / MRR@5 0.928，章节 Hit@1 0.875 / Hit@5 0.938 /
+MRR@5 0.906；`tests/fixtures/global_kb_retrieval_cases.local.json` 中的阈值是
+压在这组数字下沿的回归底线（跨书 0.8/0.95，章节 0.85/0.9），不是目标值。
+题集为单机专用，每题的期望锚点都先在真实章节正文里核对过——问句词元根本不在
+目标文档里属于出题错误，不是检索缺陷。已知缺口记在题集的 `known_gaps`：
+跨引号的三元组无法命中（`所谓“世界系”这个词` 落在第 6 位），以及若干
+同主题书籍（柄谷行人、康德）之间的第 2、3 位近似命中。命中率衡量的是检索定位，
+不代表原书 OCR、翻译或校对已经通过质量门。`--verified-only` 只返回目前具有
+未过期、通过的完整发布报告的工作区。原页及旧版语料可能未经当前质量门验收，
+入库不等于已校对通过。`verify` 可检查来源有无新增、删除或改动；工作区内容
+发生变化后重新运行 `sync`；数据库在完整构建并通过 SQLite 完整性检查后才会
+替换旧索引。
+
 ## 常用参数
 
 ```text
