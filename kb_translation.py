@@ -294,12 +294,15 @@ def _restore(text: str, tokens: Sequence[str]) -> str:
     return restore_tokens(text, tokens)
 
 
-def _build_prompt(segments: Sequence[str]) -> str:
+def _build_prompt(segments: Sequence[str], extra_instructions: str = "") -> str:
     blocks = [f"{_MARKER.format(index=index)}\n{segment}" for index, segment in enumerate(segments)]
-    return (
+    prompt = (
         f"把下面 {len(segments)} 段文本逐段译为简体中文。"
         "每段以 <<<SEG nnnn>>> 开头，输出时必须保留同样的标记与顺序。\n\n" + "\n\n".join(blocks)
     )
+    if extra_instructions:
+        prompt += "\n\n" + extra_instructions
+    return prompt
 
 
 def _split_oversized(text: str, max_chars: int) -> list[str]:
@@ -346,13 +349,16 @@ def translate_texts(
     *,
     batch_chars: int = 8000,
     concurrency: int = 8,
+    extra_instructions: str = "",
 ) -> list[str]:
     """Translate texts 1:1, batching on character budget.
 
     Batches are independent, so they run concurrently; results are re-ordered by
     batch index before being returned.  Fails closed: a batch whose markers do
     not come back intact raises instead of guessing, because a silently
-    misaligned corpus is worse than a failed run.
+    misaligned corpus is worse than a failed run.  ``extra_instructions`` is
+    appended to every user prompt — it carries book-specific directives (OCR
+    damage policy, elision bans) that do not belong in the shared system prompt.
     """
 
     if not isinstance(batch_chars, int) or isinstance(batch_chars, bool) or batch_chars <= 0:
@@ -382,7 +388,9 @@ def translate_texts(
 
     def run_batch(batch: list[str]) -> list[str]:
         protected = [_protect(segment) for segment in batch]
-        response = translator.translate(_build_prompt([item[0] for item in protected]))
+        response = translator.translate(
+            _build_prompt([item[0] for item in protected], extra_instructions)
+        )
         segments = _parse_response(response, len(batch))
         output: list[str] = []
         for segment, (_, tokens) in zip(segments, protected, strict=True):

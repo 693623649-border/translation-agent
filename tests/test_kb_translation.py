@@ -205,6 +205,47 @@ class TranslateTextsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             translate_texts([""], _FakeTranslator())
 
+    def test_extra_instructions_reach_every_prompt(self) -> None:
+        """Book-specific directives ride along on every batch and retry call."""
+
+        class _PromptRecordingTranslator(_FakeTranslator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prompts: list[str] = []
+
+            def translate(self, prompt: str) -> str:
+                self.prompts.append(prompt)
+                return super().translate(prompt)
+
+        translator = _PromptRecordingTranslator()
+        long_a = "あ" * 60 + "。"
+        long_b = "い" * 60 + "。"
+        result = translate_texts(
+            [long_a, long_b],
+            translator,
+            batch_chars=100,
+            concurrency=1,
+            extra_instructions="禁止用省略号概括任何内容。",
+        )
+        self.assertEqual(result, ["[译]中文译文", "[译]中文译文"])
+        self.assertEqual(len(translator.prompts), 2)
+        for prompt in translator.prompts:
+            self.assertIn("禁止用省略号概括任何内容。", prompt)
+
+    def test_default_prompt_carries_no_extra_instructions(self) -> None:
+        class _PromptRecordingTranslator(_FakeTranslator):
+            def __init__(self) -> None:
+                super().__init__()
+                self.prompts: list[str] = []
+
+            def translate(self, prompt: str) -> str:
+                self.prompts.append(prompt)
+                return super().translate(prompt)
+
+        translator = _PromptRecordingTranslator()
+        translate_texts(["一段日文。"], translator)
+        self.assertNotIn("禁止", translator.prompts[0])
+
 
 class EnsureChineseRowsTests(unittest.TestCase):
     def _rows(self) -> list[dict]:
