@@ -89,6 +89,32 @@ class DocxSemanticMigrationTests(unittest.TestCase):
                 target.writestr(info, data)
         replacement.replace(path)
 
+    def test_migrates_footnote_free_docx_without_footnotes_part(self) -> None:
+        """A package with no footnote artifacts at all is a trivially closed contract."""
+
+        source = self.root / "footnote-free.docx"
+        document = Document()
+        document.add_heading("第一章", level=1)
+        document.add_paragraph("无注正文。")
+        document.add_heading("第二章", level=1)
+        document.add_paragraph("末章正文。")
+        document.save(source)
+
+        migration = extract_docx_semantic_markdown(source, self.manifest)
+        self.assertEqual(len(migration.chapters), 2)
+        self.assertEqual(migration.chapters[0].footnotes, ())
+        self.assertIn("# 第一章", migration.chapters[0].markdown)
+        self.assertIn("无注正文。", migration.chapters[0].markdown)
+        audit = migration.audit_dict()
+        self.assertEqual(audit["status"], "passed")
+        self.assertEqual(audit["summary"]["footnote_count"], 0)
+
+        write_semantic_migration(
+            migration, self.root / "chapters", audit_path=self.root / "audit.json"
+        )
+        written = (self.root / "chapters" / "001_第一章.md").read_text(encoding="utf-8")
+        self.assertIn("无注正文。", written)
+
     def test_extracts_document_order_markdown_and_exact_true_footnotes(self) -> None:
         migration = extract_docx_semantic_markdown(
             self._accepted_docx(), self.manifest

@@ -222,8 +222,11 @@ def _footnote_definitions(path: Path) -> dict[int, str]:
     with zipfile.ZipFile(path, "r") as archive:
         try:
             root = _xml(archive.read("word/footnotes.xml"), "word/footnotes.xml")
-        except KeyError as exc:
-            raise DocxSemanticMigrationError("DOCX has no footnotes.xml") from exc
+        except KeyError:
+            # A package without a footnotes part has no footnote artifacts at
+            # all; inspect_docx_footnotes already validated that it likewise
+            # carries zero references, so the contract is trivially closed.
+            return {}
     definitions: dict[int, str] = {}
     for note in root.findall(W + "footnote"):
         raw_id = note.get(W + "id")
