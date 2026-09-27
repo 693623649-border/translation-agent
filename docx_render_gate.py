@@ -475,6 +475,24 @@ def inspect_rendered_pdf(pdf_path: Path, *, expected_text: str) -> dict[str, Any
                 }
             )
 
+    # The footer makes the ink bounding box span the page even when the body
+    # ends after a few lines.  Count visible characters on interior pages to
+    # catch the short pages caused by forced chapter breaks in prose books.
+    interior_pages = pages[1:-1]
+    short_prose_pages = [
+        item["page"] for item in interior_pages if item["text_characters"] < 300
+    ]
+    if len(pages) >= 20 and len(short_prose_pages) > max(2, int(len(interior_pages) * 0.04)):
+        issues.append(
+            _issue(
+                "docx_render_too_many_short_pages",
+                "Word 正文短页过多，检查章节强制分页和断句段落。",
+                count=len(short_prose_pages),
+                pages=short_prose_pages[:30],
+                interior_page_count=len(interior_pages),
+            )
+        )
+
     expected = _canonical_characters(expected_text)
     actual = _canonical_characters("\n".join(rendered_text))
     expected_cjk_count = len(re.findall(r"[\u3400-\u9fff]", expected_text))
@@ -543,6 +561,8 @@ def inspect_rendered_pdf(pdf_path: Path, *, expected_text: str) -> dict[str, Any
                 int(item["interleaved_index_block_count"]) >= 2 for item in pages
             ),
             "sparse_page_count": sum(bool(item["sparse"]) for item in pages),
+            "short_prose_page_count": len(short_prose_pages),
+            "short_prose_pages": short_prose_pages,
             "pages": pages,
         },
     }

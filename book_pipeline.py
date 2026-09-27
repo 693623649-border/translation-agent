@@ -25,6 +25,7 @@ import time
 import tomllib
 import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -1746,6 +1747,21 @@ def _kana_ratio(text: str) -> float:
 
 KANA_CHARS = re.compile(r"[぀-ヿ]")
 
+DASH_FRAGMENT_LIMIT = 5
+DASH_FRAGMENT_RE = re.compile(r"^[ \t]*[“\"]*——", re.M)
+
+
+def _dash_fragment_count(text: str) -> int:
+    """Paragraphs that open with a “——“ continuation dash.
+
+    A handful of such paragraphs is a legitimate dialogue convention; a dense
+    cluster on one page is the signature of interleaved OCR line order that
+    the translator reproduced verbatim (each scrambled source line becomes a
+    quoted dash fragment).
+    """
+
+    return len(DASH_FRAGMENT_RE.findall(text))
+
 
 def _enforceable_numbered_labels(text: str) -> list[str]:
     """Labels the footnote-preservation gate must require in the translation.
@@ -1910,6 +1926,15 @@ class ChatTranslator:
                 raise RuntimeError(
                     "Translation retained Japanese text "
                     f"(kana_ratio={kana_ratio:.2f})."
+                )
+            dash_fragments = _dash_fragment_count(joined)
+            if dash_fragments > DASH_FRAGMENT_LIMIT:
+                raise RuntimeError(
+                    "Translation looks like scrambled reading order: "
+                    f"{dash_fragments} paragraphs open with a “——“ continuation "
+                    "dash, which happens when interleaved OCR line order is "
+                    "translated verbatim. Proofread the page OCR "
+                    "(--phase proofread) or fix the reading order, then re-run."
                 )
         return joined
 
@@ -4271,6 +4296,53 @@ def _docx_style_name(
     return preferred
 
 
+def _docx_join_short_prose(previous: ET.Element, following: ET.Element) -> bool:
+    """Join a short, unfinished prose fragment without changing its words.
+
+    Scanned page boundaries sometimes survive in chapter Markdown as a blank
+    line in the middle of a sentence.  Keep headings, lists, quotations and
+    intentional complete sentences separate; this is only a Word layout fix.
+    """
+
+    if _html_local_name(previous) != "p" or _html_local_name(following) != "p":
+        return False
+    if any(_html_local_name(node) == "br" for node in (*previous.iter(), *following.iter())):
+        return False
+    left = _html_element_text(previous)
+    right = _html_element_text(following)
+    if not (8 <= len(left) <= 120 and right):
+        return False
+    if re.fullmatch(r"(?:[IVXLC]+|\d+|[\u3400-\u9fff]{1,12})", left):
+        return False
+    if left[-1] in "。！？!?；;：:…—.”’\"'）)]】》〉」』":
+        return False
+    return bool(re.match(r"[\w\u3400-\u9fff]", right))
+
+
+def _docx_fold_soft_breaks(value: str) -> str:
+    """Turn Markdown source wrapping inside a prose paragraph into flow text."""
+
+    parts = re.split(r"[ \t]*\n[ \t]*", value)
+    if len(parts) == 1:
+        return value
+    cjk_boundary = r"[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]"
+    result = parts[0]
+    for part in parts[1:]:
+        if not part:
+            continue
+        if not result:
+            result = part
+            continue
+        joiner = (
+            ""
+            if re.fullmatch(cjk_boundary, result[-1])
+            and re.fullmatch(cjk_boundary, part[0])
+            else " "
+        )
+        result += joiner + part
+    return result
+
+
 def _append_markdown_to_docx(
     document: Any,
     markdown_text: str,
@@ -4290,12 +4362,15 @@ def _append_markdown_to_docx(
         italic: bool = False,
         underline: bool = False,
         skip_tags: frozenset[str] = frozenset(),
+        preserve_breaks: bool = False,
     ) -> None:
         """Append the supported inline XHTML subset without losing run styles."""
 
         def add_run(text: str | None, *, run_bold: bool, run_italic: bool, run_underline: bool) -> None:
             if not text:
                 return
+            if not preserve_breaks:
+                text = _docx_fold_soft_breaks(text)
             run = paragraph.add_run(text)
             if run_bold:
                 run.bold = True
@@ -4315,12 +4390,7 @@ def _append_markdown_to_docx(
             if tag in skip_tags:
                 pass
             elif tag == "br":
-                add_run(
-                    "\n",
-                    run_bold=bold,
-                    run_italic=italic,
-                    run_underline=underline,
-                )
+                paragraph.add_run().add_break()
             else:
                 append_inline(
                     paragraph,
@@ -4329,6 +4399,7 @@ def _append_markdown_to_docx(
                     italic=italic or tag in {"em", "i"},
                     underline=underline or tag in {"u", "ins"},
                     skip_tags=skip_tags,
+                    preserve_breaks=preserve_breaks,
                 )
             add_run(
                 child.tail,
@@ -4343,6 +4414,7 @@ def _append_markdown_to_docx(
         style: str | None = None,
         bold: bool = False,
         skip_tags: frozenset[str] = frozenset(),
+        preserve_breaks: bool = False,
     ) -> Any | None:
         if not _html_element_text(element, skip_tags=skip_tags):
             return None
@@ -4352,6 +4424,7 @@ def _append_markdown_to_docx(
             element,
             bold=bold,
             skip_tags=skip_tags,
+            preserve_breaks=preserve_breaks,
         )
         return paragraph
 
@@ -4408,7 +4481,7 @@ def _append_markdown_to_docx(
                     bold=_html_local_name(source_cell) == "th",
                 )
 
-    def render(element: ET.Element, *, quote: bool = False) -> None:
+    def render(element: ET.Element, *, quote: bool = False) -> Any | None:
         tag = _html_local_name(element)
         if re.fullmatch(r"h[1-6]", tag):
             level = min(3, int(tag[1]))
@@ -4421,8 +4494,11 @@ def _append_markdown_to_docx(
                 if quote
                 else body_style
             )
-            add_paragraph(element, style=style)
-            return
+            return add_paragraph(
+                element,
+                style=style,
+                preserve_breaks=style in {"Bibliography Entry", "Index Entry"},
+            )
         if tag == "blockquote":
             for child in element:
                 render(child, quote=True)
@@ -4434,13 +4510,39 @@ def _append_markdown_to_docx(
             render_table(element)
             return
         if tag == "pre":
-            add_paragraph(element, style=_docx_style_name(document, "No Spacing"))
+            add_paragraph(
+                element,
+                style=_docx_style_name(document, "No Spacing"),
+                preserve_breaks=True,
+            )
             return
         if tag == "hr":
             return
         if tag in {"div", "section", "article", "document"}:
+            previous_source: ET.Element | None = None
+            previous_paragraph: Any | None = None
             for child in element:
-                render(child, quote=quote)
+                if (
+                    not quote
+                    and body_style is None
+                    and previous_source is not None
+                    and previous_paragraph is not None
+                    and _docx_join_short_prose(previous_source, child)
+                ):
+                    left = _html_element_text(previous_source)
+                    right = _html_element_text(child)
+                    cjk_boundary = r"[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]"
+                    if not (
+                        re.fullmatch(cjk_boundary, left[-1])
+                        and re.fullmatch(cjk_boundary, right[0])
+                    ):
+                        previous_paragraph.add_run(" ")
+                    append_inline(previous_paragraph, child)
+                    previous_source = child
+                    continue
+                rendered = render(child, quote=quote)
+                previous_source = child if _html_local_name(child) == "p" else None
+                previous_paragraph = rendered if previous_source is not None else None
             return
         add_paragraph(
             element,
@@ -4542,9 +4644,11 @@ def _configure_book_docx_styles(document: Any) -> str:
         style.paragraph_format.first_line_indent = Pt(0)
         style.paragraph_format.keep_with_next = True
         style.paragraph_format.widow_control = True
-        style.paragraph_format.page_break_before = name == "Heading 1"
+        # A forced break for every short essay leaves many near-empty pages.
+        # keep_with_next still prevents a stranded heading at the page foot.
+        style.paragraph_format.page_break_before = False
         style.paragraph_format.line_spacing = 1.15
-        style.paragraph_format.space_before = Pt(0 if name == "Heading 1" else 14)
+        style.paragraph_format.space_before = Pt(18 if name == "Heading 1" else 14)
         style.paragraph_format.space_after = Pt(8)
 
     quote = document.styles["Quote"]
@@ -4845,6 +4949,70 @@ def build_docx(
         temporary_path.unlink(missing_ok=True)
 
 
+_EPUB_IMAGE_MEDIA_TYPES = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".webp": "image/webp",
+}
+
+
+def _package_epub_images(
+    body_html: str,
+    chapter_dir: Path,
+    images: dict[str, tuple[bytes, str]],
+) -> str:
+    """Rewrite Markdown image sources into packaged archive members.
+
+    Semantic EPUB chapters keep source-relative image links such as
+    ``../images/00002.jpeg``.  Those resolve against the managed output
+    directory where the semantic importer materialized the source images.
+    The EPUB release gate requires every ``src`` resource to be packaged, so
+    each referenced image is copied into the archive under ``images/`` and
+    its ``src`` is rewritten to that member path.
+    """
+    try:
+        from lxml import etree
+    except ImportError as exc:
+        raise RuntimeError(
+            "EPUB compilation requires lxml>=5; install requirements.txt."
+        ) from exc
+    wrapper = etree.fromstring(f"<body>{body_html}</body>")
+    root_dir = chapter_dir.resolve().parent
+    for img in wrapper.xpath("//*[local-name()='img']"):
+        src = str(img.get("src") or "").strip()
+        if not src:
+            img.getparent().remove(img)
+            continue
+        parsed = urllib.parse.urlsplit(src)
+        if parsed.scheme or parsed.netloc:
+            raise ValueError(
+                f"EPUB image resource must be packaged, got external src: {src!r}"
+            )
+        candidate = (chapter_dir / urllib.parse.unquote(parsed.path)).resolve()
+        if not candidate.is_relative_to(root_dir):
+            raise ValueError(f"EPUB image resource escapes output directory: {src!r}")
+        if not candidate.is_file():
+            raise ValueError(
+                f"EPUB image resource not found on disk: {src!r} "
+                "(re-run the semantic import to materialize source images)"
+            )
+        member = f"images/{candidate.name}"
+        data = candidate.read_bytes()
+        media_type = _EPUB_IMAGE_MEDIA_TYPES.get(
+            candidate.suffix.casefold(), "application/octet-stream"
+        )
+        existing = images.get(member)
+        if existing is not None and existing[0] != data:
+            raise ValueError(f"EPUB image basename collision for {candidate.name}")
+        images[member] = (data, media_type)
+        img.set("src", member)
+    rendered = etree.tostring(wrapper, encoding="unicode")
+    return rendered[len("<body>") : -len("</body>")]
+
+
 def build_epub(
     output_path: Path,
     chapter_dir: Path,
@@ -4859,6 +5027,7 @@ def build_epub(
     spine_items: list[str] = []
     manifest_items: list[str] = []
     chapter_files: list[tuple[str, str]] = []
+    images: dict[str, tuple[bytes, str]] = {}
     for item in manifest:
         md_path = chapter_dir / item["filename"]
         xhtml_name = md_path.with_suffix(".xhtml").name
@@ -4872,6 +5041,7 @@ def build_epub(
                 chapter_title=str(item.get("display_title") or ""),
             )
         )
+        body = _package_epub_images(body, chapter_dir, images)
         title = html.escape(str(item["display_title"]))
         document = f'''<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{html.escape(language)}">
@@ -4883,6 +5053,12 @@ def build_epub(
         manifest_items.append(f'<item id="{item_id}" href="{html.escape(xhtml_name)}" media-type="application/xhtml+xml"/>')
         spine_items.append(f'<itemref idref="{item_id}"/>')
         nav_items.append(f'<li><a href="{html.escape(xhtml_name)}">{title}</a></li>')
+    for index, member in enumerate(sorted(images), start=1):
+        _data, media_type = images[member]
+        manifest_items.append(
+            f'<item id="image-{index:04d}" href="{html.escape(member)}" '
+            f'media-type="{html.escape(media_type)}"/>'
+        )
     nav = f'''<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="{html.escape(language)}">
 <head><title>目录</title></head><body><nav epub:type="toc" id="toc"><h1>目录</h1><ol>{''.join(nav_items)}</ol></nav></body>
@@ -4910,6 +5086,8 @@ def build_epub(
         archive.writestr("OEBPS/style.css", css)
         for filename, content in chapter_files:
             archive.writestr(f"OEBPS/{filename}", content)
+        for member, (data, _media_type) in images.items():
+            archive.writestr(f"OEBPS/{member}", data)
 
 
 def build_bookmarked_pdf(source_pdf: Path, output_pdf: Path, toc_payload: dict[str, Any]) -> None:

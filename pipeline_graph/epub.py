@@ -1775,7 +1775,7 @@ def prepare_epub_graph(
             provides=frozenset({ART_EPUB}),
             version="1",
             fingerprint=stable_fingerprint(
-                {**publication_fingerprint, "publisher": "epub-v1"}
+                {**publication_fingerprint, "publisher": "epub-v2"}
             ),
             cache_validator=_single_output_is_current(
                 ART_EPUB, _file_artifact_is_current

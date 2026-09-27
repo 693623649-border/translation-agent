@@ -45,7 +45,8 @@ CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 OPF_NS = "http://www.idpf.org/2007/opf"
 DC_NS = "http://purl.org/dc/elements/1.1/"
 SCHEMA_VERSION = 1
-IMPORTER_VERSION = "epub-semantic-v4"
+IMPORTER_VERSION = "epub-semantic-v6"
+MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 
 class EpubSemanticError(ValueError):
@@ -113,6 +114,22 @@ def _atomic_write_json(path: Path, value: Any) -> None:
         path,
         json.dumps(value, ensure_ascii=False, indent=2, sort_keys=False) + "\n",
     )
+
+
+def _atomic_write_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _safe_member(value: str) -> str:
@@ -557,10 +574,21 @@ class _XhtmlRenderer:
             return anchored(
                 f"[{label}]({rewritten})" if rewritten and label else label
             )
-        if tag == "sup" and inner.strip():
-            return anchored(f"<sup>{html.escape(inner.strip())}</sup>")
-        if tag == "sub" and inner.strip():
-            return anchored(f"<sub>{html.escape(inner.strip())}</sub>")
+        if tag in {"sup", "sub"} and inner.strip():
+            # Anchor markers inside a superscript were escaped with the rest of
+            # the visible text, which turned fragment targets such as
+            # ``noteBack_1`` into plain characters and broke the published
+            # back-link.  Hoist leading markers out as raw inline HTML so the
+            # ids survive Markdown rendering.
+            body = inner.strip()
+            prefix = ""
+            while body.startswith('<span id="'):
+                close = body.find("</span>")
+                if close == -1:
+                    break
+                prefix += body[: close + len("</span>")]
+                body = body[close + len("</span>") :].strip()
+            return anchored(f"{prefix}<{tag}>{html.escape(body)}</{tag}>")
         return anchored(inner)
 
     def _blocks(self, element: etree._Element, current_href: str) -> Iterator[str]:
@@ -780,8 +808,10 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     metadata, documents, roots, title_hints, opf_member = _package_documents(source)
     chapter_dir = output_dir / "chapters"
     source_dir = output_dir / "semantic" / "source_chapters"
+    images_dir = output_dir / "images"
     chapter_dir.mkdir(parents=True, exist_ok=True)
     source_dir.mkdir(parents=True, exist_ok=True)
+    images_dir.mkdir(parents=True, exist_ok=True)
 
     # Publication filenames depend on reconstructed titles, while internal
     # links need those final filenames during reconstruction.  A read-only
@@ -812,82 +842,115 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     audit_chapters: list[dict[str, Any]] = []
     units: list[dict[str, Any]] = []
     expected_files: set[str] = set()
-    for sequence, document, title, chapter_id, filename in document_plan:
-        body, definitions, issues = renderer.render(document)
-        if not re.match(r"^#\s+", body):
-            body = f"# {title}\n\n{body}".strip()
-        if definitions:
-            body += "\n\n" + "\n\n".join(
-                f"[^{note_id}]: " + text.replace("\n\n", "\n\n    ")
-                for note_id, text in definitions
-            )
-        markdown = body.rstrip() + "\n"
-        inventory = parse_markdown_footnotes(markdown)
-        for code, values in (
-            ("semantic_markdown_duplicate_definitions", inventory.duplicate_definitions),
-            ("semantic_markdown_missing_definitions", inventory.missing_definitions),
-            ("semantic_markdown_unused_definitions", inventory.unused_definitions),
-            ("semantic_markdown_duplicate_references", inventory.duplicate_references),
-        ):
-            if values:
-                issues.append(
-                    {
-                        "code": code,
-                        "message": "EPUB 章节脚注未形成一对一闭环。",
-                        "source_page": document.href,
-                        "note_label": None,
-                        "blocking": True,
-                        "evidence": {"values": list(values)},
-                    }
+    images: list[dict[str, str]] = []
+    expected_images: set[str] = set()
+    seen_images: dict[str, str] = {}
+    with zipfile.ZipFile(source) as archive:
+        for sequence, document, title, chapter_id, filename in document_plan:
+            body, definitions, issues = renderer.render(document)
+            if not re.match(r"^#\s+", body):
+                body = f"# {title}\n\n{body}".strip()
+            if definitions:
+                body += "\n\n" + "\n\n".join(
+                    f"[^{note_id}]: " + text.replace("\n\n", "\n\n    ")
+                    for note_id, text in definitions
                 )
-        expected_files.add(filename)
-        _atomic_write_text(chapter_dir / filename, markdown)
-        _atomic_write_text(source_dir / filename, markdown)
-        chapter_units = _translation_units(chapter_id, markdown, document.href)
-        units.extend(chapter_units)
-        manifest.append(
-            {
-                "id": chapter_id,
-                "sequence": sequence,
-                "level": 1,
-                "title": title,
-                "display_title": title,
-                "filename": filename,
-                "source_format": "epub",
-                "source_href": document.href,
-                "source_item_id": document.item_id,
-                "source_sha256": document.raw_sha256,
-                "reviewed_override": False,
-                "semantic_footnote_count": len(inventory.definitions),
-                "semantic_issue_count": len(issues),
-            }
-        )
-        audit_chapters.append(
-            {
-                "chapter_id": chapter_id,
-                "filename": filename,
-                "source_href": document.href,
-                "source_sha256": document.raw_sha256,
-                "markdown_sha256": _sha256_bytes(markdown.encode("utf-8")),
-                "footnote_contract_sha256": markdown_footnote_contract_sha256(markdown),
-                "footnote_count": len(inventory.definitions),
-                "translation_unit_count": len(chapter_units),
-                "continuation_merged_count": renderer.render_metrics.get(
-                    document.href, {}
-                ).get("continuation_merged_count", 0),
-                "issues": issues,
-                "release_blocked": any(bool(issue.get("blocking", True)) for issue in issues),
-            }
-        )
+            markdown = body.rstrip() + "\n"
+            for src in MARKDOWN_IMAGE_PATTERN.findall(markdown):
+                parsed = urlsplit(src)
+                if parsed.scheme or parsed.netloc or not parsed.path:
+                    continue
+                member = _resolve_member(document.href, unquote(parsed.path))
+                raw = _read_member(archive, member)
+                name = PurePosixPath(member).name
+                digest = _sha256_bytes(raw)
+                previous = seen_images.get(name)
+                if previous is not None and previous != digest:
+                    raise EpubSemanticError(
+                        f"image basename collision: {member} reuses {name}"
+                    )
+                expected_images.add(name)
+                if previous is None:
+                    seen_images[name] = digest
+                    images.append(
+                        {"member": member, "name": name, "sha256": digest}
+                    )
+                target = images_dir / name
+                if not target.exists() or _sha256_bytes(target.read_bytes()) != digest:
+                    _atomic_write_bytes(target, raw)
+            inventory = parse_markdown_footnotes(markdown)
+            for code, values in (
+                ("semantic_markdown_duplicate_definitions", inventory.duplicate_definitions),
+                ("semantic_markdown_missing_definitions", inventory.missing_definitions),
+                ("semantic_markdown_unused_definitions", inventory.unused_definitions),
+                ("semantic_markdown_duplicate_references", inventory.duplicate_references),
+            ):
+                if values:
+                    issues.append(
+                        {
+                            "code": code,
+                            "message": "EPUB 章节脚注未形成一对一闭环。",
+                            "source_page": document.href,
+                            "note_label": None,
+                            "blocking": True,
+                            "evidence": {"values": list(values)},
+                        }
+                    )
+            expected_files.add(filename)
+            _atomic_write_text(chapter_dir / filename, markdown)
+            _atomic_write_text(source_dir / filename, markdown)
+            chapter_units = _translation_units(chapter_id, markdown, document.href)
+            units.extend(chapter_units)
+            manifest.append(
+                {
+                    "id": chapter_id,
+                    "sequence": sequence,
+                    "level": 1,
+                    "title": title,
+                    "display_title": title,
+                    "filename": filename,
+                    "source_format": "epub",
+                    "source_href": document.href,
+                    "source_item_id": document.item_id,
+                    "source_sha256": document.raw_sha256,
+                    "reviewed_override": False,
+                    "semantic_footnote_count": len(inventory.definitions),
+                    "semantic_issue_count": len(issues),
+                }
+            )
+            audit_chapters.append(
+                {
+                    "chapter_id": chapter_id,
+                    "filename": filename,
+                    "source_href": document.href,
+                    "source_sha256": document.raw_sha256,
+                    "markdown_sha256": _sha256_bytes(markdown.encode("utf-8")),
+                    "footnote_contract_sha256": markdown_footnote_contract_sha256(markdown),
+                    "footnote_count": len(inventory.definitions),
+                    "translation_unit_count": len(chapter_units),
+                    "continuation_merged_count": renderer.render_metrics.get(
+                        document.href, {}
+                    ).get("continuation_merged_count", 0),
+                    "issues": issues,
+                    "release_blocked": any(bool(issue.get("blocking", True)) for issue in issues),
+                }
+            )
 
     for directory in (chapter_dir, source_dir):
         for stale in directory.glob("*.md"):
             if stale.name not in expected_files:
                 stale.unlink()
+    for stale in images_dir.iterdir():
+        if stale.name in expected_images:
+            continue
+        if stale.is_symlink() or not stale.is_file():
+            raise EpubSemanticError(f"unsafe stale image artifact: {stale}")
+        stale.unlink()
     summary = semantic_audit_summary(audit_chapters)
     summary["continuation_merged_count"] = sum(
         int(item["continuation_merged_count"]) for item in audit_chapters
     )
+    summary["image_count"] = len(images)
     audit = {
         "schema_version": SCHEMA_VERSION,
         "status": "blocked" if summary["release_blocked"] else "passed",
@@ -903,6 +966,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         },
         "summary": summary,
         "chapters": audit_chapters,
+        "images": images,
     }
     _atomic_write_json(output_dir / "chapters.json", manifest)
     _atomic_write_json(output_dir / "audit" / "semantic-reconstruction.json", audit)
@@ -917,12 +981,14 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         "release_blocked": audit["release_blocked"],
         "chapter_count": len(manifest),
         "footnote_count": summary["footnote_count"],
+        "image_count": len(images),
         "translation_unit_count": len(units),
         "title": metadata.title,
         "author": metadata.author,
         "language": metadata.language,
         "manifest": str((output_dir / "chapters.json").resolve()),
         "chapters": str(chapter_dir.resolve()),
+        "images": str(images_dir.resolve()),
         "translation_units": str(units_path.resolve()),
         "audit": str((output_dir / "audit" / "semantic-reconstruction.json").resolve()),
         "review_audit": str(review.audit_path),

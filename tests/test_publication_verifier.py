@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import fitz
@@ -21,10 +22,13 @@ from book_pipeline import (
     write_knowledge_base,
 )
 from publication_verifier import (
+    _canonical_docx_body_text,
+    _check_ocr_quality,
     _citation_inventory,
     _docx_markdown_body,
     _docx_positive_footnote_texts,
     _markdown_visible_text,
+    _trace_issues,
     verify_publication,
 )
 from semantic_review_policy import (
@@ -48,6 +52,70 @@ class PublicationVerifierTests(unittest.TestCase):
     def test_docx_body_strips_footnote_after_ascii_exclamation(self) -> None:
         source = "# 章节\n\n人心![^note]\n\n[^note]: 注释。\n"
         self.assertEqual(_docx_markdown_body(source), "# 章节\n\n人心!\n")
+
+    def test_docx_body_canonicalization_keeps_latin_word_spaces(self) -> None:
+        self.assertEqual(
+            _canonical_docx_body_text("麻木了的\n人， and then"),
+            "麻木了的人， and then",
+        )
+
+    def test_ocr_quality_gate_requires_source_bound_manual_samples(self) -> None:
+        quality = self.root / "ocr-quality-fixture"
+        (quality / "pages").mkdir(parents=True)
+        (quality / "audit").mkdir()
+        gold = "这是人工逐字核对过的原文片段，长度足以校验识别结果是否存在明显的漏字和错字。"
+        for page in (2, 3, 4):
+            (quality / "pages" / f"page_{page:04}.json").write_text(
+                json.dumps({"pdf_page": page, "text": gold, "translated_text": "译文。"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        (quality / "toc.json").write_text('{"page_offset": 0}', encoding="utf-8")
+        context = SimpleNamespace(
+            output_dir=quality,
+            source_pdf=self.source_pdf,
+            manifest=[{"id": "chapter", "pdf_page": 2, "end_pdf_page": 4, "reviewed_override": False}],
+            chapter_texts={"chapter": "# 正文\n\n可靠正文。"},
+        )
+        missing = _check_ocr_quality(context, require_knowledge_base=True)
+        self.assertIn("ocr_quality_audit_missing", {x["code"] for x in missing["issues"]})
+        (quality / "audit" / "ocr-quality-samples.json").write_text(
+            json.dumps({
+                "source_pdf_sha256": hashlib.sha256(self.source_pdf.read_bytes()).hexdigest(),
+                "samples": [{"pdf_page": page, "gold": gold} for page in (2, 3, 4)],
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        passed = _check_ocr_quality(context, require_knowledge_base=True)
+        self.assertEqual(passed["issues"], [])
+        self.assertEqual(passed["metrics"]["pooled_cer"], 0)
+        record_path = quality / "pages" / "page_0002.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["text"] = "这是明显漏掉大部分文字的错误识别"
+        record["translated_text"] = "译文。\n2\n"
+        record_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        failed = _check_ocr_quality(context, require_knowledge_base=True)
+        codes = {x["code"] for x in failed["issues"]}
+        self.assertIn("ocr_quality_cer_too_high", codes)
+        self.assertIn("ocr_quality_printed_folio_in_translation", codes)
+
+    def test_dash_truncation_seam_flags_scrambled_fragment_pairs(self) -> None:
+        text = (
+            "宇野氏引用了志贺氏的话。\n\n"
+            "“……的评论（《文——”\n\n"
+            "“——艺春秋》十一月号）之类。”\n\n"
+            "正文继续。"
+        )
+        issues = _trace_issues(text, path="chapter.md")
+        self.assertIn("dash_truncation_seam", {issue["code"] for issue in issues})
+
+    def test_dash_truncation_seam_ignores_dialogue_convention(self) -> None:
+        text = (
+            "“——请问，你最喜爱谁？”\n\n"
+            "“——我没有父亲。”\n\n"
+            "“——你的朋友？”"
+        )
+        issues = _trace_issues(text, path="chapter.md")
+        self.assertNotIn("dash_truncation_seam", {issue["code"] for issue in issues})
 
     def test_standard_footnote_inventory_keeps_legacy_markers_out_of_contract(self) -> None:
         inventory = _citation_inventory(

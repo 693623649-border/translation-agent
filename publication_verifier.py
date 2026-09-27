@@ -35,6 +35,7 @@ from semantic_review_policy import validate_semantic_review
 SCHEMA_VERSION = "1.2"
 CHECK_IDS = (
     "checkpoints.complete",
+    "ocr.quality",
     "manifest.valid",
     "chapters.files",
     "reviewed.exact",
@@ -390,6 +391,15 @@ TRACE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "replacement_character",
         re.compile(r"[\ufffd\x00]|(?:□\s*){3,}|(?:Ã.|Â.|â€|ðŸ){2,}"),
     ),
+    (
+        "dash_truncation_seam",
+        # A line that ends mid-sentence on a “——” dash immediately followed by
+        # a line that resumes with one: interleaved OCR reading order that was
+        # translated verbatim (e.g. “……的评论（《文——” ⏎ “——艺春秋》十一月号）”).
+        # A dialogue line legitimately opens with “——”, but then the previous
+        # line ends in sentence punctuation, not a dash.
+        re.compile(r"(?m)^[^\n]*——[”\"]*[ \t]*\n(?:[ \t]*\n)*[ \t]*[“\"]*——"),
+    ),
 )
 
 
@@ -635,6 +645,19 @@ def _canonical_visible_text(value: str) -> str:
     """Normalize reader-visible text for cross-format completeness checks."""
 
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", value)).strip()
+
+
+def _canonical_docx_body_text(value: str) -> str:
+    """Allow Word to reflow CJK prose while retaining its visible characters.
+
+    The DOCX publisher may join a sentence split into two Markdown paragraphs.
+    Spaces between CJK glyphs or CJK punctuation are then layout separators,
+    whereas spaces between Latin words remain content and must still match.
+    """
+
+    text = _canonical_visible_text(value)
+    cjk = r"\u3400-\u9fff\u3000-\u303f\uff00-\uffef"
+    return re.sub(rf"(?<=[{cjk}]) (?=[{cjk}])", "", text)
 
 
 def _detect_language(value: str) -> str:
@@ -1080,6 +1103,264 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
         },
         issues=issues,
         warnings=warnings,
+    )
+
+
+def _ocr_quality_characters(value: str) -> str:
+    """Keep characters, including historical kana and diacritics, for CER."""
+
+    return "".join(
+        char
+        for char in unicodedata.normalize("NFKC", value).casefold()
+        if unicodedata.category(char)[0] not in "PZS" and not char.isspace()
+    )
+
+
+def _ocr_quality_best_distance(gold: str, ocr: str) -> int:
+    """Minimum edit distance to any OCR substring in its opening window.
+
+    Free prefix/suffix alignment deliberately favors the OCR result: even this
+    optimistic error estimate must pass the book's quality threshold.
+    """
+
+    previous = [0] * (len(ocr) + 1)
+    for row, expected in enumerate(gold, start=1):
+        current = [row] + [0] * len(ocr)
+        for column, actual in enumerate(ocr, start=1):
+            current[column] = min(
+                previous[column - 1] + (expected != actual),
+                previous[column] + 1,
+                current[column - 1] + 1,
+            )
+        previous = current
+    return min(previous)
+
+
+def _check_ocr_quality(
+    context: _VerificationContext,
+    *,
+    require_knowledge_base: bool,
+) -> dict[str, Any]:
+    """Require source-bound manual OCR evidence before unreviewed KB release."""
+
+    if not require_knowledge_base:
+        return _result("未选择知识库产物，无需 OCR 入库质量审计。")
+    unreviewed_pages = {
+        page
+        for item in context.manifest
+        if not item.get("reviewed_override")
+        for page in range(
+            int(item.get("pdf_page") or 0),
+            int(item.get("end_pdf_page") or item.get("pdf_page") or -1) + 1,
+        )
+        if page > 0
+    }
+    if not unreviewed_pages:
+        return _result("知识库章节均由审定稿覆盖；无待抽检的原始 OCR 页面。")
+
+    audit_path = context.output_dir / "audit" / "ocr-quality-samples.json"
+    issues: list[dict[str, Any]] = []
+    metrics: dict[str, Any] = {
+        "unreviewed_page_count": len(unreviewed_pages),
+        "audit_path": str(audit_path),
+        "max_pooled_cer": 0.02,
+        "max_page_cer": 0.05,
+    }
+    if context.source_pdf is None or not context.source_pdf.is_file():
+        issues.append(_issue(
+            "ocr_quality_source_missing",
+            "OCR 准确率抽样必须绑定可读取的源 PDF。",
+            path=context.source_pdf,
+        ))
+    if not audit_path.is_file():
+        issues.append(_issue(
+            "ocr_quality_audit_missing",
+            "未审定章节进入知识库前，须提供按原扫描图逐字校对的 OCR 抽样基准。",
+            path=audit_path,
+        ))
+        return _result("缺少 OCR 入库准确率证据。", metrics=metrics, issues=issues)
+    try:
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        issues.append(_issue("ocr_quality_audit_invalid", str(exc), path=audit_path))
+        return _result("OCR 抽样基准无法读取。", metrics=metrics, issues=issues)
+    if not isinstance(audit, dict) or not isinstance(audit.get("samples"), list):
+        issues.append(_issue(
+            "ocr_quality_audit_invalid",
+            "OCR 审计必须是包含 samples 数组的 JSON 对象。",
+            path=audit_path,
+        ))
+        return _result("OCR 抽样基准格式无效。", metrics=metrics, issues=issues)
+    if context.source_pdf is not None and context.source_pdf.is_file():
+        digest = str(audit.get("source_pdf_sha256") or "")
+        if digest != _sha256_file(context.source_pdf):
+            issues.append(_issue(
+                "ocr_quality_source_mismatch",
+                "OCR 抽样基准没有绑定当前源 PDF 的 SHA-256。",
+                path=audit_path,
+            ))
+
+    page_records: dict[int, dict[str, Any]] = {}
+    for page in unreviewed_pages:
+        path = context.output_dir / "pages" / f"page_{page:04d}.json"
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                page_records[page] = value
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue  # checkpoints.complete reports the precise missing page
+
+    sampled: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for entry in audit["samples"]:
+        if not isinstance(entry, dict):
+            issues.append(_issue("ocr_quality_sample_invalid", "抽样条目必须是对象。", path=audit_path))
+            continue
+        page = entry.get("pdf_page")
+        if not isinstance(page, int) or isinstance(page, bool) or page not in unreviewed_pages or page in seen:
+            issues.append(_issue(
+                "ocr_quality_sample_page_invalid",
+                "抽样页必须唯一且属于未审定的正文范围。",
+                path=audit_path,
+                page=page,
+            ))
+            continue
+        seen.add(page)
+        gold = _ocr_quality_characters(str(entry.get("gold") or ""))
+        if len(gold) < 25:
+            issues.append(_issue(
+                "ocr_quality_gold_too_short",
+                "人工校对片段至少需要 25 个有效字符。",
+                path=audit_path,
+                page=page,
+                characters=len(gold),
+            ))
+            continue
+        record = page_records.get(page)
+        if record is None:
+            continue
+        raw = str(record.get("text") or "")
+        proofread = str(record.get("proofread_text") or "")
+        effective = (
+            proofread
+            if proofread.strip()
+            and record.get("proofread_source_sha256") == _sha256_text(raw)
+            and record.get("proofread_provider")
+            and record.get("proofread_model")
+            and record.get("proofread_language")
+            else raw
+        )
+        distance = _ocr_quality_best_distance(
+            gold, _ocr_quality_characters(effective)[:350]
+        )
+        sampled.append({
+            "pdf_page": page,
+            "gold_characters": len(gold),
+            "edit_errors": distance,
+            "cer": round(distance / len(gold), 6),
+        })
+
+    required_samples = min(10, len(unreviewed_pages), max(3, (len(unreviewed_pages) + 19) // 20))
+    metrics["required_sample_count"] = required_samples
+    metrics["sample_count"] = len(sampled)
+    metrics["samples"] = sampled
+    if len(sampled) < required_samples:
+        issues.append(_issue(
+            "ocr_quality_samples_insufficient",
+            "人工校对的独立页面样本数量不足。",
+            path=audit_path,
+            required=required_samples,
+            actual=len(sampled),
+        ))
+    if len(unreviewed_pages) >= 50 and len(sampled) >= 10:
+        start, end = min(unreviewed_pages), max(unreviewed_pages)
+        deciles = {
+            min(9, 10 * (item["pdf_page"] - start) // max(1, end - start + 1))
+            for item in sampled
+        }
+        metrics["covered_deciles"] = len(deciles)
+        if len(deciles) < 8:
+            issues.append(_issue(
+                "ocr_quality_sample_spread_insufficient",
+                "抽样页过于集中，须覆盖全书至少八个位置区间。",
+                path=audit_path,
+                covered_deciles=len(deciles),
+            ))
+    total_gold = sum(item["gold_characters"] for item in sampled)
+    total_errors = sum(item["edit_errors"] for item in sampled)
+    pooled_cer = total_errors / total_gold if total_gold else None
+    metrics.update({
+        "gold_characters": total_gold,
+        "edit_errors": total_errors,
+        "pooled_cer": round(pooled_cer, 6) if pooled_cer is not None else None,
+    })
+    if pooled_cer is not None and pooled_cer > 0.02:
+        issues.append(_issue(
+            "ocr_quality_cer_too_high",
+            "人工抽样的 OCR 字符错误率超过知识库入库门槛 2%。",
+            path=audit_path,
+            pooled_cer=round(pooled_cer, 6),
+            gold_characters=total_gold,
+            edit_errors=total_errors,
+        ))
+    high_error_pages = [item["pdf_page"] for item in sampled if item["cer"] > 0.05]
+    if high_error_pages:
+        issues.append(_issue(
+            "ocr_quality_page_cer_too_high",
+            "抽样页存在超过 5% 字符错误率的高风险片段。",
+            path=audit_path,
+            pages=high_error_pages,
+        ))
+
+    offset = None
+    try:
+        toc = json.loads((context.output_dir / "toc.json").read_text(encoding="utf-8"))
+        if isinstance(toc.get("page_offset"), int):
+            offset = toc["page_offset"]
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        pass
+    translated_folio_pages: list[int] = []
+    if offset is not None:
+        for page, record in page_records.items():
+            printed_page = page - offset
+            if printed_page > 0 and re.search(
+                rf"(?m)^\s*{printed_page}\s*$",
+                str(record.get("translated_text") or ""),
+            ):
+                translated_folio_pages.append(page)
+    metrics["translated_folio_page_count"] = len(translated_folio_pages)
+    if translated_folio_pages:
+        issues.append(_issue(
+            "ocr_quality_printed_folio_in_translation",
+            "逐页译文仍混有源书印刷页码，须在入库前修复上游文本。",
+            path=context.output_dir / "pages",
+            count=len(translated_folio_pages),
+            pages=sorted(translated_folio_pages)[:30],
+        ))
+
+    uncertain_chapters = [
+        str(item.get("id") or "")
+        for item in context.manifest
+        if not item.get("reviewed_override")
+        and re.search(
+            r"\[(?:原文存疑|存疑)\]",
+            context.chapter_texts.get(str(item.get("id") or ""), ""),
+        )
+    ]
+    metrics["uncertain_chapter_count"] = len(uncertain_chapters)
+    if uncertain_chapters:
+        issues.append(_issue(
+            "ocr_quality_unresolved_source_uncertainty",
+            "未审定的入库章节仍含 [原文存疑] 或 [存疑]，须逐项核对或明确审定。",
+            path=context.output_dir / "chapters",
+            count=len(uncertain_chapters),
+            chapter_ids=uncertain_chapters[:30],
+        ))
+
+    return _result(
+        "OCR 抽样准确率和页码清理达到入库门槛。" if not issues else "OCR 入库质量门未通过。",
+        metrics=metrics,
+        issues=issues,
     )
 
 
@@ -3457,10 +3738,10 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
             source_markdown = context.chapter_texts.get(chapter_id)
             if source_markdown is None:
                 continue
-            expected_text = _canonical_visible_text(
+            expected_text = _canonical_docx_body_text(
                 _markdown_visible_text(_docx_markdown_body(source_markdown))
             )
-            canonical_actual = _canonical_visible_text(actual_text)
+            canonical_actual = _canonical_docx_body_text(actual_text)
             if canonical_actual != expected_text:
                 issues.append(
                     _issue(
@@ -4249,6 +4530,9 @@ def verify_publication(
 
     full_checks: tuple[tuple[str, bool, Callable[[_VerificationContext], dict[str, Any]]], ...] = (
         ("checkpoints.complete", True, _check_checkpoints),
+        ("ocr.quality", True, lambda value: _check_ocr_quality(
+            value, require_knowledge_base=require_knowledge_base
+        )),
         ("epub.structure", require_epub, _check_epub),
         ("docx.structure", require_docx, _check_docx),
         (

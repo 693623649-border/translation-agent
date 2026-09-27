@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -460,6 +461,45 @@ class UtilityTests(unittest.TestCase):
             target_language="简体中文",
         )
         self.assertIn("基里尔（キイ）", result)
+
+    def test_translation_rejects_dense_dash_continuation_fragments(self) -> None:
+        class FragmentClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "\n\n".join(
+                    f"“——{index}断片。”" for index in range(6)
+                )
+
+        with self.assertRaisesRegex(RuntimeError, "scrambled reading order"):
+            ChatTranslator(FragmentClient()).translate(
+                "原文。",
+                source_language="ja",
+                target_language="简体中文",
+            )
+
+    def test_translation_accepts_scattered_dialogue_dashes(self) -> None:
+        class DialogueClient:
+            def chat_text(
+                self,
+                prompt: str,
+                *,
+                system: str,
+                max_tokens: int = 16384,
+            ) -> str:
+                return "“——请问，你最喜爱谁？”\n\n“——我没有父亲。”\n\n正文继续。"
+
+        translator = ChatTranslator(DialogueClient())
+        result = translator.translate(
+            "原文。",
+            source_language="ja",
+            target_language="简体中文",
+        )
+        self.assertIn("请问，你最喜爱谁", result)
 
     def test_status_accepts_multiple_ocr_model_prefixes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2443,11 +2483,66 @@ class MappingAndCompilationTests(unittest.TestCase):
             ".//w:style[@w:styleId='Heading1']", namespace
         )
         self.assertIsNotNone(heading_style)
-        self.assertIsNotNone(heading_style.find(".//w:pageBreakBefore", namespace))
+        # Essays flow after the preceding section; headings still keep with
+        # their first body paragraph through the Heading 1 style.
+        page_break_before = heading_style.find(".//w:pageBreakBefore", namespace)
+        self.assertIsNotNone(page_break_before)
+        self.assertEqual(page_break_before.get(f"{{{namespace['w']}}}val"), "0")
+        self.assertIsNotNone(heading_style.find(".//w:keepNext", namespace))
         self.assertEqual(
             [field.get(f"{{{namespace['w']}}}instr") for field in footer.findall(".//w:fldSimple", namespace)],
             ["PAGE"],
         )
+
+    def test_docx_joins_only_short_unfinished_prose_paragraphs(self) -> None:
+        output = self.root / "docx-flow"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_正文.md"
+        (chapter_dir / filename).write_text(
+            "# 正文\n\n"
+            "他在昏暗房间里逐渐麻木了的\n\n"
+            "人又走了出来。\n\n"
+            "这是完整的一句。\n\n"
+            "下一段保持独立。\n",
+            encoding="utf-8",
+        )
+        path = output / "flow.docx"
+        build_docx(
+            path,
+            chapter_dir,
+            [{"id": "chapter", "filename": filename, "display_title": "正文", "reviewed_override": True}],
+            book_title="测试书",
+        )
+        from docx import Document
+
+        paragraphs = [p.text for p in Document(path).paragraphs if p.text]
+        self.assertIn("他在昏暗房间里逐渐麻木了的人又走了出来。", paragraphs)
+        self.assertIn("这是完整的一句。", paragraphs)
+        self.assertIn("下一段保持独立。", paragraphs)
+
+    def test_docx_soft_source_lines_flow_but_explicit_breaks_remain(self) -> None:
+        output = self.root / "docx-soft-breaks"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_正文.md"
+        (chapter_dir / filename).write_text(
+            "# 正文\n\n这一句来自扫描页，\n下一句仍在同一段。\n\n"
+            "诗行一。  \n诗行二。\n",
+            encoding="utf-8",
+        )
+        path = output / "flow.docx"
+        build_docx(
+            path,
+            chapter_dir,
+            [{"id": "chapter", "filename": filename, "display_title": "正文", "reviewed_override": True}],
+            book_title="测试书",
+        )
+        from docx import Document
+
+        paragraphs = [p.text for p in Document(path).paragraphs if p.text]
+        self.assertIn("这一句来自扫描页，下一句仍在同一段。", paragraphs)
+        self.assertIn("诗行一。\n诗行二。", paragraphs)
 
     def test_docx_book_layout_styles_backmatter_and_table_geometry(self) -> None:
         output = self.root / "docx-book-backmatter"
@@ -2941,10 +3036,25 @@ class MappingAndCompilationTests(unittest.TestCase):
 
     def test_cli_manual_toc_to_all_outputs(self) -> None:
         output = self.root / "cli-output"
+        gold = "人工核对的测试正文片段，用来证明完整发布路径已经提供与源文件绑定的文字准确率样本。"
         for record in self.sample_records():
             record.ocr_model = "fixture-ocr"
             record.language = "zh"
+            record.text += "\n" + gold
             save_page_record(output, record)
+        (output / "audit").mkdir(exist_ok=True)
+        (output / "audit" / "ocr-quality-samples.json").write_text(
+            json.dumps(
+                {
+                    "source_pdf_sha256": hashlib.sha256(self.pdf_path.read_bytes()).hexdigest(),
+                    "samples": [
+                        {"pdf_page": page, "gold": gold} for page in (4, 8, 12)
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         manual_toc = self.root / "manual-toc.json"
         manual_toc.write_text(
             json.dumps(

@@ -91,6 +91,57 @@ def _write_cross_spine_link_epub(path: Path) -> None:
             archive.writestr(name, value)
 
 
+def _write_image_epub(path: Path) -> None:
+    image_bytes = b"\xff\xd8\xff\xe0test-image-bytes\xff\xd9"
+    members = {
+        "mimetype": b"application/epub+zip",
+        "META-INF/container.xml": b'''<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>''',
+        "OEBPS/content.opf": b'''<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+ <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Image Book</dc:title><dc:creator>A. Author</dc:creator><dc:language>zh</dc:language><dc:identifier>id</dc:identifier></metadata>
+ <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/></manifest>
+ <spine><itemref idref="c1"/></spine>
+</package>''',
+        "OEBPS/nav.xhtml": b'''<html xmlns="http://www.w3.org/1999/xhtml"><body><nav><a href="chapter1.xhtml">One</a></nav></body></html>''',
+        "OEBPS/chapter1.xhtml": '''<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<section><h1>封面章</h1><p><img src="../images/cover.jpg" alt="封面"/></p>
+<p>正文段落。</p></section></body></html>'''.encode(),
+        "images/cover.jpg": image_bytes,
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", members.pop("mimetype"), compress_type=zipfile.ZIP_STORED)
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
+def _write_calibre_note_epub(path: Path) -> None:
+    members = {
+        "mimetype": b"application/epub+zip",
+        "META-INF/container.xml": b'''<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>''',
+        "OEBPS/content.opf": b'''<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+ <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Note Book</dc:title><dc:creator>A. Author</dc:creator><dc:language>zh</dc:language><dc:identifier>id</dc:identifier></metadata>
+ <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="c1" href="chapter1.xhtml" media-type="application/xhtml+xml"/></manifest>
+ <spine><itemref idref="c1"/></spine>
+</package>''',
+        "OEBPS/nav.xhtml": b'''<html xmlns="http://www.w3.org/1999/xhtml"><body><nav><a href="chapter1.xhtml">One</a></nav></body></html>''',
+        "OEBPS/chapter1.xhtml": '''<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<section><h1>致读者</h1>
+<p>正文第一行<sup><a id="noteBack_1" href="#note_1">[1]</a></sup>。</p>
+<p class="note"><a id="note_1" href="#noteBack_1">[1]</a>注释定义文本。</p></section></body></html>'''.encode(),
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("mimetype", members.pop("mimetype"), compress_type=zipfile.ZIP_STORED)
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
 class EpubSemanticImportTests(unittest.TestCase):
     def test_cross_spine_links_are_rewritten_and_target_anchors_survive_publish(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -131,6 +182,115 @@ class EpubSemanticImportTests(unittest.TestCase):
                 source_epub=source,
                 artifact_path=artifact,
                 target_language="en",
+                require_translation=False,
+            )
+            self.assertTrue(report["release_ready"], report["errors"])
+
+    def test_source_images_are_materialized_and_packaged_in_published_epub(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_image_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+                encoding="utf-8"
+            )
+            audit = json.loads(
+                (output / "audit" / "semantic-reconstruction.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(result["image_count"], 1)
+            self.assertIn("](../images/cover.jpg)", markdown)
+            materialized = output / "images" / "cover.jpg"
+            self.assertTrue(materialized.is_file())
+            self.assertEqual(audit["images"], [
+                {
+                    "member": "images/cover.jpg",
+                    "name": "cover.jpg",
+                    "sha256": hashlib.sha256(materialized.read_bytes()).hexdigest(),
+                }
+            ])
+
+            artifact = output / "Image_Book.epub"
+            build_epub(
+                artifact,
+                output / "chapters",
+                manifest,
+                book_title="Image Book",
+                language="zh-CN",
+            )
+            with zipfile.ZipFile(artifact) as archive:
+                names = archive.namelist()
+                self.assertIn("OEBPS/images/cover.jpg", names)
+                self.assertEqual(
+                    archive.read("OEBPS/images/cover.jpg"),
+                    materialized.read_bytes(),
+                )
+                chapter_xhtml = archive.read(
+                    f"OEBPS/{Path(manifest[0]['filename']).with_suffix('.xhtml').name}"
+                )
+                package = archive.read("OEBPS/package.opf").decode()
+            self.assertIn(b'src="images/cover.jpg"', chapter_xhtml)
+            self.assertIn(
+                'href="images/cover.jpg" media-type="image/jpeg"',
+                package,
+            )
+
+            report = verify_epub_publication(
+                output,
+                source_epub=source,
+                artifact_path=artifact,
+                target_language="zh-CN",
+                require_translation=False,
+            )
+            self.assertTrue(report["release_ready"], report["errors"])
+
+    def test_superscript_note_backlinks_keep_fragment_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_calibre_note_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+                encoding="utf-8"
+            )
+            published = Path(manifest[0]["filename"]).with_suffix(".xhtml").name
+
+            self.assertEqual(result["status"], "passed")
+            self.assertIn('<span id="noteBack_1"></span><sup>[[1]](#note_1)</sup>', markdown)
+            self.assertIn('<span id="note_1"></span>[[1]](#noteBack_1)', markdown)
+
+            artifact = output / "Note_Book.epub"
+            build_epub(
+                artifact,
+                output / "chapters",
+                manifest,
+                book_title="Note Book",
+                language="zh-CN",
+            )
+            with zipfile.ZipFile(artifact) as archive:
+                chapter_xhtml = archive.read(f"OEBPS/{published}").decode()
+            self.assertIn('id="noteBack_1"', chapter_xhtml)
+            self.assertIn('id="note_1"', chapter_xhtml)
+
+            report = verify_epub_publication(
+                output,
+                source_epub=source,
+                artifact_path=artifact,
+                target_language="zh-CN",
                 require_translation=False,
             )
             self.assertTrue(report["release_ready"], report["errors"])
