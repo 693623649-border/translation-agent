@@ -31,17 +31,17 @@ model = "deepseek-v4-pro"
 credential_env = "DEEPSEEK_API_KEY"
 timeout = 120
 concurrency = 16
-thinking = "disabled"
+thinking = "enabled"
 
 [profiles.deepseek_flash]
 adapter = "openai-chat"
 provider = "deepseek"
 base_url = "https://api.deepseek.com"
-model = "deepseek-v4-flash"
+model = "deepseek-flash"
 credential_env = "DEEPSEEK_API_KEY"
 timeout = 120
 concurrency = 32
-thinking = "disabled"
+thinking = "enabled"
 
 [pipeline]
 ocr_profile = "glm_vision"

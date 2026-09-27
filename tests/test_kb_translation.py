@@ -197,6 +197,31 @@ class TranslateTextsTests(unittest.TestCase):
         result = translate_texts(["第一段", "第二段"], translator, batch_chars=100, concurrency=1)
         self.assertEqual(result, ["[译]中文译文", "[译]中文译文"])
 
+    def test_dropped_placeholder_degrades_to_single_segments(self) -> None:
+        """A batch that loses protected placeholders follows the same ladder.
+
+        Measured against a real provider: a five-segment batch came back with
+        every ``<<<SEG nnnn>>>`` marker intact but all ⟦SEMANTIC_TOKEN_xxxx⟧
+        placeholders dropped.  That is the same 1:1 contract break as a marker
+        mismatch, so it must retry and degrade to single segments instead of
+        aborting the whole book.
+        """
+
+        class _TokenDroppingOnBatches(_FakeTranslator):
+            def translate(self, prompt: str) -> str:
+                markers = [line for line in prompt.splitlines() if line.startswith("<<<SEG")]
+                if len(markers) > 1:
+                    return "\n".join(f"{marker}\n[译]中文译文" for marker in markers)
+                return f"{markers[0]}\n[译]中文⟦SEMANTIC_TOKEN_0000⟧译文"
+
+        result = translate_texts(
+            ["本文[^1]の続き", "第二段[^2]の続き"],
+            _TokenDroppingOnBatches(),
+            batch_chars=100,
+            concurrency=1,
+        )
+        self.assertEqual(result, ["[译]中文[^1]译文", "[译]中文[^2]译文"])
+
     def test_single_segment_mismatch_still_raises(self) -> None:
         with self.assertRaises(KbTranslationError):
             translate_texts(["唯一一段"], _MarkerBreakingTranslator(), concurrency=1)

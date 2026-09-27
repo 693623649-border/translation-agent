@@ -115,14 +115,21 @@ class DeepSeekTranslator:
         base_url: str = "https://api.deepseek.com",
         # Kept in lockstep with book_pipeline.DEFAULT_DEEPSEEK_MODEL so every
         # DeepSeek caller (pipeline translation, translate-kb, repair tools)
-        # resolves to the same current model instead of a legacy alias.
-        model: str = "deepseek-v4-flash",
+        # resolves to the same current model. deepseek-flash is the account's
+        # fast reasoning model per the API's /models listing.
+        model: str = "deepseek-flash",
         timeout: int = 300,
+        # Project-wide policy (2026-09): reasoning stays ON for translation —
+        # the model produces more faithful, context-aware renderings of
+        # damaged OCR prose, and the corpus quality gate depends on that
+        # fidelity. Pass "disabled" explicitly only for bulk utility runs.
+        thinking: str = "enabled",
     ) -> None:
         self.api_key_env = api_key_env
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.thinking = thinking
 
     def translate(self, prompt: str) -> str:
         api_key = os.getenv(self.api_key_env, "").strip()
@@ -138,6 +145,8 @@ class DeepSeekTranslator:
                 {"role": "user", "content": prompt},
             ],
         }
+        if self.thinking != "default":
+            payload["thinking"] = {"type": self.thinking}
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

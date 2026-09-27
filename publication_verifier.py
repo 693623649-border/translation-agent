@@ -4071,6 +4071,122 @@ def _check_docx_chinese(context: _VerificationContext) -> dict[str, Any]:
     )
 
 
+def _ellipsis_runs(text: str) -> int:
+    """Count Chinese ellipsis runs, treating ``……`` and ``…`` alike."""
+
+    return len(re.findall(r"…+", text))
+
+
+#: Markers a translation must never contain.  （原文缺损） is deliberately NOT
+#: listed: the translation prompt instructs the model to mark wholly
+#: unreadable passages with exactly that token instead of eliding them, so it
+#: is the sanctioned alternative to an invented ellipsis.
+TRANSLATION_MARKER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("原文存疑", re.compile(r"\[原文存疑\]")),
+    ("存疑", re.compile(r"\[存疑\]")),
+    ("原文即此", re.compile(r"原文即此")),
+)
+
+
+def _check_translation_ellipsis(context: _VerificationContext) -> dict[str, Any]:
+    """Anti-elision gate: a translation may not contain more ellipses than its source.
+
+    The page-translation prompt forbids summarizing or skipping content and
+    states that an ellipsis the source does not have must never appear.  A
+    model that cannot read part of an OCR page will nonetheless elide it and
+    emit ``……``, or annotate it with a bracketed doubt marker — both of which
+    silently delete text from the finished book while leaving every structural
+    check green.
+
+    This check is deterministic and offline.  It compares each page's OCR
+    source with its translation and reports only *invented* ellipsis pairs, so
+    a source that legitimately ends a sentence with ``……`` (or a table of
+    contents that is nothing but leader dots) stays clean.  It is the only
+    check in this verifier that can see text which was removed rather than
+    text which failed to arrive.
+    """
+
+    pages_dir = context.output_dir / "pages"
+    if not pages_dir.is_dir():
+        return _result("没有逐页检查点；跳过反省略门（该工作区不是 PDF 流水线产物）。")
+
+    offenders: list[dict[str, Any]] = []
+    marker_hits: list[dict[str, Any]] = []
+    page_count = 0
+    excess_total = 0
+
+    for path in sorted(pages_dir.glob("page_*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue  # checkpoints.complete owns unreadable checkpoints.
+        if not isinstance(record, dict):
+            continue
+        source = str(record.get("text") or "")
+        target = str(record.get("translated_text") or "")
+        if len(source.strip()) < 30 or not target.strip():
+            continue
+        page_count += 1
+        excess = _ellipsis_runs(target) - _ellipsis_runs(source)
+        if excess > 0:
+            excess_total += excess
+            offenders.append(
+                {
+                    "pdf_page": record.get("pdf_page"),
+                    "invented_ellipsis_pairs": excess,
+                    "source_ellipsis_pairs": _ellipsis_runs(source),
+                    "translation_ellipsis_pairs": _ellipsis_runs(target),
+                }
+            )
+        for name, pattern in TRANSLATION_MARKER_PATTERNS:
+            found = pattern.findall(target)
+            if found:
+                marker_hits.append(
+                    {
+                        "pdf_page": record.get("pdf_page"),
+                        "marker": name,
+                        "count": len(found),
+                    }
+                )
+
+    issues: list[dict[str, Any]] = []
+    if offenders:
+        offenders.sort(key=lambda item: -int(item["invented_ellipsis_pairs"]))
+        issues.append(
+            _issue(
+                "translation_ellipsis_invented",
+                "译文中出现了原文没有的省略号，说明这些页面的内容被省略或跳过而非完整译出。",
+                affected_pages=len(offenders),
+                invented_ellipsis_pairs=excess_total,
+                samples=offenders[:8],
+            )
+        )
+    if marker_hits:
+        issues.append(
+            _issue(
+                "translation_doubt_marker_present",
+                "译文中出现了存疑标注；翻译提示词明确禁止输出此类标注。",
+                affected_pages=len({item["pdf_page"] for item in marker_hits}),
+                markers=marker_hits[:8],
+            )
+        )
+
+    return _result(
+        (
+            f"已核对 {page_count} 页译文的反省略契约。"
+            if not issues
+            else f"{len(offenders)} 页译文含原文没有的省略号。"
+        ),
+        metrics={
+            "pages_checked": page_count,
+            "pages_with_invented_ellipsis": len(offenders),
+            "invented_ellipsis_pairs": excess_total,
+            "pages_with_doubt_markers": len({item["pdf_page"] for item in marker_hits}),
+        },
+        issues=issues,
+    )
+
+
 def _expected_bookmarks(toc_payload: dict[str, Any]) -> list[list[Any]]:
     entries: list[dict[str, Any]] = []
     raw_entries = toc_payload.get("entries")
@@ -4554,6 +4670,7 @@ def verify_publication(
         ("knowledge_base.structure", require_knowledge_base, _check_knowledge_base),
         ("knowledge_base.chinese", require_knowledge_base, _check_knowledge_base_chinese),
         ("docx.chinese", require_docx, _check_docx_chinese),
+        ("translation.ellipsis", True, _check_translation_ellipsis),
         ("pdf.bookmarks", require_bookmarked_pdf, _check_pdf),
         ("runtime.hygiene", True, _check_runtime_hygiene),
     )
@@ -4591,6 +4708,9 @@ def verify_publication(
             "epub.structure",
             "knowledge_base.structure",
             "knowledge_base.chinese",
+            # A Word-only recipe publishes targets that carry no page layer at
+            # all, so the anti-elision gate has nothing to compare against.
+            "translation.ellipsis",
             "pdf.bookmarks",
         }
         if publication_profile == "word"

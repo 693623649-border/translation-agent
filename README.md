@@ -20,15 +20,15 @@ flowchart TD
         TXT[粘贴文/文章]
     end
 
-    PDF1 --> OCR{{本地 OCR<br/>PaddleOCR PP-OCRv5-server<br/>Docker GPU · 横/竖排<br/>本地不可用即 fail-closed}}
+    PDF1 --> OCR{{本地 OCR<br/>PaddleOCR PP-OCRv5-server<br/>Docker GPU · 横/竖排<br/>本地不可用即 fail-closed<br/>云端 OCR 后端已移除}}
     PDF2 --> IMP[语义导入]
     EPUB --> IMP
     TXT --> TXTKB[txt_article_kb<br/>两级标题切块]
 
-    OCR --> PR[校对 proofread<br/>deepseek-v4-flash]
-    PR --> TR[页面翻译<br/>deepseek-v4-flash]
+    OCR --> PR[校对 proofread<br/>日文 OCR 行序/错字修正<br/>不翻译 · GLM 文本模型]
+    PR --> TR[页面翻译<br/>deepseek-flash · 推理开启<br/>prompt v5：禁省略号/禁存疑标注<br/>列序交错先重排再译<br/>整段不可辨认标（原文缺损）]
     OCR --> TOC[目录抽取 glm-5.2]
-    TR --> CMP[编译 compile<br/>chapters.md + chapters.json]
+    TR --> CMP[编译 compile<br/>页签名 freshness 契约<br/>model/lang/prompt_version/fingerprint]
     TOC --> CMP
     IMP --> CMP
     TXTKB --> KBD[知识库 jsonl]
@@ -37,26 +37,34 @@ flowchart TD
     CMP --> KBR[KB 行生成<br/>4000 字切块]
 
     subgraph 数据库两层
-        KBR --> REG[单书向量注册<br/>zhipu embedding-3]
+        KBR --> REG[单书向量注册<br/>zhipu embedding-3<br/>register 即语言门]
         KBD --> REG
         REG --> SYNC[全库 SQLite<br/>FTS5 trigram + bm25<br/>nfkc+t2s 归一]
     end
 
     subgraph 质量门
-        V1[结构门 verify<br/>manifest/脚注/语义审计]
+        V1[结构门 verify<br/>manifest/脚注/语义审计<br/>签名过期即回退告警]
         V2[语言门<br/>KB register 拒未译外文<br/>docx.chinese / kb.chinese<br/>全库 sync 拦未译]
+        V2E[反省略门 translation.ellipsis<br/>译文省略号不得多于源文<br/>存疑标注禁止<br/>（原文缺损）为合法标注]
         V3[渲染门<br/>Word COM 隔离渲染]
         V4[视觉门<br/>风险分层抽验]
     end
 
-    DOCX --> V1 --> V3 --> V4
+    DOCX --> V1 --> V2E --> V3 --> V4
     KBR --> V2
     DOCX --> V2
     SYNC --> V2
     V4 -->|通过| OUT[outputs/ 交付<br/>canonical docx + KB 三件套]
     V2 -->|未译外文| FIX[translate-kb /<br/>translate_docx 翻译后重过门]
+    V2E -->|省略号/存疑| FIX2[页级反省略重译<br/>tools/books/*_page_retranslate.py<br/>前页尾句上下文+签名同步]
     FIX --> V2
+    FIX2 --> V2E
 ```
+
+翻译与校对的模型策略：DeepSeek `deepseek-flash`（推理开启，`thinking=enabled`
+为项目级默认）负责页面翻译与校对后的重译；`kb_translation.DeepSeekTranslator`
+与 `book_pipeline.DEFAULT_DEEPSEEK_MODEL` 保持同一模型名。目录抽取用
+`glm-5.2`，向量用智谱 `embedding-3`。OCR/视觉只在本地 GPU 执行。
 
 ## 五分钟开始
 

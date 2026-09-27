@@ -474,6 +474,113 @@ class PublicationVerifierTests(unittest.TestCase):
             check["metrics"]["reference_exempt_paragraphs"], 1
         )
 
+    def _write_page(
+        self,
+        number: int,
+        source: str,
+        translation: str,
+    ) -> None:
+        """Write one page checkpoint into the fixture workspace."""
+        pages = self.output / "pages"
+        pages.mkdir(parents=True, exist_ok=True)
+        (pages / f"page_{number:04d}.json").write_text(
+            json.dumps(
+                {
+                    "pdf_page": number,
+                    "text": source,
+                    "language": "ja",
+                    "translated_text": translation,
+                },
+                ensure_ascii=False,
+                indent=1,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_translation_ellipsis_gate_flags_invented_ellipsis(self) -> None:
+        """A translation may not contain ellipses its source does not have.
+
+        This is the only check that can see text the translator *removed*
+        rather than text that failed to arrive: every structural check stays
+        green while whole clauses disappear behind '……'.
+        """
+        self._write_page(
+            1,
+            "これは元の日本語テキストです。省略はありません。"
+            "文がそのまま続いていますので、翻訳も継続します。",
+            "这是原本的日文文本……没有省略……句子就这样继续，翻译也继续……",
+        )
+
+        report = self._verify(report_name="ellipsis-invented.json")
+        check = self._checks(report)["translation.ellipsis"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(check["issues"][0]["code"], "translation_ellipsis_invented")
+        self.assertEqual(check["metrics"]["pages_with_invented_ellipsis"], 1)
+        self.assertEqual(check["metrics"]["invented_ellipsis_pairs"], 3)
+
+    def test_translation_ellipsis_gate_accepts_source_ellipsis(self) -> None:
+        """A source that really ends in an ellipsis must stay clean.
+
+        Dialogue, tables of contents and trailing-off sentences legitimately
+        carry '……'; the gate compares against the source instead of banning the
+        character outright.
+        """
+        self._write_page(
+            1,
+            "「そうかしら……」「ええ、そうよ……」（中略）そこまで言って、彼は口を閉じた。",
+            "「是吗……」「嗯，是的……」（中略）说到这里，他闭上了嘴。",
+        )
+
+        report = self._verify(report_name="ellipsis-source.json")
+        check = self._checks(report)["translation.ellipsis"]
+        self.assertEqual(check["status"], "passed")
+        self.assertEqual(check["metrics"]["invented_ellipsis_pairs"], 0)
+
+    def test_translation_ellipsis_gate_counts_double_and_single_alike(self) -> None:
+        """`…` and `……` are the same evidence and must not be compared literally."""
+        self._write_page(
+            1,
+            "原本には省略記号がない長い段落がここにあります。翻訳も完全でなければなりません。",
+            "原文里没有省略号的长段落在此……译文也必须是完整的。",
+        )
+
+        report = self._verify(report_name="ellipsis-mixed.json")
+        check = self._checks(report)["translation.ellipsis"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(check["metrics"]["invented_ellipsis_pairs"], 1)
+
+    def test_translation_ellipsis_gate_flags_doubt_markers(self) -> None:
+        """The prompt forbids doubt markers, so their presence is a defect."""
+        self._write_page(
+            1,
+            "文字が一部不鮮明な箇所がありますが、文脈から復元できる本文です。",
+            "有些字迹不清，但可以依据上下文复原的正文，这里用[原文存疑]标注了。",
+        )
+
+        report = self._verify(report_name="ellipsis-marker.json")
+        check = self._checks(report)["translation.ellipsis"]
+        self.assertEqual(check["status"], "failed")
+        codes = {issue["code"] for issue in check["issues"]}
+        self.assertIn("translation_doubt_marker_present", codes)
+        self.assertEqual(check["metrics"]["pages_with_doubt_markers"], 1)
+
+    def test_translation_ellipsis_gate_skips_short_pages(self) -> None:
+        """A page too short to carry prose (a plate, a blank) is not judged."""
+        self._write_page(1, "図版", "插图……")
+
+        report = self._verify(report_name="ellipsis-short.json")
+        check = self._checks(report)["translation.ellipsis"]
+        self.assertEqual(check["status"], "passed")
+        self.assertEqual(check["metrics"]["pages_checked"], 0)
+
+    def test_translation_ellipsis_gate_passes_a_prose_workspace(self) -> None:
+        """A workspace whose pages carry no translation is not a failure."""
+        report = self._verify(report_name="ellipsis-none.json")
+        check = self._checks(report)["translation.ellipsis"]
+        self.assertEqual(check["status"], "passed")
+        self.assertEqual(check["metrics"]["pages_checked"], 0)
+
     def test_docx_render_failure_blocks_release_report(self) -> None:
         self.render_gate_mock.return_value = {
             "summary": "rendered Word output lost visible CJK glyphs",

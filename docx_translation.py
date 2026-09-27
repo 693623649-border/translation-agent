@@ -39,7 +39,6 @@ _RIGHTS_RE = re.compile(r"^[©Ⓒ\(]?\s*(?:copyright|©|Ⓒ)", re.I)
 # U+30A0 double hyphen) that must not be mistaken for evidence of Japanese.
 _KANA_RE = re.compile(r"[\u3041-\u3096\u309d\u309e\u30a1-\u30fa\u30fd\u30fe]")
 _HAN_RE = re.compile(r"[\u3400-\u9fff]")
-_KANA_RE = re.compile(r"[\u3040-\u30ff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 # A printed page's running head survived OCR as "<folio> <section word>
 # <damaged title fragment> <year range>" and sits where the page break used to

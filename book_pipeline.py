@@ -79,10 +79,10 @@ except ImportError:  # pragma: no cover - POSIX compatibility path.
 DEFAULT_CODING_API_BASE = "https://open.bigmodel.cn/api/coding/paas/v4"
 DEFAULT_STANDARD_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
-TRANSLATION_PROMPT_VERSION = "book-translation-v3"
+TRANSLATION_PROMPT_VERSION = "book-translation-v5"
 PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v1"
 TOC_KINDS = {"part", "chapter", "section", "subsection", "frontmatter", "other"}
 NON_CONTENT_MARKERS = {"[无法辨认]", "[空白页]"}
@@ -2006,8 +2006,8 @@ class ChatTranslator:
 1. 不总结、不删减、不扩写。
 2. 保留列表、表格、脚注和段落结构；Markdown 标题已由程序保护，不会出现在本分块中。
 3. 源文中每一个行首脚注编号及其对应定义全文都必须逐条保留并完整翻译；严禁合并、跳号、截断、只保留编号或省略出处。{numbered_requirement}
-4. 人名、书名、术语前后一致；无法确认的内容保留原文并标注 [存疑]。
-5. 输入来自 OCR。先依据源语言的语法和上下文修正明显的字符、断行和空格错误；无法可靠还原时标注 [原文存疑]，不要编造。
+4. 人名、书名、术语前后一致；严禁用省略号（……）概括、省略或跳过任何内容——原文没有省略号的地方绝不允许出现省略号，原文自带的省略号原样保留。
+5. 输入来自 OCR。本书为竖排扫描，文本可能存在列序交错、行序错乱、缺字断句：请先依据日语语法与上下文把语序重排连贯，再翻译；断裂处按文意补足衔接，宁可意译连贯也不得输出省略号；个别字词缺损时依上下文推断复原；仅当整段完全无法辨认时才标（原文缺损），除此之外不得输出 [原文存疑]、[存疑] 或任何存疑标注。页面以半句开头或结尾时（跨页句子），顺势译出，不得因句子跨页而省略。
 6. 正文中出现的日语、英语及其他外语段落或引文也必须译成目标语言，不得整段保留未译；仅专名、必要术语和文献标识可按惯例保留原文。
 7. 如果目标是简体中文，必须使用中国大陆通行简体字与标点，不得输出繁体字。
 8. 只输出译文，不附加说明或质量报告。
@@ -2067,7 +2067,7 @@ class ChatOCRProofreader:
 2. 严禁翻译成中文或任何其他语言；输出必须仍是原文日语。
 3. 不总结、不删减、不扩写，不改写作者表达，不凭常识补造原文没有的内容。
 4. 保留 Markdown 标题、列表、表格、脚注、引文和段落结构。
-5. 无法可靠还原的文字保留原 OCR，并紧邻标注 [原文存疑]。
+5. 无法可靠还原的文字保留原 OCR，并紧邻标注（原文缺损）。不要输出 [原文存疑]、[存疑] 或任何其他形式的存疑标注：翻译阶段的提示词明确禁止这类标注，校勘阶段引入它们会直接违反该契约。
 6. 只输出校勘后的原文，不附加说明、修改清单或质量报告。
 
 OCR 原文：

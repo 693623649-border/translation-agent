@@ -588,7 +588,7 @@ class UtilityTests(unittest.TestCase):
     def test_deepseek_chat_disables_thinking(self) -> None:
         class RecordingClient(DeepSeekClient):
             def __init__(self) -> None:
-                super().__init__(api_key="test-key", text_model="deepseek-v4-flash")
+                super().__init__(api_key="test-key", text_model="deepseek-flash")
                 self.requests: list[tuple[str, dict]] = []
 
             def _post(self, endpoint: str, payload: dict) -> dict:
@@ -601,7 +601,7 @@ class UtilityTests(unittest.TestCase):
         self.assertEqual(len(client.requests), 2)
         for endpoint, payload in client.requests:
             self.assertEqual(endpoint, "chat/completions")
-            self.assertEqual(payload["model"], "deepseek-v4-flash")
+            self.assertEqual(payload["model"], "deepseek-flash")
             self.assertEqual(payload["thinking"], {"type": "disabled"})
 
     def test_standard_glm_ocr_content_filter_uses_segmented_fallback(self) -> None:
@@ -693,7 +693,7 @@ class UtilityTests(unittest.TestCase):
         self.assertIsInstance(client, DeepSeekClient)
         assert isinstance(client, DeepSeekClient)
         self.assertEqual(client.api_base, "https://api.deepseek.com")
-        self.assertEqual(client.text_model, "deepseek-v4-flash")
+        self.assertEqual(client.text_model, "deepseek-flash")
         self.assertNotIn("deepseek-sentinel", repr(client.__dict__).replace(client.api_key, ""))
 
     def test_api_timeout_cli(self) -> None:
@@ -1359,7 +1359,7 @@ M.E.Sharpe, Inc., 1983.
                 force=False,
                 concurrency=1,
                 translation_provider="deepseek",
-                translation_model="deepseek-v4-flash",
+                translation_model="deepseek-flash",
             )
             translate_non_chinese_pages(
                 [record],
