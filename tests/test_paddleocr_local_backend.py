@@ -136,13 +136,22 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             self.assertEqual(backend, "paddleocr-local")
             self.assertIn("local", reason)
         with patch("book_pipeline.paddle_local_available", return_value=False):
+            # Cloud fallback is gone: an OCR run fails closed, while
+            # introspection callers assume the local cache identity.
+            with self.assertRaises(ValueError):
+                resolve_ocr_backend_name(args, remote_profile, strict=True)
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
-            self.assertEqual(backend, "coding-plan-mcp")
+            self.assertEqual(backend, "paddleocr-local")
             self.assertIn("unavailable", reason)
-        explicit = _book_parser().parse_args(["--ocr-backend", "coding-plan-mcp"])
+        # The CLI itself rejects the removed backends at parse time, so
+        # exercise the resolver's rejection with a hand-built namespace.
+        removed = argparse.Namespace(ocr_backend="coding-plan-mcp")
+        with self.assertRaises(ValueError):
+            resolve_ocr_backend_name(removed, remote_profile)
+        explicit = _book_parser().parse_args(["--ocr-backend", "tesseract"])
         with patch("book_pipeline.paddle_local_available", return_value=True):
             backend, reason = resolve_ocr_backend_name(explicit, remote_profile)
-            self.assertEqual(backend, "coding-plan-mcp")
+            self.assertEqual(backend, "tesseract")
             self.assertEqual(reason, "explicit --ocr-backend")
 
     def test_cloud_rerun_protects_local_paddle_checkpoints(self) -> None:

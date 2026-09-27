@@ -6004,14 +6004,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local"],
+        choices=["auto", "tesseract", "paddleocr-local"],
         default=os.getenv("OCR_BACKEND", "auto"),
         help=(
-            "auto prefers the local PaddleOCR GPU deployment and falls back to "
-            "the OCR profile/cloud backend when it is unavailable; coding-plan-mcp "
-            "is the cloud vision MCP, glm-ocr the separately billed standard API, "
-            "tesseract the offline engine, paddleocr-local the explicit local GPU "
-            "deployment (no content filtering, no API quota)."
+            "auto selects the local PaddleOCR GPU deployment and never falls "
+            "back to a cloud vision backend: when the deployment is unavailable "
+            "the OCR phase fails closed (vision executes locally only; cloud OCR "
+            "backends have been removed). tesseract is the offline engine, "
+            "paddleocr-local the explicit local GPU deployment."
         ),
     )
     parser.add_argument(
@@ -6624,14 +6624,6 @@ def resolve_expected_ocr_model_prefix(
     if args.ocr_cache_model_prefix:
         return str(args.ocr_cache_model_prefix)
     backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
-    if backend == "coding-plan-mcp":
-        direction = resolve_ocr_reading_direction(args, ocr_profile)
-        model = (
-            ocr_profile.model
-            if ocr_profile is not None
-            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
-        )
-        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
     if backend == "paddleocr-local":
         return "paddleocr-local/"
     return None
@@ -6680,30 +6672,48 @@ def paddle_local_available() -> bool:
     )
 
 
+_REMOVED_CLOUD_OCR_BACKENDS = {"coding-plan-mcp", "glm-ocr"}
+
+
 def resolve_ocr_backend_name(
     args: argparse.Namespace,
     ocr_profile: ModelProfile | None = None,
+    *,
+    strict: bool = False,
 ) -> tuple[str, str]:
-    """Resolve the effective OCR backend, preferring the local GPU deployment.
+    """Resolve the effective OCR backend; vision runs on the local GPU only.
 
     ``--ocr-backend auto`` (the default) selects the local PaddleOCR Docker
-    deployment whenever it is available and keeps the cloud/vision backend as
-    the fallback.  An explicit ``--ocr-backend`` always wins.
+    deployment.  The former cloud-vision fallback branch has been removed:
+    when the local deployment is unavailable, an OCR run now fails closed
+    (``strict=True``) instead of silently sending page images to a remote
+    model.  Non-OCR phases resolve introspection identities without
+    ``strict`` and assume the local backend's cache identity.  An explicit
+    ``--ocr-backend`` still wins, but the removed cloud backends are rejected
+    everywhere.
     """
 
     requested = str(getattr(args, "ocr_backend", "") or "auto").strip()
+    if requested in _REMOVED_CLOUD_OCR_BACKENDS:
+        raise ValueError(
+            f"--ocr-backend {requested} has been removed: OCR/vision runs "
+            "exclusively on the local PaddleOCR GPU deployment. Use "
+            "'paddleocr-local' (or 'tesseract') instead."
+        )
     if requested not in {"auto", ""}:
         return requested, "explicit --ocr-backend"
     if paddle_local_available():
         return "paddleocr-local", "auto: local PaddleOCR GPU deployment detected"
-    fallback = (
-        ocr_profile.adapter
-        if ocr_profile is not None and ocr_profile.adapter
-        else "coding-plan-mcp"
-    )
-    return fallback, (
-        "auto: local PaddleOCR GPU deployment unavailable; using "
-        f"{fallback}"
+    if strict:
+        raise ValueError(
+            "auto: local PaddleOCR GPU deployment unavailable and the cloud "
+            "OCR fallback has been removed - vision executes locally only. "
+            "Start the local GPU deployment (Docker) and retry, or pass an "
+            "explicit local backend such as --ocr-backend tesseract."
+        )
+    return "paddleocr-local", (
+        "auto: local PaddleOCR deployment unavailable right now; assuming "
+        "local cache identity (cloud fallback removed)"
     )
 
 
@@ -6778,16 +6788,6 @@ def resolve_expected_ocr_model_exact(
     if args.ocr_cache_model_prefix:
         return None
     backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
-    if backend == "coding-plan-mcp":
-        direction = resolve_ocr_reading_direction(args, ocr_profile)
-        model = (
-            ocr_profile.model
-            if ocr_profile is not None
-            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
-        )
-        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
-    if backend == "glm-ocr":
-        return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
     if backend == "paddleocr-local":
@@ -7300,64 +7300,11 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                     raise ValueError(f"--skip-ocr was used but cached OCR pages are missing: {missing[:20]}")
             else:
                 ocr_backend_name, backend_reason = resolve_ocr_backend_name(
-                    args, effective_ocr_profile
+                    args, effective_ocr_profile, strict=True
                 )
                 if str(getattr(args, "ocr_backend", "") or "auto") in {"auto", ""}:
                     print(f"[ocr-backend] {backend_reason}", flush=True)
-                if ocr_backend_name == "coding-plan-mcp":
-                    if not ocr_key:
-                        raise ValueError("Coding Plan vision OCR requires GLM_CODING_API_KEY or Z_AI_API_KEY.")
-                    if effective_ocr_profile is not None and effective_ocr_profile.command:
-                        ocr_command = (
-                            effective_ocr_profile.command[0]
-                            if len(effective_ocr_profile.command) == 1
-                            else shlex.join(effective_ocr_profile.command)
-                        )
-                    else:
-                        ocr_command = args.ocr_command
-                    ocr_backend = CodingPlanVisionOCR(
-                        api_key=ocr_key,
-                        command=ocr_command,
-                        reading_direction=args.ocr_reading_direction,
-                        vision_model=(
-                            effective_ocr_profile.model
-                            if effective_ocr_profile is not None
-                            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
-                        ),
-                        request_timeout=(
-                            effective_ocr_profile.timeout
-                            if effective_ocr_profile is not None
-                            else int(os.getenv("CODING_PLAN_VISION_TIMEOUT", "120"))
-                        ),
-                    )
-                elif ocr_backend_name == "glm-ocr":
-                    standard_ocr_key = resolve_ocr_api_key(args, effective_ocr_profile)
-                    if not standard_ocr_key:
-                        raise ValueError(
-                            "Standard GLM-OCR is not covered by Coding Plan. Set GLM_OCR_API_KEY separately, "
-                            "or use --ocr-backend coding-plan-mcp."
-                        )
-                    ocr_backend = GlmClient(
-                        api_key=standard_ocr_key,
-                        api_base=(
-                            effective_ocr_profile.base_url
-                            if effective_ocr_profile is not None and effective_ocr_profile.base_url
-                            else args.ocr_api_base
-                        ),
-                        ocr_model=(
-                            effective_ocr_profile.model
-                            if effective_ocr_profile is not None
-                            else args.ocr_model
-                        ),
-                        text_model=toc_text_model,
-                        timeout=(
-                            effective_ocr_profile.timeout
-                            if effective_ocr_profile is not None
-                            else args.api_timeout
-                        ),
-                        reading_direction=args.ocr_reading_direction,
-                    )
-                elif ocr_backend_name == "tesseract":
+                if ocr_backend_name == "tesseract":
                     ocr_backend = TesseractOCR(
                         language=args.tesseract_language,
                         psm=args.tesseract_psm,

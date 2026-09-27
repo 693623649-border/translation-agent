@@ -5,6 +5,59 @@ EPUB 通过显式 Source Adapter 进入同一语义、清洗与发布契约；DA
 断点缓存和产物身份；已接入对应 verification profile 的文件必须通过发布门后才
 可以正式交付。
 
+## 数据管线总览
+
+OCR/视觉部分**只在本地执行**（PaddleOCR GPU 容器，本地不可用时直接失败，
+不回退云端）；数据库与 Word 输出中的外文内容必须翻译为中文（语言门在
+register、发布验证、全库 sync 三个执行点闭环）。
+
+```mermaid
+flowchart TD
+    subgraph 输入
+        PDF1[扫描 PDF 无文本层]
+        PDF2[文本层 PDF]
+        EPUB[EPUB 电子书]
+        TXT[粘贴文/文章]
+    end
+
+    PDF1 --> OCR{{本地 OCR<br/>PaddleOCR PP-OCRv5-server<br/>Docker GPU · 横/竖排<br/>本地不可用即 fail-closed}}
+    PDF2 --> IMP[语义导入]
+    EPUB --> IMP
+    TXT --> TXTKB[txt_article_kb<br/>两级标题切块]
+
+    OCR --> PR[校对 proofread<br/>deepseek-v4-flash]
+    PR --> TR[页面翻译<br/>deepseek-v4-flash]
+    OCR --> TOC[目录抽取 glm-5.2]
+    TR --> CMP[编译 compile<br/>chapters.md + chapters.json]
+    TOC --> CMP
+    IMP --> CMP
+    TXTKB --> KBD[知识库 jsonl]
+
+    CMP --> DOCX[Word 构建<br/>build_docx]
+    CMP --> KBR[KB 行生成<br/>4000 字切块]
+
+    subgraph 数据库两层
+        KBR --> REG[单书向量注册<br/>zhipu embedding-3]
+        KBD --> REG
+        REG --> SYNC[全库 SQLite<br/>FTS5 trigram + bm25<br/>nfkc+t2s 归一]
+    end
+
+    subgraph 质量门
+        V1[结构门 verify<br/>manifest/脚注/语义审计]
+        V2[语言门<br/>KB register 拒未译外文<br/>docx.chinese / kb.chinese<br/>全库 sync 拦未译]
+        V3[渲染门<br/>Word COM 隔离渲染]
+        V4[视觉门<br/>风险分层抽验]
+    end
+
+    DOCX --> V1 --> V3 --> V4
+    KBR --> V2
+    DOCX --> V2
+    SYNC --> V2
+    V4 -->|通过| OUT[outputs/ 交付<br/>canonical docx + KB 三件套]
+    V2 -->|未译外文| FIX[translate-kb /<br/>translate_docx 翻译后重过门]
+    FIX --> V2
+```
+
 ## 五分钟开始
 
 需要 Python 3.11+（推荐 3.12）：
@@ -1249,33 +1302,58 @@ DOCX、EPUB、PDF 和图片以可追溯的文件路径及哈希登记。默认 `
 JSONL 和缺失章节的补入文本，`--scope pages|archive|all` 可切换范围。
 结果会显示工作区、来源文件、章节、验收报告状态和内容哈希；跨书正文检索
 默认每本最多返回一条，以免同一本书占满结果页，可用 `--per-book-cap`
-调整，或用 `--workspace` 检索指定书的更多段落。
+调整，或用 `--workspace` 检索指定书的更多段落。每书限额先在不含正文的
+轻量候选行上计算、再取回最终正文，因此一本书的高频命中不会把其他书的
+匹配挤过取数截断。FTS5 三元组无法匹配一两个汉字的词，此类短词不再被
+丢弃：查询只由短词组成时按"全部出现"组合匹配（`自然 正式` 可命中
+"自然主义正式正文"）；查询同时含三元组词时短词只用于摘要高亮、不参与
+过滤，避免把跨块章节的最佳块挤出结果。
 
 工作区如果带 `knowledge_base.apparatus.json`（由 `rag_apparatus.py` 生成），
 其 `default_weight` 会在写入 `chunks.apparatus_weight` 时随块入库：结构性装置
-（目录、索引、版权页）为 0.25，说明性装置为 0.7，正文为 1.0。检索按
-`score + (1 - weight) * |score|` 在 `ORDER BY` 内降权，因此索引、目录这类
-"重复每个词条"的块不会挤掉讨论同一概念的正文；降权必须发生在取数之前，
-否则超出 `LIMIT` 的正文块已经被丢弃。本机 61 个工作区里有 130 个结构性装置块、
-9 个说明性装置块，`tests/test_global_knowledge_base.py::ApparatusDemotionTests`
+（目录、索引、版权页）为 0.25，说明性装置为 0.7，正文为 1.0。旁车缺失是
+合法状态（全部按 1.0 处理），但旁车存在且无法解析、`documents_sha256`
+与语料字节不符、或标注未覆盖全部行时，`sync` 会中止并保留旧库，而不是
+静默把降权重置为 1.0。检索按 `score + (1 - weight) * |score|` 在 `ORDER BY`
+内降权，因此索引、目录这类"重复每个词条"的块不会挤掉讨论同一概念的正文；
+降权必须发生在取数之前，否则超出 `LIMIT` 的正文块已经被丢弃。子串回退
+分支（无法构成三元组的查询）同样把装置块排在正文之后。
+`tests/test_global_knowledge_base.py::ApparatusDemotionTests`
 用合成库双向验证该机制（无 sidecar 时索引块确实会排到第一位）。
 
 检索索引用项目已声明的 OpenCC 依赖统一繁简字形；请在安装了项目依赖的
-Python 环境中运行上述命令。`evaluate` 使用固定的 30 道跨书问题和 16 道
-书内章节问题，报告写入 `work/global_kb_evaluation.json`。本机 61 个工作区
-（6932 个阅读块、2219 个页面块、1275 个存档块）的实测基线是：跨书
-Hit@1 0.867 / Hit@5 1.000 / MRR@5 0.928，章节 Hit@1 0.875 / Hit@5 0.938 /
-MRR@5 0.906；`tests/fixtures/global_kb_retrieval_cases.local.json` 中的阈值是
+Python 环境中运行上述命令。
+
+**中文语言质量门**：`sync` 默认拒绝未翻译的外文 reader 块——检测复用
+`kb_translation.classify_row`（离线），索引/对照表/书目等双语装置与短尾块豁免。
+存在外文块时 `sync` 列出工作区清单并中止（旧库保持不变），先运行
+`translation-agent-kb translate-kb <工作区>` 完成翻译；`--allow-foreign` 可临时
+绕过并在 meta 记录 `chinese_gate: allowed`。翻译受 Provider 速率限制时可降速：
+`translate-kb <工作区> --concurrency 1 --batch-chars 3000`（失败即中止且不写入
+语料，可安全重跑）。发布侧同一条门由
+`publication_verifier` 的 `knowledge_base.chinese` 与 `docx.chinese` 检查强制执行。
+当前实况：10 个工作区共 179 个外文块待译（畏怖する人間 69、私小説論 51、
+少女民俗学 43、知识库_鲁迅全集 5 等），故现阶段 `sync` 需带 `--allow-foreign`。
+
+`evaluate` 使用固定的 30 道跨书问题和 16 道
+书内章节问题，报告写入 `work/global_kb_evaluation.json`。本机 66 个工作区
+（7,242 个阅读块、3,154 个页面块、1,526 个存档块）的实测基线是：跨书
+Hit@1 0.867 / Hit@5 1.000 / MRR@5 0.928，章节 Hit@1 0.875 / Hit@5 1.000 /
+MRR@5 0.938；`tests/fixtures/global_kb_retrieval_cases.local.json` 中的阈值是
 压在这组数字下沿的回归底线（跨书 0.8/0.95，章节 0.85/0.9），不是目标值。
-题集为单机专用，每题的期望锚点都先在真实章节正文里核对过——问句词元根本不在
+题集中的 `expected_workspaces` 是下限而非等值：新增书籍不会让门变红，
+语料缩水才会。题集为单机专用，每题的期望锚点都先在真实章节正文里核对过——问句词元根本不在
 目标文档里属于出题错误，不是检索缺陷。已知缺口记在题集的 `known_gaps`：
 跨引号的三元组无法命中（`所谓“世界系”这个词` 落在第 6 位），以及若干
 同主题书籍（柄谷行人、康德）之间的第 2、3 位近似命中。命中率衡量的是检索定位，
 不代表原书 OCR、翻译或校对已经通过质量门。`--verified-only` 只返回目前具有
 未过期、通过的完整发布报告的工作区。原页及旧版语料可能未经当前质量门验收，
-入库不等于已校对通过。`verify` 可检查来源有无新增、删除或改动；工作区内容
-发生变化后重新运行 `sync`；数据库在完整构建并通过 SQLite 完整性检查后才会
-替换旧索引。
+入库不等于已校对通过。`verify` 可检查来源有无新增、删除或改动；除正文源文件
+与资产外，它还跟踪装置旁车、发布报告以及 `toc.json`、`semantic-review.json`、
+`review-decisions.jsonl` 等影响 `report_status` 的审核文件，同步后被改动即报
+过期。`report_status` 是同步时的快照，严格检索请配合 `verify` 使用。工作区内容
+发生变化后重新运行 `sync`；数据库在完整构建、通过 SQLite 完整性检查、且同步
+期间没有源文件被改动（mtime/size 复核）后才会替换旧索引。
 
 ## 常用参数
 

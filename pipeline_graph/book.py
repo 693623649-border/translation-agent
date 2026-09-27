@@ -798,41 +798,7 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
     profile = _selected_model_profiles(args)["ocr"]
     reading_direction = legacy.resolve_ocr_reading_direction(args, profile)
     backend, _reason = legacy.resolve_ocr_backend_name(args, profile)
-    if backend == "coding-plan-mcp":
-        identity: dict[str, Any] = {
-            "backend": backend,
-            "model": (
-                profile.model
-                if profile is not None
-                else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
-            ),
-            "reading_direction": reading_direction,
-            "command_sha256": (
-                stable_fingerprint(list(profile.command))
-                if profile is not None and profile.command
-                else stable_fingerprint(args.ocr_command)
-            ),
-            "prompt_version": f"{reading_direction}-v2",
-            "mode": os.getenv("Z_AI_MODE", "ZHIPU").strip().upper(),
-            "max_output_tokens": max(
-                1,
-                int(os.getenv("Z_AI_VISION_MODEL_MAX_TOKENS", "4096")),
-            ),
-        }
-        segmentation: dict[str, Any] | None = _ocr_segmentation_semantics()
-    elif backend == "glm-ocr":
-        identity = {
-            "backend": backend,
-            "provider": profile.provider if profile is not None else "glm",
-            "base_url": _safe_endpoint(
-                profile.base_url
-                if profile is not None and profile.base_url
-                else args.ocr_api_base
-            ),
-            "model": profile.model if profile is not None else args.ocr_model,
-        }
-        segmentation = None
-    elif backend == "paddleocr-local":
+    if backend == "paddleocr-local":
         identity = {
             "backend": backend,
             "model": legacy.paddle_local_model_id(

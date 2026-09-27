@@ -2012,34 +2012,6 @@ class BookGraphExecutionTests(unittest.TestCase):
                 ["--ocr-backend", "tesseract", "--dpi", "200"],
                 ["--ocr-backend", "tesseract", "--dpi", "240"],
             ),
-            "base": (
-                [
-                    "--ocr-backend",
-                    "glm-ocr",
-                    "--ocr-api-base",
-                    "https://ocr-a.example.invalid",
-                ],
-                [
-                    "--ocr-backend",
-                    "glm-ocr",
-                    "--ocr-api-base",
-                    "https://ocr-b.example.invalid",
-                ],
-            ),
-            "command": (
-                [
-                    "--ocr-backend",
-                    "coding-plan-mcp",
-                    "--ocr-command",
-                    "vision-mcp --variant alpha",
-                ],
-                [
-                    "--ocr-backend",
-                    "coding-plan-mcp",
-                    "--ocr-command",
-                    "vision-mcp --variant beta",
-                ],
-            ),
         }
         for label, (first_options, changed_options) in semantic_changes.items():
             with self.subTest(change=label), tempfile.TemporaryDirectory() as directory:
@@ -2089,7 +2061,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 "--phase",
                 "ocr",
                 "--ocr-backend",
-                "glm-ocr",
+                "tesseract",
             ]
             calls: list[list[str]] = []
 
@@ -2484,13 +2456,18 @@ translation_profile = "translation"
                     "--phase",
                     "ocr",
                     "--ocr-backend",
-                    "glm-ocr",
+                    "tesseract",
                     "--ocr-model",
+                    "glm-ocr",
+                    "--ocr-cache-model",
                     "glm-ocr",
                 ]
             )
 
             def fake_ocr(argv: list[str]) -> int:
+                # Cloud OCR backends are gone, so --ocr-model no longer feeds
+                # a local cache identity; an explicit --ocr-cache-model must
+                # still win and travel as a complete pair with --ocr-model.
                 self.assertEqual(argv[argv.index("--ocr-model") + 1], "glm-ocr")
                 self.assertEqual(
                     argv[argv.index("--ocr-cache-model") + 1],
@@ -2650,7 +2627,7 @@ translation_profile = "translation"
                         "--phase",
                         "ocr",
                         "--ocr-backend",
-                        "glm-ocr",
+                        "tesseract",
                         "--ocr-api-base",
                         endpoint,
                         "--api-base",
@@ -2667,7 +2644,8 @@ translation_profile = "translation"
             )
             public_values = json.dumps(dict(result.values), ensure_ascii=False)
 
-        self.assertIn("https://api.example.invalid/path-sha256:", identity_text)
+        # Cloud OCR identity (which serialized the hashed endpoint) is gone;
+        # the security property under test is that no secret leaks verbatim.
         for secret in secrets:
             self.assertNotIn(secret, identity_text)
             self.assertNotIn(secret, persisted)
@@ -3277,17 +3255,6 @@ translation_profile = "translation"
                 ],
                 "tesseract/chi_sim/psm-3",
                 "tesseract/chi_sim/psm-30",
-            ),
-            (
-                "glm",
-                [
-                    "--ocr-backend",
-                    "coding-plan-mcp",
-                    "--ocr-reading-direction",
-                    "horizontal",
-                ],
-                "coding-plan/glm-4.6v-vision-mcp/horizontal-v2",
-                "coding-plan/glm-4.6v-vision-mcp/horizontal-v20",
             ),
         )
         with tempfile.TemporaryDirectory() as directory:

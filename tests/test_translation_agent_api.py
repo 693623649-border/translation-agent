@@ -382,9 +382,11 @@ translation_profile = "deepseek_pro"
         identity = mocked_status.call_args.kwargs["expected_translation_identity"]
         self.assertEqual(identity.provider, "deepseek")
         self.assertEqual(identity.model, "deepseek-v4-pro")
+        # Cloud OCR backends are removed; the vision profile no longer
+        # produces a cache prefix and status assumes the local backend.
         self.assertEqual(
             mocked_status.call_args.kwargs["expected_ocr_model_prefix"],
-            "coding-plan/glm-4.6v-vision-mcp/vertical-v2",
+            "paddleocr-local/",
         )
 
 
