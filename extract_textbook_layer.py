@@ -248,13 +248,12 @@ def extract_page_texts(
                 missing.append((page_index + 1, content))
                 page_texts.append("")
                 continue
-            page_texts.append(
-                _strip_expected_leading_page_number(
-                    text,
-                    pdf_page=page_index + 1,
-                    offset=strip_leading_page_number_offset,
-                )
+            stripped = _strip_expected_leading_page_number(
+                text,
+                pdf_page=page_index + 1,
+                offset=strip_leading_page_number_offset,
             )
+            page_texts.append(stripped if stripped.strip() else "[空白页]")
     missing_pages = {page for page, _kind in missing}
     boundary_blank_pages: set[int] = set()
     for page in range(1, len(page_texts) + 1):

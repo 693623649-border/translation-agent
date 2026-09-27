@@ -1,6 +1,7 @@
 import threading
 import tempfile
 import unittest
+import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -97,6 +98,7 @@ class StartRateLimiterTests(unittest.TestCase):
 
 
 class SharedAdaptiveRateLimiterTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "cross-process file locking is POSIX-only")
     def test_instances_with_same_identity_share_request_schedule(self) -> None:
         now = [100.0]
         sleeps: list[float] = []

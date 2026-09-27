@@ -24,9 +24,12 @@ from book_pipeline import (
 from publication_verifier import (
     _canonical_docx_body_text,
     _check_ocr_quality,
+    _canonical_visible_text,
     _citation_inventory,
+    _docx_document_payload,
     _docx_markdown_body,
     _docx_positive_footnote_texts,
+    _expected_chapter_end_pages,
     _markdown_visible_text,
     _trace_issues,
     verify_publication,
@@ -41,6 +44,23 @@ from semantic_review_policy import (
 
 class PublicationVerifierTests(unittest.TestCase):
     book_title = "测试书"
+
+    def test_expected_frontmatter_range_stops_before_trailing_toc(self) -> None:
+        entries = [
+            {"id": "intro", "kind": "frontmatter", "level": 1, "pdf_page": 6},
+            {"id": "chapter", "kind": "chapter", "level": 1, "pdf_page": 22},
+        ]
+        self.assertEqual(
+            _expected_chapter_end_pages(
+                entries,
+                entries,
+                granularity="chapter",
+                last_pdf_page=30,
+                printed_pages_per_pdf_page=1,
+                toc_pages=[19],
+            ),
+            {"intro": 18, "chapter": 30},
+        )
 
     def test_markdown_visible_text_mirrors_trailing_page_discard(self) -> None:
         source = "# 章节\n\n正文。\n\n4\n0\n"
@@ -116,6 +136,49 @@ class PublicationVerifierTests(unittest.TestCase):
         )
         issues = _trace_issues(text, path="chapter.md")
         self.assertNotIn("dash_truncation_seam", {issue["code"] for issue in issues})
+    def test_docx_expected_text_mirrors_soft_wrap_merge(self) -> None:
+        from book_pipeline import _normalize_wrapped_markdown_for_docx
+
+        source = (
+            "# 章节\n\n"
+            "批评理论仍然把特定的某一方面\n作为诗歌的本原主题。\n\n"
+            "quoted ascii tail.\n"
+        )
+        expected = _canonical_visible_text(
+            _markdown_visible_text(
+                _normalize_wrapped_markdown_for_docx(_docx_markdown_body(source))
+            )
+        )
+        self.assertIn("某一方面作为诗歌的本原主题", expected)
+        self.assertIn("quoted ascii tail.", expected)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            chapter_dir = root / "chapters"
+            chapter_dir.mkdir()
+            (chapter_dir / "001_章节.md").write_text(source, encoding="utf-8")
+            docx_path = root / "章节.docx"
+            build_docx(
+                docx_path,
+                chapter_dir,
+                [
+                    {
+                        "sequence": 1,
+                        "id": "chapter",
+                        "display_title": "章节",
+                        "filename": "001_章节.md",
+                        "reviewed_override": False,
+                    }
+                ],
+                book_title="书",
+            )
+            from docx import Document
+
+            _preamble, chapters = _docx_document_payload(Document(str(docx_path)))
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(
+            _canonical_visible_text(str(chapters[0]["text"])), expected
+        )
 
     def test_standard_footnote_inventory_keeps_legacy_markers_out_of_contract(self) -> None:
         inventory = _citation_inventory(
@@ -734,7 +797,7 @@ class PublicationVerifierTests(unittest.TestCase):
         reviewed_path = self.output / "reviewed_chapters" / "ch-1.md"
         chapter_path = self.output / "chapters" / manifest[0]["filename"]
         reviewed_path.write_text(orphaned, encoding="utf-8")
-        chapter_path.write_text(orphaned, encoding="utf-8")
+        chapter_path.write_text(orphaned, encoding="utf-8", newline="")
 
         report = self._verify(chapter_ids=["ch-1"], report_name="orphan.json")
         checks = self._checks(report)
@@ -752,7 +815,7 @@ class PublicationVerifierTests(unittest.TestCase):
             orphaned, encoding="utf-8"
         )
         (self.output / "chapters" / manifest[0]["filename"]).write_text(
-            orphaned, encoding="utf-8"
+            orphaned, encoding="utf-8", newline=""
         )
 
         report = self._verify(chapter_ids=["ch-1"], report_name="unused.json")
@@ -776,7 +839,7 @@ class PublicationVerifierTests(unittest.TestCase):
             mixed, encoding="utf-8"
         )
         (self.output / "chapters" / manifest[0]["filename"]).write_text(
-            mixed, encoding="utf-8"
+            mixed, encoding="utf-8", newline=""
         )
         self._refresh_semantic_markdown_digest("ch-1")
 
@@ -920,6 +983,13 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertIn("epub_heading_structure_mismatch", codes)
         self.assertIn("epub_chapter_text_mismatch", codes)
 
+    def test_epub_structure_accepts_posix_zip_member_paths(self) -> None:
+        report = self._verify(report_name="epub-posix-paths.json")
+        check = self._checks(report)["epub.structure"]
+
+        self.assertEqual(check["status"], "passed")
+        self.assertEqual(check["issues"], [])
+
     def test_docx_front_matter_heading_quote_and_inline_style_tampering_are_blocked(self) -> None:
         from docx import Document
 
@@ -1008,7 +1078,17 @@ class PublicationVerifierTests(unittest.TestCase):
             if paragraph.style.name == "Heading 1"
         )
         if existing_author is None and not had_author:
-            author = first_heading.insert_paragraph_before("测试作者")
+            title_break = next(
+                (
+                    paragraph
+                    for paragraph in document.paragraphs
+                    if paragraph._p.xpath(".//w:br[@w:type='page']")
+                ),
+                None,
+            )
+            author = (title_break or first_heading).insert_paragraph_before(
+                "测试作者"
+            )
             author.alignment = WD_ALIGN_PARAGRAPH.CENTER
         first_heading_index = next(
             index
@@ -1208,6 +1288,19 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(check["status"], "failed")
         self.assertIn(
             "knowledge_base_stable_ids_mismatch",
+            {issue["code"] for issue in check["issues"]},
+        )
+
+    def test_missing_rag_manifest_blocks_knowledge_base_release(self) -> None:
+        (self.output / "knowledge_base.rag.json").unlink()
+
+        report = self._verify(report_name="kb-rag-manifest-missing.json")
+        check = self._checks(report)["knowledge_base.structure"]
+
+        self.assertFalse(report["ok"])
+        self.assertEqual(check["status"], "failed")
+        self.assertIn(
+            "knowledge_base_rag_manifest_invalid",
             {issue["code"] for issue in check["issues"]},
         )
 

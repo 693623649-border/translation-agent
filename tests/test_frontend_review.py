@@ -186,14 +186,14 @@ class FrontendReviewPageTests(unittest.TestCase):
     def setUp(self) -> None:
         main_module = sys.modules["__main__"]
         self._main_metadata = {
-            name: getattr(main_module, name, None)
+            name: (name in main_module.__dict__, getattr(main_module, name, None))
             for name in ("__file__", "__spec__", "__package__", "__loader__", "__cached__")
         }
 
     def tearDown(self) -> None:
         main_module = sys.modules["__main__"]
-        for name, value in self._main_metadata.items():
-            if value is None:
+        for name, (exists, value) in self._main_metadata.items():
+            if not exists:
                 main_module.__dict__.pop(name, None)
             else:
                 setattr(main_module, name, value)

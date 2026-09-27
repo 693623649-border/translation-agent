@@ -99,6 +99,23 @@ class MarkdownFootnoteInventory:
         return dict(self.definitions)
 
 
+@dataclass(frozen=True)
+class MarkdownFootnotePruneResult:
+    markdown: str
+    removed: tuple[tuple[str, int], ...]
+    remaining_count: int
+
+    @property
+    def removed_ids(self) -> tuple[str, ...]:
+        return tuple(note_id for note_id, _ in self.removed)
+
+
+@dataclass(frozen=True)
+class MarkdownPageMarkerPruneResult:
+    markdown: str
+    removed: tuple[int, ...]
+
+
 def _join_visual_lines(value: str) -> str:
     """Join OCR visual wraps without inserting spaces between CJK glyphs."""
 
@@ -152,7 +169,17 @@ def reconstruct_page_footnotes(text: str, *, source_page: str) -> SemanticPage:
     """
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    starts = list(LEGACY_NOTE_START.finditer(normalized))
+    starts = [
+        match
+        for match in LEGACY_NOTE_START.finditer(normalized)
+        # A citation year can begin a wrapped physical page, for example
+        # ``[1971], pp. 35-40``.  Four-digit calendar years are bibliography
+        # content, never page-local footnote labels.  The translation-side
+        # footnote gate applies the same 1800-2099 exclusion.
+        if not 1800
+        <= int(match.group("square") or match.group("corner") or "0")
+        <= 2099
+    ]
     if not starts:
         return SemanticPage(body=normalized)
 
@@ -330,6 +357,152 @@ def parse_markdown_footnotes(markdown_text: str) -> MarkdownFootnoteInventory:
     )
 
 
+def prune_long_markdown_footnotes(
+    markdown_text: str,
+    *,
+    minimum_characters: int = 150,
+) -> MarkdownFootnotePruneResult:
+    """Remove long footnotes while preserving a closed Markdown contract.
+
+    The threshold is inclusive and counts the normalized definition text,
+    including meaningful spaces.  Both the body reference and its complete
+    definition are removed.  Short definitions retain their original source
+    formatting instead of being reconstructed from parsed text.
+    """
+
+    if minimum_characters < 1:
+        raise ValueError("minimum_characters must be positive")
+
+    inventory = parse_markdown_footnotes(markdown_text)
+    if not inventory.valid:
+        raise ValueError(
+            "Markdown footnotes are not a one-to-one closed set: "
+            f"duplicate_definitions={list(inventory.duplicate_definitions)}, "
+            f"missing_definitions={list(inventory.missing_definitions)}, "
+            f"unused_definitions={list(inventory.unused_definitions)}, "
+            f"duplicate_references={list(inventory.duplicate_references)}"
+        )
+
+    removed = tuple(
+        (note_id, len(text.strip()))
+        for note_id, text in inventory.definitions
+        if len(text.strip()) >= minimum_characters
+    )
+    if not removed:
+        return MarkdownFootnotePruneResult(
+            markdown=markdown_text,
+            removed=(),
+            remaining_count=len(inventory.definitions),
+        )
+
+    removed_ids = {note_id for note_id, _ in removed}
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    had_final_newline = normalized.endswith("\n")
+    lines = normalized.splitlines()
+    output_lines: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = MARKDOWN_NOTE_START.match(lines[index])
+        if match is None:
+            output_lines.append(
+                MARKDOWN_REFERENCE.sub(
+                    lambda reference: (
+                        "" if reference.group("id") in removed_ids else reference.group(0)
+                    ),
+                    lines[index],
+                )
+            )
+            index += 1
+            continue
+
+        end = index + 1
+        while end < len(lines):
+            line = lines[end]
+            if re.match(r"^(?: {2,}|\t)\S", line):
+                end += 1
+                continue
+            if not line.strip():
+                lookahead = end + 1
+                while lookahead < len(lines) and not lines[lookahead].strip():
+                    lookahead += 1
+                if lookahead < len(lines) and re.match(
+                    r"^(?: {2,}|\t)\S", lines[lookahead]
+                ):
+                    end += 1
+                    continue
+            break
+
+        if match.group("id") not in removed_ids:
+            output_lines.extend(lines[index:end])
+        index = end
+
+    rendered = "\n".join(output_lines)
+    if had_final_newline:
+        rendered += "\n"
+
+    pruned = parse_markdown_footnotes(rendered)
+    expected_remaining = len(inventory.definitions) - len(removed)
+    if not pruned.valid or len(pruned.definitions) != expected_remaining:
+        raise RuntimeError("long-footnote pruning broke the Markdown footnote contract")
+    if removed_ids & (set(pruned.references) | {item[0] for item in pruned.definitions}):
+        raise RuntimeError("long-footnote pruning left removed IDs in the Markdown")
+
+    return MarkdownFootnotePruneResult(
+        markdown=rendered,
+        removed=removed,
+        remaining_count=expected_remaining,
+    )
+
+
+def prune_standalone_page_markers(
+    markdown_text: str,
+) -> MarkdownPageMarkerPruneResult:
+    """Remove a high-confidence monotonic run of standalone EPUB page labels.
+
+    A candidate must be an unindented 1-3 digit paragraph outside fenced code.
+    At least three candidates must form a strictly increasing sequence whose
+    adjacent gaps are no larger than 50.  Ambiguous single numbers, years,
+    list syntax, tables, and code examples remain untouched.
+    """
+
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    had_final_newline = normalized.endswith("\n")
+    lines = normalized.splitlines()
+    candidates: list[tuple[int, int]] = []
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        fence_match = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
+        if fence_match is not None:
+            token = fence_match.group(1)
+            if fence is None:
+                fence = (token[0], len(token))
+            elif token[0] == fence[0] and len(token) >= fence[1]:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        match = re.fullmatch(r"[ \t]{0,3}(\d{1,3})[ \t]*", line)
+        if match is not None:
+            value = int(match.group(1))
+            if value > 0:
+                candidates.append((index, value))
+
+    values = tuple(value for _, value in candidates)
+    if len(values) < 3 or any(
+        not (0 < current - previous <= 50)
+        for previous, current in zip(values, values[1:])
+    ):
+        return MarkdownPageMarkerPruneResult(markdown=markdown_text, removed=())
+
+    removed_indexes = {index for index, _ in candidates}
+    rendered = "\n".join(
+        line for index, line in enumerate(lines) if index not in removed_indexes
+    )
+    if had_final_newline:
+        rendered += "\n"
+    return MarkdownPageMarkerPruneResult(markdown=rendered, removed=values)
+
+
 def markdown_footnotes_to_docx_markers(
     markdown_text: str,
     *,
@@ -404,6 +577,8 @@ def semantic_audit_summary(
 
 __all__ = [
     "MarkdownFootnoteInventory",
+    "MarkdownFootnotePruneResult",
+    "MarkdownPageMarkerPruneResult",
     "SemanticFootnote",
     "SemanticIssue",
     "SemanticPage",
@@ -411,6 +586,8 @@ __all__ = [
     "markdown_footnote_contract_sha256",
     "markdown_footnotes_to_docx_markers",
     "parse_markdown_footnotes",
+    "prune_long_markdown_footnotes",
+    "prune_standalone_page_markers",
     "reconstruct_page_footnotes",
     "semantic_audit_summary",
 ]

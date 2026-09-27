@@ -36,6 +36,13 @@ translation-agent run SOURCE.pdf -o OUTPUT --source-mode scanned-pdf \
 
 PDF 自带可靠 outline 时改用 `recipes/outline-word.toml`。这两个 Recipe 只关闭知识库、EPUB 和参考 PDF publisher，不关闭验证节点，目标必须是 `publication.word_report`。Word gate 仍要求语义审计、真实脚注 OOXML 结构门及固定字体 LibreOffice 渲染门；`publication.docx` 只是未验收的中间产物。不要用 `--target publication.docx`、`--no-verify`、`--no-docx-render` 或 API 的 `verify_publication=false` 覆盖该发布契约。
 
+## 处理 Word 返工问题
+
+用户反馈已经生成的 Word 存在来源页码、错误换行、异常字距/对齐、脚注或版面
+问题时，切换到 `$docx-publication-finisher`。它负责源级修复、显式批量重建、
+结构门、隔离渲染、视觉抽检和精确交付清单；本 skill 继续负责 PDF/EPUB 到
+`publication.word_report` 的主编译流程。不要直接编辑 canonical DOCX。
+
 OCR 继续使用 GLM/Coding Plan Profile；中文翻译默认使用独立 DeepSeek `deepseek-v4-flash` Profile，并显式关闭思考模式。模型、端点、worker 和 `credential_env` 写入 `pipeline.toml`，原始 Key 只从环境变量注入；不要写入源码、argv、输出或日志。用 `--ocr-concurrency`、`--proofread-concurrency`、`--translation-concurrency` 独立调整 worker。
 
 简体转换必须调用框架的 `normalize_target_script()` 词法保护，不要用全局“著→着”替换：`望著→望着` 可以转换，但作者义和词汇义的 `所著`、`名著`、`显著` 必须保留。框架改动后保留这组三类回归样例。

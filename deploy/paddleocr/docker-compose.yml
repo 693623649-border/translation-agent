@@ -1,0 +1,47 @@
+# PaddleOCR 本地部署（GPU 主路径 + CPU 备选）
+# 用法：
+#   GPU: docker compose --profile gpu up -d --build
+#   CPU: docker compose --profile cpu up -d --build
+# 一次性任务（下载权重 / 验证 / 批量 OCR）建议用 run 而非常驻：
+#   docker compose --profile gpu run --rm paddleocr python /opt/paddleocr-tools/download_models.py --all
+#   docker compose --profile gpu run --rm paddleocr python /opt/paddleocr-tools/verify_ocr.py
+
+services:
+  paddleocr:
+    profiles: ["gpu"]
+    image: local/paddleocr:3.7.0-gpu
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: paddleocr
+    gpus: all
+    shm_size: "4gb"
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - ./models:/workspace/models        # 模型权重（宿主机下载后挂载进容器）
+      - ./io:/workspace/io                # 输入图片 / 输出结果交换目录
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+    command: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  paddleocr-cpu:
+    profiles: ["cpu"]
+    image: local/paddleocr:3.7.0-cpu
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.3.0
+    container_name: paddleocr-cpu
+    shm_size: "2gb"
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - ./models:/workspace/models
+      - ./io:/workspace/io
+    command: ["sleep", "infinity"]
+    restart: unless-stopped

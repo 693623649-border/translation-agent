@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-08",
+  "fixture": "tests/fixtures/retrieval_eval.jsonl",
+  "cases": 44,
+  "answerable": 40,
+  "notes": "Baseline before reranker tuning. Hybrid = BM25+vector RRF, zhipu embedding-3, candidate_depth=60, top_k=5. Quote queries degrade under hybrid RRF (BM25 was 1.00) - reranking candidate.",
+  "modes": {
+    "lexical": {
+      "candidate_hit_at_60": 1.0,
+      "final_hit_at_5": 0.775,
+      "mrr": 0.581,
+      "context_coverage": 0.7,
+      "by_category": {
+        "concept": 0.86,
+        "paraphrase": 0.71,
+        "terminology": 0.58,
+        "quote": 1.0,
+        "cross_book": 1.0,
+        "cross_lingual": 1.0,
+        "example": 1.0
+      }
+    },
+    "hybrid": {
+      "candidate_hit_at_60": 1.0,
+      "final_hit_at_5": 0.9,
+      "mrr": 0.659,
+      "context_coverage": 0.9,
+      "effective_modes": {
+        "hybrid": 40
+      },
+      "fallbacks": 0,
+      "by_category": {
+        "concept": 0.93,
+        "paraphrase": 0.86,
+        "terminology": 0.92,
+        "quote": 0.67,
+        "cross_book": 1.0,
+        "cross_lingual": 1.0,
+        "example": 1.0
+      }
+    }
+  },
+  "unanswerable": {
+    "returned_any_rate": 1.0,
+    "note": "No refusal path yet; every unanswerable query still returns top-k hits."
+  }
+}

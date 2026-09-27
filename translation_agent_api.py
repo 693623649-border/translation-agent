@@ -25,6 +25,14 @@ from pipeline_graph.book import (
     prepare_book_graph,
     semantic_status_for_args,
 )
+from rag_knowledge_base import (
+    EmbeddingProvider,
+    RagContext,
+    RagEmbeddingMetadata,
+    RagKnowledgeBase,
+    ZhipuEmbeddingProvider,
+    build_embedding_index,
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +42,11 @@ class RunRequest:
     phase: str = "all"
     config: Path | str | None = None
     ocr_profile: str | None = None
+    ocr_backend: str | None = None
+    paddle_native_variant: str | None = None
+    paddle_native_models_dir: Path | str | None = None
+    paddle_native_threads: int = 4
+    paddle_native_det_limit: int = 960
     toc_profile: str | None = None
     proofread_profile: str | None = None
     translation_profile: str | None = None
@@ -64,6 +77,7 @@ class RunRequest:
     generate_epub: bool = True
     generate_docx: bool = True
     generate_knowledge_base: bool = True
+    rag_embed: bool | None = None
     generate_bookmarked_pdf: bool = True
     verify_publication: bool = True
     verification_profile: str | None = None
@@ -76,6 +90,10 @@ class RunRequest:
             raise ValueError(
                 "verification_chapter_ids are only valid when phase='verify'."
             )
+        if self.rag_embed is True and not self.generate_knowledge_base:
+            raise ValueError(
+                "rag_embed=True requires generate_knowledge_base=True."
+            )
         argv: list[str] = []
         if self.input_pdf is not None:
             argv.append(str(self.input_pdf))
@@ -83,6 +101,11 @@ class RunRequest:
         pairs = (
             ("--config", self.config),
             ("--ocr-profile", self.ocr_profile),
+            ("--ocr-backend", self.ocr_backend),
+            ("--paddle-native-variant", self.paddle_native_variant),
+            ("--paddle-native-models-dir", self.paddle_native_models_dir),
+            ("--paddle-native-threads", self.paddle_native_threads),
+            ("--paddle-native-det-limit", self.paddle_native_det_limit),
             ("--toc-profile", self.toc_profile),
             ("--proofread-profile", self.proofread_profile),
             ("--translation-profile", self.translation_profile),
@@ -131,6 +154,10 @@ class RunRequest:
             argv.append("--no-docx")
         if not self.generate_knowledge_base:
             argv.append("--no-kb")
+        if self.rag_embed is True:
+            argv.append("--rag-embed")
+        elif self.rag_embed is False:
+            argv.append("--no-rag-embed")
         if not self.generate_bookmarked_pdf:
             argv.append("--no-bookmarked-pdf")
         if not self.verify_publication:
@@ -333,3 +360,66 @@ def run_graph(request: GraphRunRequest) -> GraphRunResult:
     """Execute a graph request with resumable node fingerprints."""
 
     return prepare_graph(request).execute()
+
+
+def build_knowledge_base_embedding_index(
+    output_dir: Path | str,
+    provider: EmbeddingProvider | None = None,
+    *,
+    batch_size: int = 64,
+) -> RagEmbeddingMetadata:
+    """Attach an embedding provider to one published RAG knowledge base."""
+
+    knowledge_base_path = (
+        Path(output_dir).expanduser().resolve() / "knowledge_base.jsonl"
+    )
+    return build_embedding_index(
+        knowledge_base_path,
+        provider or ZhipuEmbeddingProvider(),
+        batch_size=batch_size,
+    )
+
+
+def retrieve_knowledge_base_context(
+    output_dir: Path | str,
+    query: str,
+    *,
+    top_k: int = 5,
+    max_chars: int = 12_000,
+    chapter_ids: tuple[str, ...] = (),
+    embedding_provider: EmbeddingProvider | None = None,
+    auto_route: bool = False,
+    mode: str | None = None,
+    book_ids: tuple[str, ...] = (),
+    authors: tuple[str, ...] = (),
+    languages: tuple[str, ...] = (),
+    per_book_cap: int | None = None,
+    candidate_depth: int = 30,
+    apparatus_weight: float | None = None,
+) -> RagContext:
+    """Retrieve citation-labelled chunks for downstream prompt augmentation.
+
+    Retrieval-tuning arguments (mode/routing/caps) forward to
+    ``RagKnowledgeBase.retrieve_context`` so the high-level API keeps parity
+    with the ``translation-agent-kb retrieve`` CLI.
+    """
+
+    knowledge_base_path = (
+        Path(output_dir).expanduser().resolve() / "knowledge_base.jsonl"
+    )
+    knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
+    return knowledge_base.retrieve_context(
+        query,
+        top_k=top_k,
+        max_chars=max_chars,
+        chapter_ids=(set(chapter_ids) if chapter_ids else None),
+        embedding_provider=embedding_provider,
+        auto_route=auto_route,
+        mode=mode,
+        book_ids=set(book_ids) if book_ids else None,
+        authors=set(authors) if authors else None,
+        languages=set(languages) if languages else None,
+        per_book_cap=per_book_cap,
+        candidate_depth=candidate_depth,
+        apparatus_weight=apparatus_weight,
+    )

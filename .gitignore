@@ -25,6 +25,7 @@ translation_cache/
 # 本地 agent / IDE 自动化配置，不属于产品源码
 .agents/
 .claude/
+.learnings/
 
 # 历史书籍专用脚本只保留在本机
 archive/states_of_injury/
@@ -69,3 +70,11 @@ desktop.ini
 venv/
 env/
 .venv/
+
+# 本地辅助工具与一次性脚本（个人工作产物，不入库）
+.omx/
+repair-ocr.toml
+cleanup_wenxue_lilun.py
+scan_fragments.py
+summarize_verify.py
+tmp/

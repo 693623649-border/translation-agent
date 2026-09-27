@@ -22,6 +22,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import tempfile
 from typing import Any, Iterable, Iterator, Mapping
 from urllib.parse import unquote, urljoin, urlsplit
@@ -32,6 +33,8 @@ from lxml import etree
 from publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
+    prune_long_markdown_footnotes,
+    prune_standalone_page_markers,
     semantic_audit_summary,
 )
 from semantic_apply import SemanticApplyError, apply_translation_transaction
@@ -45,7 +48,7 @@ CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
 OPF_NS = "http://www.idpf.org/2007/opf"
 DC_NS = "http://purl.org/dc/elements/1.1/"
 SCHEMA_VERSION = 1
-IMPORTER_VERSION = "epub-semantic-v6"
+IMPORTER_VERSION = "epub-semantic-v7"
 MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 
@@ -349,6 +352,13 @@ class _XhtmlRenderer:
                     self.targets[(href, fragment)] = element
                 if _is_note(element):
                     self.note_roots.add(element)
+        self.legacy_reference_targets: dict[
+            etree._Element,
+            tuple[str, str],
+        ] = {}
+        self.legacy_suppressed_links: set[etree._Element] = set()
+        for href, root in documents.items():
+            self._register_legacy_split_bracket_notes(href, root)
         self.reference_counts: dict[tuple[str, str], int] = {}
         self.definitions: list[tuple[str, str]] = []
         self.issues: list[dict[str, Any]] = []
@@ -459,14 +469,101 @@ class _XhtmlRenderer:
             target += f"#{parsed.fragment}"
         return target or href
 
+    @staticmethod
+    def _legacy_note_target_id(fragment: str) -> tuple[str, str] | None:
+        match = re.fullmatch(r"(?P<prefix>.+)_note_(?P<label>\d+)", fragment)
+        if match:
+            return (
+                f"{match.group('prefix')}_noteBack_{match.group('label')}",
+                match.group("label"),
+            )
+        match = re.fullmatch(r"(?P<prefix>.+)-(?P<label>\d+)-ref", fragment)
+        if match:
+            return (
+                f"{match.group('prefix')}-{match.group('label')}-back",
+                match.group("label"),
+            )
+        return None
+
+    @staticmethod
+    def _nearest_block(element: etree._Element) -> etree._Element:
+        current = element
+        while current.getparent() is not None:
+            current = current.getparent()
+            if _local_name(current) in {"p", "li", "aside", "div", "section"}:
+                return current
+        return element
+
+    @staticmethod
+    def _self_links(
+        container: etree._Element,
+        fragment: str,
+    ) -> list[etree._Element]:
+        links: list[etree._Element] = []
+        for element in container.iter():
+            if _local_name(element) != "a":
+                continue
+            parsed = urlsplit(str(element.get("href") or ""))
+            if not parsed.path and unquote(parsed.fragment) == fragment:
+                links.append(element)
+        return links
+
+    def _register_legacy_split_bracket_notes(
+        self,
+        href: str,
+        root: etree._Element,
+    ) -> None:
+        """Recover self-linked ``[``/``1``/``]`` footnotes from old EPUBs.
+
+        Some Calibre-era books encode a reference and its definition as two
+        self-linked bracket triplets instead of reciprocal noteref/footnote
+        links.  Treat the pair as a semantic footnote only when both IDs and
+        both complete bracket labels are present; otherwise preserve the raw
+        links for fail-visible review.
+        """
+
+        for element in root.iter():
+            if _local_name(element) != "a":
+                continue
+            fragment = _element_id(element)
+            target_spec = self._legacy_note_target_id(fragment)
+            if not fragment or target_spec is None:
+                continue
+            target_fragment, label = target_spec
+            target = self.targets.get((href, target_fragment))
+            if target is None:
+                continue
+            reference_block = self._nearest_block(element)
+            reference_links = self._self_links(reference_block, fragment)
+            definition_links = self._self_links(target, target_fragment)
+            reference_label = "".join(_text_value(link) for link in reference_links)
+            definition_label = "".join(_text_value(link) for link in definition_links)
+            expected_label = f"[{label}]"
+            if (
+                reference_label.replace(" ", "") != expected_label
+                or definition_label.replace(" ", "") != expected_label
+            ):
+                continue
+            self.legacy_reference_targets[element] = (href, target_fragment)
+            self.legacy_suppressed_links.update(reference_links)
+            self.legacy_suppressed_links.discard(element)
+            self.legacy_suppressed_links.update(definition_links)
+            self.note_roots.add(target)
+            self.note_roots.add(self._nearest_block(target))
+
     def _note_reference(self, element: etree._Element, current_href: str) -> str:
         href = str(element.get("href") or "")
-        parsed = urlsplit(href)
-        fragment = unquote(parsed.fragment)
-        try:
-            target_href = _resolve_member(current_href, parsed.path) if parsed.path else current_href
-        except EpubSemanticError:
-            target_href = ""
+        legacy_target = self.legacy_reference_targets.get(element)
+        if legacy_target is not None:
+            target_href, fragment = legacy_target
+            href = f"#{fragment}"
+        else:
+            parsed = urlsplit(href)
+            fragment = unquote(parsed.fragment)
+            try:
+                target_href = _resolve_member(current_href, parsed.path) if parsed.path else current_href
+            except EpubSemanticError:
+                target_href = ""
         target = self.targets.get((target_href, fragment)) if fragment else None
         if target is None:
             self.issues.append(
@@ -542,7 +639,11 @@ class _XhtmlRenderer:
 
         if tag in {"script", "style"}:
             return ""
-        if tag == "a" and _is_noteref(element):
+        if element in self.legacy_suppressed_links:
+            return ""
+        if tag == "a" and (
+            _is_noteref(element) or element in self.legacy_reference_targets
+        ):
             return self._note_reference(element, current_href)
         inner = self._inline_children(element, current_href)
         if tag in {"em", "i"} and inner.strip():
@@ -574,6 +675,17 @@ class _XhtmlRenderer:
             return anchored(
                 f"[{label}]({rewritten})" if rewritten and label else label
             )
+        if (
+            tag == "sup"
+            and "calibre14" in str(element.get("class") or "").split()
+            and re.fullmatch(r"\d{1,4}", inner.strip())
+            and not element.xpath(".//*[local-name()='a']")
+        ):
+            # This Calibre class is used by the source book for printed-page
+            # digits embedded in the text flow.  Restrict the cleanup to the
+            # class and to non-linked numbers so mathematical superscripts and
+            # semantic footnote references remain intact.
+            return ""
         if tag in {"sup", "sub"} and inner.strip():
             # Anchor markers inside a superscript were escaped with the rest of
             # the visible text, which turned fragment targets such as
@@ -631,6 +743,17 @@ class _XhtmlRenderer:
                 yield f"{'#' * level} {value}"
             return
         if tag in {"p", "dt", "dd", "figcaption"}:
+            if (
+                tag == "p"
+                and "calibre7" in str(element.get("class") or "").split()
+                and element.get("id") is None
+                and re.fullmatch(r"\d{1,4}", _text_value(element))
+                and not element.xpath(".//*[local-name()='a']")
+            ):
+                # Standalone printed page numbers in the repaired source are
+                # paragraphs of this exact structural form.  A class-scoped
+                # predicate avoids deleting legitimate numbered prose.
+                return
             value = self._inline_children(element, current_href).strip()
             if value:
                 yield value
@@ -800,6 +923,10 @@ def _translation_units(chapter_id: str, markdown: str, source_href: str) -> list
     return units
 
 
+
+
+
+
 def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
     """Import an EPUB spine into chapter Markdown and translation units."""
 
@@ -875,6 +1002,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
                     images.append(
                         {"member": member, "name": name, "sha256": digest}
                     )
+                markdown = markdown.replace(f"]({src})", f"](../images/{name})")
                 target = images_dir / name
                 if not target.exists() or _sha256_bytes(target.read_bytes()) != digest:
                     _atomic_write_bytes(target, raw)
@@ -1018,6 +1146,217 @@ def apply_translations(
         raise EpubSemanticError(str(exc)) from exc
 
 
+def prune_long_footnotes(
+    output_dir: Path,
+    *,
+    minimum_characters: int = 150,
+    remove_standalone_page_markers: bool = False,
+) -> dict[str, Any]:
+    """Create a reader edition by suppressing long semantic footnotes.
+
+    The immutable EPUB evidence under ``semantic/source_chapters`` is left
+    untouched.  Current publication chapters, their manifest, and the
+    semantic audit are updated together so the normal verifier can prove the
+    new reference-definition contract before DOCX publication.
+    """
+
+    if minimum_characters < 1:
+        raise EpubSemanticError("minimum footnote length must be positive")
+
+    output_dir = output_dir.expanduser().resolve()
+    manifest_path = output_dir / "chapters.json"
+    audit_path = output_dir / "audit" / "semantic-reconstruction.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise EpubSemanticError("semantic publication manifest or audit is invalid") from exc
+    if not isinstance(manifest, list) or not manifest:
+        raise EpubSemanticError("chapter manifest must be a non-empty array")
+    if not isinstance(audit, dict) or not isinstance(audit.get("chapters"), list):
+        raise EpubSemanticError("semantic reconstruction audit must contain chapters")
+
+    audit_by_id: dict[str, dict[str, Any]] = {}
+    for item in audit["chapters"]:
+        if not isinstance(item, dict) or not str(item.get("chapter_id") or ""):
+            raise EpubSemanticError("semantic reconstruction audit has an invalid chapter")
+        chapter_id = str(item["chapter_id"])
+        if chapter_id in audit_by_id:
+            raise EpubSemanticError("semantic reconstruction audit has duplicate chapters")
+        audit_by_id[chapter_id] = item
+
+    pending_markdown: dict[Path, str] = {}
+    chapter_reports: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for manifest_item in manifest:
+        if not isinstance(manifest_item, dict):
+            raise EpubSemanticError("chapter manifest contains a non-object entry")
+        chapter_id = str(manifest_item.get("id") or "")
+        filename = str(manifest_item.get("filename") or "")
+        if (
+            not chapter_id
+            or chapter_id in seen_ids
+            or not filename
+            or Path(filename).name != filename
+            or Path(filename).suffix.lower() != ".md"
+        ):
+            raise EpubSemanticError("chapter manifest identity or filename is invalid")
+        seen_ids.add(chapter_id)
+        audited = audit_by_id.get(chapter_id)
+        if audited is None:
+            raise EpubSemanticError(f"semantic audit is missing chapter: {chapter_id}")
+
+        chapter_path = output_dir / "chapters" / filename
+        try:
+            markdown = chapter_path.read_text(encoding="utf-8")
+            note_result = prune_long_markdown_footnotes(
+                markdown,
+                minimum_characters=minimum_characters,
+            )
+            page_result = (
+                prune_standalone_page_markers(note_result.markdown)
+                if remove_standalone_page_markers
+                else None
+            )
+        except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+            raise EpubSemanticError(
+                f"cannot prune long footnotes in chapter {chapter_id}: {exc}"
+            ) from exc
+
+        publication_markdown = (
+            page_result.markdown if page_result is not None else note_result.markdown
+        )
+        removed_page_markers = page_result.removed if page_result is not None else ()
+        pending_markdown[chapter_path] = publication_markdown
+        manifest_item["semantic_footnote_count"] = note_result.remaining_count
+        if note_result.removed:
+            manifest_item["suppressed_long_footnote_count"] = len(note_result.removed)
+            manifest_item["suppressed_long_footnote_minimum_characters"] = (
+                minimum_characters
+            )
+        if removed_page_markers:
+            manifest_item["suppressed_source_page_marker_count"] = len(
+                removed_page_markers
+            )
+        digest = _sha256_bytes(publication_markdown.encode("utf-8"))
+        audited["markdown_sha256"] = digest
+        if "translated_markdown_sha256" in audited:
+            audited["translated_markdown_sha256"] = digest
+        audited["footnote_contract_sha256"] = markdown_footnote_contract_sha256(
+            publication_markdown
+        )
+        audited["footnote_count"] = note_result.remaining_count
+        if note_result.removed:
+            transformations = audited.setdefault("transformations", [])
+            if not isinstance(transformations, list):
+                raise EpubSemanticError(
+                    f"semantic audit transformations are invalid: {chapter_id}"
+                )
+            transformations.append(
+                {
+                    "kind": "suppress-long-footnotes",
+                    "minimum_characters": minimum_characters,
+                    "removed": [
+                        {"id": note_id, "characters": characters}
+                        for note_id, characters in note_result.removed
+                    ],
+                }
+            )
+        if removed_page_markers:
+            transformations = audited.setdefault("transformations", [])
+            if not isinstance(transformations, list):
+                raise EpubSemanticError(
+                    f"semantic audit transformations are invalid: {chapter_id}"
+                )
+            transformations.append(
+                {
+                    "kind": "suppress-source-page-markers",
+                    "removed": list(removed_page_markers),
+                }
+            )
+        chapter_reports.append(
+            {
+                "chapter_id": chapter_id,
+                "filename": filename,
+                "removed_count": len(note_result.removed),
+                "removed": [
+                    {"id": note_id, "characters": characters}
+                    for note_id, characters in note_result.removed
+                ],
+                "remaining_count": note_result.remaining_count,
+                "removed_page_marker_count": len(removed_page_markers),
+                "removed_page_markers": list(removed_page_markers),
+            }
+        )
+
+    total_removed = sum(item["removed_count"] for item in chapter_reports)
+    total_remaining = sum(item["remaining_count"] for item in chapter_reports)
+    total_page_markers = sum(
+        item["removed_page_marker_count"] for item in chapter_reports
+    )
+    if not total_removed and not total_page_markers:
+        return {
+            "status": "passed",
+            "release_blocked": bool(audit.get("release_blocked", False)),
+            "minimum_characters": minimum_characters,
+            "removed_count": 0,
+            "remaining_count": total_remaining,
+            "removed_page_marker_count": 0,
+            "changed": False,
+        }
+
+    summary = audit.setdefault("summary", {})
+    if not isinstance(summary, dict):
+        raise EpubSemanticError("semantic reconstruction summary is invalid")
+    summary["footnote_count"] = total_remaining
+    if total_removed:
+        summary["suppressed_long_footnote_count"] = int(
+            summary.get("suppressed_long_footnote_count") or 0
+        ) + total_removed
+    if total_page_markers:
+        summary["suppressed_source_page_marker_count"] = int(
+            summary.get("suppressed_source_page_marker_count") or 0
+        ) + total_page_markers
+    generated_steps = []
+    if total_removed:
+        generated_steps.append("core.publication.prune-long-footnotes")
+    if total_page_markers:
+        generated_steps.append("core.publication.prune-page-markers")
+    audit["generated_by"] = "+".join(
+        [str(audit.get("generated_by") or "semantic"), *generated_steps]
+    )
+    transformations = audit.setdefault("transformations", [])
+    if not isinstance(transformations, list):
+        raise EpubSemanticError("semantic reconstruction transformations are invalid")
+    transformations.append(
+        {
+            "kind": "reader-edition-pruning",
+            "minimum_characters": minimum_characters,
+            "removed_count": total_removed,
+            "remaining_count": total_remaining,
+            "removed_page_marker_count": total_page_markers,
+        }
+    )
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "passed",
+        "release_blocked": bool(audit.get("release_blocked", False)),
+        "generated_by": "+".join(generated_steps),
+        "minimum_characters": minimum_characters,
+        "removed_count": total_removed,
+        "remaining_count": total_remaining,
+        "removed_page_marker_count": total_page_markers,
+        "chapters": chapter_reports,
+    }
+
+    for path, markdown in pending_markdown.items():
+        _atomic_write_text(path, markdown)
+    _atomic_write_json(manifest_path, manifest)
+    _atomic_write_json(audit_path, audit)
+    _atomic_write_json(output_dir / "audit" / "reader-edition-pruning.json", report)
+    return {**report, "changed": True}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Import EPUB into translation-agent semantic chapters.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1027,6 +1366,22 @@ def build_parser() -> argparse.ArgumentParser:
     apply = subparsers.add_parser("apply-translations", help="validate and apply translated JSONL units")
     apply.add_argument("-o", "--output-dir", required=True)
     apply.add_argument("translations")
+    prune = subparsers.add_parser(
+        "prune-long-footnotes",
+        help="remove long semantic footnotes for a reader-edition publication",
+    )
+    prune.add_argument("-o", "--output-dir", required=True)
+    prune.add_argument(
+        "--minimum-characters",
+        type=int,
+        default=150,
+        help="remove definitions with at least this many normalized characters",
+    )
+    prune.add_argument(
+        "--remove-standalone-page-markers",
+        action="store_true",
+        help="also remove high-confidence monotonic standalone legacy EPUB page labels",
+    )
     return parser
 
 
@@ -1035,8 +1390,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "import":
             result = import_epub(Path(args.source), Path(args.output_dir))
-        else:
+        elif args.command == "apply-translations":
             result = apply_translations(Path(args.output_dir), Path(args.translations))
+        else:
+            result = prune_long_footnotes(
+                Path(args.output_dir),
+                minimum_characters=args.minimum_characters,
+                remove_standalone_page_markers=args.remove_standalone_page_markers,
+            )
     except (OSError, zipfile.BadZipFile, EpubSemanticError) as exc:
         print(json.dumps({"status": "blocked", "error": str(exc)}, ensure_ascii=False))
         return 1

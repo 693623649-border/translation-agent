@@ -132,6 +132,13 @@ class JobCancellationRequested(RuntimeError):
     """Raised cooperatively when the registry records a cancellation request."""
 
 
+class _ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        result = super().__exit__(exc_type, exc, tb)
+        self.close()
+        return bool(result)
+
+
 def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -306,7 +313,11 @@ class JobRegistry:
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database, timeout=10)
+        connection = sqlite3.connect(
+            self.database,
+            timeout=10,
+            factory=_ClosingConnection,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=10000")
         connection.execute("PRAGMA foreign_keys=ON")
@@ -1679,6 +1690,27 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
                 report_path=report_path if covered else None,
             )
         )
+    for artifact_name, filename in (
+        ("publication.knowledge_base", "knowledge_base.jsonl"),
+    ):
+        if artifact_name not in requested or artifact_name in identities:
+            continue
+        candidate = output / filename
+        path = candidate.resolve()
+        if not candidate.is_symlink() and _is_relative_to(path, output) and path.is_file():
+            kind = PUBLICATION_KINDS[artifact_name]
+            records.append(
+                ArtifactRecord(
+                    schema_version=CONTRACT_SCHEMA_VERSION,
+                    name=path.name,
+                    kind=kind,
+                    path=path,
+                    status="draft",
+                    sha256=_sha256_file(path),
+                    media_type=MEDIA_TYPES[kind],
+                    report_path=None,
+                )
+            )
     if report_path is not None and report_path.is_file():
         records.append(
             ArtifactRecord(

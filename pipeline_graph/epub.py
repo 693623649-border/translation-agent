@@ -30,6 +30,7 @@ from pathlib import PurePosixPath
 import zipfile
 
 import book_pipeline as legacy
+import rag_knowledge_base
 from epub_publication_verifier import (
     VERIFIER_VERSION,
     normalize_epub_language,
@@ -71,6 +72,7 @@ NODE_APPLY = "core.semantic.apply"
 NODE_READER = "core.semantic.materialize_reader"
 NODE_EPUB = "core.publish.epub"
 NODE_DOCX = "core.publish.docx"
+NODE_KB = "core.publish.knowledge_base"
 NODE_VERIFY_EPUB = "core.publication.verify.epub"
 
 ART_SOURCE = "source.epub"
@@ -81,6 +83,7 @@ ART_REVIEW = "semantic.review"
 ART_READER_CHAPTERS = "chapters.reader"
 ART_EPUB = "publication.epub"
 ART_DOCX = "publication.docx"
+ART_KB = "publication.knowledge_base"
 ART_EPUB_REPORT = "publication.epub_report"
 
 KNOWN_TARGET_ARTIFACTS = frozenset(
@@ -93,6 +96,7 @@ KNOWN_TARGET_ARTIFACTS = frozenset(
         ART_READER_CHAPTERS,
         ART_EPUB,
         ART_DOCX,
+        ART_KB,
         ART_EPUB_REPORT,
     }
 )
@@ -1414,6 +1418,12 @@ def _publication_path(output_dir: Path, title: str, suffix: str) -> Path:
     return target
 
 
+def _knowledge_base_is_current(context: GraphContext, value: Mapping[str, Any]) -> bool:
+    return _file_artifact_is_current(context, value) and rag_knowledge_base.rag_manifest_is_current(
+        Path(str(value["path"]))
+    )
+
+
 def _publisher_handler(
     artifact_name: str,
     options: EpubGraphOptions,
@@ -1445,6 +1455,13 @@ def _publisher_handler(
                 book_title=title,
                 author=author or None,
             )
+        elif artifact_name == ART_KB:
+            path = _publication_path(context.output_dir, "knowledge_base", ".jsonl")
+            source = Path(str(context.require(ART_SOURCE)["path"]))
+            rows = [row for row in legacy.build_knowledge_rows_from_manifest(
+                source, chapter_dir, manifest
+            ) if str(row.get("content") or "").strip()]
+            legacy.write_knowledge_base(path, rows)
         else:  # pragma: no cover - construction prevents this.
             raise AssertionError(artifact_name)
         artifact = _file_artifact(path)
@@ -1775,7 +1792,7 @@ def prepare_epub_graph(
             provides=frozenset({ART_EPUB}),
             version="1",
             fingerprint=stable_fingerprint(
-                {**publication_fingerprint, "publisher": "epub-v2"}
+                {**publication_fingerprint, "publisher": "epub-v3"}
             ),
             cache_validator=_single_output_is_current(
                 ART_EPUB, _file_artifact_is_current
@@ -1791,12 +1808,28 @@ def prepare_epub_graph(
             provides=frozenset({ART_DOCX}),
             version="1",
             fingerprint=stable_fingerprint(
-                {**publication_fingerprint, "publisher": "docx-v1"}
+                {**publication_fingerprint, "publisher": "docx-v2"}
             ),
             cache_validator=_single_output_is_current(
                 ART_DOCX, _file_artifact_is_current
             ),
             description="Publish Word from the exact materialized reader bundle.",
+        )
+    )
+    graph.add(
+        NodeSpec(
+            name=NODE_KB,
+            handler=_publisher_handler(ART_KB, options),
+            requires=frozenset({ART_SOURCE, ART_READER_CHAPTERS}),
+            provides=frozenset({ART_KB}),
+            version="1",
+            fingerprint=stable_fingerprint(
+                {**publication_fingerprint, "publisher": "knowledge-base-v1"}
+            ),
+            cache_validator=_single_output_is_current(
+                ART_KB, _knowledge_base_is_current
+            ),
+            description="Publish lexical RAG knowledge base from the audited reader bundle.",
         )
     )
     if verifier_node is not None:
@@ -1835,6 +1868,7 @@ def prepare_epub_graph(
             ART_READER_CHAPTERS: _bundle_is_current,
             ART_EPUB: _file_artifact_is_current,
             ART_DOCX: _file_artifact_is_current,
+            ART_KB: _knowledge_base_is_current,
             ART_EPUB_REPORT: _file_artifact_is_current,
         },
     )
@@ -1872,6 +1906,7 @@ def run_epub_graph(
 
 __all__ = [
     "ART_DOCX",
+    "ART_KB",
     "ART_EPUB",
     "ART_EPUB_REPORT",
     "ART_READER_CHAPTERS",
@@ -1890,6 +1925,7 @@ __all__ = [
     "EpubSourceChangedError",
     "NODE_APPLY",
     "NODE_DOCX",
+    "NODE_KB",
     "NODE_EPUB",
     "NODE_IMPORT",
     "NODE_READER",

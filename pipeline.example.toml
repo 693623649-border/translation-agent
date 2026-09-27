@@ -1,5 +1,15 @@
 schema_version = 1
 
+# Optional native CPU backend (macOS / Linux / Windows). Install .[paddle]
+# and run translation-agent-paddle setup --variant mobile first.
+[profiles.paddle_native]
+adapter = "paddleocr-native"
+provider = "paddleocr"
+model = "PP-OCRv5-mobile"
+credential_env = ""
+concurrency = 1
+reading_direction = "horizontal"
+
 [profiles.glm_vision]
 adapter = "coding-plan-mcp"
 provider = "zhipu"

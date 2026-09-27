@@ -1,8 +1,10 @@
+import os
 import tempfile
 import unittest
 import zipfile
 from collections import OrderedDict
 from pathlib import Path
+from unittest import mock
 
 from docx import Document
 from lxml import etree
@@ -16,6 +18,7 @@ from docx_footnotes import (
     FootnotePatchError,
     inspect_docx_footnotes,
     patch_docx_footnotes,
+    replace_with_retry,
 )
 
 
@@ -49,6 +52,41 @@ class DocxFootnoteTests(unittest.TestCase):
     @staticmethod
     def _xml(archive: zipfile.ZipFile, name: str) -> etree._Element:
         return etree.fromstring(archive.read(name))
+
+    def test_replace_with_retry_survives_transient_lock(self) -> None:
+        source = self.root / "stage.docx"
+        target = self.root / "final.docx"
+        source.write_bytes(b"new")
+        target.write_bytes(b"old")
+        real_replace = os.replace
+        calls = {"count": 0}
+
+        def flaky_replace(src, dst):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise PermissionError("held by Word renderer")
+            return real_replace(src, dst)
+
+        with mock.patch("docx_footnotes.os.replace", side_effect=flaky_replace):
+            with mock.patch("docx_footnotes.time.sleep") as sleep:
+                replace_with_retry(source, target, attempts=3, delay=0.01)
+
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(target.read_bytes(), b"new")
+        sleep.assert_called_once_with(0.01)
+
+    def test_replace_with_retry_raises_after_exhausted_attempts(self) -> None:
+        source = self.root / "stage.docx"
+        target = self.root / "final.docx"
+        source.write_bytes(b"new")
+
+        with mock.patch(
+            "docx_footnotes.os.replace",
+            side_effect=PermissionError("held by Word renderer"),
+        ):
+            with mock.patch("docx_footnotes.time.sleep"):
+                with self.assertRaises(PermissionError):
+                    replace_with_retry(source, target, attempts=3, delay=0.01)
 
     def test_materializes_true_footnotes_and_preserves_surrounding_runs(self) -> None:
         source = self._source()

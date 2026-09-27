@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable
 from xml.etree import ElementTree as ET
 
 from publication_checks.runtime_hygiene import check_runtime_hygiene
+import rag_knowledge_base
 from publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
@@ -197,15 +198,20 @@ def _expected_chapter_end_pages(
     granularity: str,
     last_pdf_page: int,
     printed_pages_per_pdf_page: int,
+    toc_pages: Iterable[int] = (),
 ) -> dict[str, int]:
     positions = {
         str(item.get("id") or ""): index for index, item in enumerate(entries)
     }
+    normalized_toc_pages = sorted(int(page) for page in toc_pages)
     result: dict[str, int] = {}
     for sequence, item in enumerate(selected):
         start = int(item.get("pdf_page") or 0)
         next_item: dict[str, Any] | None = None
         if granularity == "all":
+            if sequence + 1 < len(selected):
+                next_item = selected[sequence + 1]
+        elif granularity == "chapter" and item.get("kind") in {"frontmatter", "other"}:
             if sequence + 1 < len(selected):
                 next_item = selected[sequence + 1]
         else:
@@ -240,6 +246,12 @@ def _expected_chapter_end_pages(
                 )
             )
             end = max(start, next_start if overlap else next_start - 1)
+        if (
+            normalized_toc_pages
+            and item.get("kind") in {"frontmatter", "other"}
+            and start < normalized_toc_pages[0] <= end
+        ):
+            end = normalized_toc_pages[0] - 1
         result[str(item.get("id") or "")] = end
     return result
 
@@ -343,7 +355,13 @@ def _strip_reviewed_publication_metadata(markdown_text: str) -> str:
 def _canonical_reviewed_markdown(markdown_text: str) -> str:
     """Mirror compile-time BOM/outer-whitespace and metadata normalization."""
 
-    normalized = markdown_text.lstrip("\ufeff").strip().rstrip() + "\n"
+    normalized = (
+        markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+        .lstrip("\ufeff")
+        .strip()
+        .rstrip()
+        + "\n"
+    )
     return _strip_reviewed_publication_metadata(normalized).rstrip() + "\n"
 
 
@@ -634,10 +652,17 @@ def _citation_inventory(text: str) -> dict[str, Any]:
 def _markdown_html(markdown_text: str) -> str:
     import markdown  # type: ignore[import-not-found]
 
-    return markdown.markdown(
+    output = markdown.markdown(
         markdown_text,
         extensions=["extra", "sane_lists", "footnotes"],
         output_format="xhtml",
+    )
+    # Mirrors book_pipeline.markdown_to_html: python-markdown serializes some
+    # mixed content as named entities ElementTree cannot parse; restore them.
+    return re.sub(
+        r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+|#x[0-9A-Fa-f]+)([A-Za-z][A-Za-z0-9]+);",
+        lambda match: html.entities.html5.get(f"{match.group(1)};", match.group(0)),
+        output,
     )
 
 
@@ -1629,6 +1654,7 @@ def _check_manifest(context: _VerificationContext) -> dict[str, Any]:
                 printed_pages_per_pdf_page=int(
                     toc_payload.get("printed_pages_per_pdf_page") or 1
                 ),
+                toc_pages=toc_payload.get("toc_pdf_pages") or [],
             )
             mismatched_ranges = [
                 {
@@ -2564,15 +2590,21 @@ def _check_epub(context: _VerificationContext) -> dict[str, Any]:
                     )
                 )
 
-            opf_dir = Path(opf_name).parent
+            opf_dir = posixpath.dirname(opf_name)
             expected_xhtml_members = {
-                str(opf_dir / href) for href in expected_hrefs
+                posixpath.join(opf_dir, href) if opf_dir else href
+                for href in expected_hrefs
             }
             actual_xhtml_members = {
                 name
                 for name in archive.namelist()
-                if Path(name).suffix.lower() == ".xhtml"
-                and name != str(opf_dir / (nav_name or ""))
+                if posixpath.splitext(name)[1].lower() == ".xhtml"
+                and name
+                != (
+                    posixpath.join(opf_dir, nav_name)
+                    if opf_dir and nav_name
+                    else (nav_name or "")
+                )
             }
             if actual_xhtml_members != expected_xhtml_members:
                 issues.append(
@@ -2588,7 +2620,9 @@ def _check_epub(context: _VerificationContext) -> dict[str, Any]:
             if nav_name is None:
                 issues.append(_issue("epub_nav_missing", "EPUB manifest 缺少导航文档。", path=path))
             else:
-                nav_archive_name = str(opf_dir / nav_name)
+                nav_archive_name = (
+                    posixpath.join(opf_dir, nav_name) if opf_dir else nav_name
+                )
                 try:
                     nav_root = ET.fromstring(archive.read(nav_archive_name))
                     nav_links = [
@@ -2614,7 +2648,7 @@ def _check_epub(context: _VerificationContext) -> dict[str, Any]:
                 )
 
             for href, item in zip(expected_hrefs, context.manifest):
-                archive_name = str(opf_dir / href)
+                archive_name = posixpath.join(opf_dir, href) if opf_dir else href
                 chapter_id = str(item.get("id") or "")
                 try:
                     raw = archive.read(archive_name).decode("utf-8")
@@ -3738,8 +3772,16 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
             source_markdown = context.chapter_texts.get(chapter_id)
             if source_markdown is None:
                 continue
+            # Mirror the Word publisher's soft-wrap merge so the expected
+            # text is derived from exactly what build_docx renders.
+            from book_pipeline import _normalize_wrapped_markdown_for_docx
+
             expected_text = _canonical_docx_body_text(
-                _markdown_visible_text(_docx_markdown_body(source_markdown))
+                _markdown_visible_text(
+                    _normalize_wrapped_markdown_for_docx(
+                        _docx_markdown_body(source_markdown)
+                    )
+                )
             )
             canonical_actual = _canonical_docx_body_text(actual_text)
             if canonical_actual != expected_text:
@@ -3817,7 +3859,13 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
             for style_name in ("bold", "italic", "underline"):
                 expected_fragments = expected_styles.get(style_name, [])
                 actual_fragments = payload["inline_styles"].get(style_name, [])
-                if actual_fragments != expected_fragments:
+                # The DOCX renderer merges CJK soft-wrapped lines without the
+                # space markdown's itertext keeps; style membership is about
+                # emphasis, not whitespace, so compare space-stripped runs.
+                strip_ws = lambda fragments: [
+                    re.sub(r"\s+", "", fragment) for fragment in fragments
+                ]
+                if strip_ws(actual_fragments) != strip_ws(expected_fragments):
                     issues.append(
                         _issue(
                             "docx_inline_style_mismatch",
@@ -3960,6 +4008,23 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
         return _result(
             "知识库文件无法读取。",
             issues=[_issue("knowledge_base_unreadable", str(exc), path=path)],
+        )
+
+    rag_embedding_status: str | None = None
+    rag_manifest_path = rag_knowledge_base.manifest_path_for(path)
+    try:
+        rag_manifest = rag_knowledge_base.read_rag_manifest(path)
+        rag_embedding_status = str(
+            rag_manifest["retrieval"]["embedding"]["status"]
+        )
+    except rag_knowledge_base.RagError as exc:
+        issues.append(
+            _issue(
+                "knowledge_base_rag_manifest_invalid",
+                "RAG 清单缺失、过期或与知识库不一致。",
+                path=rag_manifest_path,
+                detail=str(exc),
+            )
         )
 
     manifest_by_id = {str(item.get("id") or ""): item for item in context.manifest}
@@ -4172,6 +4237,11 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
             "covered_chapter_count": sum(bool(rows_by_chapter[key]) for key in manifest_by_id),
             "content_match_chapter_count": content_match_count,
             "chapter_count": len(manifest_by_id),
+            "rag_manifest_path": str(rag_manifest_path),
+            "rag_lexical_status": (
+                "ready" if rag_embedding_status is not None else "invalid"
+            ),
+            "rag_embedding_status": rag_embedding_status or "invalid",
         },
         issues=issues,
     )

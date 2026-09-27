@@ -1,5 +1,7 @@
 import hashlib
 import json
+import hashlib
+import io
 import os
 import re
 import sys
@@ -15,6 +17,7 @@ from unittest.mock import patch
 import fitz
 from PIL import Image
 from publication_service import DOCX, PublicationVerificationResult
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from book_pipeline import (
     ChatTranslator,
@@ -51,6 +54,7 @@ from book_pipeline import (
     resolve_worker_counts,
     save_page_record,
     strip_publication_metadata,
+    strip_reviewed_publication_metadata,
     trim_before_next_title,
     translate_non_chinese_pages,
     write_json,
@@ -753,6 +757,34 @@ class UtilityTests(unittest.TestCase):
             self.assertEqual(payload["model"], "deepseek-v4-flash")
             self.assertEqual(payload["thinking"], {"type": "disabled"})
 
+    def test_standard_glm_ocr_content_filter_uses_segmented_fallback(self) -> None:
+        class FilterThenReadGlm(GlmClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    api_key="test-key",
+                    reading_direction="horizontal",
+                )
+
+            def _ocr_image_once(self, image_path: Path) -> tuple[str, str]:
+                if "_segment_" not in image_path.stem:
+                    raise RuntimeError(
+                        'GLM request failed: GLM HTTP 400: {"contentFilter":[],'
+                        '"error":{"code":"1301","message":"potentially unsafe content"}}'
+                    )
+                match = re.search(r"_segment_(\d+)_", image_path.stem)
+                assert match is not None
+                values = {"1": "（无可见文字）", "2": "彼得", "3": "堡正文。", "4": "结尾。"}
+                return values[match.group(1)], "glm-test"
+
+        with tempfile.TemporaryDirectory() as directory:
+            image_path = Path(directory) / "page.jpg"
+            Image.new("RGB", (240, 800), "white").save(image_path)
+            text, request_id = FilterThenReadGlm().ocr_image(image_path)
+
+            self.assertEqual(text, "彼得堡正文。\n\n结尾。")
+            self.assertTrue(request_id.startswith("glm-segmented-"))
+            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
+
     def test_provider_keys_are_isolated(self) -> None:
         parser = build_parser()
         with patch.dict(
@@ -774,6 +806,77 @@ class UtilityTests(unittest.TestCase):
             args = parser.parse_args(["sample.pdf"])
             self.assertEqual(resolve_api_key(args), "glm-only")
             self.assertEqual(resolve_translation_api_key(args), "")
+
+    def test_explicit_ocr_backend_overrides_profile_adapter(self) -> None:
+        class RecordingGlmOCR:
+            instances: list["RecordingGlmOCR"] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                self.ocr_model = str(kwargs["ocr_model"])
+                self.kwargs = kwargs
+                self.instances.append(self)
+
+            def ocr_image(self, image_path: Path) -> tuple[str, str]:
+                return "识别正文内容。", "glm-override-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "one-page.pdf"
+            document = fitz.open()
+            page = document.new_page(width=200, height=200)
+            page.insert_text((72, 72), "source")
+            document.save(pdf_path)
+            document.close()
+            config_path = root / "profiles.toml"
+            config_path.write_text(
+                "\n".join(
+                    (
+                        "schema_version = 1",
+                        "[profiles.vision]",
+                        'adapter = "coding-plan-mcp"',
+                        'provider = "glm"',
+                        'model = "glm-4.6v"',
+                        'credential_env = "PROFILE_CODING_KEY"',
+                        "[pipeline]",
+                        'ocr_profile = "vision"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+
+            with (
+                patch.dict("os.environ", {"GLM_OCR_API_KEY": "standard-key"}, clear=True),
+                patch("book_pipeline.GlmClient", RecordingGlmOCR),
+                patch("book_pipeline.load_env_file", lambda path: None),
+                patch("sys.stderr", stderr),
+            ):
+                result = main(
+                    [
+                        str(pdf_path),
+                        "-o",
+                        str(root / "out"),
+                        "--phase",
+                        "ocr",
+                        "--config",
+                        str(config_path),
+                        "--ocr-backend",
+                        "glm-ocr",
+                        "--ocr-model",
+                        "glm-ocr",
+                        "--ocr-concurrency",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            self.assertEqual(len(RecordingGlmOCR.instances), 1)
+            self.assertEqual(RecordingGlmOCR.instances[0].ocr_model, "glm-ocr")
+            self.assertIn("--ocr-backend=glm-ocr overrides OCR profile", stderr.getvalue())
 
     def test_worker_count_precedence_and_legacy_compatibility(self) -> None:
         parser = build_parser()
@@ -910,6 +1013,32 @@ class UtilityTests(unittest.TestCase):
         result = strip_publication_metadata(source)
         self.assertEqual(result, "# 第一章\n\n第一页正文。\n\n第二页正文。\n")
 
+    def test_publication_metadata_is_removed_when_only_pdf_page_comment_exists(self) -> None:
+        source = """# 第一章
+
+<!-- PDF_PAGE: 13 -->
+
+13
+
+后文。
+"""
+        self.assertEqual(
+            strip_publication_metadata(source),
+            "# 第一章\n\n后文。\n",
+        )
+
+    def test_publication_metadata_keeps_small_numbers_without_page_boundary(self) -> None:
+        source = """# 章节
+
+119
+
+后文。
+"""
+        self.assertEqual(
+            strip_publication_metadata(source),
+            "# 章节\n\n119\n\n后文。\n",
+        )
+
     def test_reader_output_removes_trailing_split_printed_page(self) -> None:
         # Column-aware OCR split printed page 40 into two lines; both are a
         # page footer and must be discarded, unlike mid-text numbers.
@@ -1029,6 +1158,20 @@ class UtilityTests(unittest.TestCase):
             "# 章节\n\n正文。\n\n## OCR 子标题\n\n后文。\n",
         )
 
+    def test_reader_discards_bare_ocr_hash_heading(self) -> None:
+        source = "# 章节\n\n正文。\n\n#\n\n后文。\n"
+        self.assertEqual(
+            strip_publication_metadata(source),
+            "# 章节\n\n正文。\n\n后文。\n",
+        )
+
+    def test_reader_discards_hash_prefixed_printed_page_heading(self) -> None:
+        source = "# 章节\n\n正文。\n\n#225\n\n后文。\n"
+        self.assertEqual(
+            strip_publication_metadata(source),
+            "# 章节\n\n正文。\n\n后文。\n",
+        )
+
     def test_reader_demotes_setext_and_html_h1(self) -> None:
         source = "# 章节\n\n子标题\n====\n\n<h1>另一子标题</h1>\n"
         self.assertEqual(
@@ -1140,6 +1283,86 @@ M.E.Sharpe, Inc., 1983.
                 chapter_title="第一章 歌德的《浮士德》：发展的悲剧",
             ),
             "# 第一章 歌德的《浮士德》：发展的悲剧\n\n正文。\n\n后文。\n",
+        )
+
+    def test_markdown_to_html_restores_named_entities(self) -> None:
+        from book_pipeline import markdown_to_html
+
+        output = markdown_to_html("“伦敦”①测试")
+        self.assertIn("“伦敦”", output)
+        self.assertNotIn("&ldquo;", output)
+        self.assertNotIn("&#", output)
+
+    def test_body_line_starting_with_book_title_is_kept(self) -> None:
+        source = """# 二
+
+包法利夫人回答道：
+
+“汪洋一片，无边无涯。”
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="包法利夫人",
+                chapter_title="二",
+            ),
+            "# 二\n\n包法利夫人回答道：\n\n“汪洋一片，无边无涯。”\n",
+        )
+
+    def test_docx_link_list_keeps_inter_link_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            chapter_dir = output / "chapters"
+            chapter_dir.mkdir(parents=True)
+            filename = "001_目录.md"
+            (chapter_dir / filename).write_text(
+                "# 目录\n\n- [第一部](a.xhtml) [一](b.xhtml) [二](c.xhtml)\n",
+                encoding="utf-8",
+            )
+            manifest = [
+                {
+                    "sequence": 1,
+                    "id": "chapter",
+                    "display_title": "目录",
+                    "filename": filename,
+                    "reviewed_override": False,
+                }
+            ]
+            docx_path = output / "toc.docx"
+            build_docx(docx_path, chapter_dir, manifest, book_title="书")
+
+            from docx import Document
+
+            document = Document(docx_path)
+            paragraph = next(
+                paragraph
+                for paragraph in document.paragraphs
+                if "第一部" in paragraph.text
+            )
+            self.assertEqual(paragraph.text, "第一部 一 二")
+
+    def test_epub_subsection_heading_repeating_chapter_title_is_kept(self) -> None:
+        source = """# 第一章 欲望机器
+
+## 1. 欲望机器
+
+正文。
+
+## 2. 无器官身体
+
+后文。
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                publication_title="反俄狄浦斯",
+                chapter_title="第一章 欲望机器",
+            ),
+            "# 第一章 欲望机器\n\n"
+            "## 1. 欲望机器\n\n"
+            "正文。\n\n"
+            "## 2. 无器官身体\n\n"
+            "后文。\n",
         )
 
     def test_markdown_formatted_short_running_title_is_removed(self) -> None:
@@ -1884,6 +2107,42 @@ for line in sys.stdin:
             self.assertTrue(request_id.startswith("mcp-filtered-"))
             self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
 
+    def test_ocr_pdf_marks_visually_blank_unreadable_page_as_blank_checkpoint(self) -> None:
+        class UnreadableBlankBackend:
+            ocr_model = "glm-ocr"
+
+            def ocr_image(self, image_path: Path) -> tuple[str, str]:
+                return "The image is too blurry to read.", "blank-test"
+
+            def close(self) -> None:
+                return
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "blank.pdf"
+            document = fitz.open()
+            document.new_page(width=200, height=200)
+            document.save(pdf_path)
+            document.close()
+
+            records = ocr_pdf(
+                pdf_path,
+                root / "out",
+                UnreadableBlankBackend(),
+                start_page=1,
+                end_page=1,
+                concurrency=1,
+                dpi=72,
+                max_image_side=400,
+                jpeg_quality=90,
+                keep_page_images=False,
+                force=True,
+            )
+
+            self.assertEqual(records[0].text, "[空白页]")
+            self.assertEqual(records[0].ocr_model, "manual/visually-confirmed-blank")
+            self.assertIn("visual_blank=true", records[0].notes)
+
 
 class MappingAndCompilationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1946,6 +2205,17 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertTrue(rows)
         self.assertNotIn("\n中产阶级的孩子们\n", rows[0]["content"])
         self.assertIn("正文提到中产阶级的孩子们参与了运动。", rows[0]["content"])
+        audit = json.loads(
+            (output / "audit" / "semantic-reconstruction.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            audit["chapters"][0]["markdown_sha256"],
+            hashlib.sha256(
+                (output / "chapters" / manifest[0]["filename"]).read_bytes()
+            ).hexdigest(),
+        )
 
     def test_infer_page_offset(self) -> None:
         offset, evidence = infer_page_offset(self.sample_entries(), self.sample_records(), toc_end=2)
@@ -1978,6 +2248,89 @@ class MappingAndCompilationTests(unittest.TestCase):
         mapped = apply_page_mapping(payload, records, page_offset=None)
         self.assertEqual(mapped["page_offset"], 2)
         self.assertEqual([item["pdf_page"] for item in mapped["entries"]], [4, 8, 12])
+
+    def test_frontmatter_before_toc_maps_by_title_and_stops_before_nested_chapter(self) -> None:
+        entries = [
+            TocEntry("ack", "", "致谢", 1, "frontmatter", 1),
+            TocEntry("intro", "", "导言：批判的停顿：没有反对派的社会", 1, "frontmatter", 1),
+            TocEntry("part", "", "单向度的社会", 1, "part", None),
+            TocEntry("chapter", "第一章", "控制的新形式", 2, "chapter", 3),
+        ]
+        records = [PageRecord(page, f"普通正文 {page}") for page in range(1, 24)]
+        records[4] = PageRecord(5, "致谢\n感谢正文")
+        records[5] = PageRecord(6, "导言\n批判的停顿：没有\n反对派的社会\n导言正文")
+        records[18] = PageRecord(
+            19,
+            "目录\n致谢\n001\n导言\n批判的停顿：没有反对派的社会\n第一章\n003\n控制的新形式",
+        )
+        records[19] = PageRecord(20, "单向度的社会")
+        records[21] = PageRecord(22, "第一章\n控制的新形式\n正文第一页")
+        payload = {"toc_pdf_pages": [19], "entries": [entry.__dict__ for entry in entries]}
+
+        mapped = apply_page_mapping(payload, records, page_offset=None)
+        self.assertEqual(mapped["page_offset"], 19)
+        self.assertEqual(
+            [item["pdf_page"] for item in mapped["entries"]],
+            [5, 6, None, 22],
+        )
+        manifest, rows = compile_chapters(
+            self.pdf_path,
+            self.root / "frontmatter-before-toc",
+            records,
+            mapped,
+            granularity="chapter",
+        )
+
+        self.assertEqual(
+            [(item["display_title"], item["pdf_page"], item["end_pdf_page"]) for item in manifest],
+            [
+                ("致谢", 5, 5),
+                ("导言：批判的停顿：没有反对派的社会", 6, 18),
+                ("第一章 控制的新形式", 22, 23),
+            ],
+        )
+        introduction = (
+            self.root
+            / "frontmatter-before-toc"
+            / "chapters"
+            / manifest[1]["filename"]
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("目录", introduction)
+        self.assertTrue(all(row["content"].strip() for row in rows))
+
+    def test_mapping_rejects_early_title_mentions_and_excludes_all_toc_pages(self) -> None:
+        entries = [
+            TocEntry("intro", "", "引言：作为文化批判的艺术", 1, "frontmatter", 1),
+            TocEntry("chapter-1", "一", "德国艺术家小说引言", 1, "chapter", 105),
+            TocEntry("chapter-2", "二", "文化的肯定性质", 1, "chapter", 121),
+            TocEntry("chapter-3", "三", "单向度社会中的艺术", 1, "chapter", 165),
+            TocEntry("chapter-4", "四", "作为艺术品的社会", 1, "chapter", 181),
+        ]
+        records = [PageRecord(page, f"普通正文 {page}") for page in range(1, 201)]
+        records[8] = PageRecord(9, "目录\n引言：作为文化批判的艺术\n001")
+        records[9] = PageRecord(10, "目录（续）")
+        records[10] = PageRecord(11, "引言：作为文化批判的艺术\n正文")
+        records[70] = PageRecord(71, "单向度社会中的艺术\n正文中的早期回顾")
+        records[114] = PageRecord(115, "一 德国艺术家小说引言\n正文")
+        records[130] = PageRecord(131, "二 文化的肯定性质\n正文")
+        records[174] = PageRecord(175, "三 单向度社会中的艺术\n正文首页")
+        records[194] = PageRecord(195, "四 作为艺术品的社会\n正文首页")
+        payload = {
+            "toc_pdf_pages": [9, 10],
+            "entries": [entry.__dict__ for entry in entries],
+        }
+
+        mapped = apply_page_mapping(payload, records, page_offset=None)
+
+        self.assertEqual(mapped["page_offset"], 10)
+        self.assertEqual(
+            [item["pdf_page"] for item in mapped["entries"]],
+            [11, 115, 131, 175, 195],
+        )
+        intro_evidence = next(
+            item for item in mapped["offset_evidence"] if item["entry_id"] == "intro"
+        )
+        self.assertEqual(intro_evidence["pdf_page"], 11)
 
     def test_two_printed_pages_per_pdf_page_are_inferred(self) -> None:
         entries = [
@@ -2428,6 +2781,293 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertTrue(runs["斜体"].italic)
         self.assertFalse(bool(runs["普通文字、"].underline))
 
+    def test_docx_inline_runs_preserve_word_boundaries(self) -> None:
+        output = self.root / "docx-inline-spacing"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_chapter.md"
+        (chapter_dir / filename).write_text(
+            "# Chapter\n\nEnglish *emphasized* tail.\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "Chapter",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "inline-spacing.docx"
+        build_docx(
+            docx_path,
+            chapter_dir,
+            manifest,
+            book_title="Test Book",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        paragraph = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text.startswith("English")
+        )
+        self.assertEqual(paragraph.text, "English emphasized tail.")
+
+    def test_docx_embeds_chapter_images(self) -> None:
+        output = self.root / "docx-image-embed"
+        chapter_dir = output / "chapters"
+        media_dir = output / "media"
+        media_dir.mkdir(parents=True)
+        chapter_dir.mkdir(parents=True)
+        Image.new("RGB", (480, 320), color=(255, 255, 255)).save(
+            media_dir / "fig_small.png"
+        )
+        Image.new("RGB", (2400, 900), color=(0, 0, 0)).save(
+            media_dir / "fig_wide.png"
+        )
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n"
+            "正文段落。\n\n"
+            "![](../media/fig_small.png)\n\n"
+            "![](../media/fig_wide.png)\n\n"
+            "后续段落。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": False,
+            }
+        ]
+        docx_path = output / "figures.docx"
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+
+        from docx import Document
+
+        document = Document(docx_path)
+        self.assertEqual(len(document.inline_shapes), 2)
+        widths = sorted(shape.width.cm for shape in document.inline_shapes)
+        self.assertAlmostEqual(widths[0], 480 / 96 * 2.54, places=2)
+        self.assertAlmostEqual(widths[1], 14.5, places=2)
+        figure_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs
+            if not paragraph.text.strip() and paragraph.runs
+        ]
+        centered = [
+            paragraph
+            for paragraph in figure_paragraphs
+            if paragraph.alignment == WD_ALIGN_PARAGRAPH.CENTER
+        ]
+        self.assertEqual(len(centered), 2)
+        for paragraph in centered:
+            self.assertEqual(paragraph.paragraph_format.first_line_indent, 0)
+
+    def test_docx_missing_image_fails_loudly(self) -> None:
+        output = self.root / "docx-image-missing"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n![](../media/absent.png)\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": False,
+            }
+        ]
+        with self.assertRaises(FileNotFoundError):
+            build_docx(
+                output / "missing-figure.docx",
+                chapter_dir,
+                manifest,
+                book_title="测试书",
+            )
+
+    def test_docx_wrap_lines_are_merged(self) -> None:
+        output = self.root / "docx-wrap-merge"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n"
+            "第一段文本，后面的内容被\n"
+            "错误拆分成了两行。\n\n"
+            "第二段。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": False,
+            }
+        ]
+        docx_path = output / "wrapped.docx"
+        build_docx(
+            docx_path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        paragraph = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text.startswith("第一段文本")
+        )
+        self.assertNotIn("\n", paragraph.text)
+        self.assertEqual(paragraph.style.name, "Normal")
+        self.assertEqual(
+            paragraph._p.findall(
+                ".//w:br",
+                {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"},
+            ),
+            [],
+        )
+
+    def test_docx_explicit_html_break_is_preserved(self) -> None:
+        output = self.root / "docx-explicit-break"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n第一行。<br>第二行。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "explicit-break.docx"
+        build_docx(
+            docx_path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        paragraph = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.text.startswith("第一行")
+        )
+        self.assertEqual(paragraph.text, "第一行。\n第二行。")
+        self.assertEqual(
+            len(
+                paragraph._p.findall(
+                    ".//w:br",
+                    {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"},
+                )
+            ),
+            1,
+        )
+
+    def test_docx_omits_ocr_blank_page_labels(self) -> None:
+        output = self.root / "docx-blank-page-label"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            "# 第一章\n\n正文第一段。\n\n[空白页]\n\n正文第二段。\n",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": False,
+            }
+        ]
+        docx_path = output / "blank-page-label.docx"
+        build_docx(
+            docx_path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        texts = [paragraph.text for paragraph in document.paragraphs]
+        self.assertNotIn("[空白页]", texts)
+        self.assertIn("正文第一段。", texts)
+        self.assertIn("正文第二段。", texts)
+
+    def test_docx_omits_duplicate_epub_titlepage_and_cover_scaffolds(self) -> None:
+        output = self.root / "docx-epub-scaffolds"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        chapters = (
+            ("001_titlepage.md", "# titlepage\n", "titlepage"),
+            (
+                "002_Cover_Image_cover_jpeg.md",
+                "# ![Cover Image](../../cover.jpeg)\n",
+                "![Cover Image](../../cover.jpeg)",
+            ),
+            ("003_第一章.md", "# 第一章\n\n正文。\n", "第一章"),
+        )
+        manifest = []
+        for sequence, (filename, markdown, title) in enumerate(chapters, start=1):
+            (chapter_dir / filename).write_text(markdown, encoding="utf-8")
+            manifest.append(
+                {
+                    "sequence": sequence,
+                    "id": f"epub-{sequence:04d}",
+                    "display_title": title,
+                    "filename": filename,
+                    "source_href": f"EPUB/xhtml/{filename[:-3]}.xhtml",
+                    "reviewed_override": False,
+                }
+            )
+        docx_path = output / "epub-scaffolds.docx"
+        build_docx(
+            docx_path,
+            chapter_dir,
+            manifest,
+            book_title="测试书",
+        )
+
+        from docx import Document
+
+        document = Document(docx_path)
+        self.assertEqual(document.core_properties.author, "")
+        headings = [
+            paragraph.text
+            for paragraph in document.paragraphs
+            if paragraph.style.name == "Heading 1"
+        ]
+        self.assertEqual(headings, ["第一章"])
+
     def test_docx_book_layout_has_controlled_front_matter_and_footer(self) -> None:
         output = self.root / "docx-book-layout"
         chapter_dir = output / "chapters"
@@ -2482,6 +3122,15 @@ class MappingAndCompilationTests(unittest.TestCase):
         heading_style = styles.find(
             ".//w:style[@w:styleId='Heading1']", namespace
         )
+        normal_style = styles.find(
+            ".//w:style[@w:styleId='Normal']", namespace
+        )
+        footnote_reference_style = styles.find(
+            ".//w:style[@w:styleId='FootnoteReference']", namespace
+        )
+        source_note_style = styles.find(
+            ".//w:style[@w:styleId='SourceNote']", namespace
+        )
         self.assertIsNotNone(heading_style)
         # Essays flow after the preceding section; headings still keep with
         # their first body paragraph through the Heading 1 style.
@@ -2489,6 +3138,46 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertIsNotNone(page_break_before)
         self.assertEqual(page_break_before.get(f"{{{namespace['w']}}}val"), "0")
         self.assertIsNotNone(heading_style.find(".//w:keepNext", namespace))
+        self.assertIsNotNone(normal_style)
+        self.assertIsNotNone(footnote_reference_style)
+        self.assertIsNotNone(source_note_style)
+        self.assertIsNotNone(heading_style.find(".//w:pageBreakBefore", namespace))
+        self.assertEqual(
+            normal_style.find("w:rPr/w:rFonts", namespace).get(
+                f"{{{namespace['w']}}}eastAsia"
+            ),
+            "SimSun",
+        )
+        self.assertEqual(
+            heading_style.find("w:rPr/w:rFonts", namespace).get(
+                f"{{{namespace['w']}}}eastAsia"
+            ),
+            "Microsoft YaHei",
+        )
+        self.assertEqual(
+            normal_style.find("w:rPr/w:spacing", namespace).get(
+                f"{{{namespace['w']}}}val"
+            ),
+            "0",
+        )
+        self.assertEqual(
+            normal_style.find("w:pPr/w:jc", namespace).get(
+                f"{{{namespace['w']}}}val"
+            ),
+            "both",
+        )
+        self.assertEqual(
+            footnote_reference_style.find("w:rPr/w:vertAlign", namespace).get(
+                f"{{{namespace['w']}}}val"
+            ),
+            "superscript",
+        )
+        self.assertEqual(
+            source_note_style.find("w:pPr/w:jc", namespace).get(
+                f"{{{namespace['w']}}}val"
+            ),
+            "left",
+        )
         self.assertEqual(
             [field.get(f"{{{namespace['w']}}}instr") for field in footer.findall(".//w:fldSimple", namespace)],
             ["PAGE"],
@@ -2691,6 +3380,18 @@ class MappingAndCompilationTests(unittest.TestCase):
         self.assertIn("罗亚的生平", docx_text)
         self.assertIn("——《月姬》", docx_text)
 
+    def test_reviewed_override_strips_pdf_page_comment_number(self) -> None:
+        source = """# 第一章 正文
+
+<!-- PDF_PAGE: 7 -->
+
+7
+
+正文。
+"""
+        result = strip_reviewed_publication_metadata(source)
+        self.assertEqual(result, "# 第一章 正文\n\n正文。\n")
+
     def test_reviewed_override_strips_only_explicit_source_page_markers(self) -> None:
         output = self.root / "reviewed-explicit-markers"
         reviewed_dir = output / "reviewed_chapters"
@@ -2816,6 +3517,137 @@ class MappingAndCompilationTests(unittest.TestCase):
             [[cell.text for cell in row.cells] for row in document.tables[0].rows],
             [["名称", "值"], ["罗亚", "保留"]],
         )
+
+    def test_reviewed_publication_metadata_removes_standalone_printed_numbers(self) -> None:
+        source = """# 第一章
+
+<span epub:type="pagebreak" id="pdf-page-1" title="1"></span>
+<!-- PDF_PAGE: 1 -->
+
+序言第一段会出现明显正文交接，需要修复这一行的排版。
+
+1
+
+2
+
+接续正文，这里开始后续段落。
+
+2022
+
+"""
+        cleaned = strip_reviewed_publication_metadata(source)
+        self.assertIn("序言第一段会出现明显正文交接，需要修复这一行的排版。", cleaned)
+        self.assertIn("接续正文，这里开始后续段落。", cleaned)
+        self.assertIn("2022", cleaned)
+        self.assertNotIn("\n1\n", cleaned)
+        self.assertNotIn("\n2\n", cleaned)
+
+    def test_docx_reviewed_wrap_and_alignment_are_normalized(self) -> None:
+        output = self.root / "docx-review-layout"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            """# 第一章
+
+<span epub:type="pagebreak" id="pdf-page-1" title="1"></span>
+<!-- PDF_PAGE: 1 -->
+
+1
+
+正文开头第一段正文交接到下一行。
+
+<span epub:type="pagebreak" id="pdf-page-2" title="2"></span>
+<!-- PDF_PAGE: 2 -->
+
+2
+
+正文第二段承接第一页内容。
+
+""",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "book.docx"
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+
+        from docx import Document
+
+        document = Document(docx_path)
+        docx_paragraphs = [paragraph.text for paragraph in document.paragraphs]
+        self.assertNotIn("1", docx_paragraphs)
+        self.assertNotIn("2", docx_paragraphs)
+        self.assertIn("正文开头第一段正文交接到下一行。", docx_paragraphs)
+        self.assertIn("正文第二段承接第一页内容。", docx_paragraphs)
+        self.assertEqual(document.styles["Normal"].paragraph_format.alignment, WD_ALIGN_PARAGRAPH.JUSTIFY)
+        self.assertEqual(document.styles["Quote"].paragraph_format.alignment, WD_ALIGN_PARAGRAPH.JUSTIFY)
+
+    def test_docx_source_notes_are_separated_from_wrapped_body(self) -> None:
+        output = self.root / "docx-source-notes"
+        chapter_dir = output / "chapters"
+        chapter_dir.mkdir(parents=True)
+        filename = "001_第一章.md"
+        (chapter_dir / filename).write_text(
+            """# 第一章
+
+正文通过把变
+Bazard,Doctrine Saint-Simonienne-Exposition,Paris1854,pp.123f.145.
+①
+Ibid.,p.124.
+②
+Ibid.,p.127.
+③迁视为实存的特有形式，正文继续。
+
+①第二次世界大战时希特勒曾建立集中营，监
+禁和屠杀爱国者和战俘。——译者
+
+后文。
+""",
+            encoding="utf-8",
+        )
+        manifest = [
+            {
+                "sequence": 1,
+                "id": "chapter",
+                "display_title": "第一章",
+                "filename": filename,
+                "reviewed_override": True,
+            }
+        ]
+        docx_path = output / "book.docx"
+        build_docx(docx_path, chapter_dir, manifest, book_title="测试书")
+
+        from docx import Document
+
+        document = Document(docx_path)
+        source_notes = [
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.style.name == "Source Note"
+        ]
+        self.assertEqual(len(source_notes), 2)
+        self.assertIn("Bazard,Doctrine", source_notes[0].text)
+        self.assertIn("① Ibid.,p.124.", source_notes[0].text)
+        self.assertIn("——译者", source_notes[1].text)
+        self.assertEqual(
+            document.styles["Source Note"].paragraph_format.alignment,
+            WD_ALIGN_PARAGRAPH.LEFT,
+        )
+        normal_text = [
+            paragraph.text
+            for paragraph in document.paragraphs
+            if paragraph.style.name == "Normal"
+        ]
+        self.assertIn("正文通过把变", normal_text)
+        self.assertIn("③迁视为实存的特有形式，正文继续。", normal_text)
 
     def test_reviewed_override_still_requires_ocr_range(self) -> None:
         output = self.root / "reviewed-missing-ocr"
@@ -3083,7 +3915,17 @@ class MappingAndCompilationTests(unittest.TestCase):
             0,
         )
         self.assertEqual(
-            main([str(self.pdf_path), "-o", str(output), "--phase", "compile", "--granularity", "chapter"]),
+            main(
+                [
+                    str(self.pdf_path),
+                    "-o",
+                    str(output),
+                    "--phase",
+                    "compile",
+                    "--granularity",
+                    "chapter",
+                ]
+            ),
             0,
         )
         self.assertTrue((output / "knowledge_base.jsonl").exists())

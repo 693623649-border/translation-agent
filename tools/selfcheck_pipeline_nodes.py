@@ -44,7 +44,7 @@ from pipeline_graph.epub import (
 from pipeline_graph.recipe import load_recipe
 
 RECIPES_DIR = Path("recipes")
-EPUB_ALL_NODES = 10
+EPUB_ALL_NODES = 11
 
 
 def _plan_full(prepared) -> tuple[str, ...]:

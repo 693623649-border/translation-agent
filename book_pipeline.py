@@ -11,8 +11,8 @@ import http.client
 import inspect
 import json
 import os
+import queue
 import re
-import select
 import shlex
 import shutil
 import signal
@@ -26,6 +26,7 @@ import tomllib
 import unicodedata
 import urllib.error
 import urllib.parse
+from urllib.parse import unquote, urlsplit
 import urllib.request
 import uuid
 import zipfile
@@ -42,6 +43,7 @@ import pymupdf as fitz
 from PIL import Image
 
 from compile_service import ChapterCompileRequest, run_chapter_compile
+import rag_knowledge_base
 from pipeline_profiles import (
     ModelIdentity,
     ModelProfile,
@@ -63,7 +65,7 @@ from publication_service import (
     PublicationVerificationRequest,
     run_publication_verification,
 )
-from docx_footnotes import patch_docx_footnotes
+from docx_footnotes import patch_docx_footnotes, replace_with_retry
 from publication_semantics import (
     append_markdown_footnotes,
     markdown_footnote_contract_sha256,
@@ -335,6 +337,19 @@ class OCRBackend(Protocol):
     def close(self) -> None: ...
 
 
+_UNREADABLE_OCR_RE = re.compile(
+    r"(?:```\s*)?(?:\[|【|\(|（)?\s*(?:"
+    r"\[无法辨认\]|无法辨认|无法辨識|无法识别|"
+    r"(?:无|没有)可见(?:文字|内容)|"
+    r"空白页|blank(?:\s+page)?|"
+    r"(?:the\s+)?(?:image|page|text)?\s*(?:is\s+)?"
+    r"(?:too\s+blurry|unreadable|illegible)"
+    r"(?:\s+to\s+(?:read|recognize|identify))?"
+    r")\s*(?:[，,：:].*)?(?:\]|】|\)|）)?[。.]?(?:\s*```)?",
+    flags=re.I,
+)
+
+
 def load_env_file(path: Path) -> None:
     # Web workers receive credentials through an explicit, allowlisted child
     # environment.  They must not silently widen that authority by loading a
@@ -377,7 +392,17 @@ def write_json(path: Path, value: Any) -> None:
             json.dumps(value, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(path)
+        for attempt in range(12):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 11:
+                    raise
+                # Two Windows workers replacing the same destination can
+                # transiently receive WinError 5 even though every temp name
+                # is unique. Retrying preserves the atomic replace contract.
+                time.sleep(min(0.001 * (2**attempt), 0.05))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -419,6 +444,27 @@ def parse_model_prefixes(value: str | None) -> tuple[str, ...]:
         for prefix in (value or "").split(",")
         if prefix.strip()
     )
+
+
+def is_unreadable_ocr_text(text: str) -> bool:
+    return bool(_UNREADABLE_OCR_RE.fullmatch(str(text).strip()))
+
+
+def page_ink_ratio(image_path: Path, *, threshold: int = 245) -> float:
+    with Image.open(image_path) as source:
+        gray = source.convert("L")
+        histogram = gray.histogram()
+    total = sum(histogram)
+    if total <= 0:
+        return 0.0
+    dark_pixels = sum(histogram[: max(0, min(256, threshold))])
+    return dark_pixels / total
+
+
+def is_visually_blank_page(image_path: Path) -> tuple[bool, float]:
+    ratio = page_ink_ratio(image_path)
+    maximum = float(os.getenv("OCR_BLANK_INK_RATIO", "0.001"))
+    return ratio <= maximum, ratio
 
 
 def detect_language(text: str) -> str:
@@ -678,6 +724,7 @@ class GlmClient:
         provider_name: str = "glm",
         adapter_name: str = "openai-chat",
         thinking: str = "disabled",
+        reading_direction: str = "horizontal",
     ) -> None:
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
@@ -690,6 +737,7 @@ class GlmClient:
         if thinking not in {"enabled", "disabled", "omit"}:
             raise ValueError("thinking must be enabled, disabled, or omit")
         self.thinking = thinking
+        self.reading_direction = reading_direction if reading_direction in {"horizontal", "vertical"} else "horizontal"
 
     def model_identity(
         self,
@@ -754,7 +802,17 @@ class GlmClient:
         ) as exc:
             raise RuntimeError(f"{self.service_name} request failed: {exc}") from exc
 
-    def ocr_image(self, image_path: Path) -> tuple[str, str]:
+    @staticmethod
+    def _is_content_filter_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return any(token in message for token in ("contentfilter", '"code":"1301"', "potentially unsafe"))
+
+    @staticmethod
+    def _is_timeout_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "timed out" in message or "timeout" in message
+
+    def _ocr_image_once(self, image_path: Path) -> tuple[str, str]:
         mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
         encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
         response = self._post(
@@ -771,6 +829,64 @@ class GlmClient:
             raise RuntimeError(f"Unexpected GLM-OCR response; request_id={response.get('request_id', 'unknown')}")
         request_id = str(response.get("request_id") or response.get("id") or "")
         return clean_ocr_text(text), request_id
+
+    def _ocr_segmented(self, image_path: Path, *, segments: int) -> tuple[str, str]:
+        part_paths: list[Path] = []
+        texts: list[str] = []
+        try:
+            with Image.open(image_path) as source:
+                image = source.convert("RGB")
+                width, height = image.size
+                if self.reading_direction == "vertical":
+                    boundaries = [0, *CodingPlanVisionOCR._blank_column_cuts(image, segments), width]
+                    regions = [
+                        (left, 0, right, height)
+                        for left, right in reversed(list(zip(boundaries, boundaries[1:])))
+                    ]
+                else:
+                    boundaries = [0, *CodingPlanVisionOCR._blank_row_cuts(image, segments), height]
+                    regions = [
+                        (0, top, width, bottom)
+                        for top, bottom in zip(boundaries, boundaries[1:])
+                    ]
+                for index, region in enumerate(regions, start=1):
+                    part_path = image_path.with_name(
+                        f"{image_path.stem}_segment_{index}_{uuid.uuid4().hex[:8]}.jpg"
+                    )
+                    image.crop(region).save(part_path, "JPEG", quality=95, optimize=True)
+                    part_paths.append(part_path)
+            for part_path in part_paths:
+                text, _request_id = self._ocr_image_once(part_path)
+                text = text.strip()
+                if text and not is_unreadable_ocr_text(text):
+                    texts.append(text)
+        finally:
+            for part_path in part_paths:
+                part_path.unlink(missing_ok=True)
+        if not texts:
+            raise RuntimeError("Segmented GLM-OCR returned an empty band.")
+        return CodingPlanVisionOCR._merge_band_texts(texts), f"glm-segmented-{uuid.uuid4().hex[:12]}"
+
+    def ocr_image(self, image_path: Path) -> tuple[str, str]:
+        try:
+            return self._ocr_image_once(image_path)
+        except Exception as exc:
+            if not (self._is_content_filter_error(exc) or self._is_timeout_error(exc)):
+                raise
+            segment_counts = (
+                (4, 8, 16, 32)
+                if self._is_content_filter_error(exc)
+                else (2,)
+            )
+            retry_error: Exception = exc
+            for segments in segment_counts:
+                try:
+                    return self._ocr_segmented(image_path, segments=segments)
+                except Exception as segmented_error:  # noqa: BLE001 - preserve original fallback behavior.
+                    retry_error = segmented_error
+                    if not self._is_content_filter_error(segmented_error):
+                        break
+            raise retry_error
 
     def chat_json(self, prompt: str, *, system: str, max_tokens: int = 16384) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -913,6 +1029,13 @@ class McpStdioClient:
             daemon=True,
         )
         self.stderr_thread.start()
+        self.stdout_lines: queue.Queue[str | None] = queue.Queue()
+        self.stdout_thread = threading.Thread(
+            target=self._drain_stdout,
+            name=f"vision-mcp-stdout-{self.process.pid}",
+            daemon=True,
+        )
+        self.stdout_thread.start()
         self.next_id = 1
         self._request(
             "initialize",
@@ -945,6 +1068,18 @@ class McpStdioClient:
             # close() may close the pipe while the daemon reader is blocked.
             return
 
+    def _drain_stdout(self) -> None:
+        if self.process.stdout is None:
+            self.stdout_lines.put(None)
+            return
+        try:
+            for raw_line in self.process.stdout:
+                self.stdout_lines.put(raw_line)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.stdout_lines.put(None)
+
     def _diagnostics(self) -> str:
         if not self.stderr_lines:
             return ""
@@ -966,14 +1101,14 @@ class McpStdioClient:
         if self.process.stdout is None:
             raise RuntimeError("Vision MCP stdout is unavailable.")
         while True:
-            ready, _, _ = select.select([self.process.stdout], [], [], self.request_timeout)
-            if not ready:
+            try:
+                line = self.stdout_lines.get(timeout=self.request_timeout)
+            except queue.Empty:
                 raise RuntimeError(
                     f"Vision MCP request timed out after {self.request_timeout} seconds."
                     f"{self._diagnostics()}"
                 )
-            line = self.process.stdout.readline()
-            if not line:
+            if line is None:
                 code = self.process.poll()
                 raise RuntimeError(
                     f"Vision MCP stopped before responding (exit={code})."
@@ -1059,7 +1194,13 @@ class McpStdioClient:
                 self.process.wait(timeout=3)
         if self.process.stdin is not None and not self.process.stdin.closed:
             self.process.stdin.close()
-        if self.process.stdout is not None and not self.process.stdout.closed:
+        if self.stdout_thread.is_alive():
+            self.stdout_thread.join(timeout=1)
+        if (
+            not self.stdout_thread.is_alive()
+            and self.process.stdout is not None
+            and not self.process.stdout.closed
+        ):
             self.process.stdout.close()
         if self.stderr_thread.is_alive():
             self.stderr_thread.join(timeout=1)
@@ -1089,7 +1230,18 @@ class CodingPlanVisionOCR:
         request_timeout: int = 120,
     ) -> None:
         self.api_key = api_key
-        self.command = shlex.split(command)
+        if os.name == "nt":
+            tokens = shlex.split(command, posix=False)
+            self.command = [
+                token[1:-1]
+                if len(token) >= 2
+                and token[0] == token[-1]
+                and token[0] in {'"', "'"}
+                else token
+                for token in tokens
+            ]
+        else:
+            self.command = shlex.split(command)
         self.vision_model = vision_model.strip() or "glm-4.6v"
         self.request_timeout = max(30, int(request_timeout))
         self.prompt_version = f"{reading_direction}-v2"
@@ -2059,6 +2211,42 @@ def _exclusive_stage_lock(output_dir: Path, stage: str) -> Iterator[None]:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return
+    if msvcrt is not None:  # pragma: no cover - exercised on Windows.
+        lock_path.touch(exist_ok=True)
+        with lock_path.open("r+b", buffering=0) as handle:
+            descriptor = handle.fileno()
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    holder = os.read(descriptor, 4096).decode(
+                        "utf-8", errors="replace"
+                    ).strip("\0\r\n ") or "unknown"
+                except OSError:
+                    holder = "unknown"
+                raise RuntimeError(
+                    f"Another {stage} process already owns {lock_path} "
+                    f"(holder={holder}). Wait for it or stop it before resuming."
+                ) from exc
+            try:
+                os.ftruncate(descriptor, 0)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                os.write(
+                    descriptor,
+                    (
+                        f"pid={os.getpid()} "
+                        f"started={dt.datetime.now(dt.timezone.utc).isoformat()}\n"
+                    ).encode("utf-8"),
+                )
+                yield
+            finally:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
     # Windows and platforms without a cross-process flock still benefit from
     # the existing portable exclusive lock implementation.
     with _exclusive_page_lock(lock_path):  # pragma: no cover - POSIX uses flock above.
@@ -2459,19 +2647,49 @@ def ocr_pdf(
     existing = {record.pdf_page: record for record in load_page_records(output_dir)}
     cache_model_prefixes = parse_model_prefixes(cache_model_prefix)
     pages = list(range(start_page, end_page + 1))
+    # Checkpoints produced by a heterogeneous local backend (PaddleOCR) are
+    # never silently overwritten by a cloud rerun: a mixed-backend book keeps
+    # its local pages unless --force explicitly replaces them.
+    local_prefixes = ("paddleocr-local/", "paddleocr-native/")
+    requested_is_paddle_local = bool(
+        str(getattr(client, "ocr_model", "")).startswith(local_prefixes)
+        or (cache_model_exact or "").startswith(local_prefixes)
+        or any(
+            (prefix or "").startswith(local_prefixes)
+            for prefix in cache_model_prefixes
+        )
+    )
+    protected = [
+        page
+        for page in pages
+        if page in existing
+        and existing[page].ocr_model.startswith(local_prefixes)
+        and not requested_is_paddle_local
+    ]
+    if protected:
+        print(
+            f"[ocr] protected-local-pages={protected} (paddleocr-local "
+            "checkpoints kept; use --force to replace with this backend)",
+            flush=True,
+        )
     pending = [
         page
         for page in pages
         if force
-        or page not in existing
-        or not existing[page].text.strip()
         or (
-            cache_model_exact
-            and existing[page].ocr_model != cache_model_exact
-        )
-        or (
-            cache_model_prefixes
-            and not existing[page].ocr_model.startswith(cache_model_prefixes)
+            page not in protected
+            and (
+                page not in existing
+                or not existing[page].text.strip()
+                or (
+                    cache_model_exact
+                    and existing[page].ocr_model != cache_model_exact
+                )
+                or (
+                    cache_model_prefixes
+                    and not existing[page].ocr_model.startswith(cache_model_prefixes)
+                )
+            )
         )
     ]
     print(f"[ocr] total={len(pages)} cached={len(pages) - len(pending)} pending={len(pending)}")
@@ -2510,21 +2728,34 @@ def ocr_pdf(
                 raise RuntimeError(
                     f"OCR physical-page structure is inconsistent on page {pdf_page}."
                 )
+            visually_blank = False
+            ink_ratio = 1.0
+            if not text or is_unreadable_ocr_text(text):
+                visually_blank, ink_ratio = is_visually_blank_page(image_path)
+                if visually_blank:
+                    text = "[空白页]"
+                    physical_page_texts = []
             elapsed = time.monotonic() - started_at
             print(
                 f"[ocr-response] page={pdf_page} elapsed={elapsed:.1f}s chars={len(text)}",
                 flush=True,
             )
+            notes = (
+                f"request_id={request_id}; elapsed_seconds={elapsed:.1f}"
+                if request_id
+                else f"elapsed_seconds={elapsed:.1f}"
+            )
+            ocr_model = client.ocr_model
+            if visually_blank:
+                notes += f"; visual_blank=true; ink_ratio={ink_ratio:.6f}"
+                if not ocr_model.startswith("paddleocr-native/"):
+                    ocr_model = "manual/visually-confirmed-blank"
             record = PageRecord(
                 pdf_page=pdf_page,
                 text=text,
                 language=detect_language(text),
-                notes=(
-                    f"request_id={request_id}; elapsed_seconds={elapsed:.1f}"
-                    if request_id
-                    else f"elapsed_seconds={elapsed:.1f}"
-                ),
-                ocr_model=client.ocr_model,
+                notes=notes,
+                ocr_model=ocr_model,
                 physical_page_texts=physical_page_texts,
             )
             save_page_record(output_dir, record)
@@ -3018,8 +3249,29 @@ def title_page_score(title: str, page_text: str) -> float:
     return best
 
 
-def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_end: int) -> list[dict[str, Any]]:
-    searchable = [record for record in records if record.pdf_page > toc_end and record.compile_text]
+def find_title_evidence(
+    entries: list[TocEntry],
+    records: list[PageRecord],
+    toc_end: int,
+    *,
+    toc_pages: Iterable[int] | None = None,
+) -> list[dict[str, Any]]:
+    toc_page_set = {
+        int(page)
+        for page in (
+            toc_pages
+            if toc_pages is not None
+            else ((toc_end,) if toc_end > 0 else ())
+        )
+    }
+    body_records = [
+        record for record in records if record.pdf_page > toc_end and record.compile_text
+    ]
+    all_non_toc_records = [
+        record
+        for record in records
+        if record.pdf_page not in toc_page_set and record.compile_text
+    ]
     evidence: list[dict[str, Any]] = []
     for entry in entries:
         if entry.kind not in {
@@ -3030,6 +3282,11 @@ def find_title_evidence(entries: list[TocEntry], records: list[PageRecord], toc_
             "other",
         }:
             continue
+        searchable = (
+            all_non_toc_records
+            if entry.kind in {"frontmatter", "other"}
+            else body_records
+        )
         best_page: int | None = None
         best_score = 0.0
         for record in searchable:
@@ -3118,20 +3375,41 @@ def infer_page_mapping(
     toc_end: int,
     *,
     divisor_candidates: tuple[int, ...] = (1, 2),
+    toc_pages: Iterable[int] | None = None,
 ) -> tuple[int, int, list[dict[str, Any]]]:
-    evidence = find_title_evidence(entries, records, toc_end)
+    evidence = find_title_evidence(
+        entries,
+        records,
+        toc_end,
+        toc_pages=toc_pages,
+    )
     if not any(item.get("printed_page") is not None for item in evidence):
         raise ValueError("Cannot infer page offset from OCR text. Pass --page-offset after checking one chapter page.")
+    # Front matter can precede a trailing table of contents and often uses an
+    # independent page-number sequence.  Its title matches are authoritative
+    # for those individual entries, but must not determine the body offset.
+    post_toc_evidence = [
+        item for item in evidence if int(item.get("pdf_page") or 0) > toc_end
+    ]
+    mapping_evidence = (
+        post_toc_evidence
+        if any(item.get("printed_page") is not None for item in post_toc_evidence)
+        else evidence
+    )
     valid_candidates = tuple(
         sorted({int(value) for value in divisor_candidates if int(value) >= 1})
     )
     if not valid_candidates:
         raise ValueError("At least one positive printed-page divisor is required.")
     ranked = [
-        (*_mapping_evidence(evidence, divisor), divisor)
+        (*_mapping_evidence(mapping_evidence, divisor), divisor)
         for divisor in valid_candidates
     ]
-    offset, annotated, _rank, divisor = max(ranked, key=lambda item: item[2])
+    offset, _mapping_annotations, _rank, divisor = max(
+        ranked,
+        key=lambda item: item[2],
+    )
+    _unused_offset, annotated, _unused_rank = _mapping_evidence(evidence, divisor)
     return offset, divisor, annotated
 
 
@@ -3145,8 +3423,9 @@ def apply_page_mapping(
 ) -> dict[str, Any]:
     normalized = normalize_toc_payload(toc_payload)
     entries = [TocEntry(**item) for item in normalized["entries"]]
-    toc_end = max(normalized.get("toc_pdf_pages") or [0])
-    evidence = find_title_evidence(entries, records, toc_end)
+    toc_pages = [int(page) for page in normalized.get("toc_pdf_pages") or []]
+    toc_end = max(toc_pages or [0])
+    evidence = find_title_evidence(entries, records, toc_end, toc_pages=toc_pages)
     manual_override = page_offset is not None
     stored_divisor = normalized.get("printed_pages_per_pdf_page")
     divisor = printed_pages_per_pdf_page or (
@@ -3165,6 +3444,7 @@ def apply_page_mapping(
                 records,
                 toc_end,
                 divisor_candidates=(divisor,) if divisor is not None else (1, 2),
+                toc_pages=toc_pages,
             )
     else:
         divisor = divisor or 1
@@ -3177,12 +3457,47 @@ def apply_page_mapping(
         if item.get("score", 0) >= 0.95
     }
     max_page = source_page_count or max((record.pdf_page for record in records), default=0)
+    first_toc_page = min(toc_pages) if toc_pages else None
+    last_assigned_page = 0
     for entry in entries:
-        if entry.id in direct_pages and (not manual_override or entry.printed_page is None):
-            entry.pdf_page = direct_pages[entry.id]
-        elif entry.printed_page is not None:
+        mapped: int | None = None
+        if entry.printed_page is not None:
             mapped = entry.printed_page // divisor + page_offset
-            entry.pdf_page = mapped if 1 <= mapped <= max_page else None
+            mapped = mapped if 1 <= mapped <= max_page else None
+
+        direct = direct_pages.get(entry.id)
+        direct_is_usable = direct is not None and (
+            not manual_override or entry.printed_page is None
+        )
+        if direct_is_usable and entry.printed_page is not None:
+            # An exact title can occur much earlier as a running header, cross-
+            # reference, or table-of-contents line.  Numbered entries therefore
+            # use title evidence only when it corroborates the dominant printed-
+            # page mapping.  Front matter before a trailing TOC is the deliberate
+            # exception because it commonly has an independent page sequence.
+            near_mapped_page = mapped is not None and abs(direct - mapped) <= 8
+            independent_pre_toc_page = (
+                entry.kind in {"frontmatter", "other"}
+                and first_toc_page is not None
+                and direct < first_toc_page
+            )
+            direct_is_usable = near_mapped_page or independent_pre_toc_page
+
+        candidate = direct if direct_is_usable else mapped
+        if candidate is not None and candidate < last_assigned_page:
+            # TOC order is authoritative.  Reject an earlier exact-title hit and
+            # fall back to the inferred mapping; an unnumbered false hit remains
+            # unmapped instead of creating a backwards chapter range.
+            candidate = (
+                mapped
+                if direct_is_usable
+                and mapped is not None
+                and mapped >= last_assigned_page
+                else None
+            )
+        entry.pdf_page = candidate
+        if candidate is not None:
+            last_assigned_page = candidate
 
     # A leading preface commonly has no printed page in the TOC.  When its
     # heading was too damaged to match, place it in the only available front-
@@ -3559,6 +3874,9 @@ def compile_chapters(
         toc_payload.get("printed_pages_per_pdf_page") or 1
     )
     page_offset = int(toc_payload.get("page_offset") or 0)
+    toc_pages = sorted(
+        int(page) for page in toc_payload.get("toc_pdf_pages") or []
+    )
     chapter_ranges: dict[
         str,
         tuple[int, int, int | None, bool, TocEntry | None],
@@ -3588,6 +3906,11 @@ def compile_chapters(
         next_level: int | None = None
         next_entry: TocEntry | None = None
         if granularity == "all":
+            if sequence < len(selected) and selected[sequence].pdf_page:
+                next_entry = selected[sequence]
+                next_start = int(next_entry.pdf_page)
+                next_level = next_entry.level
+        elif granularity == "chapter" and entry.kind in {"frontmatter", "other"}:
             if sequence < len(selected) and selected[sequence].pdf_page:
                 next_entry = selected[sequence]
                 next_start = int(next_entry.pdf_page)
@@ -3622,6 +3945,14 @@ def compile_chapters(
             end = max(start, next_start)
         else:
             end = max(start, next_start - 1)
+        if (
+            toc_pages
+            and entry.kind in {"frontmatter", "other"}
+            and start < toc_pages[0] <= end
+        ):
+            # A table of contents placed after prefatory material is a
+            # structural boundary, not part of the preceding chapter body.
+            end = toc_pages[0] - 1
         entry.end_pdf_page = end
         missing = [page for page in range(start, end + 1) if page not in record_map]
         if missing:
@@ -3803,7 +4134,14 @@ def compile_chapters(
                 publication_title=publication_title,
                 chapter_title=entry.display_title,
             )
-        (chapter_dir / filename).write_text(markdown, encoding="utf-8")
+        # Semantic audit digests bind the exact Markdown bytes.  Disable the
+        # Windows text-mode CRLF translation so the persisted bytes match the
+        # UTF-8 payload hashed below.
+        (chapter_dir / filename).write_text(
+            markdown,
+            encoding="utf-8",
+            newline="",
+        )
         manifest.append(
             {
                 **asdict(entry),
@@ -3875,6 +4213,10 @@ def write_knowledge_base(output_path: Path, rows: list[dict[str, Any]]) -> None:
     with output_path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    # Keep the verifier-owned JSONL schema stable while publishing the RAG
+    # discovery sidecar.  Embeddings remain optional until a provider is
+    # supplied through ``rag_knowledge_base.EmbeddingProvider``.
+    rag_knowledge_base.initialize_rag_manifest(output_path)
 
 
 def strip_publication_metadata(
@@ -3884,6 +4226,63 @@ def strip_publication_metadata(
     chapter_title: str | None = None,
 ) -> str:
     """Remove audit-only source/page markers from reader-facing documents."""
+
+    def is_page_comment(line: str) -> int | None:
+        match = re.fullmatch(
+            r"<!--\s*PDF_PAGE:\s*(\d{1,6})\s*-->",
+            line.strip(),
+            flags=re.I,
+        )
+        if match is None:
+            return None
+        page = int(match.group(1))
+        return page if page > 0 else None
+
+    def is_standalone_printed_page(line: str) -> int | None:
+        match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
+        if match is None:
+            return None
+        page = int(match.group(1))
+        return page if 0 < page < 1000 else None
+
+    def is_probable_standalone_footer(
+        current_index: int,
+        stripped: str,
+    ) -> bool:
+        if is_standalone_printed_page(stripped) is None:
+            return False
+        if current_index <= 0:
+            return False
+        if not source_lines[current_index - 1].strip():
+            return False
+        if current_index + 1 >= len(source_lines):
+            return False
+        prev_index = current_index - 1
+        while prev_index >= 0 and not source_lines[prev_index].strip():
+            prev_index -= 1
+        if prev_index < 0:
+            return False
+        next_index = current_index + 1
+        while next_index < len(source_lines) and not source_lines[next_index].strip():
+            next_index += 1
+        if next_index >= len(source_lines):
+            return False
+        previous = source_lines[prev_index].strip()
+        next_line = source_lines[next_index].strip()
+        if len(previous) < 6 or len(next_line) < 6:
+            return False
+        if re.fullmatch(r"\d{1,3}", previous):
+            return False
+        if re.fullmatch(r"\d{1,3}", next_line):
+            return False
+        if re.search(r"\b[0-9０-９]{3,4}\b", previous + next_line):
+            return False
+        if previous[-1:] in "。！？!?…—.”’\"'）)]】》〉」』":
+            return False
+        if next_line[0] in "—-–—":
+            return False
+        return True
+
     output: list[str] = []
     normalized_chapter_title = normalize_match_text(chapter_title or "")
     is_contents_chapter = normalized_chapter_title in {
@@ -3906,12 +4305,17 @@ def strip_publication_metadata(
         stripped = line.strip()
         if not normalized_titles or not stripped:
             return False
-        if stripped.startswith("#"):
+        heading_match = re.match(r"^(#+)\s*", stripped)
+        if heading_match is not None:
             # Keep the generated chapter H1 at the start, but still recognize
             # OCR that spuriously formats a later running header as Markdown.
+            # Real subsection headings (## …) may legitimately repeat chapter
+            # title text, so only H1 lines qualify as running headers.
             if not output:
                 return False
-            stripped = re.sub(r"^#{1,6}\s*", "", stripped)
+            if len(heading_match.group(1)) != 1:
+                return False
+            stripped = stripped[heading_match.end():]
         without_page = re.sub(r"^\s*\d{1,4}\s*", "", stripped)
         without_page = re.sub(r"\s*\d{1,4}\s*$", "", without_page)
         candidate = normalize_match_text(without_page)
@@ -3926,13 +4330,17 @@ def strip_publication_metadata(
                 return True
             # OCR often changes one or two title glyphs (for example 普遍→普通)
             # and appends the author after a divider.  Keep the threshold strict
-            # enough that ordinary body sentences cannot be mistaken for headers.
+            # enough that ordinary body sentences cannot be mistaken for headers:
+            # a mutated running header keeps the title's length, so lines that
+            # merely START with the title (dialogue attributions like
+            # ``包法利夫人回答道：``) fail the length-similarity guard.
             title_prefix = re.split(r"[|｜]", without_page, maxsplit=1)[0]
             if "〉" in title_prefix:
                 title_prefix = title_prefix.split("〉", maxsplit=1)[0] + "〉"
             comparable = normalize_match_text(title_prefix)
             if (
-                len(comparable) <= len(normalized_title) + 12
+                abs(len(comparable) - len(normalized_title)) <= 2
+                and len(comparable) <= len(normalized_title) + 12
                 and SequenceMatcher(None, normalized_title, comparable).ratio() >= 0.68
             ):
                 return True
@@ -4026,8 +4434,14 @@ def strip_publication_metadata(
     # previous page (for example ``凯`` + ``中``), leaving a corrupt fragment
     # even if the remaining title glyphs are removed later.
     source_lines = discard_vertical_running_titles(markdown_text.splitlines())
-    for line in source_lines:
+    for index, line in enumerate(source_lines):
         stripped = line.strip()
+        if re.fullmatch(
+            r"(?:\[|【|\(|（)?\s*(?:空白页|blank\s+page)\s*(?:\]|】|\)|）)?",
+            stripped,
+            flags=re.I,
+        ):
+            continue
         if stripped.startswith('<span epub:type="pagebreak"'):
             is_known_printed_marker = 'id="printed-page-' in stripped
             if not is_known_printed_marker:
@@ -4036,6 +4450,13 @@ def strip_publication_metadata(
             # The known printed-page number was replaced by this marker, so a
             # following standalone number can be real content and must remain.
             skipped_leading_page_number = is_known_printed_marker
+            continue
+        page_comment_number = is_page_comment(stripped)
+        if page_comment_number is not None:
+            # When explicit comment markers remain, keep footer cleaning behavior
+            # aligned with nearby pagebreak spans.
+            pending_page_boundary = True
+            skipped_leading_page_number = False
             continue
         if stripped.startswith("<!--") and stripped.endswith("-->"):
             continue
@@ -4051,6 +4472,18 @@ def strip_publication_metadata(
             continue
         if is_running_title(line):
             continue
+        if output and re.fullmatch(r"#\s*\d{1,4}", stripped):
+            # Vision OCR can prefix a printed page number with a single hash
+            # (for example ``#225``).  Several Markdown consumers still treat
+            # that compact form as an H1, which splits the EPUB/DOCX chapter
+            # stream.  A digits-only H1 inside the generated chapter H1 is a
+            # page artifact, not reader-facing structure.
+            continue
+        if output and re.fullmatch(r"#{1,6}", stripped):
+            # OCR occasionally emits a bare hash as decoration/noise.  In
+            # Markdown it becomes an empty H1 and shifts every following DOCX
+            # chapter boundary, so it has no reader-facing meaning.
+            continue
         if output and re.match(r"^#\s+", line):
             # The generated chapter title is the only reader-facing H1.
             # OCR/model-created headings inside its body remain navigable but
@@ -4064,14 +4497,14 @@ def strip_publication_metadata(
             line = re.sub(r"<(\s*/?\s*)h1\b", r"<\1h2", line, flags=re.I)
             stripped = line.strip()
         if pending_page_boundary:
+            pending_page_mark = is_standalone_printed_page(stripped)
             if not stripped:
                 continue
             # A standalone number immediately following the page marker is
             # the printed page header. Do not discard the same-looking line
             # elsewhere: it may be a real numbered item or data value.
-            numeric_header = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", stripped)
             if (
-                numeric_header
+                pending_page_mark is not None
                 and not skipped_leading_page_number
             ):
                 skipped_leading_page_number = True
@@ -4085,6 +4518,13 @@ def strip_publication_metadata(
                     output.append("")
                 output.append(line.rstrip())
             pending_page_boundary = False
+            continue
+        if (
+            is_probable_standalone_footer(index, stripped)
+            and (index >= 2 or output)
+            and output
+            and not output[-1].strip()
+        ):
             continue
         output.append(line.rstrip())
     discard_trailing_printed_page()
@@ -4144,15 +4584,96 @@ def strip_reviewed_publication_metadata(markdown_text: str) -> str:
             numbers.add(int(title.group(2)))
         return numbers
 
+    def _is_standalone_printed_number(line: str) -> int | None:
+        match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _is_pdf_page_comment(line: str) -> int | None:
+        match = re.fullmatch(
+            r"<!--\s*PDF_PAGE:\s*(\d{1,6})\s*-->",
+            line.strip(),
+            flags=re.I,
+        )
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _is_body_line(line: str) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return False
+        if stripped.startswith(("<!--", "<span")):
+            return False
+        if re.fullmatch(r"#{1,6}\s+.*", stripped):
+            return False
+        if re.fullmatch(r"(?:[-*+]|\d+[.)])\s+.+", stripped):
+            return False
+        if stripped.startswith(">") or stripped.startswith("|"):
+            return False
+        return True
+
+    def _looks_like_printed_footer(line: str, previous: str, next_line: str) -> bool:
+        if len(line) != 0 and len(line) <= 4 and _is_standalone_printed_number(line):
+            if previous[-1:] in "。！？!?…—.”’\"'）)]】》〉」』":
+                return False
+            if not (_is_body_line(previous) and _is_body_line(next_line)):
+                return False
+            if len(previous) < 6 or len(next_line) < 6:
+                return False
+            return True
+        return False
+
+    def _belongs_to_consecutive_printed_number_run(
+        current_index: int,
+        current_number: int,
+    ) -> bool:
+        """Recognize page-number runs without treating every small number as metadata."""
+
+        for step in (-1, 1):
+            cursor = current_index + step
+            while 0 <= cursor < len(lines):
+                candidate = lines[cursor].strip()
+                cursor += step
+                if not candidate:
+                    continue
+                if candidate.startswith(("<!--", "<span")):
+                    continue
+                adjacent_number = _is_standalone_printed_number(candidate)
+                if adjacent_number is None:
+                    break
+                if abs(adjacent_number - current_number) == 1:
+                    return True
+                break
+        return False
+
+    lines = markdown_text.splitlines()
     output: list[str] = []
     removed_marker = False
     pending_page_numbers: set[int] | None = None
-    for line in markdown_text.splitlines():
+    for index, line in enumerate(lines):
         stripped = line.strip()
+        if re.fullmatch(
+            r"(?:\[|【|\(|（)?\s*(?:空白页|blank\s+page)\s*(?:\]|】|\)|）)?",
+            stripped,
+            flags=re.I,
+        ):
+            # OCR engines may emit a literal placeholder for a deliberately
+            # blank source page.  It is source metadata, not reader content.
+            removed_marker = True
+            continue
         anchor_numbers = pagebreak_numbers(stripped)
         if anchor_numbers is not None:
             removed_marker = True
             pending_page_numbers = anchor_numbers
+            continue
+        pdf_comment = _is_pdf_page_comment(stripped)
+        if pdf_comment is not None:
+            removed_marker = True
+            if pending_page_numbers is None:
+                pending_page_numbers = set()
+            pending_page_numbers.add(pdf_comment)
             continue
         metadata = re.fullmatch(
             r"<!--\s*(?P<key>source[-_ ]pdf|pdf[-_ ]pages|pdf[-_ ]page)"
@@ -4189,11 +4710,43 @@ def strip_reviewed_publication_metadata(markdown_text: str) -> str:
                 pending_page_numbers = None
                 continue
             pending_page_numbers = None
+
+        number_value = _is_standalone_printed_number(stripped)
+        if number_value is not None:
+            previous_line = ""
+            next_body_line = ""
+            if removed_marker:
+                if _belongs_to_consecutive_printed_number_run(index, number_value):
+                    continue
+                for cursor in range(index - 1, -1, -1):
+                    candidate = lines[cursor].strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith(("<!--", "<span")):
+                        continue
+                    previous_line = candidate
+                    break
+                for cursor in range(index + 1, len(lines)):
+                    candidate = lines[cursor].strip()
+                    if not candidate:
+                        continue
+                    if candidate.startswith(("<!--", "<span")):
+                        continue
+                    next_body_line = candidate
+                    break
+                if previous_line and next_body_line and _looks_like_printed_footer(
+                    stripped,
+                    previous_line,
+                    next_body_line,
+                ):
+                    removed_marker = True
+                    continue
         output.append(line)
 
     if not removed_marker:
         return markdown_text
     cleaned = "\n".join(output)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     if markdown_text.endswith(("\n", "\r")):
         cleaned += "\n"
     return cleaned
@@ -4204,10 +4757,19 @@ def markdown_to_html(markdown_text: str) -> str:
         import markdown  # type: ignore[import-not-found]
     except ImportError as exc:
         raise RuntimeError("EPUB compilation requires Markdown>=3.6; install requirements.txt.") from exc
-    return markdown.markdown(
+    output = markdown.markdown(
         markdown_text,
         extensions=["extra", "sane_lists", "footnotes"],
         output_format="xhtml",
+    )
+    # python-markdown serializes some mixed content through ElementTree with
+    # an ASCII codec, emitting named entities ("&ldquo;") that ElementTree
+    # itself only accepts for the five XML-predefined ones.  Restore every
+    # HTML named entity to its literal character before downstream parsing.
+    return re.sub(
+        r"&(?!amp;|lt;|gt;|quot;|apos;|#\d+|#x[0-9A-Fa-f]+)([A-Za-z][A-Za-z0-9]+);",
+        lambda match: html.entities.html5.get(f"{match.group(1)};", match.group(0)),
+        output,
     )
 
 
@@ -4243,13 +4805,203 @@ def _markdown_blocks(markdown_text: str) -> list[str]:
     return blocks
 
 
+def _is_docx_structural_markdown_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if re.match(r"^\s*```", line):
+        return True
+    if re.match(r"^\s*#{1,6}\s+", stripped):
+        return True
+    if re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", stripped):
+        return True
+    if re.match(r"^\s*>", stripped):
+        return True
+    if re.match(r"^\s{0,3}[-*_]{3,}\s*$", stripped):
+        return True
+    if stripped.startswith("|") and stripped.count("|") >= 2:
+        return True
+    if re.fullmatch(r"<aside>.*</aside>", stripped, flags=re.I):
+        return True
+    return False
+
+
+_DOCX_CIRCLED_NOTE_ONLY = re.compile(r"^[①-⑳]$")
+_DOCX_CIRCLED_NOTE_START = re.compile(r"^[①-⑳](?=\S)")
+_DOCX_SOURCE_NOTE_CREDIT = re.compile(
+    r"(?:译者|译注|编者|编注|校者|校注)(?:注)?[。．.]?$"
+)
+
+
+def _docx_note_like_ascii_line(value: str) -> bool:
+    """Return whether an OCR line looks like compact bibliographic note text."""
+
+    compact = "".join(character for character in value if not character.isspace())
+    if not compact:
+        return False
+    ascii_ratio = sum(character.isascii() for character in compact) / len(compact)
+    return ascii_ratio >= 0.7 and bool(
+        re.search(
+            r"(?:\bIbid\b|\b(?:p|pp)\.?\s*\d|\b(?:Paris|London|NewYork)\b|"
+            r"^[A-Z][A-Za-z'’.-]+,)",
+            value,
+            flags=re.I,
+        )
+    )
+
+
+def _docx_source_note_indices(lines: Sequence[str]) -> set[int]:
+    """Locate source footnote blocks that OCR inserted between prose lines.
+
+    This is deliberately narrower than general footnote inference: a block is
+    selected only when it has an isolated circled label, a translator/editor
+    credit, or a bibliographic line immediately adjoining an isolated label.
+    Inline circled references therefore remain in the body.
+    """
+
+    values = [line.strip() for line in lines]
+    note_indices: set[int] = set()
+    for index, value in enumerate(values):
+        if not value:
+            continue
+        if _DOCX_CIRCLED_NOTE_ONLY.fullmatch(value):
+            candidate_indices = [index]
+            cursor = index + 1
+            while cursor < len(values) and values[cursor]:
+                candidate = values[cursor]
+                if _DOCX_CIRCLED_NOTE_ONLY.fullmatch(candidate):
+                    break
+                if (
+                    _DOCX_CIRCLED_NOTE_START.match(candidate)
+                    and not _docx_note_like_ascii_line(candidate[1:])
+                ):
+                    break
+                if _is_docx_structural_markdown_line(candidate):
+                    break
+                candidate_indices.append(cursor)
+                cursor += 1
+            # Long OCR regions often concatenate a real note and resumed body
+            # prose without a boundary.  Styling those regions as notes would
+            # be worse than leaving them untouched, so accept only compact
+            # page-footnote blocks whose extent is unambiguous.
+            if len(candidate_indices) > 12:
+                continue
+            note_indices.update(candidate_indices)
+            previous = index - 1
+            while previous >= 0 and not values[previous]:
+                previous -= 1
+            if previous >= 0 and _docx_note_like_ascii_line(values[previous]):
+                note_indices.add(previous)
+            continue
+        if not _DOCX_CIRCLED_NOTE_START.match(value):
+            continue
+        cursor = index
+        candidate_indices: list[int] = []
+        while cursor < len(values) and values[cursor]:
+            candidate = values[cursor]
+            if cursor > index and _DOCX_CIRCLED_NOTE_START.match(candidate):
+                break
+            if _is_docx_structural_markdown_line(candidate):
+                break
+            candidate_indices.append(cursor)
+            cursor += 1
+        combined = "".join(values[candidate] for candidate in candidate_indices)
+        if (
+            len(candidate_indices) <= 12
+            and _DOCX_SOURCE_NOTE_CREDIT.search(combined)
+        ):
+            note_indices.update(candidate_indices)
+    return note_indices
+
+
+def _mark_docx_source_notes(lines: Sequence[str]) -> list[str]:
+    """Wrap detected OCR note blocks in a semantic element for DOCX styling."""
+
+    note_indices = _docx_source_note_indices(lines)
+    if not note_indices:
+        return list(lines)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        if index not in note_indices:
+            output.append(lines[index])
+            index += 1
+            continue
+        note_lines: list[str] = []
+        while index < len(lines) and index in note_indices:
+            if lines[index].strip():
+                note_lines.append(lines[index].strip())
+            index += 1
+        if note_lines:
+            output.append(f"<aside>{html.escape(' '.join(note_lines))}</aside>")
+    return output
+
+
+def _normalize_wrapped_markdown_for_docx(markdown_text: str) -> str:
+    """Merge wrapped OCR prose lines for DOCX while preserving markdown structure."""
+
+    blocks: list[str] = []
+    current: list[str] = []
+    in_code_fence = False
+    source_lines = _mark_docx_source_notes(markdown_text.splitlines())
+    for line in source_lines:
+        stripped = line.strip()
+        if re.match(r"^\s*```", line):
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append(line)
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            blocks.append(line)
+            continue
+        if not stripped:
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append("")
+            continue
+        if line.endswith("  ") or line.endswith("\\"):
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append(line)
+            continue
+        if _is_docx_structural_markdown_line(line):
+            if current:
+                blocks.append(_join_wrapped_lines(current))
+                current = []
+            blocks.append(line)
+            continue
+        current.append(line)
+    if current:
+        blocks.append(_join_wrapped_lines(current))
+    normalized = "\n".join(block for block in blocks if block is not None)
+    if markdown_text.endswith(("\n", "\r")):
+        normalized += "\n"
+    return normalized
+
+
+
 def markdown_inline_to_plain_text(value: str) -> str:
     """Convert the small inline-Markdown/HTML subset used by page translations."""
     cleaned = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", value)
     cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.I)
     cleaned = re.sub(r"<[^>]+>", "", cleaned)
     cleaned = html.unescape(cleaned)
-    return re.sub(r"[`*_]{1,3}", "", cleaned).strip()
+    # Emphasis stripping must not eat underscores inside bare URLs
+    # (``.../apm_papers/...``), so stash the link targets first.
+    links: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        links.append(match.group(0))
+        return f"\x00{len(links) - 1}\x00"
+
+    cleaned = re.sub(r"(?:https?|ftp)://\S+", stash, cleaned)
+    cleaned = re.sub(r"[`*_]{1,3}", "", cleaned)
+    cleaned = re.sub(r"\x00(\d+)\x00", lambda m: links[int(m.group(1))], cleaned)
+    return cleaned.strip()
 
 
 def _html_local_name(element: ET.Element) -> str:
@@ -4282,6 +5034,26 @@ def _html_element_text(
 
     visit(element)
     return "".join(parts).strip()
+
+
+def _html_contains_image(element: ET.Element) -> bool:
+    return any(_html_local_name(node) == "img" for node in element.iter())
+
+
+def _resolve_local_publication_image(src: str, base_dir: Path | None) -> Path | None:
+    parsed = urlsplit(html.unescape(src))
+    if parsed.scheme or parsed.netloc or parsed.path.startswith("data:"):
+        return None
+    candidate = Path(unquote(parsed.path))
+    if not candidate.is_absolute():
+        if base_dir is None:
+            return None
+        candidate = base_dir / candidate
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_file() else None
 
 
 def _docx_style_name(
@@ -4341,6 +5113,40 @@ def _docx_fold_soft_breaks(value: str) -> str:
         )
         result += joiner + part
     return result
+_DOCX_MAX_IMAGE_WIDTH_CM = 14.5
+
+
+def _resolve_markdown_image_path(src: str, base_dir: Path | None) -> Path:
+    """Resolve an authored image reference against its chapter directory."""
+
+    if not src.strip():
+        raise ValueError("Markdown references an image without a source path.")
+    candidate = Path(src.strip())
+    if not candidate.is_absolute():
+        if base_dir is None:
+            raise FileNotFoundError(
+                f"Markdown references image {src!r} but no chapter directory "
+                "is available to resolve it."
+            )
+        candidate = base_dir / candidate
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"Markdown references image {src!r} but the file is missing: "
+            f"{candidate}"
+        )
+    return candidate
+
+
+def _docx_image_display_width(path: Path) -> Any:
+    """Return a display width that never upscales or overflows the column."""
+
+    from docx.shared import Cm
+    from PIL import Image
+
+    with Image.open(path) as image:
+        pixel_width = image.width
+    native_cm = pixel_width / 96.0 * 2.54
+    return Cm(min(max(native_cm, 1.0), _DOCX_MAX_IMAGE_WIDTH_CM))
 
 
 def _append_markdown_to_docx(
@@ -4348,11 +5154,42 @@ def _append_markdown_to_docx(
     markdown_text: str,
     *,
     body_style: str | None = None,
+    base_dir: Path | None = None,
 ) -> None:
     """Render reader-facing Markdown without flattening its structure."""
 
-    fragment = markdown_to_html(markdown_text)
+    from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
+    from docx.enum.text import WD_BREAK  # type: ignore[import-not-found]
+    from docx.shared import Pt  # type: ignore[import-not-found]
+
+    fragment = markdown_to_html(_normalize_wrapped_markdown_for_docx(markdown_text))
+    # Python-Markdown preserves authored raw HTML verbatim, so ``<br>`` may
+    # remain HTML-style even when XHTML output is requested.  ElementTree needs
+    # the void element to be self-closing.
+    fragment = re.sub(
+        r"<br(?P<attrs>[^>]*)>",
+        lambda match: f"<br{match.group('attrs').rstrip().rstrip('/')} />",
+        fragment,
+        flags=re.I,
+    )
     root = ET.fromstring(f"<document>{fragment}</document>")
+
+    def embed_image(
+        paragraph: Any,
+        element: ET.Element,
+        *,
+        centered: bool,
+    ) -> None:
+        """Embed an authored image run, resolving it against ``base_dir``."""
+
+        if centered:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.first_line_indent = Pt(0)
+        path = _resolve_markdown_image_path(element.get("src") or "", base_dir)
+        paragraph.add_run().add_picture(
+            str(path),
+            width=_docx_image_display_width(path),
+        )
 
     def append_inline(
         paragraph: Any,
@@ -4390,7 +5227,25 @@ def _append_markdown_to_docx(
             if tag in skip_tags:
                 pass
             elif tag == "br":
-                paragraph.add_run().add_break()
+                run = paragraph.add_run()
+                run.add_break(WD_BREAK.LINE)
+            elif tag == "img":
+                source = _resolve_local_publication_image(
+                    str(child.get("src") or ""),
+                    base_dir,
+                )
+                if source is not None:
+                    paragraph.add_run().add_picture(
+                        str(source),
+                        width=_docx_image_display_width(source),
+                    )
+                else:
+                    add_run(
+                        str(child.get("alt") or ""),
+                        run_bold=bold,
+                        run_italic=italic,
+                        run_underline=underline,
+                    )
             else:
                 append_inline(
                     paragraph,
@@ -4416,9 +5271,10 @@ def _append_markdown_to_docx(
         skip_tags: frozenset[str] = frozenset(),
         preserve_breaks: bool = False,
     ) -> Any | None:
-        if not _html_element_text(element, skip_tags=skip_tags):
+        if not _html_element_text(element, skip_tags=skip_tags) and not _html_contains_image(element):
             return None
-        paragraph = document.add_paragraph(style=style)
+        resolved_style = style or _docx_style_name(document, "Normal")
+        paragraph = document.add_paragraph(style=resolved_style)
         append_inline(
             paragraph,
             element,
@@ -4486,14 +5342,27 @@ def _append_markdown_to_docx(
         if re.fullmatch(r"h[1-6]", tag):
             level = min(3, int(tag[1]))
             heading = document.add_heading("", level=level)
+            if heading.style is None:
+                heading.style = _docx_style_name(
+                    document,
+                    f"Heading {level}",
+                )
             append_inline(heading, element)
             return
         if tag == "p":
             style = (
                 _docx_style_name(document, "Quote")
                 if quote
-                else body_style
+                else (body_style or _docx_style_name(document, "Normal"))
             )
+            image_children = [
+                child for child in element if _html_local_name(child) == "img"
+            ]
+            if image_children and not _html_element_text(element):
+                for child in image_children:
+                    figure = document.add_paragraph(style=style)
+                    embed_image(figure, child, centered=True)
+                return
             return add_paragraph(
                 element,
                 style=style,
@@ -4502,6 +5371,12 @@ def _append_markdown_to_docx(
         if tag == "blockquote":
             for child in element:
                 render(child, quote=True)
+            return
+        if tag == "aside":
+            add_paragraph(
+                element,
+                style=_docx_style_name(document, "Source Note", "Quote"),
+            )
             return
         if tag in {"ol", "ul"}:
             render_list(element)
@@ -4566,6 +5441,15 @@ def _docx_manifest_body_style(item: dict[str, Any]) -> str | None:
     return None
 
 
+
+
+def _sha256_file(path: Path) -> str:
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+
+
 def _set_docx_style_font(
     style: Any,
     *,
@@ -4575,6 +5459,7 @@ def _set_docx_style_font(
 ) -> None:
     """Set all Word font slots instead of depending on theme fallbacks."""
 
+    from docx.oxml import OxmlElement  # type: ignore[import-not-found]
     from docx.oxml.ns import qn  # type: ignore[import-not-found]
     from docx.shared import Pt  # type: ignore[import-not-found]
 
@@ -4586,6 +5471,11 @@ def _set_docx_style_font(
     fonts.set(qn("w:hAnsi"), latin)
     fonts.set(qn("w:eastAsia"), east_asia)
     fonts.set(qn("w:cs"), latin)
+    spacing = rpr.find(qn("w:spacing"))
+    if spacing is None:
+        spacing = OxmlElement("w:spacing")
+        rpr.append(spacing)
+    spacing.set(qn("w:val"), "0")
 
 
 def _configure_book_docx_styles(document: Any) -> str:
@@ -4598,7 +5488,7 @@ def _configure_book_docx_styles(document: Any) -> str:
     normal = document.styles["Normal"]
     _set_docx_style_font(
         normal,
-        east_asia="Songti SC",
+        east_asia="SimSun",
         latin="Times New Roman",
         size=11,
     )
@@ -4616,7 +5506,7 @@ def _configure_book_docx_styles(document: Any) -> str:
         title = document.styles.add_style(title_style_name, WD_STYLE_TYPE.PARAGRAPH)
     _set_docx_style_font(
         title,
-        east_asia="Hiragino Sans GB",
+        east_asia="Microsoft YaHei",
         latin="Arial",
         size=24,
     )
@@ -4635,7 +5525,7 @@ def _configure_book_docx_styles(document: Any) -> str:
         style = document.styles[name]
         _set_docx_style_font(
             style,
-            east_asia="Hiragino Sans GB",
+            east_asia="Microsoft YaHei",
             latin="Arial",
             size=size,
         )
@@ -4654,7 +5544,7 @@ def _configure_book_docx_styles(document: Any) -> str:
     quote = document.styles["Quote"]
     _set_docx_style_font(
         quote,
-        east_asia="Songti SC",
+        east_asia="SimSun",
         latin="Times New Roman",
         size=10.5,
     )
@@ -4662,6 +5552,7 @@ def _configure_book_docx_styles(document: Any) -> str:
     quote.paragraph_format.right_indent = Pt(22)
     quote.paragraph_format.first_line_indent = Pt(0)
     quote.paragraph_format.line_spacing = 1.35
+    quote.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     quote.paragraph_format.space_before = Pt(4)
     quote.paragraph_format.space_after = Pt(4)
 
@@ -4677,16 +5568,27 @@ def _configure_book_docx_styles(document: Any) -> str:
             style = document.styles.add_style(name, WD_STYLE_TYPE.PARAGRAPH)
         _set_docx_style_font(
             style,
-            east_asia="Songti SC",
+            east_asia="SimSun",
             latin="Times New Roman",
             size=size,
         )
         style.paragraph_format.left_indent = Pt(left)
         style.paragraph_format.first_line_indent = Pt(first)
         style.paragraph_format.line_spacing = spacing
+        style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         style.paragraph_format.space_before = Pt(0)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.widow_control = True
+
+    for list_style in ("List Bullet", "List Number", "List Bullet 2", "List Number 2", "List Bullet 3", "List Number 3"):
+        try:
+            style = document.styles[list_style]
+        except KeyError:
+            continue
+        style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        style.paragraph_format.space_before = Pt(0)
+        style.paragraph_format.space_after = Pt(0)
+        style.paragraph_format.line_spacing = 1.5
 
     try:
         footnote_text = document.styles["Footnote Text"]
@@ -4696,15 +5598,51 @@ def _configure_book_docx_styles(document: Any) -> str:
         )
     _set_docx_style_font(
         footnote_text,
-        east_asia="Songti SC",
+        east_asia="SimSun",
         latin="Times New Roman",
         size=9,
     )
     footnote_text.paragraph_format.first_line_indent = Pt(0)
     footnote_text.paragraph_format.line_spacing = 1.0
+    footnote_text.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
     footnote_text.paragraph_format.space_before = Pt(0)
     footnote_text.paragraph_format.space_after = Pt(0)
     footnote_text.paragraph_format.widow_control = False
+
+    try:
+        footnote_reference = document.styles["Footnote Reference"]
+    except KeyError:
+        footnote_reference = document.styles.add_style(
+            "Footnote Reference", WD_STYLE_TYPE.CHARACTER
+        )
+    _set_docx_style_font(
+        footnote_reference,
+        east_asia="SimSun",
+        latin="Times New Roman",
+        size=8,
+    )
+    footnote_reference.font.superscript = True
+
+    try:
+        source_note = document.styles["Source Note"]
+    except KeyError:
+        source_note = document.styles.add_style(
+            "Source Note", WD_STYLE_TYPE.PARAGRAPH
+        )
+    _set_docx_style_font(
+        source_note,
+        east_asia="SimSun",
+        latin="Times New Roman",
+        size=9,
+    )
+    source_note.paragraph_format.left_indent = Pt(22)
+    source_note.paragraph_format.right_indent = Pt(22)
+    source_note.paragraph_format.first_line_indent = Pt(0)
+    source_note.paragraph_format.line_spacing = 1.0
+    source_note.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    source_note.paragraph_format.space_before = Pt(3)
+    source_note.paragraph_format.space_after = Pt(3)
+    source_note.paragraph_format.widow_control = False
     return title_style_name
 
 
@@ -4854,6 +5792,35 @@ def _style_docx_tables(document: Any) -> None:
                         run.bold = row_index == 0
 
 
+def _is_duplicate_epub_frontmatter_scaffold(
+    item: dict[str, Any],
+    source_markdown: str,
+) -> bool:
+    """Skip source-only EPUB cover scaffolds duplicated by our title page."""
+
+    title = str(item.get("display_title") or "").strip()
+    filename = str(item.get("filename") or "").lower()
+    source_href = str(item.get("source_href") or "").lower()
+    if title.lower() == "titlepage" and re.fullmatch(
+        r"\s*#{1,6}\s+titlepage\s*",
+        source_markdown,
+        flags=re.I,
+    ):
+        return True
+    is_cover_identity = (
+        "cover" in filename
+        or re.search(r"(?:^|[/_-])cover(?:[/_.-]|$)", source_href) is not None
+        or "cover image" in title.lower()
+        or "封面" in title
+    )
+    is_image_only_heading = re.fullmatch(
+        r"\s*#{0,6}\s*!\[[^]]*\]\([^)]+\)\s*",
+        source_markdown,
+        flags=re.I,
+    ) is not None
+    return bool(is_cover_identity and is_image_only_heading)
+
+
 def build_docx(
     output_path: Path,
     chapter_dir: Path,
@@ -4900,6 +5867,8 @@ def build_docx(
     ordered_notes: list[tuple[str, str]] = []
     for sequence, item in enumerate(manifest, start=1):
         source = (chapter_dir / item["filename"]).read_text(encoding="utf-8")
+        if _is_duplicate_epub_frontmatter_scaffold(item, source):
+            continue
         publication = (
             strip_reviewed_publication_metadata(source)
             if item.get("reviewed_override")
@@ -4921,11 +5890,11 @@ def build_docx(
             document,
             rendered_markdown,
             body_style=_docx_manifest_body_style(item),
+            base_dir=chapter_dir,
         )
     _style_docx_tables(document)
     document.core_properties.title = book_title
-    if author:
-        document.core_properties.author = author
+    document.core_properties.author = author or ""
     document.core_properties.subject = "由章节 Markdown 合并生成的文字版 Word 文档"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -4944,7 +5913,7 @@ def build_docx(
                 ordered_notes,
             )
         else:
-            os.replace(temporary_path, output_path)
+            replace_with_retry(temporary_path, output_path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -5033,13 +6002,13 @@ def build_epub(
         xhtml_name = md_path.with_suffix(".xhtml").name
         source_markdown = md_path.read_text(encoding="utf-8")
         body = markdown_to_html(
-            strip_reviewed_publication_metadata(source_markdown)
-            if item.get("reviewed_override")
-            else strip_publication_metadata(
-                source_markdown,
-                publication_title=book_title,
-                chapter_title=str(item.get("display_title") or ""),
-            )
+                strip_reviewed_publication_metadata(source_markdown)
+                if item.get("reviewed_override")
+                else strip_publication_metadata(
+                    source_markdown,
+                    publication_title=book_title,
+                    chapter_title=str(item.get("display_title") or ""),
+                )
         )
         body = _package_epub_images(body, chapter_dir, images)
         title = html.escape(str(item["display_title"]))
@@ -5188,9 +6157,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["coding-plan-mcp", "glm-ocr", "tesseract"],
-        default=os.getenv("OCR_BACKEND", "coding-plan-mcp"),
-        help="Coding Plan vision MCP (recommended) or separately billed standard GLM-OCR API.",
+        choices=["auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"],
+        default=os.getenv("OCR_BACKEND", "auto"),
+        help=(
+            "auto prefers local PaddleOCR GPU, then native CPU, and falls back to "
+            "the OCR profile/cloud backend when it is unavailable; coding-plan-mcp "
+            "is the cloud vision MCP, glm-ocr the separately billed standard API, "
+            "tesseract the offline engine, paddleocr-local the explicit local GPU "
+            "deployment (no content filtering, no API quota)."
+        ),
     )
     parser.add_argument(
         "--ocr-reading-direction",
@@ -5204,6 +6179,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tesseract-language", default="jpn_vert+eng")
     parser.add_argument("--tesseract-psm", type=int, default=3)
+    parser.add_argument(
+        "--paddle-workers",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Local PaddleOCR Docker shards (1 or 2).",
+    )
+    parser.add_argument(
+        "--paddle-det-variant",
+        choices=("server", "mobile"),
+        default="server",
+        help="Local PaddleOCR detection model variant.",
+    )
+    parser.add_argument(
+        "--paddle-rec-variant",
+        choices=("server", "mobile"),
+        default="server",
+        help="Local PaddleOCR recognition model variant.",
+    )
+    from paddle_native import add_native_arguments
+    add_native_arguments(parser)
+    parser.add_argument("--paddle-det-mode", default="paddle_fp32")
+    parser.add_argument("--paddle-rec-mode", default="paddle_fp16")
+    parser.add_argument("--paddle-rec-batch", type=int, default=16)
+    parser.add_argument("--paddle-det-len", type=int, default=736)
     parser.add_argument("--ocr-api-key", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--ocr-api-key-env",
@@ -5367,6 +6367,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-epub", action="store_true")
     parser.add_argument("--no-docx", action="store_true")
     parser.add_argument("--no-kb", action="store_true")
+    rag_embedding = parser.add_mutually_exclusive_group()
+    rag_embedding.add_argument(
+        "--rag-embed",
+        dest="rag_embed",
+        action="store_true",
+        help=(
+            "Build the Zhipu embedding-3 vector index after publishing the "
+            "knowledge base; without either flag, enable automatically when "
+            "ZHIPU_API_KEY is configured."
+        ),
+    )
+    rag_embedding.add_argument(
+        "--no-rag-embed",
+        dest="rag_embed",
+        action="store_false",
+        help="Publish lexical RAG metadata without calling the embedding API.",
+    )
+    parser.set_defaults(rag_embed=None)
     parser.add_argument("--no-bookmarked-pdf", action="store_true")
     parser.add_argument(
         "--no-verify",
@@ -5434,6 +6452,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _option_was_supplied(argv: list[str], *option_names: str) -> bool:
+    prefixes = tuple(f"{name}=" for name in option_names)
+    return any(token in option_names or token.startswith(prefixes) for token in argv)
 
 
 def _credential_from_env(name: str | None) -> str:
@@ -5755,10 +6778,153 @@ def resolve_expected_ocr_model_prefix(
         return args.required_ocr_model_prefix
     if args.ocr_cache_model_prefix:
         return str(args.ocr_cache_model_prefix)
-    if ocr_profile is not None and ocr_profile.adapter == "coding-plan-mcp":
+    backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
+    if backend == "coding-plan-mcp":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
-        return f"coding-plan/{ocr_profile.model}-vision-mcp/{direction}-v2"
+        model = (
+            ocr_profile.model
+            if ocr_profile is not None
+            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
+        )
+        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
+    if backend in {"paddleocr-local", "paddleocr-native"}:
+        return backend + "/"
     return None
+
+
+_PADDLE_OCR_IMAGE = "local/paddleocr:3.7.0-gpu"
+_PADDLE_MODELS_DIR = (
+    Path(__file__).resolve().parent / "deploy" / "paddleocr" / "models"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def paddle_local_available() -> bool:
+    """Probe whether the local PaddleOCR Docker deployment can serve OCR.
+
+    The check is deliberately cheap (engine ping + image + weights); it does
+    not launch a GPU container.  Cached per process so every stage in one run
+    sees the same answer.
+    """
+
+    if shutil.which("docker") is None:
+        return False
+    try:
+        engine = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if engine.returncode:
+            return False
+        images = subprocess.run(
+            ["docker", "images", "-q", _PADDLE_OCR_IMAGE],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if images.returncode or not images.stdout.strip():
+            return False
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return all(
+        (_PADDLE_MODELS_DIR / name).is_dir()
+        for name in ("PP-OCRv5_server_det", "PP-OCRv5_server_rec")
+    )
+
+
+def paddle_native_available(args, profile=None) -> bool:
+    from paddle_native import options_from_args, readiness
+    return readiness(options_from_args(args, profile))[0]
+
+
+def resolve_ocr_backend_name(
+    args: argparse.Namespace,
+    ocr_profile: ModelProfile | None = None,
+) -> tuple[str, str]:
+    """Resolve the effective OCR backend, preferring the local GPU deployment.
+
+    ``--ocr-backend auto`` (the default) selects the local PaddleOCR Docker
+    deployment whenever it is available and keeps the cloud/vision backend as
+    the fallback.  An explicit ``--ocr-backend`` always wins.
+    """
+
+    requested = str(getattr(args, "ocr_backend", "") or "auto").strip()
+    if requested not in {"auto", ""}:
+        return requested, "explicit --ocr-backend"
+    if ocr_profile is not None and ocr_profile.adapter in {"paddleocr-native", "paddleocr-local"}:
+        return ocr_profile.adapter, "selected local OCR profile"
+    if paddle_local_available():
+        return "paddleocr-local", "auto: local PaddleOCR GPU deployment detected"
+    if paddle_native_available(args, ocr_profile):
+        return "paddleocr-native", "auto: native PaddleOCR CPU models detected"
+    fallback = (
+        ocr_profile.adapter
+        if ocr_profile is not None and ocr_profile.adapter
+        else "coding-plan-mcp"
+    )
+    return fallback, (
+        "auto: local PaddleOCR GPU deployment unavailable; using "
+        f"{fallback}"
+    )
+
+
+def paddle_local_model_id(
+    *,
+    det_variant: str,
+    rec_variant: str,
+    det_mode: str,
+    rec_mode: str,
+    rec_batch: int,
+    det_len: int,
+    dpi: int,
+    max_image_side: int,
+) -> str:
+    """Deterministic checkpoint identity for the local PaddleOCR backend."""
+
+    return (
+        "paddleocr-local/"
+        f"PP-OCRv5-{det_variant}-det-{det_mode}-"
+        f"{rec_variant}-rec-{rec_mode}-"
+        f"b{rec_batch}-det{det_len}-"
+        f"dpi{dpi}-max{max_image_side}-v1"
+    )
+
+
+def paddle_local_pending_pages(
+    records: Sequence[Any],
+    *,
+    requested: Iterable[int],
+    model_id: str,
+    force: bool = False,
+) -> list[int]:
+    """Pages the local PaddleOCR backend still has to produce.
+
+    A page is cached when its checkpoint carries the exact backend model id;
+    like every other backend, ``force`` bypasses the cache for the range.
+    """
+
+    by_page = {record.pdf_page: record for record in records}
+    return sorted(
+        page
+        for page in requested
+        if force or by_page.get(page) is None
+        or by_page[page].ocr_model != model_id
+    )
+
+
+def contiguous_page_segments(pages: Sequence[int]) -> list[list[int]]:
+    """Split a page set into consecutive runs for batched local OCR calls."""
+
+    segments: list[list[int]] = []
+    for page in sorted(set(pages)):
+        if segments and page == segments[-1][-1] + 1:
+            segments[-1].append(page)
+        else:
+            segments.append([page])
+    return segments
 
 
 def resolve_expected_ocr_model_exact(
@@ -5775,7 +6941,7 @@ def resolve_expected_ocr_model_exact(
         return str(args.ocr_cache_model)
     if args.ocr_cache_model_prefix:
         return None
-    backend = ocr_profile.adapter if ocr_profile is not None else args.ocr_backend
+    backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
     if backend == "coding-plan-mcp":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
         model = (
@@ -5788,6 +6954,20 @@ def resolve_expected_ocr_model_exact(
         return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
+    if backend == "paddleocr-native":
+        from paddle_native import identity_from_args
+        return identity_from_args(args, ocr_profile)
+    if backend == "paddleocr-local":
+        return paddle_local_model_id(
+            det_variant=args.paddle_det_variant,
+            rec_variant=args.paddle_rec_variant,
+            det_mode=args.paddle_det_mode,
+            rec_mode=args.paddle_rec_mode,
+            rec_batch=args.paddle_rec_batch,
+            det_len=args.paddle_det_len,
+            dpi=args.dpi,
+            max_image_side=args.max_image_side,
+        )
     return None
 
 
@@ -6002,13 +7182,17 @@ def _main_unlocked(
     if load_dotenv:
         load_env_file(Path(__file__).with_name(".env"))
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(raw_argv)
+    explicit_ocr_backend = _option_was_supplied(raw_argv, "--ocr-backend")
     if args.ocr_cache_model and args.ocr_cache_model_prefix:
         parser.error(
             "--ocr-cache-model and --ocr-cache-model-prefix are mutually exclusive."
         )
     if args.chapter_id and args.phase != "verify":
         parser.error("--chapter-id is only valid with --phase verify.")
+    if args.no_kb and args.rag_embed is True:
+        parser.error("--rag-embed cannot be combined with --no-kb.")
     output_dir = Path(args.output_dir).expanduser().resolve()
     if args.phase == "status" and not output_dir.exists():
         parser.error(f"Output directory does not exist: {output_dir}")
@@ -6055,7 +7239,21 @@ def _main_unlocked(
         )
     except ValueError as exc:
         parser.error(str(exc))
-    args.ocr_reading_direction = resolve_ocr_reading_direction(args, ocr_profile)
+    effective_ocr_profile = ocr_profile
+    if (explicit_ocr_backend and args.ocr_backend != "auto"
+            and (ocr_profile is None or ocr_profile.adapter != args.ocr_backend)):
+        effective_ocr_profile = None
+    if (explicit_ocr_backend and ocr_profile is not None and args.ocr_backend != "auto"
+            and ocr_profile.adapter != args.ocr_backend):
+        print(
+            f"[warning] --ocr-backend={args.ocr_backend} overrides OCR profile "
+            f"{ocr_profile.name!r} adapter={ocr_profile.adapter!r}.",
+            file=sys.stderr,
+        )
+    args.ocr_reading_direction = resolve_ocr_reading_direction(
+        args,
+        effective_ocr_profile,
+    )
     if (
         toc_profile is not None
         and toc_profile.adapter not in {"openai-chat", "glm-chat"}
@@ -6123,8 +7321,14 @@ def _main_unlocked(
     )
 
     if args.phase == "status":
-        expected_ocr_prefix = resolve_expected_ocr_model_prefix(args, ocr_profile)
-        expected_ocr_exact = resolve_expected_ocr_model_exact(args, ocr_profile)
+        expected_ocr_prefix = resolve_expected_ocr_model_prefix(
+            args,
+            effective_ocr_profile,
+        )
+        expected_ocr_exact = resolve_expected_ocr_model_exact(
+            args,
+            effective_ocr_profile,
+        )
         print(
             json.dumps(
                 output_status(
@@ -6268,7 +7472,7 @@ def _main_unlocked(
     ):
         parser.error("API timeouts must be positive.")
     toc_key = resolve_api_key(args, toc_profile)
-    ocr_key = resolve_api_key(args, ocr_profile)
+    ocr_key = resolve_api_key(args, effective_ocr_profile)
     toc_text_model = (
         toc_profile.model if toc_profile is not None else args.text_model
     )
@@ -6295,17 +7499,19 @@ def _main_unlocked(
                 if missing:
                     raise ValueError(f"--skip-ocr was used but cached OCR pages are missing: {missing[:20]}")
             else:
-                ocr_backend_name = (
-                    ocr_profile.adapter if ocr_profile is not None else args.ocr_backend
+                ocr_backend_name, backend_reason = resolve_ocr_backend_name(
+                    args, effective_ocr_profile
                 )
+                if str(getattr(args, "ocr_backend", "") or "auto") in {"auto", ""}:
+                    print(f"[ocr-backend] {backend_reason}", flush=True)
                 if ocr_backend_name == "coding-plan-mcp":
                     if not ocr_key:
                         raise ValueError("Coding Plan vision OCR requires GLM_CODING_API_KEY or Z_AI_API_KEY.")
-                    if ocr_profile is not None and ocr_profile.command:
+                    if effective_ocr_profile is not None and effective_ocr_profile.command:
                         ocr_command = (
-                            ocr_profile.command[0]
-                            if len(ocr_profile.command) == 1
-                            else shlex.join(ocr_profile.command)
+                            effective_ocr_profile.command[0]
+                            if len(effective_ocr_profile.command) == 1
+                            else shlex.join(effective_ocr_profile.command)
                         )
                     else:
                         ocr_command = args.ocr_command
@@ -6314,18 +7520,18 @@ def _main_unlocked(
                         command=ocr_command,
                         reading_direction=args.ocr_reading_direction,
                         vision_model=(
-                            ocr_profile.model
-                            if ocr_profile is not None
+                            effective_ocr_profile.model
+                            if effective_ocr_profile is not None
                             else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
                         ),
                         request_timeout=(
-                            ocr_profile.timeout
-                            if ocr_profile is not None
+                            effective_ocr_profile.timeout
+                            if effective_ocr_profile is not None
                             else int(os.getenv("CODING_PLAN_VISION_TIMEOUT", "120"))
                         ),
                     )
                 elif ocr_backend_name == "glm-ocr":
-                    standard_ocr_key = resolve_ocr_api_key(args, ocr_profile)
+                    standard_ocr_key = resolve_ocr_api_key(args, effective_ocr_profile)
                     if not standard_ocr_key:
                         raise ValueError(
                             "Standard GLM-OCR is not covered by Coding Plan. Set GLM_OCR_API_KEY separately, "
@@ -6334,47 +7540,145 @@ def _main_unlocked(
                     ocr_backend = GlmClient(
                         api_key=standard_ocr_key,
                         api_base=(
-                            ocr_profile.base_url
-                            if ocr_profile is not None and ocr_profile.base_url
+                            effective_ocr_profile.base_url
+                            if effective_ocr_profile is not None and effective_ocr_profile.base_url
                             else args.ocr_api_base
                         ),
                         ocr_model=(
-                            ocr_profile.model
-                            if ocr_profile is not None
+                            effective_ocr_profile.model
+                            if effective_ocr_profile is not None
                             else args.ocr_model
                         ),
                         text_model=toc_text_model,
                         timeout=(
-                            ocr_profile.timeout
-                            if ocr_profile is not None
+                            effective_ocr_profile.timeout
+                            if effective_ocr_profile is not None
                             else args.api_timeout
                         ),
+                        reading_direction=args.ocr_reading_direction,
                     )
                 elif ocr_backend_name == "tesseract":
                     ocr_backend = TesseractOCR(
                         language=args.tesseract_language,
                         psm=args.tesseract_psm,
                     )
+                elif ocr_backend_name == "paddleocr-native":
+                    from paddle_native import PaddleNativeOCR, options_from_args, identity_from_args
+                    ocr_backend = PaddleNativeOCR(
+                        options_from_args(args, effective_ocr_profile),
+                        model_id=identity_from_args(args, effective_ocr_profile),
+                    )
+                    # Bound rendering as well as inference; cloud concurrency
+                    # and delays must not inflate a local CPU job.
+                    ocr_workers = 1
+                    args.ocr_delay = 0.0
+                    if not args.ocr_cache_model and not args.ocr_cache_model_prefix:
+                        args.ocr_cache_model = ocr_backend.ocr_model
+                elif ocr_backend_name == "paddleocr-local":
+                    # The local GPU deployment OCRs whole image directories in
+                    # one docker run per consecutive page segment, so it does
+                    # not go through the per-page ocr_pdf loop.  Checkpoint
+                    # caching still uses the same ocr_model identity contract.
+                    model_id = paddle_local_model_id(
+                        det_variant=args.paddle_det_variant,
+                        rec_variant=args.paddle_rec_variant,
+                        det_mode=args.paddle_det_mode,
+                        rec_mode=args.paddle_rec_mode,
+                        rec_batch=args.paddle_rec_batch,
+                        det_len=args.paddle_det_len,
+                        dpi=args.dpi,
+                        max_image_side=args.max_image_side,
+                    )
+                    requested = set(range(args.start_page, end_page + 1))
+                    pending = paddle_local_pending_pages(
+                        records,
+                        requested=requested,
+                        model_id=model_id,
+                        force=args.force,
+                    )
+                    if pending:
+                        import_tool = (
+                            Path(__file__).resolve().parent
+                            / "tools"
+                            / "local_paddleocr_import.py"
+                        )
+                        if not import_tool.is_file():
+                            raise ValueError(
+                                "paddleocr-local backend requires "
+                                "tools/local_paddleocr_import.py"
+                            )
+                        for segment in contiguous_page_segments(pending):
+                            print(
+                                f"[paddleocr-local] pages={segment[0]}-{segment[-1]} "
+                                f"model={model_id}",
+                                flush=True,
+                            )
+                            command = [
+                                sys.executable,
+                                str(import_tool),
+                                str(pdf_path),
+                                "--output-dir",
+                                str(output_dir),
+                                "--start-page",
+                                str(segment[0]),
+                                "--end-page",
+                                str(segment[-1]),
+                                "--workers",
+                                str(args.paddle_workers),
+                                "--det-variant",
+                                args.paddle_det_variant,
+                                "--rec-variant",
+                                args.paddle_rec_variant,
+                                "--det-mode",
+                                args.paddle_det_mode,
+                                "--rec-mode",
+                                args.paddle_rec_mode,
+                                "--rec-batch",
+                                str(args.paddle_rec_batch),
+                                "--det-len",
+                                str(args.paddle_det_len),
+                                "--dpi",
+                                str(args.dpi),
+                                "--max-side",
+                                str(args.max_image_side),
+                                "--jpeg-quality",
+                                str(args.jpeg_quality),
+                            ]
+                            completed = subprocess.run(
+                                command,
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                            )
+                            if completed.returncode:
+                                detail = (completed.stderr or completed.stdout).strip()
+                                raise RuntimeError(
+                                    "paddleocr-local failed for pages "
+                                    f"{segment[0]}-{segment[-1]}: {detail[-1200:]}"
+                                )
+                    records = load_page_records(output_dir)
                 else:
                     raise ValueError(
                         f"Unsupported OCR profile adapter: {ocr_backend_name}"
                     )
-                records = ocr_pdf(
-                    pdf_path,
-                    output_dir,
-                    ocr_backend,
-                    start_page=args.start_page,
-                    end_page=end_page,
-                    concurrency=ocr_workers,
-                    dpi=args.dpi,
-                    max_image_side=args.max_image_side,
-                    jpeg_quality=args.jpeg_quality,
-                    keep_page_images=args.keep_page_images,
-                    force=args.force,
-                    cache_model_prefix=args.ocr_cache_model_prefix,
-                    cache_model_exact=args.ocr_cache_model,
-                    request_delay=args.ocr_delay,
-                )
+                if ocr_backend_name != "paddleocr-local":
+                    records = ocr_pdf(
+                        pdf_path,
+                        output_dir,
+                        ocr_backend,
+                        start_page=args.start_page,
+                        end_page=end_page,
+                        concurrency=ocr_workers,
+                        dpi=args.dpi,
+                        max_image_side=args.max_image_side,
+                        jpeg_quality=args.jpeg_quality,
+                        keep_page_images=args.keep_page_images,
+                        force=args.force,
+                        cache_model_prefix=args.ocr_cache_model_prefix,
+                        cache_model_exact=args.ocr_cache_model,
+                        request_delay=args.ocr_delay,
+                    )
             # Release the model subprocess as soon as its stage finishes so
             # translation/compilation and the publication gate never run
             # while an idle OCR MCP service is still alive.
@@ -6523,7 +7827,7 @@ def _main_unlocked(
             if not required_ocr_model_prefix and args.require_complete_ocr:
                 required_ocr_model_prefix = resolve_expected_ocr_model_prefix(
                     args,
-                    ocr_profile,
+                    effective_ocr_profile,
                 )
             compile_result = run_chapter_compile(
                 ChapterCompileRequest(
@@ -6549,10 +7853,34 @@ def _main_unlocked(
             knowledge_rows = compile_result.knowledge_rows
             toc_payload = compile_result.toc_payload
             if not args.no_kb:
-                write_knowledge_base(
-                    output_dir / "knowledge_base.jsonl",
-                    knowledge_rows,
-                )
+                knowledge_base_path = output_dir / "knowledge_base.jsonl"
+                write_knowledge_base(knowledge_base_path, knowledge_rows)
+                # The embedding index is an additive retrieval convenience; a
+                # provider outage or quota limit must not fail the publication
+                # itself, whose contract only covers the lexical KB.
+                try:
+                    rag_metadata = (
+                        rag_knowledge_base.maybe_build_zhipu_embedding_index(
+                            knowledge_base_path,
+                            requested=args.rag_embed,
+                        )
+                    )
+                except rag_knowledge_base.RagError as exc:
+                    print(
+                        f"[rag] embedding index deferred: {exc} "
+                        "(knowledge base stays lexical-only; rerun "
+                        "translation-agent-kb register later)",
+                        flush=True,
+                    )
+                    rag_metadata = None
+                if rag_metadata is not None:
+                    print(
+                        "[rag] embedding index ready "
+                        f"model={rag_metadata.model} "
+                        f"dimensions={rag_metadata.dimensions} "
+                        f"chunks={rag_metadata.chunk_count}",
+                        flush=True,
+                    )
             if not args.no_epub:
                 build_epub(
                     output_dir / f"{slugify(book_title)}.epub",

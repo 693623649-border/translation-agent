@@ -1,0 +1,41 @@
+{
+  "_description": "PaddleOCR 官方推理模型权重清单。download_models.py 按此清单下载并解压到 models/ 目录。新增模型只需追加条目：name 用于目录名，url 为官方推理模型 tar 包，variant 用于 --only 过滤（server=高精度，mobile=轻量，common=通用组件）。",
+  "base_url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0",
+  "models": [
+    {
+      "name": "PP-OCRv5_server_det",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_server_det_infer.tar",
+      "variant": "server",
+      "role": "det",
+      "note": "PP-OCRv5 服务端检测模型，精度优先"
+    },
+    {
+      "name": "PP-OCRv5_server_rec",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_server_rec_infer.tar",
+      "variant": "server",
+      "role": "rec",
+      "note": "PP-OCRv5 服务端识别模型，单模型支持简体/繁体/英文/日文/拼音"
+    },
+    {
+      "name": "PP-OCRv5_mobile_det",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_mobile_det_infer.tar",
+      "variant": "mobile",
+      "role": "det",
+      "note": "PP-OCRv5 轻量检测模型，速度优先"
+    },
+    {
+      "name": "PP-OCRv5_mobile_rec",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_mobile_rec_infer.tar",
+      "variant": "mobile",
+      "role": "rec",
+      "note": "PP-OCRv5 轻量识别模型"
+    },
+    {
+      "name": "PP-LCNet_x1_0_doc_ori",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-LCNet_x1_0_doc_ori_infer.tar",
+      "variant": "common",
+      "role": "doc_ori",
+      "note": "文档方向分类模型，配合 use_doc_orientation_classify 使用"
+    }
+  ]
+}

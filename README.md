@@ -5,6 +5,11 @@ EPUB 通过显式 Source Adapter 进入同一语义、清洗与发布契约；DA
 断点缓存和产物身份；已接入对应 verification profile 的文件必须通过发布门后才
 可以正式交付。
 
+## 本机 PaddleOCR（Mac CPU）
+
+新增原生 `paddleocr-native` 后端，支持本机识别、模型复用、页级缓存和 Web“仅 OCR”任务。
+安装、使用和资源限制见 [本机 CPU PaddleOCR](docs/paddleocr-native.md)。
+
 ## 五分钟开始
 
 本机知识库的维护分支、各 worktree 的用途和固定数据路径，见
@@ -130,6 +135,23 @@ first-class DAG 和无模型的原生发布门；`publication.epub_report` 是�
 python -m unittest discover tests
 ```
 
+### 项目级 Agent 工作流
+
+仓库在 `skills/` 中提供可自动发现的 Codex skill。`pdf-translation-pipeline`
+负责从 PDF/EPUB 语义输入到发布产物的主流程；`docx-publication-finisher`
+负责已经生成的 Word 成品出现来源页码、OCR 硬换行、异常字距、正文对齐、
+脚注或版面问题时的源级修复、显式批量重建、结构审计、隔离渲染、视觉抽检
+与最终交付清单。后者不直接手改派生 DOCX，也不以少量截图代替整批结构门。
+
+框架或 skill 发生变化后，除相关功能测试外还应运行：
+
+```bash
+python -m unittest tests.test_project_skills
+python -m unittest discover -s tests -q
+python -m compileall -q .
+git diff --check
+```
+
 ## 仓库结构
 
 ```text
@@ -175,6 +197,7 @@ translation-agent/
 ├── patch_translations.py         # 新格式译文人工修补工具
 ├── extract_textbook_layer.py     # 新格式文本层提取工具
 ├── tools/note_reflow.py          # 章节注释重组工具（见下文）
+├── skills/                       # Codex 项目级工作流与发布验收指令
 ├── archive/
 │   ├── karatani/                 # 硬编码单本书的一次性脚本
 │   └── legacy/monitor.py         # 仅适用旧 Windows 流程
@@ -709,6 +732,39 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 
 Tesseract OCR 本身不需要 API Key，但自动目录解析仍需要 GLM/Coding Plan Key，把非中文 OCR 翻译为中文则需要独立的 DeepSeek Key。复杂竖排、注音或多栏页面建议抽样复核；可以只对失败页结合 `--start-page`、`--end-page` 和 `--force` 重跑。
 
+### 本地 PaddleOCR（GPU Docker 后端，auto 默认优先）
+
+本机部署的 PaddleOCR（`deploy/paddleocr/`，RTX 5090 GPU）已接为流水线
+一等后端，并设为 `--ocr-backend auto` 的默认优先选择：**本地部署可用时
+一律走本地 GPU 推理**（无内容过滤、不耗 API 配额），不可用时自动回退
+到 OCR profile（云端 coding-plan/glm_vision）。显式 `--ocr-backend
+coding-plan-mcp` 等仍可强制远端；适合整本本地 OCR、续跑失败页，以及云端
+视觉模型内容过滤拒绝的页面：
+
+```bash
+# 默认即本地优先（auto）：可用时走本地 GPU，否则自动回退云端，无需任何参数
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr
+
+# 强制本地（检查点指纹为 paddleocr-local/PP-OCRv5-…，与云端检查点互不混用）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend paddleocr-local
+
+# 强制云端（备用）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend coding-plan-mcp
+
+# 只补失败页（自动按连续页段批量调用 Docker，已匹配指纹的页直接命中缓存）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --start-page 198 --end-page 198 --ocr-backend paddleocr-local
+
+# 或经 Profile 选用（pipeline.toml 已内置 profiles.paddleocr_local）
+python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --config pipeline.toml --ocr-profile paddleocr_local
+```
+
+执行体是 `tools/local_paddleocr_import.py`（渲染 → `docker compose --profile
+gpu` 分片识别 → 导入 PageRecord），参数用 `--paddle-det-variant/--paddle-rec-
+variant/--paddle-det-mode/--paddle-rec-mode/--paddle-rec-batch/--paddle-det-len/
+--paddle-workers` 调整；先决条件：Docker Desktop 已启动、`deploy/paddleocr/
+models/` 权重已下载（见 `deploy/paddleocr/README.md` 实测配置）。空白页沿用
+`[空白页]` 显式标记约定，跨页断句、目录与出版流程与其他后端完全一致。
+
 ### ZIP 图片输入先转为正向 PDF
 
 `book_pipeline.py` 的输入是 PDF，不直接读取 ZIP。图片 ZIP 必须先解压、按自然页序排序，忽略 `__MACOSX`、`.DS_Store` 等元数据文件，对每张图应用 EXIF 方向并确认正文实际朝上，再按“一张图片对应一页”合成 PDF。不要仅凭文件宽高猜方向；日文竖排书页也应保持整页正向，文字栏通常从右向左排列。建议抽查首、中、末页，确认没有 90°/180° 倒置后再运行 OCR：
@@ -902,6 +958,146 @@ EPUB 导航、Word 标题和 PDF 书签均从这些结构化标题生成，而�
 python book_pipeline.py -o "outputs/my_book" --phase docx --title "书名"
 ```
 
+### RAG 知识库与 embedding 接口
+
+知识库发布器保留经过发布验收的 `knowledge_base.jsonl` 作为 canonical 文档语料，
+并自动生成 `knowledge_base.rag.json`。在尚未配置 embedding API 时，RAG 运行时
+使用内置 Okapi BM25 检索；接入 API 后，向量单独写入
+`knowledge_base.vectors.jsonl`，不会把向量字段混入正文 JSONL 或破坏稳定 ID、
+全文覆盖与发布验收契约。
+
+本分支已内置智谱 OpenAI 兼容 provider，默认使用
+`https://open.bigmodel.cn/api/paas/v4/`、`embedding-3` 和 2048 维向量。
+密钥只从环境变量读取，不写入源码或 RAG 产物：
+
+```powershell
+$env:ZHIPU_API_KEY = "在智谱控制台生成的密钥"
+```
+
+构建向量索引并检索带 chunk 引用、可直接注入生成提示词的上下文：
+
+```python
+from rag_knowledge_base import ZhipuEmbeddingProvider
+from translation_agent_api import (
+    build_knowledge_base_embedding_index,
+    retrieve_knowledge_base_context,
+)
+
+provider = ZhipuEmbeddingProvider()  # embedding-3 / 2048 dimensions
+build_knowledge_base_embedding_index("outputs/my_book", provider)
+context = retrieve_knowledge_base_context(
+    "outputs/my_book",
+    "作者如何界定文化领导权？",
+    top_k=5,
+    embedding_provider=provider,
+)
+print(context.text)
+```
+
+若暂时不传 `embedding_provider`，`retrieve_knowledge_base_context` 会自动使用
+BM25 回退，因此当前阶段无需任何联网依赖或额外向量数据库。
+智谱单次请求最多提交 64 条输入，索引器默认按该上限分批；仅安装 core
+依赖时需使用 `pip install '.[legacy]'` 安装已有的 OpenAI 兼容客户端。
+
+仓库内也提供统一 CLI，方便把成品目录注册成可检索 RAG 产物：
+
+```bash
+translation-agent-kb register "outputs/my_book"
+translation-agent-kb retrieve "outputs/my_book" "作者如何界定文化领导权？" --semantic
+translation-agent-kb status "outputs/my_book"
+```
+
+`register` 默认使用智谱 `embedding-3` / 2048 维并读取 `ZHIPU_API_KEY`；
+如只想生成清单和 BM25 回退，可加 `--lexical-only`。`retrieve --semantic`
+只有在向量索引已就绪时才调用 embedding provider，否则自动回退 lexical 检索。
+临时 DOCX 成品可用 Heading 1 章节结构派生知识库：
+
+```bash
+translation-agent-kb derive-docx "outputs/Book.docx"
+```
+
+该命令会自动创建同名产物目录并写入 `knowledge_base.jsonl` 与 RAG 清单；如果
+DOCX 没有可识别的 Heading 1 章节契约，会直接失败而不是生成不可审计的语料。
+
+#### 装置内容标注与降权
+
+建库和 `register` 自动生成独立的 `knowledge_base.apparatus.json`，记录各块的
+`is_apparatus`、`apparatus_kind`、识别依据和默认权重，并绑定正文哈希与来源标题。
+原五字段 JSONL、向量内容及其哈希契约不变。旧库补标注无需调用 embedding API：
+
+```bash
+translation-agent-kb annotate-apparatus outputs --recursive
+translation-agent-kb retrieve "outputs/某书" "欲望机器如何运作？" --mode hybrid
+# 查目录、索引或出版信息时可关闭降权；0 则仅排除已经标记的块
+translation-agent-kb retrieve "outputs/某书" "目录" --apparatus-weight 1
+```
+
+目录、索引、版权页、书目、封底等结构性装置默认权重 **0.25**；出版说明、作者介绍、
+译者介绍和译者名词简释默认 **0.7**，保留其中的解释性证据；普通正文始终为 **1**。
+这些权重是可调的工程初值，不代表已经测得的最优值。标题使用完整标签匹配（支持编号、
+书名前缀和部分简繁变体），另识别占多数的点线＋页码条目；不会仅因正文提及“索引”就标记。
+未标注的旧库继续按原权重工作；CLI 返回 `apparatus.annotation_available` 可检查标注是否存在。
+
+三种检索模式均使用标注。BM25 和余弦分数在候选截断前施加降权，负余弦不会因乘小数而
+被提升；hybrid 在各通道候选排序以及 RRF 融合排序时使用装置先验，防止它们占满候选池。
+后续显式配置的模型重排仍可根据内容相关性重新排序。诊断包含被降权的 ID 和覆盖参数。
+API `retrieve_knowledge_base_context`、`retrieve`、`retrieve_context` 和 CLI `evaluate`
+均支持 `apparatus_weight` / `--apparatus-weight`（默认按类型、1 关闭、0 排除）。
+修改正文或派生块来源标题后应重新建库或补标注；陈旧侧表会被拒绝使用。
+
+#### 混合检索、查询路由与每书上限
+
+多书合辑库（语料不均衡、大书淹没小书、单一排序偏差）默认使用
+**BM25＋向量 RRF 融合**（`--mode hybrid` 为默认）：两通道各取
+`--candidate-depth`（默认 30）候选，按 Reciprocal Rank Fusion 合并，命中方式
+（`lexical` / `semantic` / `lexical+semantic`）随每条结果返回；embedding 索引
+不可用时自动降级 lexical。查询会识别明确出现的书名及作者，并在排序前自动
+缩小语料范围；显式 `--book` / `--author` 始终优先，`--no-auto-route` 可关闭
+自动路由。比较型问题中提及的书籍与作者所属书籍取并集，不会被错误地求交集。
+非比较问题同时出现书名和作者时，明确书名优先，以免把该作者的其他著作一并
+混入。RRF 的 `--candidate-depth` 必须不小于 `--top-k`。
+查询路由与结果均衡：
+
+```bash
+# 限定某书 / 某作者 / 某语言（元数据侧表 knowledge_base.meta.jsonl 提供）
+translation-agent-kb retrieve "outputs/合集" "共同幻想与国家" --book 共同幻想論
+translation-agent-kb retrieve "outputs/合集" "奥姆之后的日常" --author 宮台真司
+translation-agent-kb retrieve "outputs/合集" "幻想論" --language ja
+
+# 每书结果上限（默认 3，防止 542 块的大书淹没 23 块的小书；0 关闭）
+translation-agent-kb retrieve "outputs/合集" "丸山真男" --per-book-cap 2
+
+# 查看未路由的全库结果
+translation-agent-kb retrieve "outputs/合集" "日本思想" --no-auto-route
+```
+
+过滤后只有一本书时，每书上限自动取消，`--top-k` 因此仍可返回该书的完整候选。
+
+侧表是可选的 `knowledge_base.meta.jsonl`（每行 `id` + `book_id`/`book_title`/
+`author`/`language`/…），不破坏五字段主语料契约；没有侧表时按合辑惯例从
+`chapter_id` 的书名前缀（`01_书名:章`）或 `[书名]` 标题前缀推导书身份。
+`translation-agent-kb status` 会报告侧表行数和覆盖率；重复ID或已不属于当前
+主语料的陈旧ID会使状态校验失败，避免错误路由静默生效。
+上下文前缀同步展示 `[KB:id] [书名] 标题 (命中通道)`。
+
+多册合集 EPUB（鲁迅全集、王小波作品大全集等）可用合集拆分构建器按目录
+拆成单独作品后注入知识库；`book_title` 侧表使检索按作品路由、每书上限
+防止大部头淹没短章：
+
+```bash
+python tools/books/epub_collection_kb.py "book/合集.epub" \
+  --output-dir "outputs/知识库_合集" --author 作者 --language zh --sources
+translation-agent-kb register "outputs/知识库_合集"
+
+# 每部作品单独成册的 Word（与知识库同一套目录拆分逻辑）
+python tools/books/epub_collection_docx.py "book/合集.epub" \
+  --output-dir "outputs/合集" --author 作者
+```
+
+拆分规则：目录嵌套解析卷→作品→篇目（纯数字续篇归并回前一部作品），
+未编目书脊文件按就近归属并入前一作品（`[n]` 脚注块并入前一篇），长篇
+在段落边界切分为 ≤4000 字块，与合辑库分块契约一致。
+
 ### 发布质量门
 
 `compile` 和 `all` 在生成产物后自动运行一次无模型调用的发布质量门；任何
@@ -1084,6 +1280,8 @@ outputs/my_book/
 │   ├── word-release-report.json      # Word Recipe 的正式验收报告
 │   └── release-report.json           # 完整多格式发布报告
 ├── knowledge_base.jsonl      # 仅含章节、顺序和正文的无分页 RAG 记录
+├── knowledge_base.rag.json   # RAG 语料哈希、检索能力与 embedding 状态
+├── knowledge_base.vectors.jsonl # 接入 embedding API 后生成的向量 sidecar
 ├── 书名.epub                  # 无原 PDF 分页信息的 EPUB3
 ├── 书名.docx                  # 无原 PDF 分页信息的 Word 文档
 └── 书名_带目录.pdf            # 原版外观 + 可复制层（若原有）+ 书签
@@ -1091,8 +1289,8 @@ outputs/my_book/
 
 ### 本机跨书知识库
 
-macOS 产线分支提供独立的向量/混合 RAG 工具；本分支提供 SQLite/FTS5
-跨书检索，两者共用五字段 JSONL 语料。当前可将 `outputs/` 下的全部
+master 已集成 Mac 原生 OCR、向量/混合 RAG 和 SQLite/FTS5
+跨书检索，两种检索入口共用五字段 JSONL 语料。当前可将 `outputs/` 下的全部
 成品工作区同步到仓库根目录的 `global_knowledge_base.sqlite3`（已被 Git 忽略）：
 
 ```mermaid

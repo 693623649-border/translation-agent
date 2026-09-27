@@ -1,3 +1,19 @@
+import contextlib
+
+from frontend_runtime import (
+    FrontendSettings,
+    JobRegistry,
+    PathPolicy,
+    artifact_catalog,
+    child_environment,
+    plan_runspec,
+    safe_upload_name,
+    start_job_process,
+    validate_upload_size,
+)
+
+from pipeline_profiles import ModelProfile
+
 import hashlib
 import io
 import json
@@ -1425,6 +1441,41 @@ class FrontendRuntimeTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(failed.status, "failed")
         self.assertIn("release-ready", failed.error or "")
+
+
+
+
+    def test_epub_adapter_accepts_knowledge_base_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = FrontendSettings(
+                database=root / "jobs.sqlite3",
+                jobs_root=root / "jobs",
+                source_roots=(root,),
+            )
+            service = ApplicationService(settings)
+            source = root / "book.epub"
+            from test_epub_graph import _write_epub
+            _write_epub(source)
+            spec = RunSpec(
+                source=source,
+                source_mode="epub",
+                output_dir="ignored",
+                targets=("publication.knowledge_base",),
+                translate=False,
+                verify=False,
+            )
+
+            job = service.submit_path(spec, start=False)
+
+            self.assertEqual(job.spec.targets, ("publication.knowledge_base",))
+            self.assertIn("core.publish.knowledge_base", plan_runspec(job.spec))
+
+
+
+
+
+
 
 
 if __name__ == "__main__":

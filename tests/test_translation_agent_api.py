@@ -26,6 +26,21 @@ class TranslationAgentApiTests(unittest.TestCase):
                 pipeline=request.pipeline,
                 load_dotenv="false",  # type: ignore[arg-type]
             )
+    def test_rag_embedding_mode_is_serialized_without_credentials(self) -> None:
+        enabled = RunRequest(output_dir="out", rag_embed=True).to_argv()
+        disabled = RunRequest(output_dir="out", rag_embed=False).to_argv()
+        automatic = RunRequest(output_dir="out", rag_embed=None).to_argv()
+
+        self.assertIn("--rag-embed", enabled)
+        self.assertIn("--no-rag-embed", disabled)
+        self.assertNotIn("--rag-embed", automatic)
+        self.assertFalse(any("API_KEY" in value for value in enabled))
+        with self.assertRaisesRegex(ValueError, "generate_knowledge_base"):
+            RunRequest(
+                output_dir="out",
+                generate_knowledge_base=False,
+                rag_embed=True,
+            ).to_argv()
 
     def test_profile_request_never_serializes_api_key(self) -> None:
         request = RunRequest(
@@ -361,6 +376,11 @@ translation_profile = "deepseek_pro"
                     "translation_agent_api.output_status",
                     return_value={"translations_profile_fresh": 0},
                 ) as mocked_status,
+                # The selected glm_vision profile is the remote fallback; the
+                # test asserts profile-based identity, so hold the local
+                # PaddleOCR probe off (its availability is host-dependent).
+                patch("book_pipeline.paddle_local_available", return_value=False),
+                patch("book_pipeline.paddle_native_available", return_value=False),
             ):
                 result = run_book(
                     RunRequest(
@@ -382,3 +402,50 @@ translation_profile = "deepseek_pro"
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
+    def test_retrieval_tuning_arguments_forward_to_knowledge_base(self) -> None:
+        from unittest.mock import MagicMock
+        import translation_agent_api as api
+
+        knowledge_base = MagicMock()
+        with patch.object(api, "RagKnowledgeBase") as open_cls:
+            open_cls.open.return_value = knowledge_base
+            api.retrieve_knowledge_base_context(
+                "outputs/book",
+                "查询",
+                auto_route=True,
+                mode="hybrid",
+                book_ids=("呐喊",),
+                authors=("鲁迅",),
+                languages=("zh",),
+                per_book_cap=2,
+                candidate_depth=48,
+            )
+
+        kwargs = knowledge_base.retrieve_context.call_args.kwargs
+        self.assertEqual(kwargs["mode"], "hybrid")
+        self.assertEqual(kwargs["book_ids"], {"呐喊"})
+        self.assertEqual(kwargs["authors"], {"鲁迅"})
+        self.assertEqual(kwargs["languages"], {"zh"})
+        self.assertEqual(kwargs["per_book_cap"], 2)
+        self.assertEqual(kwargs["candidate_depth"], 48)
+        self.assertTrue(kwargs["auto_route"])
+
+    def test_retrieval_defaults_keep_hybrid_parity_with_cli(self) -> None:
+        from unittest.mock import MagicMock
+        import translation_agent_api as api
+
+        knowledge_base = MagicMock()
+        with patch.object(api, "RagKnowledgeBase") as open_cls:
+            open_cls.open.return_value = knowledge_base
+            api.retrieve_knowledge_base_context("outputs/book", "查询")
+
+        kwargs = knowledge_base.retrieve_context.call_args.kwargs
+        self.assertIsNone(kwargs["mode"])
+        self.assertIsNone(kwargs["book_ids"])
+        self.assertIsNone(kwargs["authors"])
+        self.assertIsNone(kwargs["languages"])
+        self.assertIsNone(kwargs["per_book_cap"])
+        self.assertEqual(kwargs["candidate_depth"], 30)

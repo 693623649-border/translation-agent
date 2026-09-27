@@ -24,6 +24,7 @@ import pymupdf as fitz
 import book_pipeline as legacy
 import extract_textbook_layer
 from compile_service import ChapterCompileRequest, run_chapter_compile
+import rag_knowledge_base
 from pipeline_profiles import load_pipeline_profiles
 from publication_service import (
     BOOKMARKED_PDF as VERIFY_BOOKMARKED_PDF,
@@ -46,7 +47,7 @@ from .core import (
 from .recipe import NodeRegistry, Recipe
 
 
-GRAPH_ADAPTER_VERSION = "book-graph-v2"
+GRAPH_ADAPTER_VERSION = "book-graph-v3"
 
 NODE_SOURCE = "core.source.inspect"
 NODE_PAGES_IMPORT = "core.pages.import"
@@ -546,6 +547,40 @@ def _single_file_is_current(
     )
 
 
+def _knowledge_base_is_current(
+    context: GraphContext,
+    outputs: Mapping[str, Any],
+) -> bool:
+    """Require both canonical JSONL and its RAG discovery/index metadata."""
+
+    if not _single_file_is_current(context, outputs):
+        return False
+    saved = next(iter(outputs.values()))
+    path = Path(str(saved["path"]))
+    if not rag_knowledge_base.rag_manifest_is_current(path):
+        return False
+    args = _parsed_args(context)
+    if not rag_knowledge_base.zhipu_embedding_enabled(
+        getattr(args, "rag_embed", None)
+    ):
+        return True
+    try:
+        manifest = rag_knowledge_base.read_rag_manifest(path)
+    except rag_knowledge_base.RagError:
+        return False
+    embedding = manifest["retrieval"]["embedding"]
+    return (
+        embedding["status"] == "ready"
+        and embedding["provider"] == "zhipu"
+        and embedding["model"] == os.getenv(
+            "ZHIPU_EMBEDDING_MODEL",
+            "embedding-3",
+        )
+        and embedding["dimensions"]
+        == int(os.getenv("ZHIPU_EMBEDDING_DIMENSIONS", "2048"))
+    )
+
+
 def _import_source_is_current(
     context: GraphContext,
     outputs: Mapping[str, Any],
@@ -693,7 +728,7 @@ def _selected_model_profiles(args: Any) -> dict[str, Any]:
     if not args.config:
         return {stage: None for stage in ("ocr", "toc", "proofread", "translation")}
     profiles = load_pipeline_profiles(args.config)
-    return {
+    selected = {
         "ocr": profiles.for_stage("ocr", args.ocr_profile),
         "toc": profiles.for_stage("toc", args.toc_profile),
         "proofread": profiles.for_stage("proofread", args.proofread_profile),
@@ -701,6 +736,11 @@ def _selected_model_profiles(args: Any) -> dict[str, Any]:
             "translation", args.translation_profile
         ),
     }
+
+    if (args.ocr_backend != "auto" and selected["ocr"] is not None
+            and selected["ocr"].adapter != args.ocr_backend):
+        selected["ocr"] = None
+    return selected
 
 
 def _profile_model_semantics(profile: Any) -> dict[str, Any] | None:
@@ -774,7 +814,7 @@ def _ocr_segmentation_semantics() -> dict[str, Any]:
 def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
     profile = _selected_model_profiles(args)["ocr"]
     reading_direction = legacy.resolve_ocr_reading_direction(args, profile)
-    backend = profile.adapter if profile is not None else args.ocr_backend
+    backend, _reason = legacy.resolve_ocr_backend_name(args, profile)
     if backend == "coding-plan-mcp":
         identity: dict[str, Any] = {
             "backend": backend,
@@ -807,6 +847,26 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
                 else args.ocr_api_base
             ),
             "model": profile.model if profile is not None else args.ocr_model,
+        }
+        segmentation = None
+    elif backend == "paddleocr-native":
+        from paddle_native import identity_from_args
+        identity = {"backend": backend, "model": identity_from_args(args, profile)}
+        segmentation = None
+    elif backend == "paddleocr-local":
+        identity = {
+            "backend": backend,
+            "model": legacy.paddle_local_model_id(
+                det_variant=args.paddle_det_variant,
+                rec_variant=args.paddle_rec_variant,
+                det_mode=args.paddle_det_mode,
+                rec_mode=args.paddle_rec_mode,
+                rec_batch=args.paddle_rec_batch,
+                det_len=args.paddle_det_len,
+                dpi=args.dpi,
+                max_image_side=args.max_image_side,
+            ),
+            "workers": args.paddle_workers,
         }
         segmentation = None
     else:
@@ -1025,7 +1085,11 @@ def _publisher_fingerprint(kind: str) -> Any:
         args = _parsed_args(context)
         value: dict[str, Any] = {
             "adapter": GRAPH_ADAPTER_VERSION,
-            "publisher": f"{kind}-v3" if kind == "docx" else f"{kind}-v2",
+            "publisher": (
+                f"{kind}-v3"
+                if kind in {"docx", "knowledge-base"}
+                else f"{kind}-v2"
+            ),
             "title": _book_title(context),
         }
         if kind == "docx":
@@ -1035,6 +1099,19 @@ def _publisher_fingerprint(kind: str) -> Any:
         if kind == "knowledge-base":
             source = context.require(ART_SOURCE)
             value["source_filename"] = Path(str(source["path"])).name
+            value["rag_embedding_enabled"] = (
+                rag_knowledge_base.zhipu_embedding_enabled(
+                    getattr(args, "rag_embed", None)
+                )
+            )
+            value["rag_embedding_model"] = os.getenv(
+                "ZHIPU_EMBEDDING_MODEL",
+                "embedding-3",
+            )
+            value["rag_embedding_dimensions"] = os.getenv(
+                "ZHIPU_EMBEDDING_DIMENSIONS",
+                "2048",
+            )
         return value
 
     return fingerprint
@@ -2825,12 +2902,34 @@ def _knowledge_base_handler(context: GraphContext) -> NodeResult:
     )
     path = _publication_target_path(context, ART_KB)
     legacy.write_knowledge_base(path, rows)
+    args = _parsed_args(context)
+    # The embedding index is an additive retrieval convenience; a provider
+    # outage or quota limit must not fail the publication itself.
+    try:
+        rag_knowledge_base.maybe_build_zhipu_embedding_index(
+            path,
+            requested=getattr(args, "rag_embed", None),
+        )
+    except rag_knowledge_base.RagError as exc:
+        print(
+            f"[rag] embedding index deferred: {exc} "
+            "(knowledge base stays lexical-only; rerun "
+            "translation-agent-kb register later)",
+            flush=True,
+        )
     _register_managed_publication(context, ART_KB, path)
     artifact = _file_artifact(path)
+    rag_manifest = rag_knowledge_base.manifest_path_for(path).resolve()
+    rag_metadata = rag_knowledge_base.read_rag_manifest(path)
+    embedding_status = rag_metadata["retrieval"]["embedding"]["status"]
     return NodeResult(
         outputs={ART_KB: artifact},
         fingerprints={ART_KB: str(artifact["sha256"])},
-        metadata={"rows": len(rows)},
+        metadata={
+            "rows": len(rows),
+            "rag_manifest": str(rag_manifest),
+            "embedding_status": embedding_status,
+        },
     )
 
 
@@ -3655,10 +3754,13 @@ def prepare_book_graph(
                             _knowledge_base_handler,
                             requires=(ART_SOURCE, ART_READER_CHAPTERS),
                             provides=(ART_KB,),
-                            version="1",
+                            version="2",
                             fingerprint=_publisher_fingerprint("knowledge-base"),
-                            cache_validator=_single_file_is_current,
-                            description="Publish knowledge-base JSONL from final chapter text.",
+                            cache_validator=_knowledge_base_is_current,
+                            description=(
+                                "Publish RAG knowledge-base JSONL and retrieval metadata "
+                                "from final chapter text."
+                            ),
                         )
                     )
                 if NODE_EPUB in selected_publishers:

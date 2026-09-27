@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
+from book_pipeline import build_docx
+from epub_semantic_import import prune_long_footnotes
 import hashlib
 from pathlib import Path
 import tempfile
@@ -559,5 +562,245 @@ class EpubSemanticImportTests(unittest.TestCase):
             self.assertFalse((output / "audit" / "semantic-translation.json").exists())
 
 
+    def test_prune_long_footnotes_updates_publication_contract_but_not_source_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_epub(source)
+            import_epub(source, output)
+            manifest_before = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            filename = manifest_before[0]["filename"]
+            source_chapter = output / "semantic" / "source_chapters" / filename
+            source_before = source_chapter.read_bytes()
+            current_chapter = output / "chapters" / filename
+            current_chapter.write_text(
+                current_chapter.read_text(encoding="utf-8")
+                + "\n3\n\n6\n\n11\n",
+                encoding="utf-8",
+            )
+
+            result = prune_long_footnotes(
+                output,
+                minimum_characters=10,
+                remove_standalone_page_markers=True,
+            )
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (output / "chapters" / filename).read_text(encoding="utf-8")
+            audit = json.loads(
+                (output / "audit" / "semantic-reconstruction.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["removed_count"], 1)
+            self.assertEqual(result["remaining_count"], 0)
+            self.assertEqual(result["removed_page_marker_count"], 3)
+            self.assertNotRegex(markdown, r"(?m)^\s*(?:3|6|11)\s*$")
+            self.assertEqual(manifest[0]["semantic_footnote_count"], 0)
+            self.assertEqual(manifest[0]["suppressed_long_footnote_count"], 1)
+            self.assertEqual(parse_markdown_footnotes(markdown).definitions, ())
+            self.assertEqual(source_chapter.read_bytes(), source_before)
+            self.assertEqual(audit["summary"]["footnote_count"], 0)
+            self.assertIn(
+                "core.publication.prune-long-footnotes",
+                audit["generated_by"],
+            )
+            self.assertTrue((output / "audit" / "reader-edition-pruning.json").is_file())
+
+
+    def test_printed_page_markers_are_removed_without_losing_real_footnotes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_printed_page_marker_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (
+                output / "chapters" / manifest[0]["filename"]
+            ).read_text(encoding="utf-8")
+            inventory = parse_markdown_footnotes(markdown)
+
+            self.assertEqual(result["status"], "passed")
+            self.assertIsNone(re.search(r"(?m)^\s*17\s*$", markdown))
+            self.assertNotIn('<sup>1</sup>', markdown)
+            self.assertNotIn('<sup>8</sup>', markdown)
+            self.assertIn('x<sup>2</sup>', markdown)
+            self.assertTrue(inventory.valid)
+            self.assertEqual(len(inventory.references), 1)
+            self.assertEqual(len(inventory.definitions), 1)
+
+
+    def test_split_bracket_links_become_semantic_footnotes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_split_bracket_link_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (
+                output / "chapters" / manifest[0]["filename"]
+            ).read_text(encoding="utf-8")
+            destination = root / "book.docx"
+            inventory = parse_markdown_footnotes(markdown)
+
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(inventory.valid)
+            self.assertEqual(len(inventory.definitions), 2)
+            self.assertIn("Note label.", inventory.definitions[1][1])
+            self.assertNotIn("#note-1-ref", markdown)
+            self.assertNotIn("#note-1-back", markdown)
+            build_docx(
+                destination,
+                output / "chapters",
+                manifest,
+                book_title="Test Book",
+            )
+            self.assertTrue(destination.is_file())
+
+
+    def test_relative_epub_image_paths_are_materialized_for_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "output"
+            _write_relative_image_epub(source)
+
+            result = import_epub(source, output)
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            markdown = (
+                output / "chapters" / manifest[0]["filename"]
+            ).read_text(encoding="utf-8")
+
+            self.assertEqual(result["status"], "passed")
+            self.assertIn("![Cover](../images/", markdown)
+            self.assertNotIn("../Images/cover.png", markdown)
+            image_refs = re.findall(r"!\[[^]]*]\((../images/[^)]+)\)", markdown)
+            self.assertEqual(len(image_refs), 1)
+            self.assertTrue((output / "chapters" / image_refs[0]).is_file())
+
+            docx_path = root / "image.docx"
+            build_docx(
+                docx_path,
+                output / "chapters",
+                manifest,
+                book_title="Image Book",
+            )
+            with zipfile.ZipFile(docx_path) as archive:
+                self.assertIn("word/media/image1.png", archive.namelist())
+
+            epub_path = root / "image.epub"
+            build_epub(
+                epub_path,
+                output / "chapters",
+                manifest,
+                book_title="Image Book",
+                language="zh-CN",
+            )
+            with zipfile.ZipFile(epub_path) as archive:
+                names = archive.namelist()
+                self.assertTrue(
+                    any(name.startswith("OEBPS/images/") for name in names)
+                )
+                xhtml = archive.read("OEBPS/001_Illustrated.xhtml").decode()
+            self.assertIn('src="images/', xhtml)
+
+
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+def _write_split_bracket_link_epub(path: Path) -> None:
+    _write_epub(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    chapter = members["OEBPS/chapter1.xhtml"].decode()
+    chapter = chapter.replace(
+        "</section>",
+        '''<p>Text <sup><a id="note-1-ref" href="#note-1-ref">[</a></sup><sup><a href="#note-1-ref">1</a></sup><sup><a href="#note-1-ref">]</a></sup>.</p>
+<p><span id="note-1-back"><a href="#note-1-back">[</a><a href="#note-1-back">1</a><a href="#note-1-back">]</a> Note label.</span></p></section>''',
+    )
+    members["OEBPS/chapter1.xhtml"] = chapter.encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
+def _write_printed_page_marker_epub(path: Path) -> None:
+    _write_epub(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        members = {name: archive.read(name) for name in archive.namelist()}
+    chapter = members["OEBPS/chapter1.xhtml"].decode()
+    chapter = chapter.replace(
+        '<section><h1>Chapter One</h1><p>Body <em>word</em>',
+        '<section><h1>Chapter One</h1>'
+        '<p class="calibre7"><span class="calibre21">17</span></p>'
+        '<p>Body <sup class="calibre14">1</sup>'
+        '<sup class="calibre14">8</sup><em>word</em> x<sup>2</sup>',
+    )
+    members["OEBPS/chapter1.xhtml"] = chapter.encode()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)
+
+
+def _write_relative_image_epub(path: Path) -> None:
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (1, 1), (255, 0, 0)).save(buffer, "PNG")
+    image = buffer.getvalue()
+    members = {
+        "mimetype": b"application/epub+zip",
+        "META-INF/container.xml": b'''<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>''',
+        "OEBPS/content.opf": b'''<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+ <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Image Book</dc:title><dc:language>en</dc:language><dc:identifier>id</dc:identifier></metadata>
+ <manifest><item id="c1" href="Text/chapter1.xhtml" media-type="application/xhtml+xml"/><item id="cover" href="Images/cover.png" media-type="image/png"/></manifest>
+ <spine><itemref idref="c1"/></spine>
+</package>''',
+        "OEBPS/Text/chapter1.xhtml": b'''<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<section><h1>Illustrated</h1><p><img alt="Cover" src="../Images/cover.png"/></p><p>Body.</p></section>
+</body></html>''',
+        "OEBPS/Images/cover.png": image,
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "mimetype",
+            members.pop("mimetype"),
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for name, value in members.items():
+            archive.writestr(name, value)

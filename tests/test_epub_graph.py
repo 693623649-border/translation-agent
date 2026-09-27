@@ -96,6 +96,51 @@ def _translated_units(units_path: Path, target: Path) -> None:
 
 
 class EpubGraphTests(unittest.TestCase):
+    def test_product_translation_profile_still_identifies_epub_cache(self) -> None:
+        from product_contracts import RunSpec
+        from run_execution_service import RunExecutionService
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            _write_epub(source)
+            config = root / "profiles.toml"
+            config.write_text('schema_version = 1\n[profiles.academic]\nadapter = "openai-chat"\n'
+                              'provider = "deepseek"\nmodel = "test"\ncredential_env = "QA_TRANSLATION_KEY"\n'
+                              'base_url = "https://example.invalid/v1"\n[pipeline]\ntranslation_profile = "academic"\n')
+            service = RunExecutionService()
+            spec = RunSpec(source=source, output_dir=root / "out", source_mode="epub",
+                           targets=("publication.epub",), config=config, translate=True, verify=False)
+            prepared = service._prepare_epub_graph(service.resolve(spec))
+            self.assertEqual(prepared.options.translation_prompt_profile, "academic")
+
+    def test_knowledge_base_uses_reader_dag_and_registers_rag_metadata(self) -> None:
+        from global_knowledge_base import sync_outputs, search
+        from product_contracts import RunSpec
+        from run_execution_service import execute_runspec, plan_runspec
+        from rag_knowledge_base import rag_manifest_is_current
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "book.epub"
+            output = root / "outputs" / "book"
+            _write_epub(source)
+            spec = RunSpec(source=source, output_dir=output, source_mode="epub",
+                           targets=("publication.knowledge_base",), translate=False, verify=False)
+            plan = plan_runspec(spec)
+            self.assertIn("core.semantic.review", plan.node_names)
+            self.assertIn("core.publish.knowledge_base", plan.node_names)
+            result = execute_runspec(spec)
+            self.assertEqual(result.status, "passed")
+            kb = output / "knowledge_base.jsonl"
+            self.assertTrue(rag_manifest_is_current(kb))
+            rows = [json.loads(line) for line in kb.read_text().splitlines()]
+            self.assertTrue(rows)
+            self.assertTrue(all(row["content"].strip() for row in rows))
+            db = root / "global.sqlite3"
+            sync_outputs(root / "outputs", db)
+            self.assertTrue(search("Body", db_path=db))
+            execute_runspec(spec)
+            self.assertTrue(rag_manifest_is_current(kb))
+
     def test_translation_cache_symlink_cannot_write_outside_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

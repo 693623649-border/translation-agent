@@ -52,6 +52,16 @@ def _spec_from_args(args: argparse.Namespace) -> RunSpec:
         translate=not getattr(args, "no_translate", False),
         verify=not getattr(args, "no_verify", False),
         options={
+            "start_page": getattr(args, "start_page", None),
+            "end_page": getattr(args, "end_page", None),
+            "ocr_profile": getattr(args, "ocr_profile", None),
+            "ocr_backend": getattr(args, "ocr_backend", None),
+            "rag_embed": getattr(args, "rag_embed", None),
+            "ocr_reading_direction": getattr(args, "ocr_reading_direction", None),
+            "paddle_native_variant": getattr(args, "paddle_native_variant", None),
+            "paddle_native_models_dir": str(args.paddle_native_models_dir) if getattr(args, "paddle_native_models_dir", None) else None,
+            "paddle_native_threads": getattr(args, "paddle_native_threads", 4),
+            "paddle_native_det_limit": getattr(args, "paddle_native_det_limit", 960),
             "toc_source": getattr(args, "toc_source", "pipeline"),
             "text_pdf_sort": getattr(args, "text_pdf_sort", False),
             "text_pdf_reflow": getattr(args, "text_pdf_reflow", False),
@@ -403,10 +413,21 @@ def _add_spec_arguments(parser: argparse.ArgumentParser, *, source: bool = True)
     parser.add_argument("--recipe", type=Path)
     parser.add_argument("--target", action="append", default=[])
     parser.add_argument("--translation-profile")
+    parser.add_argument("--start-page", type=int)
+    parser.add_argument("--end-page", type=int)
+    parser.add_argument("--ocr-profile")
+    parser.add_argument("--ocr-backend", choices=("auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"))
+    parser.add_argument("--ocr-reading-direction", choices=("horizontal", "vertical"))
+    from paddle_native import add_native_arguments
+    add_native_arguments(parser)
     parser.add_argument("--glossary", type=Path)
     parser.add_argument("--toc-source", choices=("pipeline", "outline"), default="pipeline")
     parser.add_argument("--text-pdf-sort", action="store_true")
     parser.add_argument("--text-pdf-reflow", action="store_true")
+    embedding = parser.add_mutually_exclusive_group()
+    embedding.add_argument("--rag-embed", dest="rag_embed", action="store_true")
+    embedding.add_argument("--no-rag-embed", dest="rag_embed", action="store_false")
+    parser.set_defaults(rag_embed=None)
     parser.add_argument("--no-translate", action="store_true")
     parser.add_argument("--no-verify", action="store_true")
 

@@ -700,7 +700,9 @@ def backup_semantic_migration_sources(
             )
             for item in inventory:
                 archive.write(root / item["path"], item["path"])
-        with temporary.open("rb") as handle:
+        # Windows implements ``os.fsync`` with ``_commit``, which rejects a
+        # read-only descriptor even though POSIX accepts one.
+        with temporary.open("rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, destination)
     finally:
