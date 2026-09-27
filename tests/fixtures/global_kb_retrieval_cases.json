@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "description": "Human-curated local corpus queries: cross-book topical discovery and within-book chapter finding. Backup is tested only as a scoped chapter case.",
+  "expected_workspaces": 18,
+  "top_k": 5,
+  "thresholds": {
+    "cross_book": {
+      "hit_at_1": 0.75,
+      "hit_at_5": 0.95
+    },
+    "chapter": {
+      "hit_at_1": 0.7,
+      "hit_at_5": 0.95
+    }
+  },
+  "cases": [
+    {
+      "id": "book-01",
+      "group": "cross_book",
+      "query": "御宅文化中的数据库消费",
+      "expected_workspace": "2019boydphd"
+    },
+    {
+      "id": "book-02",
+      "group": "cross_book",
+      "query": "TYPE MOON同人批评怎么写",
+      "expected_workspace": "binder_vol1"
+    },
+    {
+      "id": "book-03",
+      "group": "cross_book",
+      "query": "女性主义流派如何讨论阶级与性别",
+      "expected_workspace": "feminist-theory-reader"
+    },
+    {
+      "id": "book-04",
+      "group": "cross_book",
+      "query": "新海诚的天气之子如何被解读",
+      "expected_workspace": "ui_book"
+    },
+    {
+      "id": "book-05",
+      "group": "cross_book",
+      "query": "陀思妥耶夫斯基在西伯利亚的经历",
+      "expected_workspace": "ドストエフスキイの生活"
+    },
+    {
+      "id": "book-06",
+      "group": "cross_book",
+      "query": "现代性如何重塑城市生活",
+      "expected_workspace": "一切坚固的东西都烟消云散了"
+    },
+    {
+      "id": "book-07",
+      "group": "cross_book",
+      "query": "英国文化领导权如何形成",
+      "expected_workspace": "中产阶级的孩子们_程巍"
+    },
+    {
+      "id": "book-08",
+      "group": "cross_book",
+      "query": "吉本隆明禁制与共同幻想",
+      "expected_workspace": "共同幻想論"
+    },
+    {
+      "id": "book-09",
+      "group": "cross_book",
+      "query": "Wendy Brown on wounded identity politics",
+      "expected_workspace": "受伤状态_温迪·布朗"
+    },
+    {
+      "id": "book-10",
+      "group": "cross_book",
+      "query": "本雅明收藏书籍的经验",
+      "expected_workspace": "启迪 本雅明文选"
+    },
+    {
+      "id": "book-11",
+      "group": "cross_book",
+      "query": "台湾性别治理如何处理人口贩卖",
+      "expected_workspace": "性别治理"
+    },
+    {
+      "id": "book-12",
+      "group": "cross_book",
+      "query": "波德莱尔诗歌中的马拉巴尔姑娘",
+      "expected_workspace": "恶之花_巴黎的忧郁"
+    },
+    {
+      "id": "book-13",
+      "group": "cross_book",
+      "query": "丸山真男关于国学与徂徕学",
+      "expected_workspace": "日本政治思想史研究"
+    },
+    {
+      "id": "book-14",
+      "group": "cross_book",
+      "query": "吉拉尔的三角欲望理论",
+      "expected_workspace": "浪漫的谎言与小说的真实"
+    },
+    {
+      "id": "book-15",
+      "group": "cross_book",
+      "query": "魔法使之夜如何关联普遍经济",
+      "expected_workspace": "消费之理"
+    },
+    {
+      "id": "book-16",
+      "group": "cross_book",
+      "query": "私小说和自然主义的关系",
+      "expected_workspace": "私小説論"
+    },
+    {
+      "id": "book-17",
+      "group": "cross_book",
+      "query": "巴赫金提出的复调小说概念",
+      "expected_workspace": "陀思妥耶夫斯基诗学问题"
+    },
+    {
+      "id": "chapter-01",
+      "group": "chapter",
+      "query": "御宅数据库游牧学",
+      "workspace_filter": "2019boydphd",
+      "expected_workspace": "2019boydphd",
+      "expected_chapter_id": "fm-title"
+    },
+    {
+      "id": "chapter-02",
+      "group": "chapter",
+      "query": "空之境界 奈须蘑菇",
+      "workspace_filter": "binder_vol1",
+      "expected_workspace": "binder_vol1",
+      "expected_chapter_id": "toc-0005"
+    },
+    {
+      "id": "chapter-03",
+      "group": "chapter",
+      "query": "交叉性理论",
+      "workspace_filter": "feminist-theory-reader",
+      "expected_workspace": "feminist-theory-reader",
+      "expected_chapter_id": "fem-0004"
+    },
+    {
+      "id": "chapter-04",
+      "group": "chapter",
+      "query": "铃芽之旅 新海诚",
+      "workspace_filter": "ui_book",
+      "expected_workspace": "ui_book",
+      "expected_chapter_id": "toc-0004"
+    },
+    {
+      "id": "chapter-05",
+      "group": "chapter",
+      "query": "彼得拉舍夫斯基事件",
+      "workspace_filter": "ドストエフスキイの生活",
+      "expected_workspace": "ドストエフスキイの生活",
+      "expected_chapter_id": "life-02"
+    },
+    {
+      "id": "chapter-06",
+      "group": "chapter",
+      "query": "歌德 浮士德 发展的悲剧",
+      "workspace_filter": "一切坚固的东西都烟消云散了",
+      "expected_workspace": "一切坚固的东西都烟消云散了",
+      "expected_chapter_id": "toc-0010"
+    },
+    {
+      "id": "chapter-07",
+      "group": "chapter",
+      "query": "文化领导权",
+      "workspace_filter": "中产阶级的孩子们_程巍",
+      "expected_workspace": "中产阶级的孩子们_程巍",
+      "expected_chapter_id": "chapter-2"
+    },
+    {
+      "id": "chapter-08",
+      "group": "chapter",
+      "query": "禁制論",
+      "workspace_filter": "共同幻想論",
+      "expected_workspace": "共同幻想論",
+      "expected_chapter_id": "toc-0004"
+    },
+    {
+      "id": "chapter-09",
+      "group": "chapter",
+      "query": "Wounded Attachments",
+      "workspace_filter": "受伤状态_温迪·布朗",
+      "expected_workspace": "受伤状态_温迪·布朗",
+      "expected_chapter_id": "epub-0012"
+    },
+    {
+      "id": "chapter-10",
+      "group": "chapter",
+      "query": "译作者的任务 波德莱尔",
+      "workspace_filter": "启迪 本雅明文选",
+      "expected_workspace": "启迪 本雅明文选",
+      "expected_chapter_id": "toc-0006"
+    },
+    {
+      "id": "chapter-11",
+      "group": "chapter",
+      "query": "台湾儿少NGO 人口贩卖",
+      "workspace_filter": "性别治理",
+      "expected_workspace": "性别治理",
+      "expected_chapter_id": "ch-1"
+    },
+    {
+      "id": "chapter-12",
+      "group": "chapter",
+      "query": "给一位马拉巴尔的姑娘",
+      "workspace_filter": "恶之花_巴黎的忧郁",
+      "expected_workspace": "恶之花_巴黎的忧郁",
+      "expected_chapter_id": "epub-0152"
+    },
+    {
+      "id": "chapter-13",
+      "group": "chapter",
+      "query": "徂徕学 国学",
+      "workspace_filter": "日本政治思想史研究",
+      "expected_workspace": "日本政治思想史研究",
+      "expected_chapter_id": "chapter-1"
+    },
+    {
+      "id": "chapter-14",
+      "group": "chapter",
+      "query": "三角欲望",
+      "workspace_filter": "浪漫的谎言与小说的真实",
+      "expected_workspace": "浪漫的谎言与小说的真实",
+      "expected_chapter_id": "toc-0001"
+    },
+    {
+      "id": "chapter-15",
+      "group": "chapter",
+      "query": "魔法使之夜 普遍经济",
+      "workspace_filter": "消费之理",
+      "expected_workspace": "消费之理",
+      "expected_chapter_id": "toc-0001"
+    },
+    {
+      "id": "chapter-16",
+      "group": "chapter",
+      "query": "关于私小说",
+      "workspace_filter": "私小説論",
+      "expected_workspace": "私小説論",
+      "expected_chapter_id": "reviews-2-05"
+    },
+    {
+      "id": "chapter-17",
+      "group": "chapter",
+      "query": "关于私小说",
+      "workspace_filter": "私小説論.before-paddle-20260923",
+      "expected_workspace": "私小説論.before-paddle-20260923",
+      "expected_chapter_id": "reviews-2-05"
+    },
+    {
+      "id": "chapter-18",
+      "group": "chapter",
+      "query": "复调小说 评论著述",
+      "workspace_filter": "陀思妥耶夫斯基诗学问题",
+      "expected_workspace": "陀思妥耶夫斯基诗学问题",
+      "expected_chapter_id": "toc-0003"
+    }
+  ]
+}
