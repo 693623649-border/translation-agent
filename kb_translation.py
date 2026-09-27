@@ -113,7 +113,10 @@ class DeepSeekTranslator:
         *,
         api_key_env: str = "DEEPSEEK_API_KEY",
         base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-chat",
+        # Kept in lockstep with book_pipeline.DEFAULT_DEEPSEEK_MODEL so every
+        # DeepSeek caller (pipeline translation, translate-kb, repair tools)
+        # resolves to the same current model instead of a legacy alias.
+        model: str = "deepseek-v4-flash",
         timeout: int = 300,
     ) -> None:
         self.api_key_env = api_key_env
@@ -289,9 +292,24 @@ def _protect(text: str) -> tuple[str, tuple[str, ...]]:
 
 
 def _restore(text: str, tokens: Sequence[str]) -> str:
-    from semantic_translation_runner import restore_tokens
+    """Restore protected placeholders, as a retryable batch failure.
 
-    return restore_tokens(text, tokens)
+    A model that drops or reorders placeholders has broken the same 1:1
+    contract as a model that drops ``<<<SEG nnnn>>>`` markers, so the error is
+    normalised to :class:`KbTranslationError`: ``translate_texts`` then retries
+    the batch and degrades it to single-segment requests instead of failing the
+    whole book on one bad response.
+    """
+
+    from semantic_translation_runner import (
+        SemanticTranslationError,
+        restore_tokens,
+    )
+
+    try:
+        return restore_tokens(text, tokens)
+    except SemanticTranslationError as exc:
+        raise KbTranslationError(f"protected-token contract broken: {exc}") from exc
 
 
 def _build_prompt(segments: Sequence[str], extra_instructions: str = "") -> str:
@@ -455,6 +473,7 @@ def ensure_chinese_rows(
     translator: Translator,
     *,
     batch_chars: int = 8000,
+    concurrency: int = 8,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return rows with Chinese bodies plus a provenance report.
 
@@ -476,6 +495,7 @@ def ensure_chinese_rows(
         [str(rows[index]["content"]) for index in pending],
         translator,
         batch_chars=batch_chars,
+        concurrency=concurrency,
     )
     # Pair positionally: a hand-edited corpus may repeat an id, and matching by
     # id membership would then translate the wrong rows.
@@ -627,6 +647,7 @@ def normalise_corpus_file(
     translator: Translator | None = None,
     *,
     batch_chars: int = 8000,
+    concurrency: int = 8,
     dry_run: bool = False,
     progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
@@ -663,7 +684,9 @@ def normalise_corpus_file(
         }
         for index in pending
     ]
-    translated_rows, report = ensure_chinese_rows(rows, translator, batch_chars=batch_chars)
+    translated_rows, report = ensure_chinese_rows(
+        rows, translator, batch_chars=batch_chars, concurrency=concurrency
+    )
     backup = write_source_backup(corpus, originals)
     write_knowledge_base(corpus, translated_rows)
     sidecar = write_translation_sidecar(corpus, report)

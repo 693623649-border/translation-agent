@@ -401,6 +401,8 @@ class PublicationVerifierTests(unittest.TestCase):
             "docx.render",
             "knowledge_base.structure",
             "pdf.bookmarks",
+            "knowledge_base.chinese",
+            "docx.chinese",
         ):
             with self.subTest(check_id=check_id):
                 self.assertEqual(checks[check_id]["status"], "passed")
@@ -411,6 +413,66 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(saved["status"], "passed")
         self.assertEqual(saved["report_path"], str(report_path.resolve()))
         self.assertEqual(saved["checks"], report["checks"])
+
+    def test_knowledge_base_chinese_gate_fails_on_foreign_chunks(self) -> None:
+        path = self.output / "knowledge_base.jsonl"
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        rows[0]["content"] = (
+            "漱石論集成における「畏怖」の概念を、内側から見た生の問題として"
+            "もう一度読み直す必要があるだろう。"
+        )
+        path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+
+        report = self._verify(report_name="foreign-kb.json")
+        check = self._checks(report)["knowledge_base.chinese"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(
+            check["issues"][0]["code"], "knowledge_base_foreign_language"
+        )
+        self.assertGreater(check["metrics"]["pending_count"], 0)
+
+    def test_docx_chinese_gate_fails_on_foreign_paragraphs(self) -> None:
+        from docx import Document
+
+        path = self.output / f"{self.book_title}.docx"
+        document = Document(str(path))
+        document.add_paragraph(
+            "これは日本語の本文です。漱石の論考をもう一度読み直す必要がある。"
+        )
+        document.save(str(path))
+
+        report = self._verify(report_name="foreign-docx.json")
+        check = self._checks(report)["docx.chinese"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(check["issues"][0]["code"], "docx_foreign_language")
+        self.assertEqual(check["metrics"]["pending_count"], 1)
+
+    def test_docx_chinese_gate_exempts_reference_chapter_paragraphs(self) -> None:
+        from docx import Document
+
+        path = self.output / f"{self.book_title}.docx"
+        document = Document(str(path))
+        document.add_heading("人名译名对照表", level=1)
+        document.add_paragraph(
+            "Blei, Franz布莱Ahrens Alarich阿拉里克Bloy, Léon布洛瓦"
+            "Altheim, Franz阿尔特海姆Blumenberg, Hans布鲁门伯格"
+        )
+        document.save(str(path))
+
+        report = self._verify(report_name="glossary-docx.json")
+        check = self._checks(report)["docx.chinese"]
+        self.assertEqual(check["status"], "passed")
+        self.assertEqual(check["metrics"]["pending_count"], 0)
+        self.assertGreaterEqual(
+            check["metrics"]["reference_exempt_paragraphs"], 1
+        )
 
     def test_docx_render_failure_blocks_release_report(self) -> None:
         self.render_gate_mock.return_value = {
@@ -1140,7 +1202,7 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertFalse(report["release_ready"])
         self.assertEqual(report["status"], "partial")
-        self.assertEqual(report["summary"]["skipped"], 5)
+        self.assertEqual(report["summary"]["skipped"], 7)
 
     def test_word_profile_is_release_ready_without_unselected_containers(self) -> None:
         report = verify_publication(
@@ -1162,7 +1224,7 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertTrue(report["release_ready"])
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["publication_profile"], "word")
-        self.assertEqual(report["summary"]["skipped"], 3)
+        self.assertEqual(report["summary"]["skipped"], 4)
         checks = self._checks(report)
         self.assertEqual(checks["docx.structure"]["status"], "passed")
         self.assertEqual(checks["docx.render"]["status"], "passed")

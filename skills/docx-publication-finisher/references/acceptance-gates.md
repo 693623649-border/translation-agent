@@ -49,6 +49,23 @@ Inspect the DOCX package and generated reports before rendering:
   引用与正 ID 定义唯一双向闭环，保留的 `-1`/`0` separator 节点类型正确，无意外 endnotes。
 - 每个显式文件都有 passed 结果；任何 DOCX 基础检查 skipped 都不能声称完成。
 
+## 语言门（外文必须译中）
+
+数据库与 Word 输出中的外文内容必须翻译为中文，三个执行点构成闭环：
+
+- `translation-agent-kb register`（单书写库时刻）：默认拒绝含未译外文块的知识库
+  （`foreign_language_gate`，exit 1），报告待译块数、语言与样本；`--allow-foreign`
+  是唯一显式逃生口（与全库 sync 同名参数语义一致）。
+- 发布验证 `knowledge_base.chinese` / `docx.chinese`（word 与 full profile）：知识库
+  行用 `kb_translation.classify_row`、Word 段落用 `docx_translation.needs_translation`
+  判定，参考文献/索引/装置类按既有豁免表放行，其余外文散文即失败。
+- 全库 `global_knowledge_base.py sync`：跨书聚合同一判据，未译工作区按名单拦截，
+  需 `--allow-foreign` 才按原样索引。
+
+翻译入口统一为 `translation-agent-kb translate-kb`（DeepSeek，模型与主管线
+`deepseek-v4-flash` 对齐）；Word 侧为 `docx_translation.translate_docx`。豁免
+（对照表/书目/索引）会在翻译时销毁映射，故只豁免识别、不豁免门。
+
 ## 渲染门
 
 Render every canonical DOCX and inspect machine-readable render results:

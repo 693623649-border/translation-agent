@@ -35,6 +35,61 @@ def _knowledge_base_path(value: str | Path) -> Path:
     return path
 
 
+def _foreign_language_report(knowledge_base_path: Path) -> dict[str, Any] | None:
+    """Classify every chunk for foreign prose; None when the gate is clean.
+
+    Mirrors publication_verifier._check_knowledge_base_chinese so the register
+    command (the single-book database write) refuses untranslated corpora at
+    the same threshold the release gate uses.  Reference material and
+    non-prose rows stay exempt, exactly as in translate-kb.
+    """
+
+    if not knowledge_base_path.is_file():
+        return None
+    from kb_translation import classify_row
+
+    pending: list[dict[str, Any]] = []
+    exempt: dict[str, int] = {}
+    chunk_count = 0
+    try:
+        lines = [
+            line
+            for line in knowledge_base_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, UnicodeError):
+        return None
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        chunk_count += 1
+        verdict = classify_row(
+            str(row.get("title") or ""), str(row.get("content") or "")
+        )
+        if verdict["needs_translation"]:
+            pending.append(
+                {
+                    "line": line_number,
+                    "title": str(row.get("title") or ""),
+                    "language": verdict["language"],
+                }
+            )
+        else:
+            reason = verdict["reason"]
+            exempt[reason] = exempt.get(reason, 0) + 1
+    return {
+        "chunk_count": chunk_count,
+        "pending_count": len(pending),
+        "pending": pending[:5],
+        "languages": sorted({item["language"] for item in pending}),
+        "exempt": exempt,
+    }
+
+
 def _json_line(payload: dict[str, Any], stdout: TextIO) -> None:
     stdout.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 
@@ -216,6 +271,21 @@ def _command_evaluate(args: argparse.Namespace, stdout: TextIO) -> int:
 
 def _command_register(args: argparse.Namespace, stdout: TextIO) -> int:
     knowledge_base_path = _knowledge_base_path(args.path)
+    language = _foreign_language_report(knowledge_base_path)
+    if language and language["pending_count"] and not getattr(args, "allow_foreign", False):
+        payload = {
+            "knowledge_base": str(knowledge_base_path),
+            "error": "foreign_language_gate",
+            "message": (
+                f"知识库有 {language['pending_count']} 个未翻译的外文文本块"
+                f"（语言：{'、'.join(language['languages'])}）。"
+                "先运行 translation-agent-kb translate-kb 完成翻译，"
+                "或显式传 --allow-foreign 按原样注册。"
+            ),
+            "language_gate": language,
+        }
+        _json_line(payload, stdout)
+        return 1
     initialize_rag_manifest(knowledge_base_path)
     payload = _status_payload(knowledge_base_path)
     if not args.lexical_only:
@@ -234,6 +304,12 @@ def _command_register(args: argparse.Namespace, stdout: TextIO) -> int:
         }
     else:
         payload["registered"] = {"embedding_index": None, "mode": "lexical"}
+    if language:
+        payload["language_gate"] = {
+            "pending_count": language["pending_count"],
+            "languages": language["languages"],
+            "exempt": language["exempt"],
+        }
     _json_line(payload, stdout)
     return 0
 
@@ -267,7 +343,8 @@ def _command_translate_kb(args: argparse.Namespace, stdout: TextIO) -> int:
         model=args.model,
     )
     results = [
-        normalise_corpus_file(path, translator, batch_chars=args.batch_chars, dry_run=args.dry_run)
+        normalise_corpus_file(path, translator, batch_chars=args.batch_chars,
+                              concurrency=args.concurrency, dry_run=args.dry_run)
         for path in paths
     ]
     _json_line(
@@ -473,6 +550,15 @@ def build_parser() -> argparse.ArgumentParser:
     register.add_argument("path", help="knowledge_base.jsonl path or artifact directory")
     register.add_argument("--batch-size", type=int, default=64)
     register.add_argument("--lexical-only", action="store_true")
+    register.add_argument(
+        "--allow-foreign",
+        action="store_true",
+        help=(
+            "Register untranslated foreign chunks as-is. The default language "
+            "gate refuses them: every database chunk must be Chinese "
+            "(reference material stays exempt), mirroring the release gate."
+        ),
+    )
     register.set_defaults(func=_command_register)
 
     annotate = subparsers.add_parser("annotate-apparatus", help="Annotate document roles without rebuilding vectors")
@@ -488,6 +574,12 @@ def build_parser() -> argparse.ArgumentParser:
     translate_kb.add_argument("--recursive", action="store_true", help="Process every knowledge_base.jsonl below path")
     translate_kb.add_argument("--dry-run", action="store_true", help="Report what would be translated without calling a model")
     translate_kb.add_argument("--batch-chars", type=int, default=8000)
+    translate_kb.add_argument(
+        "--concurrency",
+        type=int,
+        default=8,
+        help="Parallel translation requests; lower it when the provider rate-limits",
+    )
     translate_kb.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     translate_kb.add_argument("--api-base", default="https://api.deepseek.com")
     translate_kb.add_argument("--model", default="deepseek-chat")

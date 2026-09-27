@@ -3893,6 +3893,184 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
     )
 
 
+def _check_knowledge_base_chinese(context: _VerificationContext) -> dict[str, Any]:
+    """Language gate: every reader chunk must be Chinese prose or exempt.
+
+    Foreign chunks are unreachable for Chinese queries and poison the shared
+    retrieval corpus, so the release gate refuses them: run
+    ``translation-agent-kb translate-kb`` before publishing.  The classifier
+    itself is offline and reuses kb_translation (reference material and
+    apparatus are exempt because translating them destroys the mapping).
+    """
+
+    path = context.output_dir / "knowledge_base.jsonl"
+    if not path.is_file():
+        # knowledge_base.structure already reports the missing file.
+        return _result("知识库缺失；由 knowledge_base.structure 报告。")
+    try:
+        from kb_translation import classify_row
+    except ImportError as exc:  # pragma: no cover - repository boundary.
+        return _result(
+            "语言门需要 kb_translation。",
+            issues=[_issue("chinese_gate_unavailable", str(exc), path=path)],
+        )
+    pending: list[dict[str, Any]] = []
+    skipped: dict[str, int] = {}
+    chunk_count = 0
+    try:
+        lines = [
+            line
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, UnicodeError) as exc:
+        return _result(
+            "知识库文件无法读取。",
+            issues=[_issue("knowledge_base_unreadable", str(exc), path=path)],
+        )
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # knowledge_base.structure owns JSON validity.
+        if not isinstance(row, dict):
+            continue
+        chunk_count += 1
+        verdict = classify_row(str(row.get("title") or ""), str(row.get("content") or ""))
+        if verdict["needs_translation"]:
+            pending.append({
+                "line": line_number,
+                "title": str(row.get("title") or ""),
+                "language": verdict["language"],
+            })
+        else:
+            reason = verdict["reason"]
+            skipped[reason] = skipped.get(reason, 0) + 1
+    issues: list[dict[str, Any]] = []
+    if pending:
+        samples = "、".join(item["title"][:24] for item in pending[:3])
+        issues.append(
+            _issue(
+                "knowledge_base_foreign_language",
+                f"知识库有 {len(pending)} 个非中文文本块（如：{samples}）。"
+                "外文块对中文检索不可达，先运行 translation-agent-kb translate-kb "
+                "完成翻译再发布。",
+                path=path,
+                pending_count=len(pending),
+                languages=sorted({item["language"] for item in pending}),
+                samples=[item["title"][:60] for item in pending[:5]],
+            )
+        )
+    return _result(
+        "知识库全部文本块为中文或获豁免。" if not issues else "知识库存在未翻译的外文文本块。",
+        metrics={
+            "path": str(path),
+            "chunk_count": chunk_count,
+            "pending_count": len(pending),
+            "exempt": skipped,
+        },
+        issues=issues,
+    )
+
+
+def _check_docx_chinese(context: _VerificationContext) -> dict[str, Any]:
+    """Language gate for the Word deliverable: foreign prose fails the gate.
+
+    Mirrors knowledge_base.chinese for the DOCX artifact using the same
+    paragraph classifier as docx_translation, so a delivered Word file that
+    still contains Japanese/English prose cannot pass verification.
+    """
+
+    path, _candidates = _pick_artifact(
+        context.output_dir, ".docx", book_title=context.book_title
+    )
+    if path is None:
+        # docx.structure already reports missing or ambiguous artifacts.
+        return _result("未找到唯一 Word 成品；由 docx.structure 报告。")
+    try:
+        from docx_translation import needs_translation
+    except ImportError as exc:  # pragma: no cover - repository boundary.
+        return _result(
+            "语言门需要 docx_translation。",
+            issues=[_issue("chinese_gate_unavailable", str(exc), path=path)],
+        )
+    try:
+        with zipfile.ZipFile(path) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
+            # Style IDs are arbitrary strings in generated packages ("1" is a
+            # common Word export of Heading 1); resolve them through styles.xml.
+            styles_root = ET.fromstring(archive.read("word/styles.xml"))
+    except (OSError, zipfile.BadZipFile, KeyError, ET.ParseError) as exc:
+        return _result(
+            "Word 成品无法读取。",
+            issues=[_issue("docx_chinese_unreadable", str(exc), path=path)],
+        )
+    word_ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    style_names: dict[str, str] = {}
+    for style in styles_root.findall(f"{word_ns}style"):
+        style_id = style.get(f"{word_ns}styleId")
+        name = style.find(f"{word_ns}name")
+        if style_id and name is not None:
+            style_names[style_id] = str(name.get(f"{word_ns}val") or "")
+    paragraph_count = 0
+    pending_count = 0
+    reference_exempt_count = 0
+    in_reference_chapter = False
+    pending_samples: list[str] = []
+    for paragraph in root.iter(f"{word_ns}p"):
+        text = "".join(node.text or "" for node in paragraph.iter(f"{word_ns}t")).strip()
+        if not text:
+            continue
+        style = paragraph.find(f"{word_ns}pPr/{word_ns}pStyle")
+        style_id = style.get(f"{word_ns}val", "") if style is not None else ""
+        style_label = style_names.get(style_id, style_id)
+        is_heading = (
+            style_label.lower().startswith("heading")
+            or style_id.lower().startswith("heading")
+            or style_label in {"Title", "Subtitle"}
+        )
+        if is_heading:
+            # Reference chapters (name glossaries, bibliographies, indexes)
+            # are bilingual by construction: their foreign names are the
+            # translation apparatus itself — the same exemption
+            # kb_translation applies to reference rows.
+            in_reference_chapter = any(
+                marker in text
+                for marker in ("对照表", "译名", "书目", "索引", "参考文献", "著書目録")
+            )
+            continue
+        if in_reference_chapter:
+            reference_exempt_count += 1
+            continue
+        paragraph_count += 1
+        if needs_translation(text):
+            pending_count += 1
+            if len(pending_samples) < 5:
+                pending_samples.append(text[:60])
+    issues: list[dict[str, Any]] = []
+    if pending_count:
+        issues.append(
+            _issue(
+                "docx_foreign_language",
+                f"Word 成品有 {pending_count} 段非中文正文。"
+                "使用 docx_translation.translate_docx 翻译后再发布。",
+                path=path,
+                pending_count=pending_count,
+                samples=pending_samples,
+            )
+        )
+    return _result(
+        "Word 成品段落全部为中文或非正文元素。" if not issues else "Word 成品存在未翻译的外文段落。",
+        metrics={
+            "path": str(path),
+            "paragraph_count": paragraph_count,
+            "pending_count": pending_count,
+            "reference_exempt_paragraphs": reference_exempt_count,
+        },
+        issues=issues,
+    )
+
+
 def _expected_bookmarks(toc_payload: dict[str, Any]) -> list[list[Any]]:
     entries: list[dict[str, Any]] = []
     raw_entries = toc_payload.get("entries")
@@ -4374,6 +4552,8 @@ def verify_publication(
             _check_docx_render,
         ),
         ("knowledge_base.structure", require_knowledge_base, _check_knowledge_base),
+        ("knowledge_base.chinese", require_knowledge_base, _check_knowledge_base_chinese),
+        ("docx.chinese", require_docx, _check_docx_chinese),
         ("pdf.bookmarks", require_bookmarked_pdf, _check_pdf),
         ("runtime.hygiene", True, _check_runtime_hygiene),
     )
@@ -4410,6 +4590,7 @@ def verify_publication(
         {
             "epub.structure",
             "knowledge_base.structure",
+            "knowledge_base.chinese",
             "pdf.bookmarks",
         }
         if publication_profile == "word"

@@ -190,6 +190,50 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         self.assertEqual(payload["embedding"]["status"], "ready")
         self.assertEqual(payload["registered"]["provider"], "zhipu")
 
+    def test_register_refuses_untranslated_foreign_chunks(self) -> None:
+        foreign = [
+            *ROWS,
+            {
+                "id": "c" * 40,
+                "title": "意識と自然",
+                "chapter_id": "chapter-3",
+                "chapter_order": 3,
+                "content": "意識は自然に対してどこまで内在するのか。この問いを扱う。",
+            },
+        ]
+        write_knowledge_base(self.kb, foreign)
+        stdout = io.StringIO()
+
+        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+            code = main(["register", str(self.output)], stdout)
+
+        payload = _json(stdout)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["error"], "foreign_language_gate")
+        self.assertEqual(payload["language_gate"]["pending_count"], 1)
+        self.assertIn("ja", payload["language_gate"]["languages"])
+
+    def test_register_allow_foreign_indexes_untranslated_corpus(self) -> None:
+        foreign = [
+            {
+                "id": "c" * 40,
+                "title": "意識と自然",
+                "chapter_id": "chapter-3",
+                "chapter_order": 3,
+                "content": "意識は自然に対してどこまで内在するのか。この問いを扱う。",
+            },
+        ]
+        write_knowledge_base(self.kb, foreign)
+        stdout = io.StringIO()
+
+        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+            code = main(["register", str(self.output), "--allow-foreign"], stdout)
+
+        payload = _json(stdout)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["language_gate"]["pending_count"], 1)
+        self.assertTrue(vector_index_path_for(self.kb).is_file())
+
     def test_retrieve_uses_semantic_when_requested_and_index_ready(self) -> None:
         with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             self.assertEqual(main(["register", str(self.output)], io.StringIO()), 0)
