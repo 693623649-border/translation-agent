@@ -27,6 +27,11 @@ try:
 except ImportError:  # The standalone script can still run without project extras.
     OpenCC = None
 
+try:
+    from rag_apparatus import VERSION as _APPARATUS_SCHEMA_VERSION
+except ImportError:  # Standalone deployments pin the published schema manually.
+    _APPARATUS_SCHEMA_VERSION = 1
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUTS = PROJECT_ROOT / "outputs"
@@ -36,7 +41,9 @@ PAGE_KINDS = ("source_page", "page_translation", "raw_ocr")
 ARCHIVE_KINDS = ("chapter_snapshot", "reviewed_chapter")
 ASSET_SUFFIXES = {".docx", ".epub", ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 REQUIRED_KB_FIELDS = {"id", "title", "chapter_id", "chapter_order", "content"}
-SCHEMA_VERSION = 2
+# v4 aligns FTS rowids with chunks and indexes one/two-character CJK substrings.
+SCHEMA_VERSION = 4
+SHORT_INDEX_STORAGE = "contentless-v1"
 _T2S = OpenCC("t2s") if OpenCC is not None else None
 _NORMALIZATION = "nfkc+t2s" if _T2S is not None else "nfkc"
 
@@ -124,14 +131,49 @@ def _load_kb(path: Path) -> tuple[list[dict[str, Any]], str]:
     return rows, _sha256(raw)
 
 
-def _manifest(workspace: Path) -> list[dict[str, Any]]:
-    path = workspace / "chapters.json"
+def _load_manifest(path: Path) -> tuple[list[dict[str, Any]], str]:
+    """Parse and hash the chapter manifest from one stable read.
+
+    Parsing and hashing the same bytes removes the torn-read window where a
+    concurrent publisher rewrites chapters.json between the two reads.
+    """
+
     if not path.is_file():
-        return []
-    payload = _read_json(path)
+        return [], ""
+    raw = _read_bytes(path)
+    payload = json.loads(raw.decode("utf-8-sig"))
     if not isinstance(payload, list):
         raise ValueError(f"Invalid chapter manifest: {path}")
-    return [item for item in payload if isinstance(item, dict)]
+    return [item for item in payload if isinstance(item, dict)], _sha256(raw)
+
+
+def _stat(path: Path) -> tuple[Path, int, int]:
+    info = path.stat()
+    return path, info.st_mtime_ns, info.st_size
+
+
+def _assert_sources_stable(stats: list[tuple[Path, int, int]]) -> None:
+    """Fail the sync when a source changed between reading and replacing.
+
+    The atomic database replacement only guarantees the output side; the
+    input files are read one by one across the whole sync. Re-checking the
+    recorded (mtime, size) snapshots before os.replace turns a torn mix of
+    two publish generations into an explicit error instead of a silently
+    inconsistent index.
+    """
+
+    moved: list[Path] = []
+    for path, mtime_ns, size in stats:
+        try:
+            info = path.stat()
+        except OSError:
+            moved.append(path)
+            continue
+        if info.st_mtime_ns != mtime_ns or info.st_size != size:
+            moved.append(path)
+    if moved:
+        listing = ", ".join(str(path) for path in sorted(moved)[:5])
+        raise ValueError(f"Sources changed during sync; rerun: {listing}")
 
 
 def _report_status(workspace: Path, reader_paths: Iterable[Path]) -> str:
@@ -187,6 +229,9 @@ def _create_schema(db: sqlite3.Connection) -> None:
         CREATE VIRTUAL TABLE chunks_fts USING fts5(
             id UNINDEXED, title, content, tokenize='trigram'
         );
+        CREATE VIRTUAL TABLE chunks_short_fts USING fts5(
+            tokens, tokenize='ascii', detail='none', content=''
+        );
         CREATE TABLE assets(
             path TEXT PRIMARY KEY, workspace TEXT NOT NULL,
             kind TEXT NOT NULL, size_bytes INTEGER NOT NULL,
@@ -195,6 +240,8 @@ def _create_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX chunks_workspace_kind ON chunks(workspace, kind);
         CREATE INDEX chunks_content_hash ON chunks(content_sha256);
+        CREATE INDEX source_files_workspace ON source_files(workspace);
+        CREATE INDEX assets_workspace ON assets(workspace);
     """)
     db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
@@ -214,6 +261,24 @@ def _require_current_schema(db: sqlite3.Connection, path: Path) -> int:
     return version
 
 
+def _short_search_tokens(value: str) -> set[str]:
+    """Encode exact CJK characters and adjacent pairs as ordinary FTS tokens.
+
+    ASCII encodings avoid tokenizer-dependent CJK word boundaries. Pairs never
+    cross punctuation or whitespace, preserving the existing substring rule.
+    """
+    tokens: set[str] = set()
+    for run in re.findall(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+", value):
+        tokens.update(f"u{ord(character):04x}" for character in run)
+        tokens.update(f"b{ord(left):04x}{ord(right):04x}"
+                      for left, right in zip(run, run[1:]))
+    return tokens
+
+
+def _short_index_text(title: str, content: str) -> str:
+    return " ".join(sorted(_short_search_tokens(title) | _short_search_tokens(content)))
+
+
 def _insert_chunk(
     db: sqlite3.Connection, *, workspace: str, kind: str,
     chapter_id: str, chapter_order: int, title: str, content: str,
@@ -223,62 +288,139 @@ def _insert_chunk(
     chunk_id = hashlib.sha1(
         json.dumps([workspace, kind, source_path, source_row_id], ensure_ascii=False).encode("utf-8")
     ).hexdigest()
-    db.execute(
+    inserted = db.execute(
         "INSERT INTO chunks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (chunk_id, workspace, kind, chapter_id, chapter_order, title, content,
          _sha256(content.encode("utf-8")), source_path, source_row_id,
          json.dumps(source_metadata, ensure_ascii=False, sort_keys=True),
          float(apparatus_weight)),
     )
-    db.execute("INSERT INTO chunks_fts(id, title, content) VALUES (?, ?, ?)",
-               (chunk_id, _normalize_search_text(f"{workspace} {title}", _NORMALIZATION),
-                _normalize_search_text(content, _NORMALIZATION)))
+    search_title = _normalize_search_text(f"{workspace} {title}", _NORMALIZATION)
+    search_content = _normalize_search_text(content, _NORMALIZATION)
+    db.execute("INSERT INTO chunks_fts(rowid, id, title, content) VALUES (?, ?, ?, ?)",
+               (inserted.lastrowid, chunk_id, search_title, search_content))
+    db.execute("INSERT INTO chunks_short_fts(rowid, tokens) VALUES (?, ?)",
+               (inserted.lastrowid, _short_index_text(search_title, search_content)))
 
 
-def _apparatus_weights(workspace: Path) -> dict[str, float]:
-    """Chunk-id -> weight from the per-book apparatus sidecar, when present."""
+def _apparatus_weights(
+    sidecar: Path, sidecar_raw: bytes,
+    rows: list[dict[str, Any]], kb_digest: str,
+) -> dict[str, float]:
+    """Chunk-id -> weight from the per-book apparatus sidecar, when present.
 
-    sidecar = workspace / "knowledge_base.apparatus.json"
-    if not sidecar.is_file():
-        return {}
+    A missing sidecar is valid and every chunk keeps weight 1.0.  A sidecar
+    that exists but is unreadable, stale, or does not cover exactly the
+    published rows aborts the sync: silently ignoring it would turn curated
+    demotions into a no-op that stays invisible until search quality
+    degrades.  This mirrors rag_apparatus.load_apparatus; its titles_sha256
+    check is redundant here because a title edit also changes the corpus
+    digest checked below.
+    """
+
     try:
-        payload = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    annotations = payload.get("annotations") if isinstance(payload, dict) else None
-    if not isinstance(annotations, dict):
-        return {}
+        payload = json.loads(sidecar_raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError(f"Unreadable apparatus sidecar {sidecar}: {exc}")
+    if not isinstance(payload, dict):
+        raise ValueError(f"Apparatus sidecar is not a JSON object: {sidecar}")
+    if payload.get("schema_version") != _APPARATUS_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported apparatus sidecar schema {sidecar}: "
+            f"expected {_APPARATUS_SCHEMA_VERSION}")
+    if payload.get("documents_sha256") != kb_digest:
+        raise ValueError(
+            f"Apparatus sidecar does not match knowledge-base bytes: {sidecar}; "
+            "rerun translation-agent-kb annotate-apparatus")
+    annotations = payload.get("annotations")
+    if (not isinstance(annotations, dict)
+            or set(annotations) != {row["id"] for row in rows}):
+        raise ValueError(
+            f"Apparatus annotations do not cover the knowledge-base rows: {sidecar}")
     weights: dict[str, float] = {}
     for row_id, verdict in annotations.items():
-        if isinstance(verdict, dict) and verdict.get("is_apparatus"):
-            weight = verdict.get("default_weight")
-            if isinstance(weight, (int, float)) and 0 <= weight <= 1:
-                weights[str(row_id)] = float(weight)
+        if (not isinstance(verdict, dict)
+                or not isinstance(verdict.get("is_apparatus"), bool)):
+            raise ValueError(f"Malformed apparatus annotation for {row_id}: {sidecar}")
+        weight = verdict.get("default_weight")
+        if (isinstance(weight, bool) or not isinstance(weight, (int, float))
+                or not 0 <= weight <= 1):
+            raise ValueError(f"Invalid apparatus weight for {row_id}: {sidecar}")
+        if not verdict["is_apparatus"] and weight != 1:
+            raise ValueError(f"Ordinary content must keep weight 1: {row_id}")
+        if verdict["is_apparatus"]:
+            weights[row_id] = float(weight)
     return weights
 
 
-def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> dict[str, int]:
+def _tally_foreign(
+    inventory: dict[str, dict[str, Any]], name: str,
+    classify_row, title: str, content: str,
+) -> None:
+    """Record one reader chunk against the Chinese-language gate."""
+
+    entry = inventory[name]
+    entry["chunks"] += 1
+    if classify_row(str(title), str(content))["needs_translation"]:
+        entry["foreign"] += 1
+        if len(entry["samples"]) < 3:
+            entry["samples"].append(str(title)[:40])
+
+
+def _ingest_workspace(
+    db: sqlite3.Connection, root: Path, workspace: Path,
+    foreign_inventory: dict[str, dict[str, Any]] | None = None,
+    source_inventory: dict[str, list[Any]] | None = None,
+) -> tuple[dict[str, int], list[tuple[Path, int, int]]]:
     name = workspace.name
-    manifest = _manifest(workspace)
+    inventory_paths = ({root / relative: entry for relative, entry in source_inventory.items()}
+                       if source_inventory is not None else None)
+    classify_row = None
+    if foreign_inventory is not None:
+        try:
+            from kb_translation import classify_row as _classify_row
+        except ImportError as exc:  # pragma: no cover - repository boundary.
+            raise ValueError(
+                "The Chinese-language quality gate requires kb_translation "
+                "from this repository; rerun from the repo or pass "
+                "require_chinese=False"
+            ) from exc
+        classify_row = _classify_row
+        foreign_inventory[name] = {"workspace": str(workspace), "chunks": 0,
+                                   "foreign": 0, "samples": []}
     counts: Counter[str] = Counter()
     sources: list[tuple[str, str, str, str]] = []
     reader_paths: list[Path] = []
+    read_stats: list[tuple[Path, int, int]] = []
+    manifest, manifest_digest = _load_manifest(workspace / "chapters.json")
     db.execute("INSERT INTO workspaces VALUES (?, ?, 0, 0, 0, 0, ?)",
                (name, len(manifest), "missing"))
     manifest_path = workspace / "chapters.json"
     if manifest_path.is_file():
         sources.append((manifest_path.relative_to(root).as_posix(), name,
-                        "chapter_manifest", _sha256(_read_bytes(manifest_path))))
+                        "chapter_manifest", manifest_digest))
         reader_paths.append(manifest_path)
+        read_stats.append(_stat(manifest_path))
     kb_path = workspace / "knowledge_base.jsonl"
     covered: set[str] = set()
-    apparatus = _apparatus_weights(workspace)
+    apparatus: dict[str, float] = {}
     if kb_path.is_file():
         rows, digest = _load_kb(kb_path)
         relative = kb_path.relative_to(root).as_posix()
         sources.append((relative, name, "knowledge_base", digest))
         reader_paths.append(kb_path)
+        read_stats.append(_stat(kb_path))
+        sidecar = workspace / "knowledge_base.apparatus.json"
+        if sidecar.is_file():
+            sidecar_raw = _read_bytes(sidecar)
+            apparatus = _apparatus_weights(sidecar, sidecar_raw, rows, digest)
+            sources.append((sidecar.relative_to(root).as_posix(), name,
+                            "apparatus", _sha256(sidecar_raw)))
+            read_stats.append(_stat(sidecar))
         for row in rows:
+            if classify_row is not None:
+                _tally_foreign(foreign_inventory, name, classify_row,
+                               row["title"], row["content"])
             covered.add(row["chapter_id"])
             _insert_chunk(
                 db, workspace=name, kind="knowledge_base",
@@ -321,11 +463,14 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
         relative = chapter_path.relative_to(root).as_posix()
         sources.append((relative, name, kind, _sha256(raw)))
         reader_paths.append(chapter_path)
+        read_stats.append(_stat(chapter_path))
         markdown = raw.decode("utf-8-sig")
         body = re.sub(r"^#\s+[^\n]*\n?", "", markdown, count=1).strip()
         title = str(item.get("display_title") or item.get("title") or chapter_id)
         order = int(item.get("sequence") or 0)
         for index, chunk in enumerate(_split_text(body), 1):
+            if classify_row is not None and kind == "chapter_fallback":
+                _tally_foreign(foreign_inventory, name, classify_row, title, chunk)
             _insert_chunk(
                 db, workspace=name, kind=kind,
                 chapter_id=chapter_id, chapter_order=order, title=title,
@@ -343,6 +488,7 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
             sources.append((reviewed_relative, name, "reviewed_chapter",
                             _sha256(reviewed_raw)))
             reader_paths.append(reviewed_path)
+            read_stats.append(_stat(reviewed_path))
             if reviewed_raw != raw:
                 reviewed_body = re.sub(
                     r"^#\s+[^\n]*\n?", "", reviewed_raw.decode("utf-8-sig"), count=1
@@ -368,6 +514,7 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
             relative = page_path.relative_to(root).as_posix()
             sources.append((relative, name, "page_record", _sha256(raw)))
             reader_paths.append(page_path)
+            read_stats.append(_stat(page_path))
             page_number = page.get("pdf_page")
             if type(page_number) is not int:
                 page_number = int(re.search(r"\d+", page_path.stem).group())
@@ -399,9 +546,27 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
     for path in workspace.rglob("*"):
         if (path.is_file() and not path.is_symlink()
                 and path.suffix.lower() in ASSET_SUFFIXES):
+            relative = path.relative_to(root).as_posix()
+            digest = (inventory_paths[path][0] if inventory_paths is not None
+                      else _sha256_file(path))
             assets.append((path.relative_to(root).as_posix(), name,
                            path.suffix.lower().lstrip("."), path.stat().st_size,
-                           _sha256_file(path)))
+                           digest))
+            read_stats.append(_stat(path))
+    # report_status is a snapshot of the release report and the audit files it
+    # compares against, so those bytes belong in source_files: any later edit
+    # must flip verify_sources to not-current instead of keeping the stale
+    # passed/failed label searchable.
+    audit = workspace / "audit"
+    for dependency, kind in (
+            (audit / "release-report.json", "release_report"),
+            (workspace / "toc.json", "report_dependency"),
+            (audit / "semantic-review.json", "report_dependency"),
+            (audit / "review-decisions.jsonl", "report_dependency")):
+        if dependency.is_file():
+            sources.append((dependency.relative_to(root).as_posix(), name,
+                            kind, _sha256(_read_bytes(dependency))))
+            read_stats.append(_stat(dependency))
     db.execute("UPDATE workspaces SET reader_chunks=?, page_chunks=?, archive_chunks=?, asset_count=?, "
                "report_status=? WHERE name=?",
                (counts["reader_chunks"], counts["page_chunks"], counts["archive_chunks"], len(assets),
@@ -410,11 +575,109 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
     db.executemany("INSERT INTO assets VALUES (?, ?, ?, ?, ?)", assets)
     counts["source_files"] = len(sources)
     counts["assets"] = len(assets)
-    return dict(counts)
+    return dict(counts), read_stats
+
+
+def _workspace_inventory(root: Path, workspace: Path) -> tuple[dict[str, list[Any]], list[tuple[Path, int, int]]]:
+    """Hash every ingestion/report input, including unlisted chapter files.
+
+    mtimes also matter: report_status uses publication ordering. Hashes detect
+    edits even when a publisher preserves size and modification time.
+    """
+    fixed = {"chapters.json", "knowledge_base.jsonl", "knowledge_base.apparatus.json",
+              "toc.json", "audit/release-report.json", "audit/semantic-review.json",
+              "audit/review-decisions.jsonl"}
+    manifest, _digest = _load_manifest(workspace / "chapters.json")
+    chapter_dir = workspace / "chapters"
+    listed_paths: set[Path] = set()
+    for item in manifest:
+        filename = item.get("filename")
+        if not isinstance(filename, str):
+            raise ValueError(f"Invalid chapter entry in {workspace / 'chapters.json'}")
+        chapter_path = chapter_dir / filename
+        if not _within(chapter_path, chapter_dir):
+            raise ValueError(f"Missing or unsafe chapter file: {chapter_path}")
+        listed_paths.add(chapter_path)
+    # Retain the path spelling used by ingestion. On Windows a directory entry
+    # may be CHAPTERS.JSON while workspace / 'chapters.json' is the same file;
+    # Path equality provides platform-correct identity without merging distinct
+    # case-sensitive files on Linux.
+    files: dict[Path, Path] = {}
+    for relative in sorted(fixed):
+        dependency = workspace / relative
+        if dependency.is_file():
+            files[dependency] = dependency
+    for dependency in sorted(listed_paths):
+        if dependency.is_file():
+            files.setdefault(dependency, dependency)
+    for directory, pattern in (("chapters", "*.md"), ("reviewed_chapters", "*.md"),
+                               ("pages", "page_*.json")):
+        for dependency in (workspace / directory).glob(pattern):
+            if dependency.is_file():
+                files.setdefault(dependency, dependency)
+    stats = [_stat(workspace)]
+    for path in workspace.rglob("*"):
+        if path.is_dir():
+            stats.append(_stat(path))
+            continue
+        relative = path.relative_to(workspace).as_posix()
+        if (path.is_file() and (
+                relative in fixed
+                or path in listed_paths
+                or (relative.casefold().startswith(("chapters/", "reviewed_chapters/"))
+                    and path.suffix.casefold() == ".md")
+                or (relative.startswith("pages/") and path.match("page_*.json"))
+                or (not path.is_symlink() and path.suffix.lower() in ASSET_SUFFIXES))):
+            files.setdefault(path, path)
+    inventory = {}
+    for path in sorted(files.values()):
+        snapshot = _stat(path)
+        digest = _sha256_file(path)
+        _assert_sources_stable([snapshot])
+        stats.append(snapshot)
+        inventory[path.relative_to(root).as_posix()] = [digest, snapshot[1], snapshot[2]]
+    _assert_sources_stable(stats)
+    return inventory, stats
+
+
+def _delete_workspace(db: sqlite3.Connection, name: str) -> None:
+    # Contentless FTS stores postings without a second copy of all encoded
+    # tokens. Its documented delete command needs the original token stream.
+    for rowid, title, content in db.execute(
+            "SELECT rowid, title, content FROM chunks WHERE workspace=?", (name,)):
+        tokens = _short_index_text(
+            _normalize_search_text(f"{name} {title}", _NORMALIZATION),
+            _normalize_search_text(content, _NORMALIZATION))
+        db.execute("INSERT INTO chunks_short_fts(chunks_short_fts, rowid, tokens) "
+                   "VALUES ('delete', ?, ?)", (rowid, tokens))
+    db.execute("DELETE FROM chunks_fts WHERE rowid IN "
+               "(SELECT rowid FROM chunks WHERE workspace=?)", (name,))
+    for table in ("chunks", "source_files", "assets"):
+        db.execute(f"DELETE FROM {table} WHERE workspace=?", (name,))
+    db.execute("DELETE FROM workspace_inventory WHERE workspace=?", (name,))
+    db.execute("DELETE FROM workspaces WHERE name=?", (name,))
+
+
+def _sync_counts(db: sqlite3.Connection) -> dict[str, int]:
+    counts = dict(zip(("reader_chunks", "page_chunks", "archive_chunks", "assets"),
+                     db.execute("SELECT coalesce(sum(reader_chunks),0), coalesce(sum(page_chunks),0), "
+                                "coalesce(sum(archive_chunks),0), coalesce(sum(asset_count),0) FROM workspaces").fetchone()))
+    counts["source_files"] = db.execute("SELECT count(*) FROM source_files").fetchone()[0]
+    return counts
+
+
+def _assert_workspace_set(root: Path, names: set[str]) -> None:
+    current = {path.name for path in root.iterdir()
+               if path.is_dir() and not path.is_symlink()
+               and ((path / "chapters.json").is_file()
+                    or (path / "knowledge_base.jsonl").is_file())}
+    if current != names:
+        raise ValueError("Sources changed during sync; rerun: workspace inventory changed")
 
 
 def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
-                 db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
+                 db_path: Path | str = DEFAULT_DB,
+                 *, require_chinese: bool = True, full_rebuild: bool = False) -> dict[str, Any]:
     root = Path(outputs_root).expanduser().resolve()
     target = Path(db_path).expanduser().resolve()
     if not root.is_dir():
@@ -426,10 +689,43 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
               or (path / "knowledge_base.jsonl").is_file())),
         key=lambda path: path.name,
     )
-    if not workspaces:
+    if not workspaces and not target.is_file():
         raise ValueError(f"No output workspaces found in {root}")
     if target.is_relative_to(root) and any(target.is_relative_to(path) for path in workspaces):
         raise ValueError("The global database must not overwrite an output workspace")
+    inventories = {}
+    read_stats = []
+    for workspace in workspaces:
+        inventory, stats = _workspace_inventory(root, workspace)
+        inventories[workspace.name] = inventory
+        read_stats.extend(stats)
+    previous = {}
+    reusable = False
+    gate = "enforced" if require_chinese else "allowed"
+    if target.is_file() and not full_rebuild:
+        with closing(sqlite3.connect(f"file:{target.as_posix()}?mode=ro", uri=True)) as old_db:
+            version = old_db.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:
+                meta = dict(old_db.execute("SELECT key, value FROM meta"))
+                reusable = (meta.get("outputs_root") == str(root)
+                            and meta.get("search_normalization") == _NORMALIZATION
+                            and meta.get("chinese_gate") == gate
+                            and meta.get("short_index_storage") == SHORT_INDEX_STORAGE
+                            and old_db.execute("SELECT 1 FROM sqlite_master WHERE name='workspace_inventory'").fetchone() is not None)
+                if reusable:
+                    previous = {name: json.loads(value) for name, value in
+                                old_db.execute("SELECT workspace, inventory FROM workspace_inventory")}
+                    old_counts = _sync_counts(old_db)
+    updated = [path for path in workspaces if not reusable or previous.get(path.name) != inventories[path.name]]
+    deleted = sorted(set(previous) - set(inventories))
+    result = {"database": str(target), "outputs_root": str(root), "workspaces": len(workspaces),
+              "updated_workspaces": [path.name for path in updated],
+              "reused_workspaces": sorted(set(inventories) - {path.name for path in updated}),
+              "deleted_workspaces": deleted}
+    if reusable and not updated and not deleted:
+        _assert_sources_stable(read_stats)
+        _assert_workspace_set(root, set(inventories))
+        return {**result, "counts": old_counts, "mode": "unchanged"}
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=".global-kb-", suffix=".sqlite3", dir=target.parent)
     os.close(fd)
@@ -439,14 +735,59 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
         # A Connection context manager commits but does not close the handle.
         # Windows cannot replace the finished database until it is closed.
         with closing(sqlite3.connect(temporary)) as db, db:
-            _create_schema(db)
-            db.execute("INSERT INTO meta VALUES (?, ?)", ("outputs_root", str(root)))
-            db.execute("INSERT INTO meta VALUES (?, ?)",
-                       ("built_at", datetime.now(timezone.utc).isoformat()))
-            db.execute("INSERT INTO meta VALUES (?, ?)",
-                       ("search_normalization", _NORMALIZATION))
-            for workspace in workspaces:
-                totals.update(_ingest_workspace(db, root, workspace))
+            if reusable:
+                with closing(sqlite3.connect(f"file:{target.as_posix()}?mode=ro", uri=True)) as old_db:
+                    old_db.backup(db)
+                db.execute("PRAGMA foreign_keys = ON")
+                for name in deleted + [path.name for path in updated if path.name in previous]:
+                    _delete_workspace(db, name)
+            else:
+                _create_schema(db)
+                db.execute("CREATE TABLE workspace_inventory(workspace TEXT PRIMARY KEY REFERENCES workspaces(name), inventory TEXT NOT NULL)")
+            db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", (
+                ("outputs_root", str(root)), ("built_at", datetime.now(timezone.utc).isoformat()),
+                ("search_normalization", _NORMALIZATION), ("chinese_gate", gate),
+                ("short_index_storage", SHORT_INDEX_STORAGE)))
+            foreign_inventory: dict[str, dict[str, Any]] | None = (
+                {} if require_chinese else None
+            )
+            for workspace in updated:
+                counts, stats = _ingest_workspace(
+                    db, root, workspace, foreign_inventory=foreign_inventory,
+                    source_inventory=inventories[workspace.name]
+                )
+                totals.update(counts)
+                read_stats.extend(stats)
+                # The bytes parsed must match the inventory checked for reuse.
+                inventory_paths = {root / relative: entry
+                                   for relative, entry in inventories[workspace.name].items()}
+                for path, digest in db.execute("SELECT path, sha256 FROM source_files WHERE workspace=?", (workspace.name,)):
+                    if inventory_paths.get(root / path, [None])[0] != digest:
+                        raise ValueError(f"Sources changed during sync; rerun: {path}")
+                db.execute("INSERT INTO workspace_inventory VALUES (?, ?)",
+                           (workspace.name, json.dumps(inventories[workspace.name], sort_keys=True)))
+            if foreign_inventory:
+                foreign_inventory = {
+                    name: entry for name, entry in foreign_inventory.items()
+                    if entry["foreign"] > 0
+                }
+                if foreign_inventory:
+                    listing = ", ".join(
+                        f"{name} ({entry['foreign']}/{entry['chunks']} 块)"
+                        for name, entry in sorted(
+                            foreign_inventory.items(),
+                            key=lambda item: -item[1]["foreign"],
+                        )
+                    )
+                    raise ValueError(
+                        "Chinese-language quality gate: the following workspaces "
+                        f"still hold untranslated foreign reader chunks: {listing}. "
+                        "Run translation-agent-kb translate-kb on each workspace, "
+                        "or rerun sync with --allow-foreign to index them as-is."
+                    )
+            _assert_sources_stable(read_stats)
+            _assert_workspace_set(root, set(inventories))
+            totals = _sync_counts(db)
             db.commit()
             if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("SQLite integrity check failed")
@@ -454,11 +795,18 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
             fts_chunks = db.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
             if total_chunks != fts_chunks:
                 raise RuntimeError("Search index row count does not match content table")
+            if total_chunks != db.execute("SELECT count(*) FROM chunks_short_fts").fetchone()[0]:
+                raise RuntimeError("Short-token index row count does not match content table")
+            if db.execute("SELECT count(*) FROM chunks c LEFT JOIN chunks_fts f ON f.rowid=c.rowid "
+                          "LEFT JOIN chunks_short_fts s ON s.rowid=c.rowid "
+                          "WHERE f.rowid IS NULL OR s.rowid IS NULL OR f.id != c.id").fetchone()[0]:
+                raise RuntimeError("Search index row IDs do not match content table")
+        _assert_sources_stable(read_stats)
+        _assert_workspace_set(root, set(inventories))
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
-    return {"database": str(target), "outputs_root": str(root),
-            "workspaces": len(workspaces), "counts": dict(totals)}
+    return {**result, "counts": dict(totals), "mode": "incremental" if reusable else "full"}
 
 
 def status(db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
@@ -513,14 +861,22 @@ def verify_sources(db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
                 or (workspace / "knowledge_base.jsonl").is_file()):
             continue
         actual_workspaces.add(workspace.name)
-        for fixed in ("chapters.json", "knowledge_base.jsonl"):
+        # Must mirror the file set registered by _ingest_workspace, including
+        # the apparatus sidecar and the report/audit dependencies.
+        for fixed in ("chapters.json", "knowledge_base.jsonl",
+                      "knowledge_base.apparatus.json", "toc.json",
+                      "audit/release-report.json",
+                      "audit/semantic-review.json",
+                      "audit/review-decisions.jsonl"):
             item = workspace / fixed
             if item.is_file():
                 actual_sources.add(item.relative_to(root).as_posix())
         for pattern in ("chapters/*.md", "reviewed_chapters/*.md", "pages/page_*.json"):
             actual_sources.update(item.relative_to(root).as_posix()
                                   for item in workspace.glob(pattern) if item.is_file())
-    new_sources = sorted(actual_sources - set(saved))
+    new_sources = sorted(path.relative_to(root).as_posix() for path in
+                         ({root / relative for relative in actual_sources}
+                          - {root / relative for relative in saved}))
     changed_assets = [relative for relative, (size, digest) in expected_assets.items()
                       if not (root / relative).is_file()
                       or (root / relative).stat().st_size != size
@@ -532,7 +888,9 @@ def verify_sources(db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
         if item.is_file() and not item.is_symlink()
         and item.suffix.lower() in ASSET_SUFFIXES
     }
-    new_assets = sorted(actual_assets - set(expected_assets))
+    new_assets = sorted(path.relative_to(root).as_posix() for path in
+                       ({root / relative for relative in actual_assets}
+                        - {root / relative for relative in expected_assets}))
     current = not (changed or missing or new_sources or changed_assets
                    or new_assets or workspace_names != actual_workspaces
                    or integrity != "ok")
@@ -547,26 +905,48 @@ def verify_sources(db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
     }
 
 
-def _query_terms(query: str) -> list[str]:
-    """Turn CJK questions into searchable trigrams and keep Latin words."""
+def _query_terms(query: str) -> tuple[list[str], list[str]]:
+    """Split a query into FTS trigram terms and short CJK words.
+
+    FTS5's trigram tokenizer cannot match strings shorter than three
+    characters, so one- and two-character CJK/kana/hangul words are returned
+    separately for substring predicates instead of being silently dropped —
+    a query like ``自然 正式`` used to degrade to a full-string match that
+    could never hit ``自然主义正式正文``.
+    """
     terms: list[str] = []
+    short_terms: list[str] = []
     for part in re.findall(
         r"[A-Za-z0-9_]+|[\u3400-\u9fff]+|[\u3040-\u30ff]+|[\uac00-\ud7af]+",
         query,
     ):
-        if not re.match(r"[A-Za-z0-9_]", part):
-            terms.extend(part[index:index + 3]
-                         for index in range(max(0, len(part) - 2)))
+        if re.match(r"[A-Za-z0-9_]", part):
+            if len(part) >= 3:
+                terms.append(part)
         elif len(part) >= 3:
-            terms.append(part)
+            terms.extend(part[index:index + 3]
+                         for index in range(len(part) - 2))
+        else:
+            short_terms.append(part)
     # Duplicate n-grams do not add evidence; cap pathological query sizes.
-    return list(dict.fromkeys(terms))[:64]
+    return list(dict.fromkeys(terms))[:64], list(dict.fromkeys(short_terms))[:16]
 
 
 def search(query: str, *, db_path: Path | str = DEFAULT_DB,
            scope: str = "reader", workspace: str | None = None,
            limit: int = 10, verified_only: bool = False,
-           per_book_cap: int | None = None) -> list[dict[str, Any]]:
+           per_book_cap: int | None = None,
+           excerpt: bool = True) -> list[dict[str, Any]]:
+    """Return ranked chunks for one query.
+
+    ``excerpt=True`` (the default) replaces each chunk's content with a short
+    window around the match and is what a caller wants for cheap discovery.
+    ``excerpt=False`` keeps the full chunk text in ``content`` and is required
+    by callers that compare *stored bytes* against a passage — a caller
+    verifying a quotation against a truncated window would report a verbatim
+    quote as a mismatch whenever the quote starts past that window. The
+    ``excerpt`` key is still populated in both modes.
+    """
     if not query.strip() or limit < 1:
         raise ValueError("A nonempty query and a positive limit are required")
     if scope not in {"reader", "pages", "archive", "all"}:
@@ -577,7 +957,9 @@ def search(query: str, *, db_path: Path | str = DEFAULT_DB,
            and scope in {"reader", "all"} else per_book_cap)
     if cap == 0:
         cap = None
-    fetch_limit = max(100, limit * 20) if cap is not None else limit
+    # The per-book cap is enforced as a window rank inside SQL, so no
+    # over-fetching is needed to let other books survive the fetch cut.
+    fetch_limit = limit
     path = Path(db_path).expanduser().resolve()
     if not path.is_file():
         raise ValueError(f"Global knowledge base does not exist: {path}")
@@ -594,36 +976,89 @@ def search(query: str, *, db_path: Path | str = DEFAULT_DB,
     if verified_only:
         conditions.append("w.report_status = 'passed'")
     filters = (" AND " + " AND ".join(conditions)) if conditions else ""
-    # FTS5 trigram is useful for CJK. Short queries cannot form a trigram, so
-    # they use an indexed-table scan with instr() instead.
+    # Trigrams retain existing long-query ranking. Pure short CJK queries use
+    # an exact unigram/bigram FTS index; punctuation-only queries keep their
+    # literal substring fallback.
     with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         mode = db.execute("SELECT value FROM meta WHERE key='search_normalization'").fetchone()[0]
         _require_current_schema(db, path)
         normalized_query = _normalize_search_text(query, mode)
-        terms = _query_terms(normalized_query)
+        terms, short_terms = _query_terms(normalized_query)
+        # FTS5's bm25() returns negative scores where smaller is better, so
+        # demoting an apparatus chunk means pushing its score toward zero:
+        # score + (1 - weight) * |score|.  Demotion must happen inside every
+        # ORDER BY — demoting after a fetch limit would already have dropped
+        # the prose chunks the TOC pushed past the cut.  Substring-only
+        # queries have no meaningful score, so they order apparatus chunks
+        # last explicitly.
+        score_sql = ("(bm25(chunks_fts, 0, 4, 1) + (1.0 - c.apparatus_weight)"
+                     " * abs(bm25(chunks_fts, 0, 4, 1)))")
+        demote_sql = ("CASE WHEN c.apparatus_weight < 1.0 THEN 1 ELSE 0 END, "
+                      "c.workspace, c.chapter_order, c.id")
+        where: list[str] = []
+        params: list[Any] = []
+        search_table = "chunks_fts"
         if terms:
             expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
-            # FTS5's bm25() returns negative scores where smaller is better, so
-            # demoting an apparatus chunk means pushing its score toward zero:
-            # score + (1 - weight) * |score|.  This must happen inside the
-            # ORDER BY — demoting after the fetch limit would already have
-            # dropped the prose chunks the TOC pushed past the cut.
-            sql = ("SELECT c.*, w.report_status, "
-                   "(bm25(chunks_fts, 0, 4, 1) + (1.0 - c.apparatus_weight)"
-                   " * abs(bm25(chunks_fts, 0, 4, 1))) AS score "
-                   "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.id "
-                   "JOIN workspaces w ON w.name = c.workspace "
-                   "WHERE chunks_fts MATCH ?" + filters + " ORDER BY score LIMIT ?")
-            rows = db.execute(sql, [expression, *values, fetch_limit]).fetchall()
+            where.append("chunks_fts MATCH ?")
+            params.append(expression)
+            inner_order = f"{score_sql}, c.chapter_order, c.id"
+            # Short words alongside trigram terms do NOT filter: a chapter
+            # query like ``无器官身体 斥力 引力`` spans chunks, and requiring
+            # every two-character word in one chunk drops the best-scoring
+            # chunk of the expected chapter (measured on the local fixture).
+            # They still guide excerpt highlighting below.
         else:
-            sql = ("SELECT c.*, w.report_status, 0.0 AS score FROM chunks_fts "
-                   "JOIN chunks c ON c.id = chunks_fts.id "
-                   "JOIN workspaces w ON w.name = c.workspace "
-                   "WHERE (instr(chunks_fts.content, ?) > 0 "
-                   "OR instr(chunks_fts.title, ?) > 0)" +
-                   filters + " ORDER BY c.workspace, c.chapter_order LIMIT ?")
-            rows = db.execute(sql, [normalized_query, normalized_query, *values, fetch_limit]).fetchall()
+            inner_order = demote_sql
+            if short_terms:
+                # Short words carrying the whole query combine with AND:
+                # ``自然 正式`` must hit a chunk containing both words, which
+                # the old full-string fallback could never match.
+                search_table = "chunks_short_fts"
+                tokens = set().union(*(_short_search_tokens(term) for term in short_terms))
+                # For a two-character word its pair token implies both
+                # characters, so only the pair is needed in the posting lookup.
+                tokens = {token for token in tokens if token.startswith("b")} | {
+                    f"u{ord(term):04x}" for term in short_terms if len(term) == 1
+                }
+                where.append("chunks_short_fts MATCH ?")
+                params.append(" AND ".join(f'"{token}"' for token in sorted(tokens)))
+            else:
+                where.append("(instr(chunks_fts.content, ?) > 0 "
+                             "OR instr(chunks_fts.title, ?) > 0)")
+                params.extend([normalized_query, normalized_query])
+        base = (f"FROM {search_table} JOIN chunks c ON c.rowid = {search_table}.rowid "
+                 "JOIN workspaces w ON w.name = c.workspace WHERE "
+                 + " AND ".join(where) + filters)
+        # Materialize direct-query BM25 scores before window ranking: calling
+        # bm25() inside the window itself is invalid. Keep content out of the
+        # intermediate rows and fetch only the final limited result into Python.
+        score_select = score_sql if terms else "0.0"
+        if cap is None:
+            sql = (f"SELECT c.*, w.report_status, {score_select} AS score {base} "
+                   f"ORDER BY {inner_order} LIMIT ?")
+            rows = db.execute(sql, [*params, *values, fetch_limit]).fetchall()
+        else:
+            slim = (f"SELECT c.rowid AS chunk_rowid, c.id, c.workspace, c.chapter_order, "
+                     f"c.apparatus_weight, {score_select} AS score {base}")
+            rank_order = ("score, chapter_order, id" if terms else
+                          "CASE WHEN apparatus_weight < 1.0 THEN 1 ELSE 0 END, "
+                          "workspace, chapter_order, id")
+            output_order = ("p.score, p.chapter_order, p.id" if terms else
+                            "CASE WHEN p.apparatus_weight < 1.0 THEN 1 ELSE 0 END, "
+                            "p.workspace, p.chapter_order, p.id")
+            sql = (
+                f"WITH scored AS MATERIALIZED ({slim}), "
+                f"ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY workspace "
+                f"ORDER BY {rank_order}) AS book_rank FROM scored), "
+                f"picked AS MATERIALIZED (SELECT * FROM ranked WHERE book_rank <= ? "
+                f"ORDER BY {rank_order} LIMIT ?) "
+                f"SELECT c.*, w.report_status, p.score FROM picked p "
+                f"JOIN chunks c ON c.rowid = p.chunk_rowid "
+                f"JOIN workspaces w ON w.name = c.workspace ORDER BY {output_order}"
+            )
+            rows = db.execute(sql, [*params, *values, cap, fetch_limit]).fetchall()
     results = []
     by_book: Counter[str] = Counter()
     for row in rows:
@@ -637,12 +1072,14 @@ def search(query: str, *, db_path: Path | str = DEFAULT_DB,
         )
         if position < 0:
             searchable = _normalize_search_text(content, mode).casefold()
-            position = next((searchable.find(term.casefold()) for term in terms
+            position = next((searchable.find(term.casefold())
+                             for term in (*terms, *short_terms)
                              if searchable.find(term.casefold()) >= 0), -1)
         item["excerpt"] = (
             content[max(0, position - 90): position + 230]
             if position >= 0 else f"[标题匹配] {item['title']}"
         )
+        item["content"] = content if not excerpt else item["excerpt"]
         item["source_metadata"] = json.loads(item["source_metadata"])
         results.append(item)
         if len(results) == limit:
@@ -716,9 +1153,12 @@ def evaluate_retrieval(cases_path: Path | str, *,
     source_audit = verify_sources(db_path)
     database_status = status(db_path)
     expected_workspaces = fixture.get("expected_workspaces")
-    if database_status["workspace_count"] != expected_workspaces:
+    # The fixture pins the corpus its queries were reviewed against.  Extra
+    # workspaces are allowed — otherwise every newly translated book would
+    # permanently fail the gate — while a shrinking corpus still fails.
+    if database_status["workspace_count"] < expected_workspaces:
         threshold_failures.append(
-            f"workspace_count={database_status['workspace_count']} != {expected_workspaces}"
+            f"workspace_count={database_status['workspace_count']} < {expected_workspaces}"
         )
     if database_status.get("search_normalization") != "nfkc+t2s":
         threshold_failures.append("OpenCC search normalization is not active")
@@ -743,8 +1183,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local repository-wide knowledge base")
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     commands = parser.add_subparsers(dest="command", required=True)
-    sync = commands.add_parser("sync", help="Rebuild the local index from all outputs")
+    sync = commands.add_parser("sync", help="Synchronize changed output workspaces")
     sync.add_argument("--outputs", type=Path, default=DEFAULT_OUTPUTS)
+    sync.add_argument("--full-rebuild", action="store_true",
+                      help="Rebuild all workspaces instead of reusing unchanged indexed sources")
+    sync.add_argument(
+        "--allow-foreign",
+        action="store_true",
+        help="Index untranslated foreign chunks instead of failing the Chinese-language gate",
+    )
     commands.add_parser("status", help="Show workspace and content coverage")
     commands.add_parser("verify", help="Check indexed sources for additions or changes")
     evaluate = commands.add_parser("evaluate", help="Measure retrieval hit rate and quality gate")
@@ -763,7 +1210,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "sync":
-            result = sync_outputs(args.outputs, args.db)
+            result = sync_outputs(args.outputs, args.db,
+                                  require_chinese=not args.allow_foreign,
+                                  full_rebuild=args.full_rebuild)
         elif args.command == "status":
             result = status(args.db)
         elif args.command == "verify":

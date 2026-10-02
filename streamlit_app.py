@@ -18,6 +18,7 @@ st.session_state.setdefault("frontend_config_path", "")
 st.session_state.setdefault("frontend_recipe_path", "")
 
 pages = [
+    st.Page("app_pages/architecture.py", title="架构与审查", icon=":material/account_tree:"),
     st.Page(
         "app_pages/new_job.py",
         title="新任务",

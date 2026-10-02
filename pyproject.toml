@@ -36,6 +36,8 @@ translation-agent-global-kb = "global_knowledge_base:main"
 [tool.setuptools]
 include-package-data = true
 py-modules = [
+  "architecture_ascii",
+  "architecture_dashboard",
   "book_pipeline",
   "born_digital_pdf_import",
   "document_pipeline",

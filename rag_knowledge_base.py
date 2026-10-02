@@ -13,6 +13,7 @@ implement :class:`EmbeddingProvider`.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import os
@@ -403,13 +404,18 @@ def _json_text(value: Mapping[str, Any]) -> str:
 def load_knowledge_rows(path: Path | str) -> list[dict[str, Any]]:
     """Load and validate the verifier-owned five-field JSONL corpus."""
 
-    source = Path(path)
+    return _load_knowledge_snapshot(Path(path))[0]
+
+
+def _load_knowledge_snapshot(source: Path) -> tuple[list[dict[str, Any]], str]:
+    """Parse and hash the same bytes so validation binds to the loaded rows."""
     if not source.is_file():
         raise RagFormatError(f"Knowledge base does not exist: {source}")
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     try:
-        lines = source.read_text(encoding="utf-8").splitlines()
+        data = source.read_bytes()
+        lines = data.decode("utf-8").splitlines()
     except (OSError, UnicodeError) as exc:
         raise RagFormatError(f"Cannot read knowledge base {source}: {exc}") from exc
     for line_number, line in enumerate(lines, start=1):
@@ -448,7 +454,7 @@ def load_knowledge_rows(path: Path | str) -> list[dict[str, Any]]:
         rows.append({field: raw[field] for field in KNOWLEDGE_FIELDS})
     if not rows:
         raise RagFormatError(f"Knowledge base contains no chunks: {source}")
-    return rows
+    return rows, hashlib.sha256(data).hexdigest()
 
 
 def _pending_manifest(
@@ -543,17 +549,23 @@ def _load_embedding_index(
     *,
     expected_documents_sha256: str,
     expected_ids: Sequence[str],
+    expected_index_sha256: str | None = None,
 ) -> tuple[RagEmbeddingMetadata, dict[str, tuple[float, ...]]]:
     index_path = vector_index_path_for(knowledge_base_path)
     if not index_path.is_file():
         raise RagFormatError(f"Embedding index does not exist: {index_path}")
     try:
-        lines = [
-            line
-            for line in index_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-    except (OSError, UnicodeError) as exc:
+        data = index_path.read_bytes()
+    except OSError as exc:
+        raise RagFormatError(f"Cannot read embedding index {index_path}: {exc}") from exc
+    index_sha256 = hashlib.sha256(data).hexdigest()
+    if expected_index_sha256 is not None and index_sha256 != expected_index_sha256:
+        raise RagIndexStaleError(
+            f"Embedding index checksum does not match the RAG manifest: {index_path}"
+        )
+    try:
+        lines = [line for line in data.decode("utf-8").splitlines() if line.strip()]
+    except UnicodeError as exc:
         raise RagFormatError(f"Cannot read embedding index {index_path}: {exc}") from exc
     if not lines:
         raise RagFormatError(f"Embedding index is empty: {index_path}")
@@ -622,7 +634,7 @@ def _load_embedding_index(
             dimensions=dimensions,
             chunk_count=chunk_count,
             documents_sha256=documents_sha256,
-            index_sha256=_sha256_file(index_path),
+            index_sha256=index_sha256,
             index_path=index_path,
         ),
         vectors,
@@ -632,9 +644,15 @@ def _load_embedding_index(
 def read_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
     """Read a manifest and prove it still describes the current corpus/index."""
 
-    source = Path(knowledge_base_path)
-    rows = load_knowledge_rows(source)
-    documents_sha256 = _sha256_file(source)
+    return _load_validated_rag_snapshot(Path(knowledge_base_path))[1]
+
+
+def _load_validated_rag_snapshot(
+    source: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any], RagEmbeddingMetadata | None, dict[str, tuple[float, ...]]]:
+    rows, documents_sha256 = _load_knowledge_snapshot(source)
+    metadata = None
+    vectors = {}
     manifest = _read_manifest_file(source)
     if (
         manifest.get("schema_version") != RAG_SCHEMA_VERSION
@@ -675,19 +693,11 @@ def read_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
             raise RagFormatError(
                 f"Embedding index checksum is invalid: {manifest_path_for(source)}"
             )
-        index_path = vector_index_path_for(source)
-        if not index_path.is_file():
-            raise RagFormatError(f"Embedding index does not exist: {index_path}")
-        actual_index_sha256 = _sha256_file(index_path)
-        if actual_index_sha256 != expected_index_sha256:
-            raise RagIndexStaleError(
-                f"Embedding index checksum does not match the RAG manifest: "
-                f"{index_path}"
-            )
-        metadata, _vectors = _load_embedding_index(
+        metadata, vectors = _load_embedding_index(
             source,
             expected_documents_sha256=documents_sha256,
             expected_ids=[str(row["id"]) for row in rows],
+            expected_index_sha256=expected_index_sha256,
         )
         if (
             embedding.get("provider") != metadata.provider_name
@@ -699,7 +709,7 @@ def read_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
             raise RagIndexStaleError(
                 f"Embedding manifest and index disagree: {manifest_path_for(source)}"
             )
-    return manifest
+    return rows, manifest, metadata, vectors
 
 
 def rag_manifest_is_current(knowledge_base_path: Path | str) -> bool:
@@ -960,6 +970,7 @@ def _lexical_scores(
     query: str,
     cached_terms: Mapping[str, Counter] | None = None,
     statistics_cache: dict | None = None,
+    compact_documents: Mapping[str, str] | None = None,
 ) -> list[float]:
     query_terms = Counter(_tokens(query))
     if not query_terms:
@@ -1012,10 +1023,10 @@ def _lexical_scores(
                 / denominator
                 * query_frequency
             )
-        compact_document = re.sub(
-            r"\s+",
-            "",
-            _normalized_text(f"{row['title']} {row['content']}"),
+        compact_document = (
+            compact_documents[str(row["id"])]
+            if compact_documents is not None
+            else re.sub(r"\s+", "", _normalized_text(f"{row['title']} {row['content']}"))
         )
         if compact_query and compact_query in compact_document:
             score += 1.0
@@ -1062,11 +1073,15 @@ class RagKnowledgeBase:
         self._lexical_statistics: dict = {}
         self._lexical_terms = {str(row["id"]): Counter(_tokens(f"{row['title']} {row['title']} {row['content']}")) for row in self._rows}
 
+        self._compact_documents = {
+            str(row["id"]): re.sub(r"\s+", "", _normalized_text(f"{row['title']} {row['content']}"))
+            for row in self._rows
+        }
+
     @classmethod
     def open(cls, knowledge_base_path: Path | str) -> "RagKnowledgeBase":
         source = Path(knowledge_base_path)
-        rows = load_knowledge_rows(source)
-        manifest = read_rag_manifest(source)
+        rows, manifest, metadata, vectors = _load_validated_rag_snapshot(source)
         metadata_sidecar = load_metadata_sidecar(source)
         unknown_metadata_ids = set(metadata_sidecar) - {
             str(row["id"]) for row in rows
@@ -1076,15 +1091,6 @@ class RagKnowledgeBase:
             raise RagIndexStaleError(
                 "Metadata sidecar contains ids absent from the knowledge base: "
                 f"{preview}"
-            )
-        embedding = manifest["retrieval"]["embedding"]
-        metadata: RagEmbeddingMetadata | None = None
-        vectors: dict[str, tuple[float, ...]] = {}
-        if embedding["status"] == "ready":
-            metadata, vectors = _load_embedding_index(
-                source,
-                expected_documents_sha256=_sha256_file(source),
-                expected_ids=[str(row["id"]) for row in rows],
             )
         return cls(
             source,
@@ -1366,28 +1372,26 @@ class RagKnowledgeBase:
             scores = (
                 semantic_scores
                 if semantic_scores is not None
-                else _lexical_scores(rows, lexical_query, self._lexical_terms, self._lexical_statistics)
+                else _lexical_scores(rows, lexical_query, self._lexical_terms, self._lexical_statistics, self._compact_documents)
             )
             # Subtract an absolute-score penalty: multiplying a negative cosine
             # by a fraction would incorrectly promote it.
             scores = [score - (1 - weights.get(str(row["id"]), 1)) * abs(score)
                       for row, score in zip(rows, scores)]
-            ranked = sorted(
-                (
-                    (score, row)
-                    for score, row in zip(scores, rows, strict=True)
-                    if semantic_scores is not None or score > 0.0
-                ),
-                key=lambda item: (
-                    -item[0],
-                    int(item[1]["chapter_order"]),
-                    str(item[1]["id"]),
-                ),
+            candidates = (
+                (score, row)
+                for score, row in zip(scores, rows, strict=True)
+                if semantic_scores is not None or score > 0.0
             )
+            def rank_key(item):
+                return (-item[0], int(item[1]["chapter_order"]), str(item[1]["id"]))
+
             if per_book_cap:
-                ranked = self._apply_per_book_cap(ranked, top_k, per_book_cap)
+                ranked = self._apply_per_book_cap(
+                    sorted(candidates, key=rank_key), top_k, per_book_cap
+                )
             else:
-                ranked = ranked[:top_k]
+                ranked = heapq.nsmallest(top_k, candidates, key=rank_key)
             hits = [
                 RagHit(
                     id=str(row["id"]),
@@ -1455,22 +1459,24 @@ class RagKnowledgeBase:
             weight = (apparatus_weights or {}).get(str(rows[index]["id"]), 1)
             return score - (1 - weight) * abs(score)
 
-        lexical_ranked = sorted(
+        lexical_ranked = heapq.nsmallest(
+            candidate_depth,
             (
                 (adjusted(score, index), index)
-                for index, score in enumerate(_lexical_scores(rows, query, self._lexical_terms, self._lexical_statistics))
+                for index, score in enumerate(_lexical_scores(rows, query, self._lexical_terms, self._lexical_statistics, self._compact_documents))
                 if score > 0.0
             ),
             key=lambda item: (-item[0], int(rows[item[1]]["chapter_order"]), str(rows[item[1]]["id"])),
-        )[:candidate_depth]
-        semantic_ranked = sorted(
+        )
+        semantic_ranked = heapq.nsmallest(
+            candidate_depth,
             range(len(rows)),
             key=lambda index: (
                 -adjusted(semantic_scores[index], index),
                 int(rows[index]["chapter_order"]),
                 str(rows[index]["id"]),
             ),
-        )[:candidate_depth]
+        )
         rrf_k = 60.0
         fused: dict[int, float] = {}
         channels: dict[int, set[str]] = {}
