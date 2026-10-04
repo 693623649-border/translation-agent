@@ -21,6 +21,7 @@ from rag_knowledge_base import (
     manifest_path_for,
     metadata_sidecar_path_for,
     read_rag_manifest,
+    retrieve_multi_book,
     vector_index_path_for,
 )
 
@@ -33,6 +34,20 @@ def _knowledge_base_path(value: str | Path) -> Path:
     if path.is_dir():
         return path / DEFAULT_KNOWLEDGE_BASE
     return path
+
+
+def _discover_workspace_knowledge_bases(root: Path) -> list[Path]:
+    """Find workspace knowledge bases under an outputs-style root.
+
+    Hidden directories (`.codex-trash`, `.tmp`, …) are skipped so archived
+    or scratch workspaces never leak into a cross-book search.
+    """
+
+    return [
+        path
+        for path in sorted(root.rglob(DEFAULT_KNOWLEDGE_BASE))
+        if not any(part.startswith(".") for part in path.relative_to(root).parts)
+    ]
 
 
 def _foreign_language_report(knowledge_base_path: Path) -> dict[str, Any] | None:
@@ -377,15 +392,78 @@ def _hits_payload(hits: Sequence[Any]) -> list[dict[str, Any]]:
 
 
 def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
-    knowledge_base_path = _knowledge_base_path(args.path)
+    root = Path(args.path).expanduser().resolve()
+    knowledge_base_path = _knowledge_base_path(root)
+    multi_sources: list[tuple[str, Path]] | None = None
+    if not knowledge_base_path.is_file() and root.is_dir():
+        discovered = _discover_workspace_knowledge_bases(root)
+        if not discovered:
+            raise RagFormatError(f"No {DEFAULT_KNOWLEDGE_BASE} found under {root}")
+        multi_sources = [(path.parent.name, path) for path in discovered]
+    # Explicit --mode wins; the legacy --semantic flag keeps its meaning;
+    # otherwise default to hybrid ranking per the retrieval plan.
+    mode = getattr(args, "mode", None) or ("semantic" if args.semantic else "hybrid")
+
+    if multi_sources is not None:
+        if getattr(args, "book", None):
+            wanted = [name.casefold() for name in args.book]
+            multi_sources = [
+                (label, path)
+                for label, path in multi_sources
+                if any(name in label.casefold() for name in wanted)
+            ]
+            if not multi_sources:
+                raise RagError(f"No workspace matches --book {sorted(args.book)}")
+        per_book_cap = max(0, int(getattr(args, "per_book_cap", 3) or 0)) or None
+        auto_route = bool(getattr(args, "auto_route", True))
+        provider_kwargs = (
+            {"api_key_env": args.api_key_env, "base_url": args.base_url}
+            if mode in ("semantic", "hybrid")
+            else None
+        )
+        context = retrieve_multi_book(
+            multi_sources,
+            args.query,
+            mode=mode,
+            top_k=args.top_k,
+            max_chars=args.max_chars,
+            candidate_depth=int(getattr(args, "candidate_depth", 30) or 30),
+            per_book_cap=per_book_cap,
+            apparatus_weight=args.apparatus_weight,
+            chapter_ids=set(args.chapter_id) if args.chapter_id else None,
+            authors=set(args.author) or None,
+            languages=set(args.language) or None,
+            auto_route=auto_route,
+            provider_kwargs=provider_kwargs,
+        )
+        _json_line(
+            {
+                "query": args.query,
+                "scope": "multi-workspace",
+                "retrieval_mode": (
+                    context.hits[0].retrieval_mode if context.hits else mode
+                ),
+                "requested_mode": mode,
+                "workspaces": context.diagnostics["multi_book"],
+                "books": sorted(set(args.book)) if getattr(args, "book", None) else [],
+                "routing": {"automatic": auto_route, "inferred_books": []},
+                "per_book_cap": per_book_cap,
+                "semantic_requested": mode in ("semantic", "hybrid"),
+                "semantic_used": bool(context.diagnostics.get("semantic_used")),
+                "semantic_error": None,
+                "apparatus": context.diagnostics.get("apparatus", {}),
+                "hits": _hits_payload(context.hits),
+                "context": context.text,
+            },
+            stdout,
+        )
+        return 0
+
     try:
         knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
     except RagFormatError:
         initialize_rag_manifest(knowledge_base_path)
         knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
-    # Explicit --mode wins; the legacy --semantic flag keeps its meaning;
-    # otherwise default to hybrid ranking per the retrieval plan.
-    mode = getattr(args, "mode", None) or ("semantic" if args.semantic else "hybrid")
     provider = (
         _provider_from_manifest(knowledge_base_path, args)
         if mode in ("semantic", "hybrid")
@@ -586,7 +664,13 @@ def build_parser() -> argparse.ArgumentParser:
     translate_kb.set_defaults(func=_command_translate_kb)
 
     retrieve = subparsers.add_parser("retrieve", parents=[provider])
-    retrieve.add_argument("path", help="knowledge_base.jsonl path or artifact directory")
+    retrieve.add_argument(
+        "path",
+        help=(
+            "knowledge_base.jsonl path, artifact directory, or an outputs root "
+            "spanning multiple workspaces (cross-book search)"
+        ),
+    )
     retrieve.add_argument("query")
     retrieve.add_argument("--semantic", action="store_true")
     retrieve.add_argument("--apparatus-weight", type=float, default=None,
@@ -607,7 +691,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--book",
         action="append",
         default=[],
-        help="Restrict retrieval to a book title/id (repeatable).",
+        help=(
+            "Restrict retrieval to a book title/id, or to workspace "
+            "directories by name in multi-workspace scope (repeatable)."
+        ),
     )
     retrieve.add_argument(
         "--author",

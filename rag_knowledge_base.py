@@ -265,6 +265,33 @@ class ZhipuEmbeddingProvider:
         return self._embed([text])[0]
 
 
+class CachedQueryProvider:
+    """Reuse one query embedding across every knowledge base in a fan-out.
+
+    ``retrieve`` embeds the query per call, which is correct for a single
+    library but would multiply identical API calls when many libraries are
+    searched with the same query and provider identity.
+    """
+
+    def __init__(self, provider: EmbeddingProvider) -> None:
+        self._provider = provider
+        self._cached: tuple[str, tuple[float, ...]] | None = None
+
+    @property
+    def provider_name(self) -> str:
+        return str(getattr(self._provider, "provider_name", ""))
+
+    @property
+    def model(self) -> str:
+        return str(getattr(self._provider, "model", ""))
+
+    def embed_query(self, query: str) -> tuple[float, ...]:
+        if self._cached is None or self._cached[0] != query:
+            vector = tuple(self._provider.embed_query(query))
+            self._cached = (query, vector)
+        return self._cached[1]
+
+
 @dataclass(frozen=True)
 class RagEmbeddingMetadata:
     provider_name: str
@@ -1586,36 +1613,308 @@ class RagKnowledgeBase:
             diagnostics=diag,
             apparatus_weight=apparatus_weight,
         )
-        included: list[RagHit] = []
-        blocks: list[str] = []
-        prefixes = [" ".join([f"[KB:{hit.id}]", *([f"[{hit.book}]"] if hit.book else []), hit.title, *([f"({hit.channels})"] if hit.channels else [])]) + "\n" for hit in hits]
-        while hits and sum(map(len, prefixes)) + 2 * (len(hits) - 1) + len(hits) > max_chars:
-            hits.pop()
-            prefixes.pop()
-        remaining = max_chars - sum(map(len, prefixes)) - max(0, 2 * (len(hits) - 1))
-        truncated: list[str] = []
-        for index, (hit, prefix) in enumerate(zip(hits, prefixes)):
-            allowance = remaining // (len(hits) - index)
-            content = hit.content
-            if len(content) > allowance:
-                terms = sorted(set(_tokens(query)), key=len, reverse=True)
-                location = next((content.lower().find(term) for term in terms if term in content.lower()), 0)
-                start = max(0, location - allowance // 3)
-                content = content[start:start + max(0, allowance - 2)]
-                content = ("…" if start else "") + content + "…"
-                content = content[:allowance]
-                truncated.append(hit.id)
-            remaining -= len(content)
-            blocks.append(prefix + content)
-            included.append(replace(hit, content=content, source_content=hit.source_content or hit.content))
-        diag.update(context_included_ids=[hit.id for hit in included], context_truncated_ids=truncated, context_chars=len("\n\n".join(blocks)), context_omitted_count=diag.get("result_count", 0)-len(included))
-        return RagContext(query=query, hits=tuple(included), text="\n\n".join(blocks), diagnostics=dict(diag))
+        return _assemble_context(query, list(hits), max_chars, diag)
 
+
+def _assemble_context(
+    query: str,
+    hits: list[RagHit],
+    max_chars: int,
+    diag: dict[str, Any],
+) -> RagContext:
+    """Pack ranked hits into citation-labelled blocks under a char budget."""
+
+    included: list[RagHit] = []
+    blocks: list[str] = []
+    prefixes = [" ".join([f"[KB:{hit.id}]", *([f"[{hit.book}]"] if hit.book else []), hit.title, *([f"({hit.channels})"] if hit.channels else [])]) + "\n" for hit in hits]
+    while hits and sum(map(len, prefixes)) + 2 * (len(hits) - 1) + len(hits) > max_chars:
+        hits.pop()
+        prefixes.pop()
+    remaining = max_chars - sum(map(len, prefixes)) - max(0, 2 * (len(hits) - 1))
+    truncated: list[str] = []
+    for index, (hit, prefix) in enumerate(zip(hits, prefixes)):
+        allowance = remaining // (len(hits) - index)
+        content = hit.content
+        if len(content) > allowance:
+            terms = sorted(set(_tokens(query)), key=len, reverse=True)
+            location = next((content.lower().find(term) for term in terms if term in content.lower()), 0)
+            start = max(0, location - allowance // 3)
+            content = content[start:start + max(0, allowance - 2)]
+            content = ("…" if start else "") + content + "…"
+            content = content[:allowance]
+            truncated.append(hit.id)
+        remaining -= len(content)
+        blocks.append(prefix + content)
+        included.append(replace(hit, content=content, source_content=hit.source_content or hit.content))
+    diag.update(context_included_ids=[hit.id for hit in included], context_truncated_ids=truncated, context_chars=len("\n\n".join(blocks)), context_omitted_count=diag.get("result_count", 0)-len(included))
+    return RagContext(query=query, hits=tuple(included), text="\n\n".join(blocks), diagnostics=dict(diag))
+
+
+
+def retrieve_multi_book(
+    sources: Sequence[tuple[str, Path]],
+    query: str,
+    *,
+    mode: str = "hybrid",
+    top_k: int = 5,
+    max_chars: int = 12_000,
+    candidate_depth: int = 30,
+    per_book_cap: int | None = 3,
+    apparatus_weight: float | None = None,
+    chapter_ids: set[str] | frozenset[str] | None = None,
+    authors: set[str] | frozenset[str] | None = None,
+    languages: set[str] | frozenset[str] | None = None,
+    auto_route: bool = True,
+    embedding_provider: EmbeddingProvider | None = None,
+    provider_kwargs: Mapping[str, Any] | None = None,
+) -> RagContext:
+    """Search many workspace libraries at once and fuse comparable scores.
+
+    Each workspace runs the ordinary single-library ranking (hybrid by
+    default). Inner hybrid scores are themselves rank-based RRF sums, so
+    they are comparable across libraries: a chunk recalled by both channels
+    outranks single-channel chunks from any library, and the per-library
+    routing boost survives. Libraries without an embedding index contribute
+    a single-channel 1/(60+rank) term in hybrid runs and are reported in
+    diagnostics instead of being skipped silently; in semantic mode they
+    cannot participate at all and are listed as ``lexical_only``. The query
+    is embedded once and reused everywhere.
+
+    ``per_book_cap`` caps results per *workspace*. A provider failure
+    aborts the whole search rather than degrading half of it.
+    """
+
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        raise ValueError("max_chars must be a positive integer")
+    if mode not in ("lexical", "semantic", "hybrid"):
+        raise ValueError("mode must be 'lexical', 'semantic', or 'hybrid'")
+    if not sources:
+        raise ValueError("sources must list (workspace label, knowledge_base path) pairs")
+
+    errored: dict[str, str] = {}
+    opened: list[tuple[str, RagKnowledgeBase]] = []
+    for label, source in sources:
+        try:
+            opened.append((str(label), RagKnowledgeBase.open(Path(source))))
+        except RagError as exc:
+            errored[str(label)] = str(exc)
+    if not opened:
+        details = "; ".join(f"{label}: {message}" for label, message in errored.items())
+        raise RagFormatError(f"No knowledge base could be opened: {details}") from None
+
+    ready: list[tuple[str, RagKnowledgeBase]] = []
+    lexical_only: list[str] = []
+    for label, knowledge_base in opened:
+        if knowledge_base.embedding_metadata is None:
+            lexical_only.append(label)
+        else:
+            ready.append((label, knowledge_base))
+
+    provider: CachedQueryProvider | None = None
+    if mode in ("semantic", "hybrid") and not ready:
+        raise RagEmbeddingUnavailableError(
+            "Hybrid retrieval requires a ready embedding index; none of the "
+            f"{len(opened)} workspaces have one"
+        )
+    if mode in ("semantic", "hybrid"):
+        identities = {
+            (
+                knowledge_base.embedding_metadata.provider_name,
+                knowledge_base.embedding_metadata.model,
+                knowledge_base.embedding_metadata.dimensions,
+            )
+            for _, knowledge_base in ready
+        }
+        if len(identities) > 1:
+            detail = ", ".join(
+                f"{name}/{model}/{dimensions}" for name, model, dimensions in sorted(identities)
+            )
+            raise RagProviderError(
+                "Workspaces mix embedding identities; run them separately: " + detail
+            )
+        provider_name, model, dimensions = next(iter(identities))
+        if embedding_provider is None:
+            if (provider_name, model) != ("zhipu", "embedding-3"):
+                raise RagProviderError(
+                    "Hybrid retrieval requires an explicit embedding provider for "
+                    f"{provider_name}/{model}"
+                )
+            try:
+                embedding_provider = ZhipuEmbeddingProvider(
+                    model="embedding-3",
+                    dimensions=dimensions,
+                    **dict(provider_kwargs or {}),
+                )
+            except ValueError as exc:
+                raise RagProviderError(f"Invalid hybrid embedding configuration: {exc}") from exc
+        actual_name, actual_model = _provider_identity(embedding_provider)
+        if (actual_name, actual_model) != (provider_name, model):
+            raise RagProviderError(
+                "Query embedding provider/model does not match the stored indexes: "
+                f"expected {provider_name}/{model}"
+            )
+        if actual_name == "zhipu" and actual_model != "embedding-3":
+            raise RagProviderError("Hybrid Zhipu retrieval only supports embedding-3")
+        provider = CachedQueryProvider(embedding_provider)
+
+    depth = max(top_k, candidate_depth)
+    per_workspace: dict[str, dict[str, Any]] = {}
+    fused: list[tuple[float, str, RagHit]] = []
+    searched: list[str] = []
+    for label, knowledge_base in opened:
+        if mode == "semantic" and knowledge_base.embedding_metadata is None:
+            continue
+        book_diag: dict[str, Any] = {}
+        book_hits = knowledge_base.retrieve(
+            query,
+            top_k=depth,
+            chapter_ids=chapter_ids,
+            embedding_provider=provider if knowledge_base.embedding_ready else None,
+            mode=mode,
+            book_ids=None,
+            authors=authors,
+            languages=languages,
+            per_book_cap=None,
+            candidate_depth=candidate_depth,
+            auto_route=auto_route,
+            apparatus_weight=apparatus_weight,
+            diagnostics=book_diag,
+        )
+        searched.append(label)
+        per_workspace[label] = {
+            "effective_mode": book_diag.get("effective_mode"),
+            "filtered_count": book_diag.get("filtered_count"),
+            "candidate_count": book_diag.get("candidate_count"),
+            "result_count": book_diag.get("result_count"),
+            "fallback_reason": book_diag.get("fallback_reason"),
+            "apparatus_tagged": (book_diag.get("apparatus") or {}).get("tagged_count", 0),
+        }
+        for rank, hit in enumerate(book_hits, start=1):
+            if knowledge_base.embedding_ready and mode in ("hybrid", "semantic"):
+                # Inner hybrid/semantic scores are rank-based RRF sums (or
+                # absolute cosines) that stay comparable across libraries;
+                # keeping them preserves both-channel and routing boosts.
+                score = float(hit.score)
+            else:
+                score = 1.0 / (60.0 + rank)
+            fused.append((score, label, replace(hit, book=label)))
+
+    query_terms = {term for term in _tokens(query) if len(term) >= 2}
+
+    def coverage(text: str) -> int:
+        normalized = re.sub(r"\s+", "", _normalized_text(text))
+        return sum(1 for term in query_terms if term in normalized)
+
+    def fusion_order(item: tuple[float, str, RagHit]) -> tuple[float, int, str, str]:
+        score, label, hit = item
+        # Equal inner scores (e.g. every library's both-channel top chunk at
+        # 2/61) are common across corpora; distinct query-term coverage is
+        # corpus-independent and separates real matches from channel noise.
+        return (-score, -coverage(f"{hit.title} {hit.content}"), label, hit.id)
+
+    fused.sort(key=fusion_order)
+    deduplicated: dict[str, tuple[float, str, RagHit]] = {}
+    for score, label, hit in fused:
+        key = re.sub(r"\s+", "", _normalized_text(hit.content))
+        if key in deduplicated:
+            kept_score, kept_label, kept = deduplicated[key]
+            deduplicated[key] = (
+                kept_score,
+                kept_label,
+                replace(
+                    kept,
+                    duplicate_sources=kept.duplicate_sources + (f"{label}/{hit.id}",),
+                ),
+            )
+        else:
+            deduplicated[key] = (score, label, hit)
+
+    selected: list[RagHit] = []
+    counts: Counter = Counter()
+    for score, label, hit in deduplicated.values():
+        if per_book_cap and counts[label] >= per_book_cap:
+            continue
+        counts[label] += 1
+        selected.append(replace(hit, score=score))
+        if len(selected) >= top_k:
+            break
+
+    semantic_used = any(hit.retrieval_mode in ("semantic", "hybrid") for hit in selected)
+    diag: dict[str, Any] = {
+        "requested_mode": mode,
+        "scope": "multi_book",
+        "result_count": len(selected),
+        "result_ids": [hit.id for hit in selected],
+        "semantic_used": semantic_used,
+        "apparatus": {
+            "tagged_count": sum(entry["apparatus_tagged"] for entry in per_workspace.values()),
+            "weight_override": apparatus_weight,
+        },
+        "multi_book": {
+            "workspaces_searched": searched,
+            "semantic_ready": [label for label, _ in ready],
+            "lexical_only": lexical_only,
+            "errored": errored,
+            "per_workspace": per_workspace,
+        },
+    }
+    return _assemble_context(query, selected, max_chars, diag)
+
+
+def retrieve_hybrid_context(
+    knowledge_base: RagKnowledgeBase,
+    query: str,
+    *,
+    embedding_provider: EmbeddingProvider | None = None,
+    **kwargs: Any,
+) -> RagContext:
+    """Production retrieval: require both lexical and indexed vector channels.
+
+    Low-level retrieval still supports explicit diagnostic/baseline modes.
+    This entry point never silently degrades a hybrid request to lexical.
+    """
+    metadata = knowledge_base.embedding_metadata
+    if metadata is None:
+        raise RagEmbeddingUnavailableError(
+            "Hybrid retrieval requires a ready embedding index; build the index first"
+        )
+    if embedding_provider is None:
+        if metadata.provider_name != "zhipu" or metadata.model != "embedding-3":
+            raise RagProviderError(
+                "Hybrid retrieval requires an explicit embedding provider for "
+                f"{metadata.provider_name}/{metadata.model}"
+            )
+        try:
+            embedding_provider = ZhipuEmbeddingProvider(
+                model="embedding-3", dimensions=metadata.dimensions
+            )
+        except ValueError as exc:
+            raise RagProviderError(f"Invalid hybrid embedding configuration: {exc}") from exc
+    provider_name, model = _provider_identity(embedding_provider)
+    if (provider_name, model) != (metadata.provider_name, metadata.model):
+        raise RagProviderError("Query embedding provider/model does not match the stored index")
+    if provider_name == "zhipu" and model != "embedding-3":
+        raise RagProviderError("Hybrid Zhipu retrieval only supports embedding-3")
+    if kwargs.pop("mode", "hybrid") not in (None, "hybrid"):
+        raise ValueError("retrieve_hybrid_context only supports hybrid mode")
+    context = knowledge_base.retrieve_context(
+        query, embedding_provider=embedding_provider, mode="hybrid", **kwargs
+    )
+    if context.diagnostics.get("fallback_reason") or any(
+        hit.retrieval_mode != "hybrid" for hit in context.hits
+    ):
+        raise RagProviderError("Hybrid retrieval did not execute both retrieval channels")
+    return context
 
 
 __all__ = [
     "EmbeddingProvider",
     "Reranker",
+    "CachedQueryProvider",
     "RagContext",
     "RagEmbeddingMetadata",
     "RagEmbeddingUnavailableError",
@@ -1624,6 +1923,8 @@ __all__ = [
     "RagHit",
     "RagIndexStaleError",
     "RagKnowledgeBase",
+    "retrieve_hybrid_context",
+    "retrieve_multi_book",
     "RagProviderError",
     "ZhipuEmbeddingProvider",
     "build_embedding_index",

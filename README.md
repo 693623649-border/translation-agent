@@ -232,6 +232,24 @@ schema 4 使用长词 trigram FTS5，加上一字/二字的 contentless FTS5 倒
 继续遵守既有召回规则。评分和每书限额在 SQL 内完成，Python 只接收最终
 结果；SQL 内部仍可能排序，不把这一变化描述为所有排序成本消失。
 
+### 跨书检索（RAG 侧）
+
+`retrieve` 的路径也可以是横跨多个工作区的目录（如 `outputs` 根，目录自身
+不含 `knowledge_base.jsonl`）。此时 CLI 自动发现全部工作区并逐库执行
+hybrid 检索，再按各库内部 RRF 分数跨库融合：双通道命中的块稳定高于任何
+单通道块，跨库分数可比。查询向量只嵌入一次，在全部工作区间复用。
+
+```powershell
+translation-agent-kb retrieve outputs '包法利夫人 爱玛' --mode hybrid --top-k 8
+# 只搜部分工作区（按目录名子串过滤，可重复）
+translation-agent-kb retrieve outputs '爱玛 通奸' --book 包法利 --top-k 4
+```
+
+无向量索引的工作区仍以词法参与并在输出的 `workspaces.lexical_only` 中
+明示；embedding 身份不一致或 provider 失败时整命令报错，不做静默降级。
+`--per-book-cap` 在此模式下限制每个工作区的命中数；`--book` 按工作区
+目录名过滤。
+
 增量同步对来源执行严格 SHA 清单比较，仅重新导入变化工作区；未变时
 复用已有数据。新增、删除、报告依赖、装置标注和资产变化也纳入检测。
 变化同步通过 backup 临时快照和原子替换完成；旧 schema 自动重建迁移。
