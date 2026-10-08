@@ -5,6 +5,9 @@ description: 将影印版或文字层 PDF 转换为可审计的逐页文本、�
 
 # PDF 翻译编译与验收
 
+英文原文 PDF 若要求中文选文库、编者材料分离和原书段落/脚注核验，使用项目
+`english-pdf-kb` skill 与 `dsh-english-pdf-kb` 插件；本 skill 仍是通用编译器的流程参考。
+
 ## 使用主入口
 
 在仓库根目录运行 `book_pipeline.py`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。

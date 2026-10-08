@@ -9,7 +9,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
-from book_pipeline import load_env_file, split_text, write_knowledge_base
+from book_pipeline import (
+    DEFAULT_DEEPSEEK_MODEL as DEFAULT_TRANSLATION_MODEL,
+    load_env_file,
+    split_text,
+    write_knowledge_base,
+)
 from rag_knowledge_base import (
     RagError,
     RagFormatError,
@@ -21,6 +26,7 @@ from rag_knowledge_base import (
     manifest_path_for,
     metadata_sidecar_path_for,
     read_rag_manifest,
+    retrieve_hybrid_context,
     retrieve_multi_book,
     vector_index_path_for,
 )
@@ -485,7 +491,10 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
     }
     semantic_error: str | None = None
     try:
-        context = knowledge_base.retrieve_context(
+        retrieve = (
+            lambda query, **kwargs: retrieve_hybrid_context(knowledge_base, query, **kwargs)
+        ) if mode == "hybrid" else knowledge_base.retrieve_context
+        context = retrieve(
             args.query,
             top_k=args.top_k,
             max_chars=args.max_chars,
@@ -498,7 +507,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             **filters,
         )
     except RagError as exc:
-        if provider is None:
+        if mode == "hybrid" or provider is None:
             raise
         semantic_error = str(exc)
         context = knowledge_base.retrieve_context(
@@ -660,7 +669,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     translate_kb.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     translate_kb.add_argument("--api-base", default="https://api.deepseek.com")
-    translate_kb.add_argument("--model", default="deepseek-chat")
+    # Pinned to the project-wide translation model. ``kb_translation`` and
+    # ``book_pipeline`` both default to this value; hardcoding a different name
+    # here silently translated the corpus with a model no other translation path
+    # uses, and the resulting chunks carried the wrong ``model`` field in their
+    # provenance sidecar.
+    translate_kb.add_argument("--model", default=DEFAULT_TRANSLATION_MODEL)
     translate_kb.set_defaults(func=_command_translate_kb)
 
     retrieve = subparsers.add_parser("retrieve", parents=[provider])
@@ -672,7 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     retrieve.add_argument("query")
-    retrieve.add_argument("--semantic", action="store_true")
+    retrieve.add_argument("--semantic", action="store_true", help="Diagnostic semantic-only retrieval (production default: hybrid)")
     retrieve.add_argument("--apparatus-weight", type=float, default=None,
                           help="Override marked section weight (0 excludes, 1 disables; default .25 structural/.7 explanatory)")
     retrieve.add_argument("--top-k", type=int, default=5)

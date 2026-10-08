@@ -1,0 +1,4 @@
+interface:
+  display_name: "中文 PDF 正文入库"
+  short_description: "按原书恢复中文 PDF 段落，分离注释并核验字段、清洗证据与 Word 成品"
+  default_prompt: "使用 $chinese-pdf-body-kb 重新处理这本中文 PDF，正文与注释分开，按原书分段，并通过质量门后入库。"

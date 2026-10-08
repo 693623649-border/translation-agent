@@ -1,0 +1,27 @@
+{
+  "name": "dsh-kb-ingest",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Source-to-knowledge-base ingest desk: kb_ingest_source turns Markdown / plain text / DOCX / EPUB / text-layer PDF into a searchable corpus entry plus a verbatim-fidelity Chinese Word (scanned PDFs are rejected with an OCR-pipeline pointer), kb_verify_word re-runs the character-fidelity gate, kb_ingest_status reports corpus coverage and gate status. · 源文件入库台：kb_ingest_source 把 MD/TXT/DOCX/EPUB/带文字层 PDF 变成可检索书库并产出逐字一致的中文 Word（扫描版拒绝并提示走 OCR 主流水线），kb_verify_word 复核保真门，kb_ingest_status 查语料覆盖与门禁状态。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "kb_ingest.py",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  }
+}

@@ -1,0 +1,6 @@
+- insert:
+    - id: english-pdf-kb
+      name: dsh-english-pdf-kb
+      config:
+        python: null
+        contract: true

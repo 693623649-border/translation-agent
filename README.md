@@ -189,12 +189,14 @@ RAG 不向这些行追加向量、评分或装置注释。检索清单、向量�
 ```powershell
 translation-agent-kb register outputs/input/knowledge_base.jsonl --lexical-only
 translation-agent-kb status outputs/input/knowledge_base.jsonl
-translation-agent-kb retrieve outputs/input/knowledge_base.jsonl '社会 个人 文学' --top-k 5
+translation-agent-kb retrieve outputs/input/knowledge_base.jsonl '社会 个人 文学' --mode hybrid --top-k 5
 translation-agent-kb annotate-apparatus outputs/input/knowledge_base.jsonl
 ```
 
-省略 `--lexical-only` 的注册可以调用配置的 embedding 服务；`retrieve --semantic`
-请求语义检索，需要有效向量和相应查询 embedding 配置。
+省略 `--lexical-only` 的注册可以调用配置的 embedding 服务。正式检索统一
+`--mode hybrid`，需要有效向量和匹配的 embedding 配置；上面的词法注册只用于
+准备正文清单或离线诊断，正式 hybrid 前需完成向量注册。缺资源或服务异常时
+明确报告，不以纯 BM25 降级冒充 hybrid。`--mode lexical/semantic` 仅用于诊断。
 
 单书 CLI 的实际子命令包括：`register`、`annotate-apparatus`、`translate-kb`、
 `retrieve`、`status`、`evaluate`、`derive-docx`。例如先检查外文翻译范围：
@@ -209,6 +211,8 @@ translation-agent-kb evaluate --help
 规范化正文。适用路径用 `heapq` 选择 top-k，保留 BM25、子串加分、装置权重
 和并列顺序；跨书限额等需要完整排序的路径保留原语义。
 首次打开仍做完整校验和预计算，没有跨 API 请求缓存或懒加载承诺。
+Python 高层 API 默认及显式 `mode=None` 均使用真实 hybrid；完整入口与失败
+规则见 [知识库正式调用规则](docs/knowledge-base-call-policy.md)。
 
 ### 全局 SQLite 索引
 
@@ -224,6 +228,9 @@ translation-agent-global-kb verify
 ```
 
 全局 CLI 子命令为 `sync`、`status`、`verify`、`evaluate`、`search`。
+此处 `search` 是跨书候选发现/诊断接口。正式跨书取证通过模型工具 `kb_ask`
+或 `python tools/kb_qa_plugin/kb_qa.py ask "<问题>" --mode hybrid` 完成单书精读，
+最终证据不混入只经过 FTS 的发现片段。
 `search` 支持 `reader`、`pages`、`archive`、`all` 范围和工作区过滤。
 全局 reader 查询默认每书最多一条；`--per-book-cap 0` 关闭限额。
 
@@ -231,24 +238,6 @@ schema 4 使用长词 trigram FTS5，加上一字/二字的 contentless FTS5 倒
 支持中文、假名和韩文短词。短词索引不另存一份编码 token 正文；混合查询
 继续遵守既有召回规则。评分和每书限额在 SQL 内完成，Python 只接收最终
 结果；SQL 内部仍可能排序，不把这一变化描述为所有排序成本消失。
-
-### 跨书检索（RAG 侧）
-
-`retrieve` 的路径也可以是横跨多个工作区的目录（如 `outputs` 根，目录自身
-不含 `knowledge_base.jsonl`）。此时 CLI 自动发现全部工作区并逐库执行
-hybrid 检索，再按各库内部 RRF 分数跨库融合：双通道命中的块稳定高于任何
-单通道块，跨库分数可比。查询向量只嵌入一次，在全部工作区间复用。
-
-```powershell
-translation-agent-kb retrieve outputs '包法利夫人 爱玛' --mode hybrid --top-k 8
-# 只搜部分工作区（按目录名子串过滤，可重复）
-translation-agent-kb retrieve outputs '爱玛 通奸' --book 包法利 --top-k 4
-```
-
-无向量索引的工作区仍以词法参与并在输出的 `workspaces.lexical_only` 中
-明示；embedding 身份不一致或 provider 失败时整命令报错，不做静默降级。
-`--per-book-cap` 在此模式下限制每个工作区的命中数；`--book` 按工作区
-目录名过滤。
 
 增量同步对来源执行严格 SHA 清单比较，仅重新导入变化工作区；未变时
 复用已有数据。新增、删除、报告依赖、装置标注和资产变化也纳入检测。
@@ -266,6 +255,50 @@ translation-agent-global-kb evaluate --cases retrieval-cases.json --report retri
 用 `verify` 检查当前来源及数据库，用 `--full-rebuild` 恢复或重建。
 严格哈希仍随输入字节数增长；变化同步的 backup 与完整性检查仍随数据库
 规模增长。精确向量搜索仍为 O(ND)，普通 SQLite 索引不会消除这个成本。
+
+## 2026-10-09 版本说明
+
+本轮把分语种入库流程固化为一组可安装的 DSH/Cordis 插件与配套 skill,
+并把知识库正式调用规则、中文质量门、竖排 OCR 与扫描书翻译的修复一并合入。
+
+### 新增入库插件与 skill
+
+| 入口 | 插件 | 配套 skill | 用途 |
+| --- | --- | --- | --- |
+| `dsh-kb-ingest` | `tools/kb_ingest_plugin/` | `source-to-kb-word-workflow` | Markdown/纯文本/DOCX/EPUB/带文字层 PDF 入库,产出逐字校对通过的中文 Word |
+| `dsh-jp-vertical-kb` | `tools/jp_vertical_kb_plugin/` | `japanese-vertical-kb` | 竖排日语扫描书分阶段入库:OCR → 逐页翻译 → 出版验收 → 单书注册 |
+| `dsh-chinese-pdf-kb` | `tools/chinese_pdf_kb_plugin/` | `chinese-pdf-body-kb` | 中文横排扫描 PDF 正文重建与入库,分离页下注、编者材料与版面噪声 |
+| `dsh-english-pdf-kb` | `tools/english_pdf_kb_plugin/` | `english-pdf-kb` | 英文原文 PDF 译为中文选文知识库,区分编者导言与选文 |
+| `kb-reader` | `tools/kb_qa_plugin/` | — | 会话问答工具:检索取证 → 引文核验 → 再作答,书内论断须标《书名》·章节出处 |
+
+插件只做入口与参数校验,各阶段质量仍由本仓库的发布门与检索验收决定;
+工具注册成功不代表某本实书已通过质量门。书籍修复脚本继续收拢在
+`tools/books/`(本轮新增施米特两册正文重建/读者版与《私小説論》验证目录)。
+
+### 检索调用规则
+
+- Python 高层 API 与 `kb_ask` 默认真实 hybrid;向量缺失、embedding 身份
+  不一致或 provider 失败时显式报错,不以纯 BM25 降级冒充 hybrid。
+  `--mode lexical/semantic` 仅用于诊断。
+- 正式入口与失败规则见[知识库正式调用规则](docs/knowledge-base-call-policy.md);
+  分书语料/全局索引两条链路与存储设计见
+  [全局知识库数据流](docs/global-knowledge-base-dataflow.md)。
+
+### 质量门与修复
+
+- 发布校验器新增 `knowledge_base.chinese` 与 `docx.chinese` 检查,复用
+  kb_translation/docx_translation 的离线中文判定;对照表、书目、索引等
+  双语装置豁免。管线图与门说明更新于 `docs/product-architecture.md`。
+- `kb_translation` 新增汉字主导判据:假名占比低于 20% 且汉字足够时按
+  "中文带引注残留"豁免,修复日文引注残留把中文块判为外文、语言门永久
+  卡住的假阴性;阈值来自 202 页竖排日文样本的实测分布。
+- 竖排 OCR 按页检测方向(`--reading-direction auto`),日文纵排按右起
+  列序、上起行序输出并保留原始行框;OCR 检查点记住方向参数。
+- 扫描书逐页翻译默认请求可见译文,拒绝空译文、残留外文段落与原文没有
+  的省略号,复杂页仅对失败段落定点补译;`translate-kb` 新增 `--concurrency`
+  应对 provider 限速。
+- 新增 10 个测试模块,覆盖四个入库入口、hybrid 调用策略(离线,不调
+  embedding 服务)、竖排阅读顺序与 OCR 提示保真。
 
 ## 2026-10-03 版本说明
 
@@ -311,6 +344,7 @@ Word 渲染属于各自环境验收，不应由单元测试通过推断其可用
 | `global_knowledge_base.py` | 全局 SQLite 索引 |
 | `frontend_runtime.py` / `application_service.py` | 任务登记与应用服务 |
 | `architecture_dashboard.py` / `architecture_ascii.py` | 架构快照与字符树 |
+| `skills/` / `tools/*_plugin/` | 分语种入库 skill 与 DSH/Cordis 插件 bundle |
 | `app_pages/` / `streamlit_app.py` | 工作台页面 |
 | `tests/` / `docs/` | 回归测试与专题文档 |
 
@@ -318,4 +352,6 @@ Word 渲染属于各自环境验收，不应由单元测试通过推断其可用
 [语义 DAG](docs/unified-semantic-dag.md) ·
 [EPUB 输入](docs/epub-semantic-input.md) ·
 [架构审查](docs/architecture-review.md) ·
-[性能验证](docs/knowledge-base-performance.md)。
+[性能验证](docs/knowledge-base-performance.md) ·
+[调用规则](docs/knowledge-base-call-policy.md) ·
+[全局数据流](docs/global-knowledge-base-dataflow.md)。

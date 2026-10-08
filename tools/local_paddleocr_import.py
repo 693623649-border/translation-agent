@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PADDLEOCR_ROOT = REPO_ROOT / "deploy" / "paddleocr"
 PADDLEOCR_IO_ROOT = PADDLEOCR_ROOT / "io"
 MANIFEST_NAME = "local_paddleocr_job.json"
-SCRIPT_VERSION = 1
+SCRIPT_VERSION = 2
 
 
 def _die(message: str) -> int:
@@ -101,6 +101,7 @@ def _expected_manifest(args: argparse.Namespace, source: dict[str, Any]) -> dict
         "version": SCRIPT_VERSION,
         "source_pdf": source,
         "render": _render_params(args),
+        "reading_direction": args.reading_direction,
     }
 
 
@@ -113,6 +114,7 @@ def _manifest_reuse_matches(path: Path, expected: dict[str, Any]) -> bool:
         existing.get("version") == expected["version"]
         and existing.get("source_pdf") == expected["source_pdf"]
         and existing.get("render") == expected["render"]
+        and existing.get("reading_direction") == expected["reading_direction"]
     )
 
 
@@ -194,6 +196,7 @@ def _model_id(args: argparse.Namespace) -> str:
         det_len=args.det_len,
         dpi=args.dpi,
         max_image_side=args.max_side,
+        reading_direction=args.reading_direction,
     )
 
 
@@ -207,6 +210,8 @@ def _run_ocr(work_dir: Path, args: argparse.Namespace, model_id: str) -> None:
         "gpu",
         "run",
         "--rm",
+        "--volume",
+        f"{PADDLEOCR_ROOT / 'batch_ocr.py'}:/opt/paddleocr-tools/batch_ocr.py:ro",
         "paddleocr",
         "python",
         "/opt/paddleocr-tools/batch_ocr.py",
@@ -230,6 +235,8 @@ def _run_ocr(work_dir: Path, args: argparse.Namespace, model_id: str) -> None:
         str(args.det_len),
         "--model-id",
         model_id,
+        "--reading-direction",
+        args.reading_direction,
     ]
     if args.force_ocr:
         base_cmd.append("--force")
@@ -332,6 +339,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--rec-mode", default="paddle_fp16")
     parser.add_argument("--rec-batch", type=int, default=16)
     parser.add_argument("--det-len", type=int, default=736)
+    parser.add_argument("--reading-direction", choices=("horizontal", "vertical", "auto"), default="horizontal")
     parser.add_argument("--force-render", action="store_true")
     parser.add_argument("--force-ocr", action="store_true")
     parser.add_argument("--start-page", type=int, default=1)

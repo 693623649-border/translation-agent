@@ -1,0 +1,13 @@
+{
+  "name": "dsh-english-pdf-kb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "English PDF staged translation and knowledge-base ingestion tools",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" },
+  "files": ["index.js", "english_ingest.py", "cordis.patch.yml", "README.md"],
+  "scripts": { "test": "node test/plugin.test.mjs" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/dsh-tools": "*" }
+}

@@ -20,11 +20,13 @@ from book_pipeline import (
     write_knowledge_base,
 )
 from publication_verifier import (
+    _canonical_docx_body_text,
     _canonical_visible_text,
     _citation_inventory,
     _docx_document_payload,
     _docx_markdown_body,
     _docx_positive_footnote_texts,
+    _docx_style_signature,
     _expected_chapter_end_pages,
     _markdown_visible_text,
     verify_publication,
@@ -104,6 +106,44 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(len(chapters), 1)
         self.assertEqual(
             _canonical_visible_text(str(chapters[0]["text"])), expected
+        )
+
+    def test_docx_text_comparison_ignores_only_word_inserted_cjk_run_spaces(self) -> None:
+        self.assertEqual(
+            _canonical_docx_body_text("句子。 引号； [作者注] ¹³ 继续。"),
+            _canonical_docx_body_text("句子。引号；[作者注]¹³继续。"),
+        )
+        self.assertNotEqual(
+            _canonical_docx_body_text("Morrison, Beloved"),
+            _canonical_docx_body_text("Morrison,Beloved"),
+        )
+
+    def test_docx_inline_style_comparison_ignores_run_segmentation(self) -> None:
+        expected = ["第一段", "第二段"]
+        actual = ["第一", "段第二段"]
+        self.assertEqual(
+            _docx_style_signature(expected),
+            _docx_style_signature(actual),
+        )
+        self.assertNotEqual(
+            _docx_style_signature(["第一段", "第二段"]),
+            _docx_style_signature(["第一段", "第三段"]),
+        )
+
+    def test_docx_style_expectations_use_the_publishers_soft_wrap_merge(self) -> None:
+        from publication_verifier import _docx_expectations
+
+        source = (
+            "# 章节\n\n"
+            "说明 *这是跨行\n的 OCR 注记*，随后继续正文。\n"
+        )
+        result = _docx_expectations(
+            [{"id": "chapter-1"}],
+            {"chapter-1": source},
+        )
+        self.assertEqual(
+            result["inline_styles"]["chapter-1"]["italic"],
+            ["这是跨行的 OCR 注记"],
         )
 
     def test_standard_footnote_inventory_keeps_legacy_markers_out_of_contract(self) -> None:
@@ -549,6 +589,20 @@ class PublicationVerifierTests(unittest.TestCase):
         check = self._checks(report)["translation.ellipsis"]
         self.assertEqual(check["status"], "failed")
         self.assertEqual(check["metrics"]["invented_ellipsis_pairs"], 1)
+
+    def test_translation_ellipsis_gate_accepts_english_source_ellipsis(self) -> None:
+        self._write_page(1,
+            "He said . . . then she replied ... All source prose remains intact.",
+            "他说……然后她回答……所有原文内容都完整保留。")
+        check = self._checks(self._verify(report_name="ellipsis-english.json"))["translation.ellipsis"]
+        self.assertEqual(check["status"], "passed")
+
+    def test_translation_ellipsis_gate_rejects_invented_ascii_ellipsis(self) -> None:
+        self._write_page(1,
+            "This complete source sentence contains no omitted content whatsoever.",
+            "这段原文并无内容省略...但译文吞掉了内容。")
+        check = self._checks(self._verify(report_name="ellipsis-ascii-invented.json"))["translation.ellipsis"]
+        self.assertEqual(check["status"], "failed")
 
     def test_translation_ellipsis_gate_flags_doubt_markers(self) -> None:
         """The prompt forbids doubt markers, so their presence is a defect."""

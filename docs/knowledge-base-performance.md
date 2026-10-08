@@ -56,6 +56,9 @@ python global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrie
 | 全局“自然” | 164.2 ms | 48.4 ms |
 | 全局“自然 正式” | 215.9 ms | 62.8 ms |
 
+该表记录的是词法离线诊断基准，不是正式问答的模式选择；正式调用统一
+hybrid，见 `docs/knowledge-base-call-policy.md`。
+
 首次打开鲁迅全集仍需约 2.53 秒（基线 2.62 秒），因为完整校验、
 向量解析和预计算仍发生在打开时。未引入跨 API 请求缓存或懒向量加载，
 每次 open 继续验证所有输入。

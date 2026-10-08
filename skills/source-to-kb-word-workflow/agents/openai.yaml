@@ -1,0 +1,4 @@
+interface:
+  display_name: "源文件入库与中文 Word 保真交付"
+  short_description: "把源文件加入知识库并产出逐字校对通过的中文 Word"
+  default_prompt: "使用 $source-to-kb-word-workflow 把这个源文件加入知识库并产出经过逐字校对的中文 Word。"

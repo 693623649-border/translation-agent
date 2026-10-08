@@ -1,0 +1,27 @@
+# dsh-kb-reader bundle layer.
+#
+# Inserted rows land after the base and web-app layers, so the three tools and
+# the retrieval contract are visible to every session in the profile. Override
+# any key from the profile's own cordis.patch.yml — a later layer replaces the
+# whole config object, so restate every key you still want.
+- insert:
+    - id: kb-reader
+      name: dsh-kb-reader
+      config:
+        # Interpreter that owns the project's dependencies. Leave unset to let
+        # the plugin probe <repo>/.venv, then fall back to "python" on PATH.
+        python: null
+        # Per-call deadlines (ms). kb_ask is generous because the close-reading
+        # stage may embed the query over the network.
+        askTimeoutMs: 180000
+        quoteTimeoutMs: 60000
+        libraryTimeoutMs: 30000
+        # Injection knobs.
+        defaultHits: 6
+        defaultMaxChars: 28000
+        # Whole-library default: a truncated shelf has been misread as books
+        # that do not exist, so listing everything is the safe setting.
+        shelfLimit: 400
+        # Set false to register the tools without the "search before answering"
+        # system-prompt contract.
+        contract: true

@@ -1,0 +1,6 @@
+- insert:
+    - id: chinese-pdf-kb
+      name: dsh-chinese-pdf-kb
+      config:
+        python: null
+        contract: true

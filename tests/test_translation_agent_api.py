@@ -400,7 +400,7 @@ class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
         import translation_agent_api as api
 
         knowledge_base = MagicMock()
-        with patch.object(api, "RagKnowledgeBase") as open_cls:
+        with patch.object(api, "RagKnowledgeBase") as open_cls, patch.object(api, "retrieve_hybrid_context") as hybrid:
             open_cls.open.return_value = knowledge_base
             api.retrieve_knowledge_base_context(
                 "outputs/book",
@@ -414,7 +414,7 @@ class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
                 candidate_depth=48,
             )
 
-        kwargs = knowledge_base.retrieve_context.call_args.kwargs
+        kwargs = hybrid.call_args.kwargs
         self.assertEqual(kwargs["mode"], "hybrid")
         self.assertEqual(kwargs["book_ids"], {"呐喊"})
         self.assertEqual(kwargs["authors"], {"鲁迅"})
@@ -428,12 +428,12 @@ class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
         import translation_agent_api as api
 
         knowledge_base = MagicMock()
-        with patch.object(api, "RagKnowledgeBase") as open_cls:
+        with patch.object(api, "RagKnowledgeBase") as open_cls, patch.object(api, "retrieve_hybrid_context") as hybrid:
             open_cls.open.return_value = knowledge_base
             api.retrieve_knowledge_base_context("outputs/book", "查询")
 
-        kwargs = knowledge_base.retrieve_context.call_args.kwargs
-        self.assertIsNone(kwargs["mode"])
+        kwargs = hybrid.call_args.kwargs
+        self.assertEqual(kwargs["mode"], "hybrid")
         self.assertIsNone(kwargs["book_ids"])
         self.assertIsNone(kwargs["authors"])
         self.assertIsNone(kwargs["languages"])

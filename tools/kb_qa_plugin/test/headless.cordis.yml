@@ -1,0 +1,12 @@
+# Verification overlay for the kb-reader bundle.
+#
+# `--patch` overlays are applied after every bundle layer. This row loads the
+# plugin straight from its source directory, so the end-to-end check does not
+# depend on the bundle being installed into this profile first. The path must be
+# a file:// URL: Node's ESM loader rejects a bare Windows drive letter.
+- insert:
+    - id: kb-reader
+      name: 'file:///E:/Deeplearning/translation-agent/tools/kb_qa_plugin/index.js'
+      config:
+        python: 'python'
+        askTimeoutMs: 240000

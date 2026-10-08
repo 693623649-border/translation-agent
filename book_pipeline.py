@@ -40,6 +40,9 @@ from typing import Any, Iterable, Iterator, Protocol
 
 import fitz
 from PIL import Image
+from opencc import OpenCC
+
+_TITLE_MATCH_TRADITIONAL_TO_SIMPLIFIED = OpenCC("t2s")
 
 import rag_knowledge_base
 from pipeline_profiles import (
@@ -57,6 +60,7 @@ from pipeline_runtime import (
 from publication_verifier import verify_publication
 from docx_footnotes import patch_docx_footnotes, replace_with_retry
 from publication_semantics import (
+    count_ellipsis_runs,
     append_markdown_footnotes,
     markdown_footnote_contract_sha256,
     markdown_footnotes_to_docx_markers,
@@ -82,8 +86,8 @@ DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
-TRANSLATION_PROMPT_VERSION = "book-translation-v5"
-PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v1"
+TRANSLATION_PROMPT_VERSION = "book-translation-v7"
+PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v2"
 TOC_KINDS = {"part", "chapter", "section", "subsection", "frontmatter", "other"}
 NON_CONTENT_MARKERS = {"[无法辨认]", "[空白页]"}
 
@@ -290,6 +294,10 @@ class TocEntry:
     printed_page: int | None
     pdf_page: int | None = None
     end_pdf_page: int | None = None
+    # The title printed on the Japanese source page may differ from its reader-
+    # facing translation. Keep both identities so page-opening running titles
+    # are removed without losing the approved Chinese chapter heading.
+    source_title: str = ""
 
     @property
     def display_title(self) -> str:
@@ -455,7 +463,11 @@ def detect_language(text: str) -> str:
     significant = han + kana + hangul + cyrillic + latin
     if significant < 12:
         return "unknown"
-    if kana >= 5 and kana / max(1, han + kana) >= 0.08:
+    # Classical/Japanese-heavy prose is kanji-dominated: two kana characters
+    # are already conclusive evidence of Japanese (Chinese text contains no
+    # kana at all), so the old 5-kana / 8% threshold misfiled literary
+    # Japanese pages as Chinese and silently skipped their translation.
+    if kana >= 2 and kana / max(1, han + kana) >= 0.02:
         return "ja"
     if hangul >= max(5, significant * 0.2):
         return "ko"
@@ -1876,6 +1888,27 @@ def _kana_ratio(text: str) -> float:
     return len(KANA_CHARS.findall(text)) / len(meaningful)
 
 
+_PAREN_GLOSS = re.compile(r"[（(][^（）()]{1,24}[）)]")
+
+
+def _retains_foreign_prose(paragraph: str) -> bool:
+    """Whether a translated paragraph still holds untranslated prose.
+
+    Short parenthesized glosses (translated name readings such as 基里尔（キイ）,
+    original short titles) are legitimate translator practice, so the foreign
+    check judges the paragraph with those spans removed.
+    """
+
+    remainder = _PAREN_GLOSS.sub("", paragraph).strip()
+    if not remainder:
+        # Nothing survives outside the glosses; the kana/latin share inside
+        # them is bounded by _PAREN_GLOSS length, let the ratio gate decide.
+        return _kana_ratio(paragraph) > 0.20
+    from docx_translation import needs_translation
+
+    return needs_translation(remainder)
+
+
 KANA_CHARS = re.compile(r"[぀-ヿ]")
 
 
@@ -1982,9 +2015,11 @@ class ChatTranslator:
         body_index = 0
         enforceable_page_labels = _enforceable_numbered_labels(text)
         translated: list[str] = []
+        translation_sources: list[str] = []
         for kind, value in plan:
             if kind == "heading":
                 translated.append(value)
+                translation_sources.append(value)
                 continue
             body_index += 1
             chunk = value
@@ -2007,7 +2042,7 @@ class ChatTranslator:
 2. 保留列表、表格、脚注和段落结构；Markdown 标题已由程序保护，不会出现在本分块中。
 3. 源文中每一个行首脚注编号及其对应定义全文都必须逐条保留并完整翻译；严禁合并、跳号、截断、只保留编号或省略出处。{numbered_requirement}
 4. 人名、书名、术语前后一致；严禁用省略号（……）概括、省略或跳过任何内容——原文没有省略号的地方绝不允许出现省略号，原文自带的省略号原样保留。
-5. 输入来自 OCR。本书为竖排扫描，文本可能存在列序交错、行序错乱、缺字断句：请先依据源语言的语法和上下文把语序重排连贯，再翻译；断裂处按文意补足衔接，宁可意译连贯也不得输出省略号；个别字词缺损时依上下文推断复原；仅当整段完全无法辨认时才标（原文缺损），除此之外不得输出 [原文存疑]、[存疑] 或任何存疑标注。页面以半句开头或结尾时（跨页句子），顺势译出，不得因句子跨页而省略。
+5. 输入来自 OCR，可能包含竖排书的列序错误、缺字或跨页半句。严格按提供的源文顺序翻译，不得擅自调整列序、行序或根据上下文重排原文。依据源语言的语法和上下文理解已辨明的内容，但不得补造原文、猜补缺字或添加衔接句，也不得以流畅改写掩盖 OCR 错序或缺损。仅将已按正确阅读顺序提供的相邻列之间、行之间的 OCR 软换行恢复为连续正文，不把视觉换行当成作者段落；保留明确的段落、诗歌分行及其他结构。页面以半句开头或结尾时，保留跨页半句，不省略，也不凭空补全。无法可靠辨认的局部紧邻标（原文缺损），保留其周围所有可辨内容；原有（原文缺损）标注必须保留。
 6. 正文中出现的日语、英语及其他外语段落或引文也必须译成目标语言，不得整段保留未译；仅专名、必要术语和文献标识可按惯例保留原文。
 7. 如果目标是简体中文，必须使用中国大陆通行简体字与标点，不得输出繁体字。
 8. 只输出译文，不附加说明或质量报告。
@@ -2024,6 +2059,7 @@ class ChatTranslator:
                 )
             )
             translated.append(normalize_target_script(output, target_language))
+            translation_sources.append(chunk)
         output_labels: Counter[str] = Counter()
         for part in translated:
             output_labels.update(_leading_numbered_line_labels(part))
@@ -2036,12 +2072,104 @@ class ChatTranslator:
                 f"leading labels: {missing_numbers}."
             )
         joined = "\n\n".join(part.strip() for part in translated if part.strip()).strip()
+        if not joined:
+            raise RuntimeError("Translation returned an empty result; the page was not committed.")
         if target_language == "简体中文":
+            # Retry an elided chunk against its original source span so the
+            # model cannot hide missing prose behind an invented ellipsis.
+            for index, (source_chunk, output_chunk) in enumerate(
+                zip(translation_sources, translated)
+            ):
+                if count_ellipsis_runs(output_chunk) <= count_ellipsis_runs(source_chunk):
+                    continue
+                complete_prompt = f"""
+请把下面的原文（源语言：{source_language}）完整译成简体中文。逐句保留全部可辨内容。原文没有省略号时绝不可添加省略号；不能补造原文没有的句子，也不能省略难以理解的部分。无法辨认的局部只标（原文缺损）。输出前检查整段没有遗漏。
+
+原文：
+{source_chunk}
+""".strip()
+                repaired = normalize_target_script(
+                    clean_translation_text(
+                        self.client.chat_text(
+                            complete_prompt,
+                            system=(
+                                "你是严谨的简体中文图书译者，完整翻译所有可辨内容，"
+                                "绝不使用省略号跳过原文。"
+                            ),
+                            max_tokens=min(32768, max(4096, len(source_chunk) * 4)),
+                        )
+                    ),
+                    target_language,
+                ).strip()
+                if not repaired:
+                    raise RuntimeError(
+                        "Source-grounded elision repair returned an empty result; "
+                        "the page was not committed."
+                    )
+                translated[index] = repaired
+
+            joined = "\n\n".join(
+                part.strip() for part in translated if part.strip()
+            ).strip()
+            # A page can otherwise pass the kana-ratio gate while retaining a
+            # complete English quotation or a short Japanese sentence. Reopen
+            # only those paragraphs in their translated context and request a
+            # focused repair before this page is allowed into the corpus.
+            paragraphs = re.split(r"(\n\s*\n)", joined)
+            for position in range(0, len(paragraphs), 2):
+                paragraph = paragraphs[position].strip()
+                if not paragraph or not _retains_foreign_prose(paragraph):
+                    continue
+                focused_prompt = f"""
+下面是一段已经翻译成简体中文、但仍残留日文或英文的译文。请把仍属外文的词句完整译为简体中文，同时保留其他已有中文信息、原有含义和段落结构。
+
+不得原样保留整句外文引文、日文假名或外文散文。遇到专名、书名或术语，给出中文译名；必要时只把原文短名放在括号中。不能可靠辨认的局部标（原文缺损），不得用省略号替代。不得增写、删减或改述整段。
+
+待修译文：
+{paragraph}
+""".strip()
+                repaired = normalize_target_script(
+                    clean_translation_text(
+                        self.client.chat_text(
+                            focused_prompt,
+                            system=(
+                                "你是简体中文图书译者，只修复目标段落中的外文残留。"
+                                "保留段落中已有的中文含义，不复制外文原句。"
+                            ),
+                            max_tokens=min(8192, max(1024, len(paragraph) * 4)),
+                        )
+                    ),
+                    target_language,
+                ).strip()
+                if not repaired:
+                    raise RuntimeError(
+                        "Focused foreign-text repair returned an empty result; "
+                        "the page was not committed."
+                    )
+                paragraphs[position] = repaired
+            joined = "".join(paragraphs).strip()
+            source_ellipsis_count = count_ellipsis_runs(text)
+            target_ellipsis_count = count_ellipsis_runs(joined)
+            if target_ellipsis_count > source_ellipsis_count:
+                raise RuntimeError(
+                    "Translation introduced ellipses not present in the source; "
+                    "the page was not committed."
+                )
             kana_ratio = _kana_ratio(joined)
             if kana_ratio > 0.20:
                 raise RuntimeError(
                     "Translation retained Japanese text "
                     f"(kana_ratio={kana_ratio:.2f})."
+                )
+            untranslated = [
+                paragraph.strip()
+                for paragraph in re.split(r"\n\s*\n", joined)
+                if paragraph.strip() and _retains_foreign_prose(paragraph.strip())
+            ]
+            if untranslated:
+                raise RuntimeError(
+                    "Translation retained a foreign-language prose segment; "
+                    "the page was not committed."
                 )
         return joined
 
@@ -2063,11 +2191,11 @@ class ChatOCRProofreader:
 分块：{index}/{len(chunks)}
 
 要求：
-1. 只修正能够从日语语法和上下文可靠判断的 OCR 错字、漏字、重复行、错误空格、断行和明显的阅读顺序错误。
+1. 纯文本校勘只修正能够可靠确认的 OCR 错字和错误空格；不得猜补漏字、删除疑似重复内容或擅自调整列序、行序。严格保留提供的源文顺序；文本上下文不能替代原页图像证据，不能据此确认或改写书名、章节标题。保留历史假名遣和旧字，不做现代化改写。
 2. 严禁翻译成中文或任何其他语言；输出必须仍是原文日语。
 3. 不总结、不删减、不扩写，不改写作者表达，不凭常识补造原文没有的内容。
-4. 保留 Markdown 标题、列表、表格、脚注、引文和段落结构。
-5. 无法可靠还原的文字保留原 OCR，并紧邻标注（原文缺损）。不要输出 [原文存疑]、[存疑] 或任何其他形式的存疑标注：翻译阶段的提示词明确禁止这类标注，校勘阶段引入它们会直接违反该契约。
+4. 保留 Markdown 标题、列表、表格、脚注、引文和明确的段落结构。仅将已按正确阅读顺序提供的相邻列之间、行之间的 OCR 软换行恢复为连续正文，不把视觉换行当成作者段落；保留诗歌分行。跨页半句原样保留，不省略、不补全。
+5. 无法可靠辨认的局部保留原 OCR，并紧邻标注（原文缺损）；保留已有缺损标注和周围所有可辨内容。不得以流畅改写掩盖 OCR 错序或缺损。
 6. 只输出校勘后的原文，不附加说明、修改清单或质量报告。
 
 OCR 原文：
@@ -2525,10 +2653,16 @@ def import_existing_ocr(source_dir: Path, output_dir: Path) -> int:
         if not text:
             continue
         translated = str(item.get("translated_text") or item.get("translation") or "").strip()
+        # The Docker OCR job classifies kanji-dominated Japanese pages as
+        # "zh"; re-check that claim with detect_language before trusting it,
+        # so literary Japanese is never silently filed as Chinese.
+        language = str(item.get("language") or "")
+        if language in {"", "zh", "unknown"}:
+            language = detect_language(text)
         record = PageRecord(
             pdf_page=page_number,
             text=text,
-            language=str(item.get("language") or detect_language(text)),
+            language=language,
             translated_text=translated,
             translation_source_sha256=str(item.get("translation_source_sha256") or ""),
             translation_provider=str(item.get("translation_provider") or ""),
@@ -3090,6 +3224,7 @@ def normalize_toc_payload(payload: dict[str, Any], *, fallback_pages: list[int] 
                 printed_page=printed,
                 pdf_page=int(raw["pdf_page"]) if isinstance(raw.get("pdf_page"), int) else None,
                 end_pdf_page=int(raw["end_pdf_page"]) if isinstance(raw.get("end_pdf_page"), int) else None,
+                source_title=str(raw.get("source_title") or "").strip(),
             )
         )
     if not entries:
@@ -3151,7 +3286,9 @@ def extract_toc(
 
 
 def normalize_match_text(value: str) -> str:
-    value = unicodedata.normalize("NFKC", value).lower()
+    value = _TITLE_MATCH_TRADITIONAL_TO_SIMPLIFIED.convert(
+        unicodedata.normalize("NFKC", value)
+    ).lower()
     # Common Japanese TOC labels are often written in kana while the opening
     # page uses kanji.  Normalising these pairs lets an unnumbered preface be
     # mapped from its heading without inventing a printed page number.
@@ -3436,6 +3573,18 @@ def apply_page_mapping(
             direct_is_usable = near_mapped_page or independent_pre_toc_page
 
         candidate = direct if direct_is_usable else mapped
+        if (
+            candidate is None
+            and manual_override
+            and entry.kind == "part"
+            and entry.printed_page is None
+            and entry.pdf_page is not None
+            and 1 <= entry.pdf_page <= max_page
+        ):
+            # A visually verified part/divider may be intentionally unnumbered
+            # in print while its exact source-PDF page is known. Keep that
+            # explicit boundary so it can close the previous chapter range.
+            candidate = entry.pdf_page
         if candidate is not None and candidate < last_assigned_page:
             # TOC order is authoritative.  Reject an earlier exact-title hit and
             # fall back to the inferred mapping; an unnumbered false hit remains
@@ -3779,7 +3928,8 @@ def build_knowledge_rows_from_manifest(
         markdown = (chapter_dir / str(item["filename"])).read_text(
             encoding="utf-8"
         )
-        reader_content = _reviewed_chapter_body(markdown)
+        footnotes = parse_markdown_footnotes(_reviewed_chapter_body(markdown))
+        reader_content = re.sub(r"\[\^[^\]\s]+\]", "", footnotes.body).strip()
         row_source = "reviewed" if item.get("reviewed_override") else "compiled"
         for chunk_index, chunk in enumerate(
             split_text(reader_content, 4000),
@@ -3814,6 +3964,11 @@ def compile_chapters(
     require_translation: bool = False,
     expected_translation_identity: ModelIdentity | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not require_translation:
+        # Without a single required profile, compile any translation that is
+        # fresh for its exact source page. This supports explicitly audited
+        # fallback providers without discarding their verified output.
+        expected_translation_identity = None
     entries = [TocEntry(**item) for item in toc_payload["entries"]]
     selected = select_entries(entries, granularity)
     if not selected:
@@ -3826,6 +3981,21 @@ def compile_chapters(
         toc_payload.get("printed_pages_per_pdf_page") or 1
     )
     page_offset = int(toc_payload.get("page_offset") or 0)
+    page_start_new_paragraphs: dict[int, bool] = {}
+    paragraph_audit_path = output_dir / "audit" / "selection-paragraph-layout.json"
+    if paragraph_audit_path.is_file():
+        try:
+            paragraph_rows = json.loads(paragraph_audit_path.read_text(encoding="utf-8"))
+            if isinstance(paragraph_rows, list):
+                page_start_new_paragraphs = {
+                    int(row["pdf_page"]): bool(row["starts_new_paragraph"])
+                    for row in paragraph_rows
+                    if isinstance(row, dict)
+                    and row.get("pdf_page") is not None
+                    and "starts_new_paragraph" in row
+                }
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            page_start_new_paragraphs = {}
     toc_pages = sorted(
         int(page) for page in toc_payload.get("toc_pdf_pages") or []
     )
@@ -4034,6 +4204,11 @@ def compile_chapters(
                     selected_physical_pages,
                     start=physical_start + 1,
                 ):
+                    if physical_text.strip() in NON_CONTENT_MARKERS:
+                        # Blank scan pages and title-only editorial dividers
+                        # remain in page checkpoints, never as reader-facing
+                        # text such as the literal marker [空白页].
+                        continue
                     source_page = (
                         f"pdf-{page:04d}-physical-{physical_index:02d}"
                     )
@@ -4051,6 +4226,8 @@ def compile_chapters(
                     chapter_semantic_issues.extend(page_audit["issues"])
                 content = join_physical_page_texts(semantic_page_bodies)
                 if page == start:
+                    if entry.source_title:
+                        content = remove_duplicate_title(content, entry.source_title)
                     content = remove_duplicate_title(content, entry.title)
                 first_printed_page = (page - page_offset) * printed_pages_per_pdf_page
                 expected_printed_pages = range(
@@ -4077,14 +4254,25 @@ def compile_chapters(
             # Chapter Markdown is a reader-facing output just like EPUB,
             # Word, and the knowledge base. Keep PDF/page coordinates only in
             # checkpoints and chapters.json; never expose them in book text.
+            reader_markdown = "\n".join(parts).rstrip() + "\n"
+            reader_footnotes = parse_markdown_footnotes(reader_markdown)
             semantic_markdown = append_markdown_footnotes(
-                "\n".join(parts).rstrip() + "\n",
+                reader_footnotes.body,
                 chapter_footnotes,
             )
+            if reader_footnotes.definitions:
+                inline_definitions = "\n\n".join(
+                    f"[^{note_id}]: {note_text}"
+                    for note_id, note_text in reader_footnotes.definitions
+                )
+                semantic_markdown = (
+                    semantic_markdown.rstrip() + "\n\n" + inline_definitions + "\n"
+                )
             markdown = strip_publication_metadata(
                 semantic_markdown,
                 publication_title=publication_title,
                 chapter_title=entry.display_title,
+                page_start_new_paragraphs=page_start_new_paragraphs,
             )
         # Semantic audit digests bind the exact Markdown bytes.  Disable the
         # Windows text-mode CRLF translation so the persisted bytes match the
@@ -4094,6 +4282,7 @@ def compile_chapters(
             encoding="utf-8",
             newline="",
         )
+        final_footnote_count = len(parse_markdown_footnotes(markdown).definitions)
         manifest.append(
             {
                 **asdict(entry),
@@ -4105,11 +4294,7 @@ def compile_chapters(
                 "boundary_mode": "closed-overlap" if overlaps_next else "non-overlap",
                 "reviewed_override": reviewed_override is not None,
                 "granularity": granularity,
-                "semantic_footnote_count": (
-                    len(chapter_footnotes)
-                    if reviewed_override is None
-                    else len(parse_markdown_footnotes(markdown).definitions)
-                ),
+                "semantic_footnote_count": final_footnote_count,
                 "semantic_issue_count": len(chapter_semantic_issues),
             }
         )
@@ -4118,11 +4303,7 @@ def compile_chapters(
                 "chapter_id": entry.id,
                 "filename": filename,
                 "reviewed_override": reviewed_override is not None,
-                "footnote_count": (
-                    len(chapter_footnotes)
-                    if reviewed_override is None
-                    else len(parse_markdown_footnotes(markdown).definitions)
-                ),
+                "footnote_count": final_footnote_count,
                 "pages": chapter_semantic_pages,
                 "issues": chapter_semantic_issues,
                 "release_blocked": any(
@@ -4176,6 +4357,7 @@ def strip_publication_metadata(
     *,
     publication_title: str | None = None,
     chapter_title: str | None = None,
+    page_start_new_paragraphs: dict[int, bool] | None = None,
 ) -> str:
     """Remove audit-only source/page markers from reader-facing documents."""
 
@@ -4189,6 +4371,10 @@ def strip_publication_metadata(
             return None
         page = int(match.group(1))
         return page if page > 0 else None
+
+    def pdf_page_number(line: str) -> int | None:
+        match = re.search(r'\bid="pdf-page-(\d{1,6})"', line.strip(), flags=re.I)
+        return int(match.group(1)) if match else None
 
     def is_standalone_printed_page(line: str) -> int | None:
         match = re.fullmatch(r"[-—–\s]*(\d{1,3})[-—–\s]*", line.strip())
@@ -4285,7 +4471,7 @@ def strip_publication_metadata(
             # enough that ordinary body sentences cannot be mistaken for headers:
             # a mutated running header keeps the title's length, so lines that
             # merely START with the title (dialogue attributions like
-            # ``包法利夫人回答道：``) fail the length-similarity guard.
+            # 包法利夫人回答道：) fail the length-similarity guard.
             title_prefix = re.split(r"[|｜]", without_page, maxsplit=1)[0]
             if "〉" in title_prefix:
                 title_prefix = title_prefix.split("〉", maxsplit=1)[0] + "〉"
@@ -4380,6 +4566,7 @@ def strip_publication_metadata(
         )
 
     pending_page_boundary = False
+    pending_pdf_page: int | None = None
     skipped_leading_page_number = False
     # Remove a vertically emitted running title before page-boundary joining.
     # Otherwise its first glyph can be mistaken for the continuation of the
@@ -4399,6 +4586,7 @@ def strip_publication_metadata(
             if not is_known_printed_marker:
                 discard_trailing_printed_page()
             pending_page_boundary = True
+            pending_pdf_page = pdf_page_number(stripped)
             # The known printed-page number was replaced by this marker, so a
             # following standalone number can be real content and must remain.
             skipped_leading_page_number = is_known_printed_marker
@@ -4408,6 +4596,7 @@ def strip_publication_metadata(
             # When explicit comment markers remain, keep footer cleaning behavior
             # aligned with nearby pagebreak spans.
             pending_page_boundary = True
+            pending_pdf_page = page_comment_number
             skipped_leading_page_number = False
             continue
         if stripped.startswith("<!--") and stripped.endswith("-->"):
@@ -4463,13 +4652,29 @@ def strip_publication_metadata(
                 continue
             while output and not output[-1].strip():
                 output.pop()
-            if output and should_join_page_boundary(output[-1], line):
+            paragraph_start = (
+                page_start_new_paragraphs.get(pending_pdf_page)
+                if page_start_new_paragraphs is not None and pending_pdf_page is not None
+                else None
+            )
+            previous_line = output[-1].strip() if output else ""
+            is_markdown_block_edge = bool(
+                previous_line.startswith(("#", "- ", "* ", "> ", "|"))
+                or line.lstrip().startswith(("#", "- ", "* ", "> ", "|"))
+            )
+            join_page_boundary = False if is_markdown_block_edge else (
+                not paragraph_start
+                if paragraph_start is not None
+                else bool(output and should_join_page_boundary(output[-1], line))
+            )
+            if output and join_page_boundary:
                 output[-1] = output[-1].rstrip() + line.lstrip()
             else:
                 if output:
                     output.append("")
                 output.append(line.rstrip())
             pending_page_boundary = False
+            pending_pdf_page = None
             continue
         if (
             is_probable_standalone_footer(index, stripped)
@@ -4932,22 +5137,12 @@ def _normalize_wrapped_markdown_for_docx(markdown_text: str) -> str:
 
 def markdown_inline_to_plain_text(value: str) -> str:
     """Convert the small inline-Markdown/HTML subset used by page translations."""
-    cleaned = re.sub(r"\[([^]]+)]\([^)]+\)", r"\1", value)
-    cleaned = re.sub(r"<br\s*/?>", "\n", cleaned, flags=re.I)
-    cleaned = re.sub(r"<[^>]+>", "", cleaned)
-    cleaned = html.unescape(cleaned)
-    # Emphasis stripping must not eat underscores inside bare URLs
-    # (``.../apm_papers/...``), so stash the link targets first.
-    links: list[str] = []
-
-    def stash(match: re.Match[str]) -> str:
-        links.append(match.group(0))
-        return f"\x00{len(links) - 1}\x00"
-
-    cleaned = re.sub(r"(?:https?|ftp)://\S+", stash, cleaned)
-    cleaned = re.sub(r"[`*_]{1,3}", "", cleaned)
-    cleaned = re.sub(r"\x00(\d+)\x00", lambda m: links[int(m.group(1))], cleaned)
-    return cleaned.strip()
+    # The parser distinguishes emphasis delimiters from authored literal stars,
+    # underscores and backticks; a blanket character deletion loses note text.
+    fragment = markdown_to_html(value)
+    fragment = re.sub(r"<br\s*/?>", "<br />", fragment, flags=re.I)
+    root = ET.fromstring(f"<document>{fragment}</document>")
+    return _html_element_text(root).strip()
 
 
 def _html_local_name(element: ET.Element) -> str:
@@ -6016,10 +6211,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-reading-direction",
-        choices=["horizontal", "vertical"],
+        choices=["horizontal", "vertical", "auto"],
         default=None,
         help=(
-            "Page reading direction used by the content-filter band fallback. "
+            "Page reading direction used by local OCR ordering. "
             "Use vertical for traditional Japanese right-to-left columns. "
             "Defaults to the OCR profile setting, then horizontal."
         ),
@@ -6727,15 +6922,18 @@ def paddle_local_model_id(
     det_len: int,
     dpi: int,
     max_image_side: int,
+    reading_direction: str = "horizontal",
 ) -> str:
     """Deterministic checkpoint identity for the local PaddleOCR backend."""
 
+    if reading_direction not in {"horizontal", "vertical", "auto"}:
+        raise ValueError(f"Unsupported OCR reading direction: {reading_direction}")
     return (
         "paddleocr-local/"
         f"PP-OCRv5-{det_variant}-det-{det_mode}-"
         f"{rec_variant}-rec-{rec_mode}-"
         f"b{rec_batch}-det{det_len}-"
-        f"dpi{dpi}-max{max_image_side}-v1"
+        f"dpi{dpi}-max{max_image_side}-{reading_direction}-v3"
     )
 
 
@@ -6800,6 +6998,7 @@ def resolve_expected_ocr_model_exact(
             det_len=args.paddle_det_len,
             dpi=args.dpi,
             max_image_side=args.max_image_side,
+            reading_direction=resolve_ocr_reading_direction(args, ocr_profile),
         )
     return None
 
@@ -7323,6 +7522,7 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                         det_len=args.paddle_det_len,
                         dpi=args.dpi,
                         max_image_side=args.max_image_side,
+                        reading_direction=args.ocr_reading_direction,
                     )
                     requested = set(range(args.start_page, end_page + 1))
                     pending = paddle_local_pending_pages(
@@ -7378,6 +7578,8 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                                 str(args.max_image_side),
                                 "--jpeg-quality",
                                 str(args.jpeg_quality),
+                                "--reading-direction",
+                                args.ocr_reading_direction,
                             ]
                             completed = subprocess.run(
                                 command,
@@ -7625,7 +7827,11 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                 granularity=compile_granularity,
                 publication_title=book_title,
                 require_translation=args.require_translation,
-                expected_translation_identity=expected_translation_identity,
+                expected_translation_identity=(
+                    expected_translation_identity
+                    if args.require_translation
+                    else None
+                ),
             )
             if not args.no_kb:
                 knowledge_base_path = output_dir / "knowledge_base.jsonl"

@@ -1,0 +1,23 @@
+# dsh-kb-ingest bundle layer.
+#
+# Inserted rows land after the base and web-app layers, so the three tools and
+# the ingest contract are visible to every session in the profile. Override any
+# key from the profile's own cordis.patch.yml — a later layer replaces the whole
+# config object, so restate every key you still want.
+- insert:
+    - id: kb-ingest
+      name: dsh-kb-ingest
+      config:
+        # Interpreter that owns the project's dependencies. Leave unset to let
+        # the plugin probe <repo>/.venv, then fall back to "python" on PATH.
+        python: null
+        # Per-call deadlines (ms). Ingest publishes and verifies a whole book,
+        # so it is generous; verify re-runs the same gate without republishing.
+        ingestTimeoutMs: 900000
+        verifyTimeoutMs: 300000
+        statusTimeoutMs: 60000
+        # Paragraph chunk ceiling, matching the repository contract.
+        defaultChunkChars: 4000
+        # Set false to register the tools without the "ingest through the tool,
+        # never hand-roll it" system-prompt contract.
+        contract: true

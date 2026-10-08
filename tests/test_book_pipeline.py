@@ -22,6 +22,7 @@ from book_pipeline import (
     CodingPlanVisionOCR,
     DeepSeekClient,
     GlmClient,
+    ModelIdentity,
     McpStdioClient,
     PageRecord,
     TocEntry,
@@ -30,6 +31,7 @@ from book_pipeline import (
     apply_page_mapping,
     build_parser,
     build_bookmarked_pdf,
+    build_knowledge_rows_from_manifest,
     build_docx,
     build_epub,
     build_translation_client,
@@ -59,6 +61,31 @@ from book_pipeline import (
 
 
 class UtilityTests(unittest.TestCase):
+    def test_knowledge_rows_separate_markdown_footnotes_from_reader_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "chapter.md").write_text(
+                "# 选文标题\n\n正文句。[^editorial-note] 后续正文。\n\n"
+                "[^editorial-note]: [编者注] 这是脚注说明。\n",
+                encoding="utf-8",
+            )
+            rows = build_knowledge_rows_from_manifest(
+                Path("source.pdf"),
+                root,
+                [{
+                    "id": "toc-0001",
+                    "filename": "chapter.md",
+                    "display_title": "选文标题",
+                    "sequence": 1,
+                    "reviewed_override": False,
+                }],
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertIn("正文句。", rows[0]["content"])
+        self.assertIn("后续正文。", rows[0]["content"])
+        self.assertNotIn("编者注", rows[0]["content"])
+        self.assertNotIn("editorial-note", rows[0]["content"])
+
     def test_model_stage_lock_decorator_preserves_keyword_call_api(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -1214,6 +1241,27 @@ M.E.Sharpe, Inc., 1983.
             "# 章节\n\n这一页结束于作为对象展开的讨论。\n\n完整句子。\n\n下一段另起。\n",
         )
 
+    def test_layout_audit_controls_paragraph_boundary_across_page(self) -> None:
+        source = """# 章节
+
+<span epub:type="pagebreak" id="pdf-page-25" title="25"></span>
+<!-- PDF_PAGE: 25 -->
+
+前页的句号。
+
+<span epub:type="pagebreak" id="pdf-page-26" title="26"></span>
+<!-- PDF_PAGE: 26 -->
+
+同一段落的后半句。
+"""
+        self.assertEqual(
+            strip_publication_metadata(
+                source,
+                page_start_new_paragraphs={25: False, 26: False},
+            ),
+            "# 章节\n\n前页的句号。同一段落的后半句。\n",
+        )
+
     def test_publication_does_not_join_signed_note_to_next_page(self) -> None:
         source = """# 第一章
 
@@ -1254,6 +1302,20 @@ M.E.Sharpe, Inc., 1983.
             "术语[原文存疑]与链接",
         )
 
+    def test_docx_note_preserves_literal_star_and_url_underscores(self) -> None:
+        self.assertEqual(
+            markdown_inline_to_plain_text('原文为“characters.\"*”，星号对应脚注。'),
+            '原文为“characters.\"*”，星号对应脚注。',
+        )
+        self.assertEqual(
+            markdown_inline_to_plain_text('*强调*、**加粗**与`代码`。'),
+            '强调、加粗与代码。',
+        )
+        self.assertEqual(
+            markdown_inline_to_plain_text("https://example.test/apm_papers/a_b_c"),
+            "https://example.test/apm_papers/a_b_c",
+        )
+
     def test_remove_multiline_duplicate_title(self) -> None:
         text = "第一章\n\n陀思妥耶夫斯基的复调\n小说和评论著述对它的阐释\n\n正文"
         title = "第一章 陀思妥耶夫斯基的复调小说和评论著述对它的阐释"
@@ -1274,6 +1336,117 @@ M.E.Sharpe, Inc., 1983.
             remove_duplicate_title(text, "细田守《无尽的斯嘉丽》批判"),
             "正文",
         )
+
+    def test_remove_duplicate_title_matches_japanese_traditional_source_heading(self) -> None:
+        text = "小說の問題Ⅰ\n本文从这里开始。"
+        self.assertEqual(
+            remove_duplicate_title(text, "小説の問題 I"),
+            "本文从这里开始。",
+        )
+
+    def test_translation_rejects_empty_provider_output(self) -> None:
+        class EmptyClient:
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                return ""
+
+        translator = ChatTranslator(EmptyClient())
+        with self.assertRaisesRegex(RuntimeError, "empty result"):
+            translator.translate(
+                "日文の本文です。",
+                source_language="ja",
+                target_language="简体中文",
+            )
+
+    def test_translation_rejects_untranslated_foreign_prose(self) -> None:
+        class ForeignQuoteClient:
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                return "中文已经译好。\n\nLadies and Gentlemen: Humanity is hopeless!"
+
+        translator = ChatTranslator(ForeignQuoteClient())
+        with self.assertRaisesRegex(RuntimeError, "foreign-language prose"):
+            translator.translate(
+                "日本語の本文です。",
+                source_language="ja",
+                target_language="简体中文",
+            )
+
+    def test_translation_repairs_only_foreign_residual_paragraphs(self) -> None:
+        class FocusedRepairClient:
+            def __init__(self) -> None:
+                self.requests: list[str] = []
+
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                self.requests.append(prompt)
+                if len(self.requests) == 1:
+                    return "中文译文保留原文引文。\n\nLadies and Gentlemen: Humanity is hopeless!"
+                return "女士们、先生们：人类毫无希望！"
+
+        client = FocusedRepairClient()
+        translated = ChatTranslator(client).translate(
+            "日文の本文です。",
+            source_language="ja",
+            target_language="简体中文",
+        )
+        self.assertEqual(
+            translated,
+            "中文译文保留原文引文。\n\n女士们、先生们：人类毫无希望！",
+        )
+        self.assertEqual(len(client.requests), 2)
+
+    def test_translation_repairs_invented_ellipsis_from_the_original_chunk(self) -> None:
+        class SourceGroundedClient:
+            def __init__(self) -> None:
+                self.requests: list[str] = []
+
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                self.requests.append(prompt)
+                if len(self.requests) == 1:
+                    return "这是一段完整的中文……但模型误加省略号。"
+                return "这是一段完整的中文。原文写道：「我并不打算离开这里。」"
+
+        client = SourceGroundedClient()
+        translated = ChatTranslator(client).translate(
+            "完全な文章です。私はここを離れるつもりはない。",
+            source_language="ja",
+            target_language="简体中文",
+        )
+        self.assertNotIn("…", translated)
+        self.assertEqual(len(client.requests), 2)
+
+    def test_translation_rejects_invented_ellipses(self) -> None:
+        class ElidingClient:
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                return "源文没有省略的地方……却被译文省略了。"
+
+        translator = ChatTranslator(ElidingClient())
+        with self.assertRaisesRegex(RuntimeError, "introduced ellipses"):
+            translator.translate(
+                "日文の本文です。",
+                source_language="ja",
+                target_language="简体中文",
+            )
+
+    def test_translation_accepts_equivalent_english_ellipses(self) -> None:
+        class QuotingClient:
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                return "他说……然后她回答……所有原文内容都完整保留。"
+
+        translated = ChatTranslator(QuotingClient()).translate(
+            "He said . . . then she replied ... All source prose remains intact.",
+            source_language="en", target_language="简体中文",
+        )
+        self.assertIn("他说……", translated)
+
+    def test_translation_rejects_invented_ascii_ellipses(self) -> None:
+        class ElidingClient:
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                return "源文没有省略的地方...却被译文省略了。"
+
+        with self.assertRaisesRegex(RuntimeError, "introduced ellipses"):
+            ChatTranslator(ElidingClient()).translate(
+                "This complete source has no omitted content.",
+                source_language="en", target_language="简体中文",
+            )
 
     def test_parallel_translation_checkpoints(self) -> None:
         class FakeTranslator:
@@ -1953,6 +2126,18 @@ class MappingAndCompilationTests(unittest.TestCase):
         records[8] = PageRecord(9, "# 第二章 终点\n第二章正文")
         return records
 
+    def test_compile_audit_counts_native_markdown_footnotes(self) -> None:
+        output = self.root / "native-notes"
+        entry = TocEntry("native", "", "正文", 1, "chapter", 1, pdf_page=1)
+        manifest, _rows = compile_chapters(
+            self.pdf_path, output,
+            [PageRecord(1, "完整正文[^native]。\n\n[^native]: 原生脚注保留字面星号*。")],
+            {"page_offset": 0, "entries": [entry.__dict__]}, granularity="chapter",
+        )
+        audit = json.loads((output / "audit" / "semantic-reconstruction.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest[0]["semantic_footnote_count"], 1)
+        self.assertEqual(audit["chapters"][0]["footnote_count"], 1)
+
     def test_chapter_compile_removes_publication_running_title(self) -> None:
         entries = [
             TocEntry("chapter-1", "第一章", "历史想象力", 1, "chapter", 1, pdf_page=1),
@@ -1993,6 +2178,70 @@ class MappingAndCompilationTests(unittest.TestCase):
             ).hexdigest(),
         )
 
+    def test_chapter_compile_drops_explicit_blank_page_markers(self) -> None:
+        entries = [
+            TocEntry("chapter-1", "", "第一篇", 1, "chapter", 1, pdf_page=1),
+            TocEntry("chapter-2", "", "第二篇", 1, "chapter", 4, pdf_page=4),
+        ]
+        records = [
+            PageRecord(1, "第一篇正文。"),
+            PageRecord(2, "[空白页]", language="unknown"),
+            PageRecord(3, "[空白页]", language="unknown"),
+            PageRecord(4, "第二篇正文。"),
+        ]
+        output = self.root / "blank-page-markers"
+        manifest, rows = compile_chapters(
+            self.pdf_path,
+            output,
+            records,
+            {"page_offset": 0, "entries": [entry.__dict__ for entry in entries]},
+            granularity="chapter",
+        )
+        markdown = (output / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("[空白页]", markdown)
+        self.assertNotIn("[空白页]", rows[0]["content"])
+
+    def test_unpinned_compile_keeps_a_source_current_fallback_translation(self) -> None:
+        source = "日本語の本文です。"
+        translation = "这是来源页当前版本的中文译文。"
+        record = PageRecord(
+            1,
+            source,
+            language="ja",
+            translated_text=translation,
+            translation_source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            translation_provider="zhipu",
+            translation_model="glm-5.2",
+            translation_target_language="简体中文",
+            translation_prompt_version="book-translation-v7",
+        )
+        entry = TocEntry("chapter", "", "试译章节", 1, "chapter", 1, pdf_page=1)
+        profile = ModelIdentity(
+            provider="deepseek",
+            adapter="openai-chat",
+            base_url="https://api.deepseek.com",
+            model="deepseek-flash",
+            target_language="简体中文",
+            prompt_version="book-translation-v7",
+            thinking="disabled",
+        )
+        out = self.root / "fallback-provider-output"
+        manifest, _ = compile_chapters(
+            self.pdf_path,
+            out,
+            [record],
+            {"page_offset": 0, "entries": [entry.__dict__]},
+            granularity="chapter",
+            require_translation=False,
+            expected_translation_identity=profile,
+        )
+        markdown = (out / "chapters" / manifest[0]["filename"]).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(translation, markdown)
+
     def test_infer_page_offset(self) -> None:
         offset, evidence = infer_page_offset(self.sample_entries(), self.sample_records(), toc_end=2)
         self.assertEqual(offset, 3)
@@ -2009,6 +2258,40 @@ class MappingAndCompilationTests(unittest.TestCase):
         mapped = apply_page_mapping(payload, records, page_offset=3)
         first = mapped["entries"][0]
         self.assertEqual(first["pdf_page"], 4)
+
+    def test_manual_offset_preserves_explicit_unprinted_part_boundaries(self) -> None:
+        payload = {
+            "entries": [
+                {
+                    "id": "chapter",
+                    "index": "",
+                    "title": "正文",
+                    "level": 1,
+                    "kind": "chapter",
+                    "printed_page": 10,
+                    "pdf_page": 13,
+                },
+                {
+                    "id": "divider",
+                    "index": "",
+                    "title": "无正文隔页",
+                    "level": 1,
+                    "kind": "part",
+                    "printed_page": None,
+                    "pdf_page": 14,
+                },
+            ]
+        }
+        mapped = apply_page_mapping(
+            payload,
+            self.sample_records(),
+            page_offset=3,
+            source_page_count=14,
+        )
+        self.assertEqual(
+            [entry["pdf_page"] for entry in mapped["entries"]],
+            [13, 14],
+        )
 
     def test_title_evidence_handles_piecewise_page_offsets(self) -> None:
         entries = [

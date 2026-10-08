@@ -25,6 +25,7 @@ from xml.etree import ElementTree as ET
 
 import rag_knowledge_base
 from publication_semantics import (
+    count_ellipsis_runs,
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
 )
@@ -272,7 +273,9 @@ def _normalize_cover_title(value: str) -> str:
 
 def _chapter_body(markdown_text: str) -> str:
     lines = markdown_text.splitlines()
-    return "\n".join(lines[1:]).strip() if lines else ""
+    body = "\n".join(lines[1:]).strip() if lines else ""
+    footnotes = parse_markdown_footnotes(body)
+    return re.sub(r"\[\^[^\]\s]+\]", "", footnotes.body).strip()
 
 
 def _strip_reviewed_publication_metadata(markdown_text: str) -> str:
@@ -664,6 +667,43 @@ def _canonical_visible_text(value: str) -> str:
     return re.sub(r"\s+", " ", unicodedata.normalize("NFC", value)).strip()
 
 
+def _canonical_docx_body_text(value: str) -> str:
+    """Ignore Word-only spaces introduced between adjacent CJK runs.
+
+    Word can serialize a run boundary as a literal space even when the
+    Markdown source has none. Compare prose after removing only those spaces
+    that occur between CJK characters/punctuation or immediately after a
+    typed note label; preserve spaces in Latin citations and ordinary prose.
+    """
+
+    text = _canonical_visible_text(value)
+    text = re.sub(
+        r"(?<=[\u3400-\u9fff\u3000-\u303f，。！？：；、]) "
+        r"(?=[\u3400-\u9fff\u3000-\u303f“”‘’\[(])",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(?<=[\u00b9\u00b2\u00b3\u2070-\u209f]) "
+        r"(?=[\u3400-\u9fff\u3000-\u303f，。！？：；、])",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"(\[(?:作者注|编者注|译者注)\]) "
+        r"(?=[\u3400-\u9fff\u3000-\u303f⁰¹²³⁴⁵⁶⁷⁸⁹])",
+        r"\1",
+        text,
+    )
+    return text
+
+
+def _docx_style_signature(fragments: Iterable[str]) -> str:
+    """Flatten Word/Markdown run boundaries while preserving styled text."""
+
+    return "".join(re.sub(r"\s+", "", fragment) for fragment in fragments)
+
+
 def _detect_language(value: str) -> str:
     """Mirror the pipeline's deterministic page-language classifier."""
 
@@ -799,7 +839,15 @@ def _docx_expectations(
     quotes: dict[str, list[str]] = {}
     for item in selected:
         chapter_id = str(item.get("id") or "")
-        source = _docx_markdown_body(chapter_texts.get(chapter_id, ""))
+        from book_pipeline import _normalize_wrapped_markdown_for_docx
+
+        # The Word publisher merges OCR soft wraps before parsing Markdown.
+        # Derive inline style, heading, quote, and table expectations from that
+        # same input so delimiter pairs cannot shift across a different line
+        # boundary in the release verifier.
+        source = _normalize_wrapped_markdown_for_docx(
+            _docx_markdown_body(chapter_texts.get(chapter_id, ""))
+        )
         root = ET.fromstring(f"<document>{_markdown_html(source)}</document>")
         headings[chapter_id] = _markdown_heading_signature(
             source,
@@ -3429,17 +3477,18 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
                     )
                 )
             )
-            canonical_actual = _canonical_visible_text(actual_text)
-            if canonical_actual != expected_text:
+            canonical_actual = _canonical_docx_body_text(actual_text)
+            canonical_expected = _canonical_docx_body_text(expected_text)
+            if canonical_actual != canonical_expected:
                 issues.append(
                     _issue(
                         "docx_chapter_text_mismatch",
                         "Word 章节正文与当前 Markdown 不一致。",
                         path=path,
                         chapter_id=chapter_id,
-                        expected_sha256=_sha256_text(expected_text),
+                        expected_sha256=_sha256_text(canonical_expected),
                         actual_sha256=_sha256_text(canonical_actual),
-                        expected_characters=len(expected_text),
+                        expected_characters=len(canonical_expected),
                         actual_characters=len(canonical_actual),
                     )
                 )
@@ -3505,13 +3554,11 @@ def _check_docx(context: _VerificationContext) -> dict[str, Any]:
             for style_name in ("bold", "italic", "underline"):
                 expected_fragments = expected_styles.get(style_name, [])
                 actual_fragments = payload["inline_styles"].get(style_name, [])
-                # The DOCX renderer merges CJK soft-wrapped lines without the
-                # space markdown's itertext keeps; style membership is about
-                # emphasis, not whitespace, so compare space-stripped runs.
-                strip_ws = lambda fragments: [
-                    re.sub(r"\s+", "", fragment) for fragment in fragments
-                ]
-                if strip_ws(actual_fragments) != strip_ws(expected_fragments):
+                # Word may split one Markdown emphasis span into multiple XML
+                # runs around footnote references or paragraph fragments. The
+                # content styled for emphasis must match in order, but run
+                # segmentation is not reader-visible.
+                if _docx_style_signature(actual_fragments) != _docx_style_signature(expected_fragments):
                     issues.append(
                         _issue(
                             "docx_inline_style_mismatch",
@@ -4072,9 +4119,9 @@ def _check_docx_chinese(context: _VerificationContext) -> dict[str, Any]:
 
 
 def _ellipsis_runs(text: str) -> int:
-    """Count Chinese ellipsis runs, treating ``……`` and ``…`` alike."""
+    """Count equivalent Chinese and English ellipsis runs."""
 
-    return len(re.findall(r"…+", text))
+    return count_ellipsis_runs(text)
 
 
 #: Markers a translation must never contain.  （原文缺损） is deliberately NOT

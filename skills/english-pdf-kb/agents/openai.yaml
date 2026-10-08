@@ -1,0 +1,4 @@
+interface:
+  display_name: "英文 PDF 中文入库"
+  short_description: "分清选文和编者材料，核验原书段落、脚注、Word 与知识库"
+  default_prompt: "使用 $english-pdf-kb 处理这本英文原文 PDF，翻译成中文，按原书结构区分选文和编者材料，并通过发行与入库质量门。"

@@ -15,6 +15,24 @@ from publication_semantics import (
 
 
 class PublicationSemanticsTests(unittest.TestCase):
+    def test_concatenated_markdown_definitions_remain_distinct(self):
+        markdown = (
+            "选文甲[^pdf-1318-physical-01-n3]乙[^inline-editor-pdf1318-1]丙[^inline-editor-pdf1318-2]。\n\n"
+            "[^pdf-1318-physical-01-n3]: 原注释。"
+            "[^inline-editor-pdf1318-1]: 第一条编者注。"
+            "[^inline-editor-pdf1318-2]: 第二条编者注。\n"
+        )
+        inventory = parse_markdown_footnotes(markdown)
+        self.assertTrue(inventory.valid)
+        self.assertEqual(inventory.definitions, (
+            ("pdf-1318-physical-01-n3", "原注释。"),
+            ("inline-editor-pdf1318-1", "第一条编者注。"),
+            ("inline-editor-pdf1318-2", "第二条编者注。"),
+        ))
+        self.assertIn("选文甲", inventory.body)
+        self.assertNotIn("编者注", inventory.body)
+        self.assertEqual(len(inventory.references), 3)
+
     def test_prune_standalone_page_markers_preserves_inline_superscripts(self) -> None:
         markdown = (
             "马克思认为<sup>3</sup>这一点成立。\n\n"

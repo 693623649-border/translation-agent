@@ -32,6 +32,7 @@ from rag_knowledge_base import (
     RagKnowledgeBase,
     ZhipuEmbeddingProvider,
     build_embedding_index,
+    retrieve_hybrid_context,
 )
 
 
@@ -373,7 +374,7 @@ def retrieve_knowledge_base_context(
     chapter_ids: tuple[str, ...] = (),
     embedding_provider: EmbeddingProvider | None = None,
     auto_route: bool = False,
-    mode: str | None = None,
+    mode: str | None = "hybrid",
     book_ids: tuple[str, ...] = (),
     authors: tuple[str, ...] = (),
     languages: tuple[str, ...] = (),
@@ -383,23 +384,27 @@ def retrieve_knowledge_base_context(
 ) -> RagContext:
     """Retrieve citation-labelled chunks for downstream prompt augmentation.
 
-    Retrieval-tuning arguments (mode/routing/caps) forward to
-    ``RagKnowledgeBase.retrieve_context`` so the high-level API keeps parity
-    with the ``translation-agent-kb retrieve`` CLI.
+    Default and explicit None use enforced hybrid retrieval, with a ready
+    vector index and matching provider. Missing resources or provider errors
+    do not silently turn a production request into lexical retrieval.
+    Explicit lexical/semantic modes remain available for diagnostics.
     """
 
     knowledge_base_path = (
         Path(output_dir).expanduser().resolve() / "knowledge_base.jsonl"
     )
     knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
-    return knowledge_base.retrieve_context(
+    retrieve = (
+        lambda query, **kwargs: retrieve_hybrid_context(knowledge_base, query, **kwargs)
+    ) if mode in (None, "hybrid") else knowledge_base.retrieve_context
+    return retrieve(
         query,
         top_k=top_k,
         max_chars=max_chars,
         chapter_ids=(set(chapter_ids) if chapter_ids else None),
         embedding_provider=embedding_provider,
         auto_route=auto_route,
-        mode=mode,
+        mode="hybrid" if mode is None else mode,
         book_ids=set(book_ids) if book_ids else None,
         authors=set(authors) if authors else None,
         languages=set(languages) if languages else None,

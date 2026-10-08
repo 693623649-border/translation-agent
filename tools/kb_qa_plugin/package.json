@@ -1,0 +1,27 @@
+{
+  "name": "dsh-kb-reader",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Philosophy & literature reading desk over the translation-agent book corpus: kb_ask retrieves chapter-anchored evidence passages, kb_verify_quote checks a direct quote verbatim (verbatim / verbatim_normalized / mismatch / not_found), kb_library lists workspaces, corpus size and publication acceptance; read-only, retrieve before answering, cite 《书名》·章节 for every corpus claim. · 本地书库检索台：kb_ask 取带章节定位的原文证据，kb_verify_quote 逐字核验直接引文，kb_library 列工作区、语料规模与发布验收状态；只读工具，先取证再作答，回答逐条标明《书名》·章节出处。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "kb_qa.py",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  }
+}

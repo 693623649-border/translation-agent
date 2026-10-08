@@ -1,0 +1,6 @@
+- insert:
+    - id: jp-vertical-kb
+      name: dsh-jp-vertical-kb
+      config:
+        python: null
+        contract: true

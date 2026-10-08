@@ -16,6 +16,13 @@ from book_pipeline import (
 
 
 class PipelineProfileTests(unittest.TestCase):
+    def test_project_flash_profile_returns_visible_translation_content(self) -> None:
+        config_path = Path(__file__).resolve().parents[1] / "pipeline.toml"
+        translation = load_pipeline_profiles(config_path).for_stage("translation")
+        assert translation is not None
+        self.assertEqual(translation.name, "deepseek_flash")
+        self.assertEqual(translation.thinking, "disabled")
+
     def test_example_config_defaults_to_deepseek_flash(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "pipeline.example.toml"
         loaded = load_pipeline_profiles(config_path)

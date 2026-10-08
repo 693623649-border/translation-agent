@@ -23,6 +23,11 @@ import re
 from typing import Any, Iterable, Sequence
 
 
+def count_ellipsis_runs(text: str) -> int:
+    """Count equivalent Unicode and English (including spaced) ellipses."""
+    return len(re.findall(r"…+|\.(?:[ \t\r\n]*\.){2,}", text))
+
+
 LEGACY_NOTE_START = re.compile(
     r"(?m)^[ \t]*(?P<token>\[(?P<square>\d{1,4})\]|〔(?P<corner>\d{1,4})〕)"
     r"[ \t]*(?=\S)"
@@ -300,7 +305,11 @@ def append_markdown_footnotes(
 def parse_markdown_footnotes(markdown_text: str) -> MarkdownFootnoteInventory:
     """Extract standard Markdown footnotes without depending on HTML rendering."""
 
-    lines = markdown_text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    normalized = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    # Page joins can concatenate otherwise valid definitions. The colon
+    # distinguishes a definition from an ordinary inline footnote reference.
+    normalized = re.sub(r"(?<=[^\n])(?=\[\^[^\]\s]+\]:)", "\n\n", normalized)
+    lines = normalized.splitlines()
     body_lines: list[str] = []
     definitions: list[tuple[str, str]] = []
     index = 0

@@ -47,6 +47,7 @@ _REFERENCE_MARKERS = (
     "术语表",
     "参考书目",
     "参考文献",
+    "参考作品",
     "书目",
     "索引",
     "bibliography",
@@ -62,6 +63,39 @@ _NON_PROSE_RE = re.compile(
 )
 _MIN_PROSE_MASS = 24
 _HAN_RE = re.compile(r"[\u3400-\u9fff]")
+_KANA_RE = re.compile(r"[\u3041-\u3096\u309d\u309e\u30a1-\u30fa\u30fd\u30fe]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+# Han-dominant chunks are Chinese even when OCR left Japanese residue in them.
+# Japanese prose runs 50-80 % kana: across 202 scanned vertical source pages the
+# kana share never fell below 0.52, and the densest Japanese apparatus seen
+# (a colophon: 大塚英志(か・えい) 1958年、東京生まれ…) still sits at 0.239,
+# while every false "ja" chunk measured so far stays at or under 0.162.  The
+# ceiling below sits inside that gap.  The residue is real — shop names
+# (マチルド・イン・ザ・ギレット), plate fragments (カーペット) and quoted
+# titles survive OCR inside otherwise translated prose — and re-running the
+# translator on such a chunk is a no-op (the model returns it unchanged), so
+# without this floor the language gate would block the release forever instead
+# of reporting genuine untranslated text.
+_MIN_HAN_FOR_CHINESE = 40
+_KANA_SHARE_CEILING = 0.20
+_LATIN_SHARE_CEILING = 0.30
+
+
+def _han_dominant_chinese(text: str) -> bool:
+    """True when Han so dominates the letter mass that the chunk is Chinese prose."""
+
+    kana = len(_KANA_RE.findall(text))
+    han = len(_HAN_RE.findall(text))
+    latin = len(_LATIN_RE.findall(text))
+    letters = kana + han + latin
+    if letters == 0 or han < _MIN_HAN_FOR_CHINESE:
+        return False
+    return (
+        kana / letters < _KANA_SHARE_CEILING
+        and latin / letters < _LATIN_SHARE_CEILING
+    )
+
+
 # An index/bibliography line ends in a page reference: "42–44, 407, 408".
 _PAGE_REFERENCE_RE = re.compile(
     r"\d{1,4}\s*(?:[–—-]\s*\d{1,4})?(?:\s*[,，、]\s*\d{1,4}\s*(?:[–—-]\s*\d{1,4})?)*\s*$"
@@ -253,6 +287,14 @@ def classify_row(title: str, content: str) -> dict[str, Any]:
     if language == "unknown" and _HAN_RE.search(stripped):
         # Below the detector's significance floor but Han-bearing: Chinese.
         return {"language": CHINESE, "needs_translation": False, "reason": "already_chinese"}
+    if _han_dominant_chinese(stripped):
+        # Detected as foreign because of kana residue, but the letter mass is
+        # Han-dominant: translated Chinese prose, not untranslated text.
+        return {
+            "language": CHINESE,
+            "needs_translation": False,
+            "reason": "chinese_with_quote_residue",
+        }
     if _prose_mass(content) < _MIN_PROSE_MASS:
         return {"language": language, "needs_translation": False, "reason": "not_prose"}
     if language == "unknown":

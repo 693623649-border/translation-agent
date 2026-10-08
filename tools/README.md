@@ -11,6 +11,19 @@
 | `note_reflow.py` | 章节注释重组（论文型 PDF 的注释定义与正文交错导入时用） | 历史，单书适配过 |
 | `repair_epub_footnote_anchors.py` | 修复 EPUB noteref/锚点关系 | 历史 |
 
+## 宿主插件（tools/*_plugin/）
+
+DSH 宿主插件：`package.json` 声明 `dsh.bundle`，`cordis.patch.yml` 提供插入行，
+入口模块导出 `apply(ctx)`。安装后其工具直接出现在会话里。
+
+| 目录 | 用途 | 维护状态 |
+|---|---|---|
+| `kb_ingest_plugin/` | 源文件 → 知识库 + Word，带逐字符中文保真门 | 活跃 |
+| `jp_vertical_kb_plugin/` | 竖排日语扫描书 → 精确页 OCR/翻译 → 目录与源审阅 → Word 渲染验收 → 单书注册；配套 `japanese-vertical-kb` skill | 活跃 |
+| `chinese_pdf_kb_plugin/` | 中文横排扫描书 → 按原书分段 → 正文/注释分离与清洗审计 → 五字段语料与 Word 质量门 → 单书注册；配套 `chinese-pdf-body-kb` skill | 活跃 |
+| `english_pdf_kb_plugin/` | 英文原文 PDF → 文字层/精确页 OCR → 选文与编者角色审阅 → 中文 Word/EPUB/五字段知识库 → 完整发行门与单书注册；配套 `english-pdf-kb` skill | 活跃 |
+| `kb_qa_plugin/` | 书库问答三工具（`kb_ask` / `kb_verify_quote` / `kb_library`）+ "知识库优先"系统提示契约（先 RAG 检索取证再作答，回答逐条标明《书名》·章节出处）；检索核心 `kb_qa.py` 可独立当 CLI 用 | **活跃** |
+
 ## 单书适配脚本（tools/books/）
 
 这些脚本是针对特定书的一次性源级修复/转换，保留在仓库里作为**体例模板**
@@ -25,6 +38,7 @@
 | `split_kant_volumes.py` | 康德著作集 | 导入工作目录按 part 号拆成 10 册目录 |
 | `fix_kant_volume_echo_lines.py` | 康德 10 册 | 章首回显行/脚手架章源级清理 + 审计刷新 |
 | `epub_cleanup_wenxue_lilun.py` | 文学理论（耶鲁） | z-lib/Duokan/WeRead 污染清单清理 |
+| `schmitt_body_rebuild.py` | 政治的神学、政治的概念 | 从新 OCR 行坐标和源图页下注分隔线重建正文段落，注释独立归档，恢复已核验的扫描页顺序，生成五字段正文库与 Word |
 | `scan_wenxue_fragments.py` | 文学理论（耶鲁） | 扫描残留标签碎片 |
 
 ## 约定

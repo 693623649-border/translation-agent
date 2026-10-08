@@ -41,6 +41,9 @@ dist/
 *.pyd
 .Python
 
+# 宿主插件解析链接（指向 DSH 安装自带的 @deepseek-ai 运行时包）
+node_modules/
+
 # 原文目录（大文件，不上传）
 原文/
 book/

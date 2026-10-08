@@ -1,0 +1,4 @@
+interface:
+  display_name: "竖排日语书入库"
+  short_description: "核验日语竖排 OCR、目录页码和完整译文，生成可验收的 Word 与知识库"
+  default_prompt: "使用 $japanese-vertical-kb 将这本竖排日语扫描书完整译为中文，核验目录和 Word 排版后加入知识库。"

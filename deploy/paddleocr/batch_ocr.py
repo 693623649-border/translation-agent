@@ -85,7 +85,41 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _ordered_lines(texts: Iterable[Any], scores: Iterable[Any], boxes: Iterable[Any]) -> tuple[list[str], list[float], list[Any]]:
+def _resolve_direction(boxes: Iterable[Any], requested: str) -> str:
+    if requested not in {"horizontal", "vertical", "auto"}:
+        raise ValueError(f"Unsupported reading direction: {requested}")
+    if requested != "auto":
+        return requested
+    bounds = [_box_to_bounds(box) for box in boxes]
+    usable = [(x2 - x1, y2 - y1) for x1, y1, x2, y2 in bounds if x2 > x1 and y2 > y1]
+    # Square glyphs and short headings are ambiguous: retain horizontal order.
+    tall = sum(height >= width * 2 for width, height in usable)
+    return "vertical" if usable and tall / len(usable) >= 0.6 else "horizontal"
+
+
+def _detect_language(text: str) -> str:
+    if re.search(r"[\u3040-\u30ff]", text):
+        return "ja"
+    if re.search(r"[\uac00-\ud7af]", text):
+        return "ko"
+    # Han alone cannot distinguish Japanese from Chinese reliably.
+    if re.search(r"[\u3400-\u9fff]", text):
+        return "und"
+    return "en" if re.search(r"[A-Za-z]", text) else "und"
+
+
+def _checkpoint_matches(path: Path, model_id: str, direction: str) -> bool:
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        notes = json.loads(record.get("notes", "{}"))
+        return (record.get("ocr_model") == model_id
+                and notes.get("reading_direction_requested") == direction
+                and notes.get("ordering_version") == 3)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def _ordered_lines(texts: Iterable[Any], scores: Iterable[Any], boxes: Iterable[Any], reading_direction: str = "horizontal") -> tuple[list[str], list[float], list[Any]]:
     rows: list[tuple[int, float, float, float, float, str, float, Any]] = []
     text_values = list(texts)
     score_values = list(scores)
@@ -106,9 +140,42 @@ def _ordered_lines(texts: Iterable[Any], scores: Iterable[Any], boxes: Iterable[
     if not rows:
         return [], [], []
 
-    median_height = statistics.median(max(1.0, row[4] - row[2]) for row in rows)
-    row_band = max(8.0, median_height * 0.55)
-    rows.sort(key=lambda row: (round(row[2] / row_band), row[1], row[2], row[0]))
+    direction = _resolve_direction([row[7] for row in rows], reading_direction)
+    if direction == "vertical":
+        # Split only at a blank horizontal band across ALL boxes. A short
+        # column ending early must not split neighbouring continuous columns.
+        min_gap = max(8.0, statistics.median(max(1.0, row[3] - row[1]) for row in rows) * 1.25)
+        regions: list[list[Any]] = []
+        bottom = float("-inf")
+        for row in sorted(rows, key=lambda item: (item[2], item[4])):
+            if not regions or row[2] - bottom >= min_gap:
+                regions.append([])
+            regions[-1].append(row)
+            bottom = max(bottom, row[4])
+        ordered = []
+        for region in regions:
+            columns: list[list[Any]] = []
+            for row in sorted(region, key=lambda item: (-(item[1] + item[3]) / 2, item[2])):
+                centre = (row[1] + row[3]) / 2
+                width = max(1.0, row[3] - row[1])
+                candidates = []
+                for column in columns:
+                    col_centre = statistics.median((item[1] + item[3]) / 2 for item in column)
+                    col_width = statistics.median(max(1.0, item[3] - item[1]) for item in column)
+                    distance = abs(centre - col_centre)
+                    if distance <= min(width, col_width) * 0.5:
+                        candidates.append((distance, column))
+                if candidates:
+                    min(candidates, key=lambda item: item[0])[1].append(row)
+                else:
+                    columns.append([row])
+            columns.sort(key=lambda col: -statistics.median((item[1] + item[3]) / 2 for item in col))
+            ordered.extend(row for col in columns for row in sorted(col, key=lambda item: (item[2], item[0])))
+        rows = ordered
+    else:
+        median_height = statistics.median(max(1.0, row[4] - row[2]) for row in rows)
+        row_band = max(8.0, median_height * 0.55)
+        rows.sort(key=lambda row: (round(row[2] / row_band), row[1], row[2], row[0]))
 
     ordered_texts = [row[5] for row in rows]
     ordered_scores = [row[6] for row in rows]
@@ -163,7 +230,7 @@ def _write_page(output_dir: Path, page_number: int, text: str, model_id: str, no
     payload = {
         "pdf_page": page_number,
         "text": text,
-        "language": "zh",
+        "language": _detect_language(text),
         "notes": json.dumps(notes, ensure_ascii=False, separators=(",", ":")),
         "ocr_model": model_id,
     }
@@ -199,6 +266,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--reading-direction", choices=("horizontal", "vertical", "auto"), default="horizontal")
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
 
@@ -268,7 +336,7 @@ def main() -> int:
     for image in images:
         page_number = _page_number(image)
         checkpoint = _checkpoint_path(args.output_dir, page_number)
-        if checkpoint.exists() and not args.force:
+        if not args.force and _checkpoint_matches(checkpoint, args.model_id, args.reading_direction):
             summary["skipped"] += 1
             print(f"[batch-ocr] skip page={page_number} existing={checkpoint}", flush=True)
             continue
@@ -280,6 +348,7 @@ def main() -> int:
                 result.get("rec_texts", []),
                 result.get("rec_scores", []),
                 result.get("rec_boxes", []),
+                args.reading_direction,
             )
             text = "\n".join(texts).strip()
             if not text:
@@ -295,6 +364,11 @@ def main() -> int:
                 "score_min": round(min(scores), 6) if scores else None,
                 "score_avg": round(sum(scores) / len(scores), 6) if scores else None,
                 "box_count": len(boxes),
+                "ordering_version": 3,
+                "reading_direction_requested": args.reading_direction,
+                "reading_direction": _resolve_direction(boxes, args.reading_direction),
+                "lines": [{"text": line, "score": score, "box": box}
+                          for line, score, box in zip(texts, scores, boxes)],
             }
             _write_page(args.output_dir, page_number, text, args.model_id, notes)
             summary["processed"] += 1

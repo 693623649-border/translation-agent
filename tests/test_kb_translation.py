@@ -83,13 +83,64 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(verdict["language"], "en")
 
     def test_reference_material_is_exempt(self) -> None:
-        for title in ("本书重要名词英德汉文对照表", "主要参考书目", "索引", "译名对照表"):
+        for title in ("本书重要名词英德汉文对照表", "主要参考书目", "主要参考作品", "索引", "译名对照表"):
             verdict = classify_row(
                 title,
                 "action | Handlung | 行动  Adorno, Theodor, The Authoritarian Personality, 1950.",
             )
             self.assertFalse(verdict["needs_translation"], (title, verdict))
             self.assertIn(verdict["reason"], {"reference_material", "already_chinese"})
+
+    def test_chinese_prose_with_japanese_residue_is_exempt(self) -> None:
+        """OCR leaves shop names and plate fragments inside translated prose.
+
+        Re-running the translator on such a chunk is a no-op (the model returns
+        it unchanged), so the residue floor keeps the gate from blocking the
+        release forever instead of reporting genuine untranslated text.
+        """
+
+        verdict = classify_row(
+            "第三章 〈变体少女文字〉",
+            "正如其名，是阁楼房间的意象。房间这一设定（マチルド・イン・ザ・ギレット直译的话，"
+            "即“阁楼里的玛蒂尔德”），作为店很有名。这里摆放着泰迪熊（テディベア）的毛绒玩具"
+            "和家居服等，本来就应该这样放置；实际上在 Mani 就是如此展示的。奶锅将花纹朝这边，"
+            "作为〈可爱之物〉放在白色凸窗的一角，画面描绘得十分细致。",
+        )
+        self.assertFalse(verdict["needs_translation"], verdict)
+        self.assertEqual(verdict["reason"], "chinese_with_quote_residue")
+
+    def test_japanese_colophon_is_not_exempted_by_the_residue_floor(self) -> None:
+        """The densest Japanese apparatus still sits above the kana ceiling.
+
+        A colophon is mostly Han (dates, addresses, company names) with only
+        24 % kana — the closest real Japanese comes to the ceiling — so this
+        case pins the boundary the floor must not cross.
+        """
+
+        verdict = classify_row(
+            "奥付",
+            "大塚英志(か・えい) 1958年、東京生まれ。【著者紹介】江藤淳と少女フェミニズム的戦後 "
+            "サブカルチ+一文学論序章 2001年11月10日初版第1刷発行 著者——大塚英志 発行者—菊池明郎 "
+            "発行所—株式会社筑摩書房 東京都台東区藏前2-5-3郵便番号111-8755振替00160-8-4123 "
+            "印刷——三松堂印刷 製本——積信堂 ©EIJIOTSUKA2001 ISBN4-480-82347-6 C0095 Printed inJapan "
+            "乱丁・落丁本の場合は、御面倒ですが下記に御送付下さい。送料小社負担てお取替致しす。 "
+            "ご注文・お問い合わせも下記へお願いいたします。 331-8507さい",
+        )
+        self.assertTrue(verdict["needs_translation"], verdict)
+
+    def test_english_dominant_prose_with_han_residue_is_not_exempted(self) -> None:
+        """A Han trace inside English prose must not flip the verdict to Chinese."""
+
+        verdict = classify_row(
+            "Chapter 1",
+            "The historical novel developed as a response to the crisis of representation in "
+            "the nineteenth century. Critics argued that the genre negotiates between private "
+            "experience and public history, and its formal conventions continue to shape "
+            "contemporary fiction across many national traditions. "
+            "柄谷行人认为，这与日本近代文学的形成密切相关，尤其是在言文一致运动之后的时期，"
+            "文学与国家的想象力之间存在着复杂的联系，这一点值得进一步考察。",
+        )
+        self.assertTrue(verdict["needs_translation"], verdict)
 
     def test_image_shrapnel_is_not_prose(self) -> None:
         verdict = classify_row("封面", "![cover](../Images/cover.jpg)")

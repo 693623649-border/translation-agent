@@ -1,0 +1,13 @@
+{
+  "name": "dsh-jp-vertical-kb",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Reviewed vertical-Japanese scanned-book ingestion: jp_vertical_prepare fixes workspace identity (title/author checked against the book), jp_vertical_run drives OCR → translate → compile → verify → register with exact-page retry lists and evidence files, jp_vertical_status reports progress, missing pages and acceptance evidence. · 竖排日语扫描书入库：jp_vertical_prepare 建档核对书名作者，jp_vertical_run 按 OCR→翻译→编译→核验→入库分阶段推进（失败页须精确重试，保留证据文件），jp_vertical_status 查进度、缺失页与验收证据。",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js", "./cordis.patch.yml": "./cordis.patch.yml", "./package.json": "./package.json" },
+  "files": ["index.js", "vertical_ingest.py", "cordis.patch.yml", "README.md"],
+  "scripts": { "test": "node test/plugin.test.mjs" },
+  "dsh": { "bundle": { "patch": "./cordis.patch.yml" } },
+  "peerDependencies": { "@deepseek-ai/dsh-tools": "*" }
+}
