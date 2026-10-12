@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -143,7 +144,7 @@ def run_pdf_spec(spec: RunSpec) -> dict[str, Any]:
     from translation_agent_api import run_graph
 
     result = run_graph(_graph_request(spec))
-    return {
+    payload = {
         "schema_version": CONTRACT_SCHEMA_VERSION,
         "app_version": APP_VERSION,
         "status": "passed",
@@ -154,6 +155,86 @@ def run_pdf_spec(spec: RunSpec) -> dict[str, Any]:
         "state": str(result.state_path),
         "events": str(result.events_path),
     }
+    output_dir = Path(spec.output_dir).expanduser().resolve()
+    verifier_nodes = {"core.publication.verify", "core.publication.verify.word"}
+    planned_nodes = set(payload["plan"])
+    resolved_nodes = set(payload["executed"]) | set(payload["skipped"])
+    current_verifier_node = next(
+        (node for node in verifier_nodes if node in planned_nodes and node in resolved_nodes),
+        None,
+    ) if spec.verify else None
+    source_path = Path(spec.source).expanduser().resolve() if spec.source else None
+    current_source_sha256 = None
+    if source_path is not None and source_path.is_file():
+        digest = hashlib.sha256()
+        with source_path.open("rb") as source_stream:
+            for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        current_source_sha256 = digest.hexdigest()
+
+    report_names = (
+        ("word-release-report.json", "release-report.json")
+        if current_verifier_node == "core.publication.verify.word"
+        else ("release-report.json", "word-release-report.json")
+    )
+    report_paths = [output_dir / "audit" / name for name in report_names]
+    verifier_report = None
+    if current_verifier_node:
+        for report_path in report_paths:
+            try:
+                candidate = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(candidate, dict) and "release_ready" in candidate:
+                verifier_report = candidate
+                break
+    report_source = verifier_report.get("source") if isinstance(verifier_report, dict) else None
+    report_source_sha256 = (
+        verifier_report.get("source_pdf_sha256")
+        or verifier_report.get("source_sha256")
+        or (report_source.get("sha256") if isinstance(report_source, Mapping) else None)
+    ) if isinstance(verifier_report, dict) else None
+    source_binding_mismatch = bool(
+        current_source_sha256 and report_source_sha256
+        and current_source_sha256 != report_source_sha256
+    )
+    if not current_verifier_node or verifier_report is None or source_binding_mismatch:
+        stale_report_exists = any(path.is_file() for path in report_paths)
+        quality_inputs = {
+            **payload,
+            "status": "unverified",
+            "release_ready": False,
+            "source": str(source_path) if source_path else None,
+            "source_sha256": current_source_sha256,
+            "mode": "verification not current for this graph plan/source",
+            "issues": ([{"code": "stale_verifier_report", "message": "An existing release report was ignored because this run did not resolve a current verification node for the current source."}]
+                       if stale_report_exists else None),
+        }
+    else:
+        quality_inputs = {
+            **payload,
+            **verifier_report,
+            "status": verifier_report.get("status") or (
+                "passed" if verifier_report.get("release_ready") is True else "failed"
+            ),
+            "release_ready": verifier_report.get("release_ready") is True,
+            "source": verifier_report.get("source") or (str(source_path) if source_path else None),
+            "source_sha256": current_source_sha256 or report_source_sha256,
+            "title": verifier_report.get("title") or getattr(spec, "title", None),
+            "verification_node": current_verifier_node,
+            "verification_source_bound_by_graph": True,
+        }
+    from ingestion_quality import write_ingestion_quality_report
+    payload["quality_report"] = str(
+        write_ingestion_quality_report(
+            output_dir,
+            quality_inputs,
+            evidence=("audit/release-report.json", "audit/word-release-report.json"),
+        )
+    )
+    payload["release_ready"] = quality_inputs["release_ready"]
+    payload["quality_status"] = quality_inputs["status"]
+    return payload
 
 
 def ingest_spec(spec: RunSpec) -> dict[str, Any]:

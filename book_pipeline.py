@@ -45,6 +45,12 @@ from opencc import OpenCC
 _TITLE_MATCH_TRADITIONAL_TO_SIMPLIFIED = OpenCC("t2s")
 
 import rag_knowledge_base
+from paragraph_translation import ParagraphTranslator
+from scan_layout import prepare_scan_pages, translation_input_sha256
+from ocr_quality_gate import (
+    punctuation_signature,
+    ocr_structure_anomalies,
+)
 from pipeline_profiles import (
     ModelIdentity,
     ModelProfile,
@@ -86,7 +92,7 @@ DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
-TRANSLATION_PROMPT_VERSION = "book-translation-v7"
+TRANSLATION_PROMPT_VERSION = "book-translation-v11-paragraph-context-v2"
 PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v2"
 TOC_KINDS = {"part", "chapter", "section", "subsection", "frontmatter", "other"}
 NON_CONTENT_MARKERS = {"[无法辨认]", "[空白页]"}
@@ -160,6 +166,7 @@ class PageRecord:
     physical_page_texts: list[str] = field(default_factory=list)
     proofread_physical_page_texts: list[str] = field(default_factory=list)
     translated_physical_page_texts: list[str] = field(default_factory=list)
+    translation_input_sha256: str = ""
 
     @property
     def compile_text(self) -> str:
@@ -1909,7 +1916,9 @@ def _retains_foreign_prose(paragraph: str) -> bool:
     return needs_translation(remainder)
 
 
-KANA_CHARS = re.compile(r"[぀-ヿ]")
+# Exclude katakana punctuation such as U+30FB (・); otherwise valid source
+# punctuation can make an otherwise Chinese paragraph look Japanese.
+KANA_CHARS = re.compile(r"[\u3041-\u3096\u309d\u309e\u30a1-\u30fa\u30fd-\u30fe]")
 
 
 def _enforceable_numbered_labels(text: str) -> list[str]:
@@ -1981,197 +1990,47 @@ def _split_translation_body(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-class ChatTranslator:
-    def __init__(self, client: TextChatBackend, *, max_chars: int = 12000) -> None:
-        self.client = client
-        self.max_chars = max_chars
+class ChatTranslator(ParagraphTranslator):
+    """Keep approved headings outside prose requests and retain numbered definitions."""
 
-    def translate(self, text: str, *, source_language: str, target_language: str) -> str:
-        # Reviewed/imported Markdown headings are structural metadata, not
-        # translatable prose. Keep them entirely outside the model request so
-        # a model cannot silently change an approved Chinese title or term.
-        plan: list[tuple[str, str]] = []
-        body_lines: list[str] = []
-
-        def flush_body() -> None:
-            body = "".join(body_lines).strip()
-            body_lines.clear()
-            if body:
-                plan.extend(
-                    ("body", chunk)
-                    for chunk in _split_translation_body(body, self.max_chars)
-                )
-
-        for line in text.splitlines(keepends=True):
-            without_ending = line.rstrip("\r\n")
-            if re.fullmatch(r"#{1,6}[ \t]+\S.*", without_ending):
-                flush_body()
-                plan.append(("heading", without_ending))
-            else:
-                body_lines.append(line)
-        flush_body()
-
-        body_total = sum(kind == "body" for kind, _value in plan)
-        body_index = 0
-        enforceable_page_labels = _enforceable_numbered_labels(text)
-        translated: list[str] = []
-        translation_sources: list[str] = []
-        for kind, value in plan:
-            if kind == "heading":
-                translated.append(value)
-                translation_sources.append(value)
-                continue
-            body_index += 1
-            chunk = value
-            source_leading_numbers = _leading_numbered_line_labels(chunk)
-            numbered_requirement = (
-                "\n本分块检测到的行首编号（必须逐项原样保留）："
-                + "、".join(source_leading_numbers)
-                + "。"
-                if source_leading_numbers
-                else ""
-            )
-            output_budget = min(32768, max(4096, len(chunk) * 4))
-            prompt = f"""
-请把下面的 OCR 原文完整翻译成{target_language}。
-源语言标签：{source_language}
-分块：{body_index}/{body_total}
-
-要求：
-1. 不总结、不删减、不扩写。
-2. 保留列表、表格、脚注和段落结构；Markdown 标题已由程序保护，不会出现在本分块中。
-3. 源文中每一个行首脚注编号及其对应定义全文都必须逐条保留并完整翻译；严禁合并、跳号、截断、只保留编号或省略出处。{numbered_requirement}
-4. 人名、书名、术语前后一致；严禁用省略号（……）概括、省略或跳过任何内容——原文没有省略号的地方绝不允许出现省略号，原文自带的省略号原样保留。
-5. 输入来自 OCR，可能包含竖排书的列序错误、缺字或跨页半句。严格按提供的源文顺序翻译，不得擅自调整列序、行序或根据上下文重排原文。依据源语言的语法和上下文理解已辨明的内容，但不得补造原文、猜补缺字或添加衔接句，也不得以流畅改写掩盖 OCR 错序或缺损。仅将已按正确阅读顺序提供的相邻列之间、行之间的 OCR 软换行恢复为连续正文，不把视觉换行当成作者段落；保留明确的段落、诗歌分行及其他结构。页面以半句开头或结尾时，保留跨页半句，不省略，也不凭空补全。无法可靠辨认的局部紧邻标（原文缺损），保留其周围所有可辨内容；原有（原文缺损）标注必须保留。
-6. 正文中出现的日语、英语及其他外语段落或引文也必须译成目标语言，不得整段保留未译；仅专名、必要术语和文献标识可按惯例保留原文。
-7. 如果目标是简体中文，必须使用中国大陆通行简体字与标点，不得输出繁体字。
-8. 只输出译文，不附加说明或质量报告。
-9. 这是翻译任务，不是校勘任务：必须把整页内容译成{target_language}，不得只修正错字后原样输出日文原文；除人名、作品名、文献标识的必要注音外，不得保留日文假名。
-
-原文：
-{chunk}
-""".strip()
-            output = clean_translation_text(
-                self.client.chat_text(
-                    prompt,
-                    system="你是严谨的书籍翻译器，优先保证完整性、准确性和结构可追溯。",
-                    max_tokens=output_budget,
-                )
-            )
-            translated.append(normalize_target_script(output, target_language))
-            translation_sources.append(chunk)
-        output_labels: Counter[str] = Counter()
-        for part in translated:
-            output_labels.update(_leading_numbered_line_labels(part))
-        missing_numbers = list(
-            (Counter(enforceable_page_labels) - output_labels).elements()
-        )
-        if missing_numbers:
-            raise RuntimeError(
-                "Translation omitted numbered footnote/list definitions with "
-                f"leading labels: {missing_numbers}."
-            )
-        joined = "\n\n".join(part.strip() for part in translated if part.strip()).strip()
-        if not joined:
-            raise RuntimeError("Translation returned an empty result; the page was not committed.")
-        if target_language == "简体中文":
-            # Retry an elided chunk against its original source span so the
-            # model cannot hide missing prose behind an invented ellipsis.
-            for index, (source_chunk, output_chunk) in enumerate(
-                zip(translation_sources, translated)
-            ):
-                if count_ellipsis_runs(output_chunk) <= count_ellipsis_runs(source_chunk):
+    def translate(self, text: str, *, source_language: str, target_language: str,
+                  context_before: str = "", context_after: str = "",
+                  allow_unreviewed_source: bool = False) -> str:
+        pieces = re.split(r"(^#{1,6}[ \t]+[^\n]+$)", text, flags=re.MULTILINE)
+        output = []
+        totals = {"requests": 0, "retries": 0, "chunks": 0, "elapsed_seconds": 0.0,
+                  "request_seconds": [], "status": "failed"}
+        if allow_unreviewed_source:
+            totals["source_review_pending"] = True
+        try:
+            for piece in pieces:
+                if not piece.strip():
                     continue
-                complete_prompt = f"""
-请把下面的原文（源语言：{source_language}）完整译成简体中文。逐句保留全部可辨内容。原文没有省略号时绝不可添加省略号；不能补造原文没有的句子，也不能省略难以理解的部分。无法辨认的局部只标（原文缺损）。输出前检查整段没有遗漏。
-
-原文：
-{source_chunk}
-""".strip()
-                repaired = normalize_target_script(
-                    clean_translation_text(
-                        self.client.chat_text(
-                            complete_prompt,
-                            system=(
-                                "你是严谨的简体中文图书译者，完整翻译所有可辨内容，"
-                                "绝不使用省略号跳过原文。"
-                            ),
-                            max_tokens=min(32768, max(4096, len(source_chunk) * 4)),
-                        )
-                    ),
-                    target_language,
-                ).strip()
-                if not repaired:
-                    raise RuntimeError(
-                        "Source-grounded elision repair returned an empty result; "
-                        "the page was not committed."
-                    )
-                translated[index] = repaired
-
-            joined = "\n\n".join(
-                part.strip() for part in translated if part.strip()
-            ).strip()
-            # A page can otherwise pass the kana-ratio gate while retaining a
-            # complete English quotation or a short Japanese sentence. Reopen
-            # only those paragraphs in their translated context and request a
-            # focused repair before this page is allowed into the corpus.
-            paragraphs = re.split(r"(\n\s*\n)", joined)
-            for position in range(0, len(paragraphs), 2):
-                paragraph = paragraphs[position].strip()
-                if not paragraph or not _retains_foreign_prose(paragraph):
+                if re.fullmatch(r"#{1,6}[ \t]+[^\n]+", piece):
+                    output.append(piece)
                     continue
-                focused_prompt = f"""
-下面是一段已经翻译成简体中文、但仍残留日文或英文的译文。请把仍属外文的词句完整译为简体中文，同时保留其他已有中文信息、原有含义和段落结构。
-
-不得原样保留整句外文引文、日文假名或外文散文。遇到专名、书名或术语，给出中文译名；必要时只把原文短名放在括号中。不能可靠辨认的局部标（原文缺损），不得用省略号替代。不得增写、删减或改述整段。
-
-待修译文：
-{paragraph}
-""".strip()
-                repaired = normalize_target_script(
-                    clean_translation_text(
-                        self.client.chat_text(
-                            focused_prompt,
-                            system=(
-                                "你是简体中文图书译者，只修复目标段落中的外文残留。"
-                                "保留段落中已有的中文含义，不复制外文原句。"
-                            ),
-                            max_tokens=min(8192, max(1024, len(paragraph) * 4)),
-                        )
-                    ),
-                    target_language,
-                ).strip()
-                if not repaired:
-                    raise RuntimeError(
-                        "Focused foreign-text repair returned an empty result; "
-                        "the page was not committed."
-                    )
-                paragraphs[position] = repaired
-            joined = "".join(paragraphs).strip()
-            source_ellipsis_count = count_ellipsis_runs(text)
-            target_ellipsis_count = count_ellipsis_runs(joined)
-            if target_ellipsis_count > source_ellipsis_count:
-                raise RuntimeError(
-                    "Translation introduced ellipses not present in the source; "
-                    "the page was not committed."
-                )
-            kana_ratio = _kana_ratio(joined)
-            if kana_ratio > 0.20:
-                raise RuntimeError(
-                    "Translation retained Japanese text "
-                    f"(kana_ratio={kana_ratio:.2f})."
-                )
-            untranslated = [
-                paragraph.strip()
-                for paragraph in re.split(r"\n\s*\n", joined)
-                if paragraph.strip() and _retains_foreign_prose(paragraph.strip())
-            ]
-            if untranslated:
-                raise RuntimeError(
-                    "Translation retained a foreign-language prose segment; "
-                    "the page was not committed."
-                )
-        return joined
+                try:
+                    output.append(super().translate(
+                        piece.strip(), source_language=source_language,
+                        target_language=target_language,
+                        context_before=context_before, context_after=context_after,
+                        allow_unreviewed_source=allow_unreviewed_source,
+                    ))
+                finally:
+                    stats = self.last_telemetry
+                    for key in ("requests", "retries", "chunks", "elapsed_seconds"):
+                        totals[key] += stats.get(key, 0)
+                    totals["request_seconds"].extend(stats.get("request_seconds", []))
+            joined = "\n\n".join(output)
+            expected = Counter(_enforceable_numbered_labels(text))
+            actual = Counter(_leading_numbered_line_labels(joined))
+            missing = list((expected - actual).elements())
+            if missing:
+                raise RuntimeError(f"Translation omitted numbered definitions with leading labels: {missing}.")
+            totals["status"] = "passed_structural_checks"
+            return normalize_target_script(joined, target_language)
+        finally:
+            self._local.telemetry = totals
 
 
 class ChatOCRProofreader:
@@ -2417,6 +2276,7 @@ class PageStore:
         translated_text: str,
         identity: ModelIdentity,
         translated_physical_page_texts: Iterable[str] | None = None,
+        input_sha256: str = "",
     ) -> PageRecord:
         with _exclusive_page_lock(self._lock_path(pdf_page)):
             latest = self.load(pdf_page)
@@ -2439,6 +2299,7 @@ class PageStore:
             latest.translation_target_language = identity.target_language
             latest.translation_prompt_version = identity.prompt_version
             latest.translation_fingerprint = identity.fingerprint
+            latest.translation_input_sha256 = input_sha256
             physical_pages = list(translated_physical_page_texts or [])
             if physical_pages and (
                 join_physical_page_texts(physical_pages) != translated_text.strip()
@@ -2650,7 +2511,19 @@ def import_existing_ocr(source_dir: Path, output_dir: Path) -> int:
         if not isinstance(page_number, int):
             continue
         text = str(item.get("text") or item.get("ocr_text") or item.get("embedded_text") or "").strip()
-        if not text:
+        raw_notes = item.get("notes")
+        try:
+            note_metadata = (
+                json.loads(raw_notes)
+                if isinstance(raw_notes, str)
+                else raw_notes
+            )
+        except (TypeError, ValueError):
+            note_metadata = {}
+        if not text and not (
+            isinstance(note_metadata, dict)
+            and note_metadata.get("hard_failure") is True
+        ):
             continue
         translated = str(item.get("translated_text") or item.get("translation") or "").strip()
         # The Docker OCR job classifies kanji-dominated Japanese pages as
@@ -2670,6 +2543,7 @@ def import_existing_ocr(source_dir: Path, output_dir: Path) -> int:
             translation_target_language=str(item.get("translation_target_language") or ""),
             translation_prompt_version=str(item.get("translation_prompt_version") or ""),
             translation_fingerprint=str(item.get("translation_fingerprint") or ""),
+            translation_input_sha256=str(item.get("translation_input_sha256") or ""),
             proofread_text=str(item.get("proofread_text") or ""),
             proofread_source_sha256=str(item.get("proofread_source_sha256") or ""),
             proofread_provider=str(item.get("proofread_provider") or ""),
@@ -2971,6 +2845,9 @@ def translate_non_chinese_pages(
                 normalized_cached += 1
     if normalized_cached:
         print(f"[translate] normalized_cached_to_simplified={normalized_cached}")
+    prepared = prepare_scan_pages([asdict(record) for record in records])
+    input_hashes = {record.pdf_page: translation_input_sha256(asdict(record), prepared)
+                    for record in records} if isinstance(translator, ParagraphTranslator) else {}
     candidates = [
         record
         for record in records
@@ -2980,8 +2857,45 @@ def translate_non_chinese_pages(
         and (
             force
             or not record.translation_is_fresh_for(identity)
+            or (isinstance(translator, ParagraphTranslator)
+                and record.translation_input_sha256 != input_hashes[record.pdf_page])
         )
     ]
+    ordered_pages = sorted(prepared)
+    if isinstance(translator, ParagraphTranslator):
+        anomalies = ocr_structure_anomalies({page: value["text"] for page, value in prepared.items()})
+        blocked = {record.pdf_page: anomalies[record.pdf_page] for record in candidates
+                   if record.pdf_page in anomalies}
+        write_json(output_dir / "audit" / "source-layout.json", prepared)
+        if blocked:
+            write_json(output_dir / "audit" / "ocr-structure-issues.json", {
+                "status": "blocked_before_translation", "pages": blocked,
+                "note": "Structural signals require image review; they are not an OCR error rate.",
+            })
+            raise RuntimeError(f"OCR source needs image review before translation: {sorted(blocked)}")
+    run_started = time.perf_counter()
+    telemetry_lock = threading.Lock()
+    events: list[dict[str, Any]] = []
+    telemetry_path = output_dir / "audit" / "performance" / "translation-requests.jsonl"
+    telemetry_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def page_context(page: int, source_text: str) -> tuple[str, str]:
+        if not isinstance(translator, ParagraphTranslator):
+            return "", ""
+        position = ordered_pages.index(page)
+        before = prepared[ordered_pages[position - 1]]["text"] if position else ""
+        after = prepared[ordered_pages[position + 1]]["text"] if position + 1 < len(ordered_pages) else ""
+        from paragraph_translation import validate_source_quotes, TranslationQualityError
+        for radius in range(1, 4):
+            before = "\n\n".join(prepared[p]["text"] for p in ordered_pages[max(0, position-radius):position])
+            after = "\n\n".join(prepared[p]["text"] for p in ordered_pages[position+1:position+radius+1])
+            try:
+                validate_source_quotes(source_text, before, after)
+                break
+            except TranslationQualityError:
+                continue
+        return before, after
+
     print(
         f"[translate] total={len(candidates)} concurrency={max(1, concurrency)} "
         f"request_delay={max(0.0, request_delay):g}s"
@@ -2989,47 +2903,57 @@ def translate_non_chinese_pages(
     rate_limiter = StartRateLimiter(max(0.0, request_delay))
 
     def process(record: PageRecord) -> int:
-        if not store.path(record.pdf_page).exists():
-            store.save(record)
-        print(f"[translate] page={record.pdf_page} language={record.language} started")
-        source_sha256 = record.effective_text_sha256
-        source_physical_pages = record.effective_physical_pages
-        translated_physical_pages: list[str] = []
-        for physical_page_index, source_text in enumerate(
-            source_physical_pages,
-            start=1,
-        ):
-            if not source_text.strip():
-                translated_physical_pages.append("")
-                continue
-            rate_limiter.wait()
-            if len(source_physical_pages) > 1:
-                print(
-                    f"[translate] page={record.pdf_page} "
-                    f"physical_page={physical_page_index}/{len(source_physical_pages)} started"
-                )
-            translated_physical_pages.append(
-                translator.translate(
-                    source_text,
-                    source_language=source_language or record.language,
-                    target_language=target_language,
-                )
+        page_started = time.perf_counter()
+        event = {"pdf_page": record.pdf_page, "prompt_version": identity.prompt_version,
+                 "source_sha256": record.effective_text_sha256, "status": "failed",
+                 "requests": 0, "retries": 0, "request_seconds": []}
+        try:
+            if not store.path(record.pdf_page).exists():
+                store.save(record)
+            print(f"[translate] page={record.pdf_page} language={record.language} started")
+            source_sha256 = record.effective_text_sha256
+            source_physical_pages = record.effective_physical_pages
+            if len(source_physical_pages) == 1 and isinstance(translator, ParagraphTranslator):
+                source_physical_pages = [prepared[record.pdf_page]["text"]]
+            translated_physical_pages: list[str] = []
+            for source_text in source_physical_pages:
+                if not source_text.strip():
+                    translated_physical_pages.append("")
+                    continue
+                rate_limiter.wait()
+                kwargs = {"source_language": source_language or record.language,
+                          "target_language": target_language}
+                if isinstance(translator, ParagraphTranslator):
+                    before, after = page_context(record.pdf_page, source_text)
+                    kwargs.update(context_before=before, context_after=after)
+                try:
+                    translated_physical_pages.append(translator.translate(source_text, **kwargs))
+                finally:
+                    stats = getattr(translator, "last_telemetry", {})
+                    event["requests"] += stats.get("requests", 0)
+                    event["retries"] += stats.get("retries", 0)
+                    event["request_seconds"].extend(stats.get("request_seconds", []))
+            translated_text = join_physical_page_texts(translated_physical_pages)
+            event["prepared_source_sha256"] = hashlib.sha256("\n\n".join(source_physical_pages).encode("utf-8")).hexdigest()
+            committed = store.commit_translation(
+                record.pdf_page, expected_text_sha256=source_sha256,
+                translated_text=translated_text, identity=identity,
+                translated_physical_page_texts=translated_physical_pages if len(source_physical_pages)>1 else None,
+                input_sha256=input_hashes.get(record.pdf_page, ""),
             )
-        translated_text = join_physical_page_texts(translated_physical_pages)
-        committed = store.commit_translation(
-            record.pdf_page,
-            expected_text_sha256=source_sha256,
-            translated_text=translated_text,
-            identity=identity,
-            translated_physical_page_texts=(
-                translated_physical_pages
-                if len(source_physical_pages) > 1
-                else None
-            ),
-        )
-        for field_name in PageRecord.__dataclass_fields__:
-            setattr(record, field_name, getattr(committed, field_name))
-        return record.pdf_page
+            for field_name in PageRecord.__dataclass_fields__:
+                setattr(record, field_name, getattr(committed, field_name))
+            event["status"] = "passed_structural_checks"
+            return record.pdf_page
+        except Exception as exc:
+            event["error"] = str(exc)
+            raise
+        finally:
+            event["elapsed_seconds"] = time.perf_counter() - page_started
+            with telemetry_lock:
+                events.append(event)
+                with telemetry_path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     failures: list[tuple[int, str]] = []
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
@@ -3045,6 +2969,14 @@ def translate_non_chinese_pages(
                 continue
             completed += 1
             print(f"[translate] page={page} completed={completed}/{len(candidates)}")
+    write_json(output_dir / "audit" / "performance" / "translation-run-summary.json", {
+        "prompt_version": identity.prompt_version, "pages": len(events),
+        "wall_seconds": time.perf_counter() - run_started,
+        "requests": sum(event["requests"] for event in events),
+        "repairs": sum(event["retries"] for event in events),
+        "failed_pages": [page for page, _error in failures],
+        "structural_checks_only": True,
+    })
     if failures:
         failed_pages = [page for page, _ in failures]
         raise RuntimeError(
@@ -3963,6 +3895,7 @@ def compile_chapters(
     publication_title: str | None = None,
     require_translation: bool = False,
     expected_translation_identity: ModelIdentity | None = None,
+    reader_page_groups: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not require_translation:
         # Without a single required profile, compile any translation that is
@@ -3977,6 +3910,20 @@ def compile_chapters(
     selected.sort(key=lambda entry: entry_positions.get(entry.id, 10**9))
     last_pdf_page = max((record.pdf_page for record in records), default=0)
     record_map = {record.pdf_page: record for record in records}
+    reader_page_groups = reader_page_groups or {}
+    grouped_pages: set[int] = set()
+    if require_translation and reader_page_groups:
+        raise ValueError('Draft source-page groups require a separate reviewed semantic release; they cannot bypass page validation.')
+    for first, group in reader_page_groups.items():
+        source_pages = group.get('source_pages', [])
+        if (not source_pages or source_pages[0] != first or
+                source_pages != list(range(first, source_pages[-1] + 1)) or
+                any(p not in record_map or p in grouped_pages for p in source_pages) or
+                not str(group.get('text', '')).strip()):
+            raise ValueError(f'Invalid or overlapping reader source-page group: {first}')
+        grouped_pages.update(source_pages)
+    if reader_page_groups:
+        write_json(output_dir / 'audit/reader-page-groups.json', reader_page_groups)
     printed_pages_per_pdf_page = int(
         toc_payload.get("printed_pages_per_pdf_page") or 1
     )
@@ -4155,10 +4102,17 @@ def compile_chapters(
                 "",
             ]
             for page in range(start, end + 1):
+                if page in grouped_pages and page not in reader_page_groups:
+                    continue  # source remains in checkpoints; translation is in its explicit group
                 record = record_map[page]
                 physical_pages = record.compile_physical_pages_for(
                     expected_translation_identity
                 )
+                if page in reader_page_groups:
+                    group = reader_page_groups[page]
+                    if group['source_pages'][-1] > end:
+                        raise ValueError('Reader source-page group crosses a chapter boundary.')
+                    physical_pages = (str(group['text']),)
                 has_exact_physical_pages = (
                     printed_pages_per_pdf_page > 1
                     and len(physical_pages) == printed_pages_per_pdf_page
@@ -4338,6 +4292,13 @@ def compile_chapters(
         chapter_dir,
         manifest,
     )
+    from ingestion_quality import write_ingestion_quality_report
+    write_ingestion_quality_report(output_dir, {
+        'status': 'blocked' if semantic_summary['release_blocked'] else 'partial',
+        'release_ready': False, 'stage': '章节编译；完整出版验收尚未执行',
+        'source': str(pdf_path), 'book_title': publication_title,
+        'summary': {'chapter_count':len(manifest), 'chunk_count':len(knowledge_rows)},
+    }, evidence=('audit/semantic-reconstruction.json',))
     return manifest, knowledge_rows
 
 
@@ -5527,8 +5488,11 @@ def _epub_image_media_type(path: Path) -> str:
 
 
 def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
     with open(path, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _rewrite_epub_local_images(
@@ -6199,14 +6163,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["auto", "tesseract", "paddleocr-local"],
+        choices=["auto", "tesseract", "paddleocr-local", "xiaomi-ocr-local"],
         default=os.getenv("OCR_BACKEND", "auto"),
         help=(
-            "auto selects the local PaddleOCR GPU deployment and never falls "
-            "back to a cloud vision backend: when the deployment is unavailable "
-            "the OCR phase fails closed (vision executes locally only; cloud OCR "
-            "backends have been removed). tesseract is the offline engine, "
-            "paddleocr-local the explicit local GPU deployment."
+            "auto selects the local PP-OCRv6 medium GPU deployment; Xiaomi-OCR-0 "
+            "is reserved for one-time page fallback after a hard failure or "
+            "calibrated low-confidence result. When Paddle is unavailable, OCR "
+            "fails closed; no cloud fallback is used. "
+            "tesseract remains an explicit offline diagnostic engine."
         ),
     )
     parser.add_argument(
@@ -6228,22 +6192,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Local PaddleOCR Docker shards (1 or 2).",
     )
-    parser.add_argument(
-        "--paddle-det-variant",
-        choices=("server", "mobile"),
-        default="server",
-        help="Local PaddleOCR detection model variant.",
-    )
-    parser.add_argument(
-        "--paddle-rec-variant",
-        choices=("server", "mobile"),
-        default="server",
-        help="Local PaddleOCR recognition model variant.",
-    )
-    parser.add_argument("--paddle-det-mode", default="paddle_fp32")
-    parser.add_argument("--paddle-rec-mode", default="paddle_fp16")
-    parser.add_argument("--paddle-rec-batch", type=int, default=16)
-    parser.add_argument("--paddle-det-len", type=int, default=736)
     parser.add_argument("--ocr-api-key", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--ocr-api-key-env",
@@ -6654,6 +6602,7 @@ def build_translation_client(
             timeout=timeout,
             thinking=(profile.thinking if profile is not None else "disabled"),
             adapter_name=(profile.adapter if profile is not None else "openai-chat"),
+            retries=1,
         )
     client = GlmClient(
         api_key=key,
@@ -6820,7 +6769,7 @@ def resolve_expected_ocr_model_prefix(
         return str(args.ocr_cache_model_prefix)
     backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
     if backend == "paddleocr-local":
-        return "paddleocr-local/"
+        return "paddleocr-local/PP-OCRv6-medium-"
     return None
 
 
@@ -6862,12 +6811,16 @@ def paddle_local_available() -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return all(
-        (_PADDLE_MODELS_DIR / name).is_dir()
-        for name in ("PP-OCRv5_server_det", "PP-OCRv5_server_rec")
+        (_PADDLE_MODELS_DIR / name / "inference.pdiparams").is_file()
+        for name in ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec")
     )
 
 
+_XIAOMI_OCR_TASKS = ("text", "document")
+
+
 _REMOVED_CLOUD_OCR_BACKENDS = {"coding-plan-mcp", "glm-ocr"}
+_LOCAL_OCR_BACKENDS = {"tesseract", "paddleocr-local"}
 
 
 def resolve_ocr_backend_name(
@@ -6878,73 +6831,95 @@ def resolve_ocr_backend_name(
 ) -> tuple[str, str]:
     """Resolve the effective OCR backend; vision runs on the local GPU only.
 
-    ``--ocr-backend auto`` (the default) selects the local PaddleOCR Docker
-    deployment.  The former cloud-vision fallback branch has been removed:
-    when the local deployment is unavailable, an OCR run now fails closed
-    (``strict=True``) instead of silently sending page images to a remote
-    model.  Non-OCR phases resolve introspection identities without
-    ``strict`` and assume the local backend's cache identity.  An explicit
-    ``--ocr-backend`` still wins, but the removed cloud backends are rejected
-    everywhere.
+    ``auto`` always means PP-OCRv6 medium. Xiaomi is a page-level fallback
+    inside the scanned-PDF importer and cannot be selected as a primary.
+    Cloud OCR has been removed; a missing Paddle deployment fails closed.
     """
 
     requested = str(getattr(args, "ocr_backend", "") or "auto").strip()
     if requested in _REMOVED_CLOUD_OCR_BACKENDS:
         raise ValueError(
             f"--ocr-backend {requested} has been removed: OCR/vision runs "
-            "exclusively on the local PaddleOCR GPU deployment. Use "
-            "'paddleocr-local' (or 'tesseract') instead."
+            "exclusively on local GPU deployments. Use 'paddleocr-local' "
+            "(or 'tesseract' for diagnostics) instead."
+        )
+    if requested == "xiaomi-ocr-local":
+        raise ValueError(
+            "Xiaomi-OCR-0 is only run once as the scanned-page fallback; "
+            "it cannot replace the PP-OCRv6 primary backend."
         )
     if requested not in {"auto", ""}:
+        if requested not in _LOCAL_OCR_BACKENDS:
+            raise ValueError(
+                f"--ocr-backend {requested} is not a known local OCR backend; "
+                f"expected one of: {', '.join(sorted(_LOCAL_OCR_BACKENDS))}"
+            )
         return requested, "explicit --ocr-backend"
     if paddle_local_available():
         return "paddleocr-local", "auto: local PaddleOCR GPU deployment detected"
     if strict:
         raise ValueError(
-            "auto: local PaddleOCR GPU deployment unavailable and the cloud "
-            "OCR fallback has been removed - vision executes locally only. "
-            "Start the local GPU deployment (Docker) and retry, or pass an "
-            "explicit local backend such as --ocr-backend tesseract."
+            "PP-OCRv6 medium deployment is unavailable; Xiaomi cannot "
+            "replace the primary OCR engine. Start the local PaddleOCR GPU "
+            "deployment or use tesseract only for diagnostics."
         )
     return "paddleocr-local", (
-        "auto: local PaddleOCR deployment unavailable right now; assuming "
-        "local cache identity (cloud fallback removed)"
+        "auto: PP-OCRv6 medium is the primary OCR cache identity"
     )
 
 
 def paddle_local_model_id(
     *,
-    det_variant: str,
-    rec_variant: str,
-    det_mode: str,
-    rec_mode: str,
-    rec_batch: int,
-    det_len: int,
     dpi: int,
     max_image_side: int,
     reading_direction: str = "horizontal",
+    jpeg_quality: int = 90,
+    source_pdf_sha256: str = "",
 ) -> str:
-    """Deterministic checkpoint identity for the local PaddleOCR backend."""
+    """Identity for the fixed PP-OCRv6 medium scan configuration."""
 
     if reading_direction not in {"horizontal", "vertical", "auto"}:
         raise ValueError(f"Unsupported OCR reading direction: {reading_direction}")
+    source_binding = f"-src{source_pdf_sha256}" if source_pdf_sha256 else ""
     return (
         "paddleocr-local/"
-        f"PP-OCRv5-{det_variant}-det-{det_mode}-"
-        f"{rec_variant}-rec-{rec_mode}-"
-        f"b{rec_batch}-det{det_len}-"
-        f"dpi{dpi}-max{max_image_side}-{reading_direction}-v3"
+        f"PP-OCRv6-medium-dpi{dpi}-max{max_image_side}-"
+        f"jpeg{jpeg_quality}-{reading_direction}{source_binding}-v2"
     )
 
 
-def paddle_local_pending_pages(
+def xiaomi_local_model_id(
+    *,
+    task: str,
+    dpi: int,
+    max_image_side: int,
+    reading_direction: str = "horizontal",
+    jpeg_quality: int = 90,
+    source_pdf_sha256: str = "",
+) -> str:
+    """Deterministic checkpoint identity for the local Xiaomi-OCR-0 backend."""
+
+    if task not in _XIAOMI_OCR_TASKS:
+        raise ValueError(f"Unsupported Xiaomi-OCR task: {task}")
+    if reading_direction not in {"horizontal", "vertical", "auto"}:
+        raise ValueError(f"Unsupported OCR reading direction: {reading_direction}")
+    source_binding = f"-src{source_pdf_sha256}" if source_pdf_sha256 else ""
+    return (
+        "xiaomi-ocr-local/"
+        f"Xiaomi-OCR-0-{task}-"
+        f"dpi{dpi}-max{max_image_side}-jpeg{jpeg_quality}-"
+        f"{reading_direction}{source_binding}-v3"
+    )
+
+
+def local_ocr_pending_pages(
     records: Sequence[Any],
     *,
     requested: Iterable[int],
     model_id: str,
     force: bool = False,
 ) -> list[int]:
-    """Pages the local PaddleOCR backend still has to produce.
+    """Pages a local Docker OCR backend still has to produce.
 
     A page is cached when its checkpoint carries the exact backend model id;
     like every other backend, ``force`` bypasses the cache for the range.
@@ -6957,6 +6932,10 @@ def paddle_local_pending_pages(
         if force or by_page.get(page) is None
         or by_page[page].ocr_model != model_id
     )
+
+
+# Historical name kept for existing callers/tests; the logic is backend-agnostic.
+paddle_local_pending_pages = local_ocr_pending_pages
 
 
 def contiguous_page_segments(pages: Sequence[int]) -> list[list[int]]:
@@ -6989,16 +6968,17 @@ def resolve_expected_ocr_model_exact(
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
     if backend == "paddleocr-local":
+        source_pdf = Path(args.input).expanduser() if getattr(args, "input", None) else None
+        if source_pdf is None or not source_pdf.is_file():
+            return None
         return paddle_local_model_id(
-            det_variant=args.paddle_det_variant,
-            rec_variant=args.paddle_rec_variant,
-            det_mode=args.paddle_det_mode,
-            rec_mode=args.paddle_rec_mode,
-            rec_batch=args.paddle_rec_batch,
-            det_len=args.paddle_det_len,
             dpi=args.dpi,
             max_image_side=args.max_image_side,
             reading_direction=resolve_ocr_reading_direction(args, ocr_profile),
+            jpeg_quality=args.jpeg_quality,
+            source_pdf_sha256=(
+                _sha256_file(source_pdf.resolve())
+            ),
         )
     return None
 
@@ -7514,15 +7494,11 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                     # not go through the per-page ocr_pdf loop.  Checkpoint
                     # caching still uses the same ocr_model identity contract.
                     model_id = paddle_local_model_id(
-                        det_variant=args.paddle_det_variant,
-                        rec_variant=args.paddle_rec_variant,
-                        det_mode=args.paddle_det_mode,
-                        rec_mode=args.paddle_rec_mode,
-                        rec_batch=args.paddle_rec_batch,
-                        det_len=args.paddle_det_len,
                         dpi=args.dpi,
                         max_image_side=args.max_image_side,
                         reading_direction=args.ocr_reading_direction,
+                        jpeg_quality=args.jpeg_quality,
+                        source_pdf_sha256=_sha256_file(pdf_path),
                     )
                     requested = set(range(args.start_page, end_page + 1))
                     pending = paddle_local_pending_pages(
@@ -7560,18 +7536,6 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                                 str(segment[-1]),
                                 "--workers",
                                 str(args.paddle_workers),
-                                "--det-variant",
-                                args.paddle_det_variant,
-                                "--rec-variant",
-                                args.paddle_rec_variant,
-                                "--det-mode",
-                                args.paddle_det_mode,
-                                "--rec-mode",
-                                args.paddle_rec_mode,
-                                "--rec-batch",
-                                str(args.paddle_rec_batch),
-                                "--det-len",
-                                str(args.paddle_det_len),
                                 "--dpi",
                                 str(args.dpi),
                                 "--max-side",
@@ -7581,6 +7545,8 @@ def _main_unlocked(argv: list[str] | None = None) -> int:
                                 "--reading-direction",
                                 args.ocr_reading_direction,
                             ]
+                            if args.force:
+                                command.append("--force-ocr")
                             completed = subprocess.run(
                                 command,
                                 capture_output=True,

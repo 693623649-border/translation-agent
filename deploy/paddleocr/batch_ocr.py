@@ -6,15 +6,13 @@ Container usage:
     --images-dir /workspace/io/images \
     --output-dir /workspace/io/ocr \
     --models-dir /workspace/models \
-    --det-variant server --rec-variant server \
-    --det-mode paddle_fp32 --rec-mode paddle_fp16 \
-    --rec-batch 16 --det-len 736 \
-    --model-id paddleocr-local/server-det32-server-rec16-b16
+    --model-id paddleocr-local/PP-OCRv6-medium-...
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,9 +27,6 @@ from typing import Any, Iterable
 from bench_ocr import build_ocr
 
 PAGE_IMAGE_RE = re.compile(r"^page_(\d+)\.(?:jpe?g|png)$", re.IGNORECASE)
-BLANK_TEXT = "[空白页]"
-
-
 def _page_number(path: Path) -> int:
     match = PAGE_IMAGE_RE.match(path.name)
     if not match:
@@ -257,12 +252,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--images-dir", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--models-dir", required=True, type=Path)
-    parser.add_argument("--det-variant", default="server", choices=("server", "mobile"))
-    parser.add_argument("--rec-variant", default="server", choices=("server", "mobile"))
-    parser.add_argument("--det-mode", default="paddle_fp32")
-    parser.add_argument("--rec-mode", default="paddle_fp16")
-    parser.add_argument("--rec-batch", type=int, default=16)
-    parser.add_argument("--det-len", type=int, default=736)
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
@@ -277,8 +266,6 @@ def main() -> int:
         raise SystemExit("--shard-count must be >= 1")
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("--shard-index must satisfy 0 <= index < shard-count")
-    if args.rec_batch < 1:
-        raise SystemExit("--rec-batch must be >= 1")
     if not args.images_dir.is_dir():
         raise SystemExit(f"Images directory does not exist: {args.images_dir}")
     if not args.models_dir.is_dir():
@@ -317,20 +304,19 @@ def main() -> int:
         return 0
 
     print(
-        "[batch-ocr] building OCR "
-        f"det={args.det_variant}/{args.det_mode} "
-        f"rec={args.rec_variant}/{args.rec_mode} "
-        f"batch={args.rec_batch} det_len={args.det_len}",
+        "[batch-ocr] building PP-OCRv6 medium "
+        "det=paddle_fp32 rec=paddle_fp16 batch=16 det_len=736",
         flush=True,
     )
     ocr = build_ocr(
         args.models_dir,
-        args.det_variant,
-        args.rec_variant,
-        args.det_mode,
-        args.rec_mode,
-        args.rec_batch,
-        args.det_len,
+        "server",
+        "server",
+        "paddle_fp32",
+        "paddle_fp16",
+        16,
+        736,
+        "v6-medium",
     )
 
     for image in images:
@@ -351,14 +337,13 @@ def main() -> int:
                 args.reading_direction,
             )
             text = "\n".join(texts).strip()
-            if not text:
-                text = BLANK_TEXT
-                summary["blank"] += 1
+            hard_failure = not text
 
             elapsed = time.perf_counter() - page_started
             notes = {
                 "engine": "paddleocr-local",
                 "source_image": image.name,
+                "source_image_sha256": hashlib.sha256(image.read_bytes()).hexdigest(),
                 "elapsed_seconds": round(elapsed, 3),
                 "line_count": len(texts),
                 "score_min": round(min(scores), 6) if scores else None,
@@ -367,11 +352,15 @@ def main() -> int:
                 "ordering_version": 3,
                 "reading_direction_requested": args.reading_direction,
                 "reading_direction": _resolve_direction(boxes, args.reading_direction),
+                "hard_failure": hard_failure,
                 "lines": [{"text": line, "score": score, "box": box}
                           for line, score, box in zip(texts, scores, boxes)],
             }
             _write_page(args.output_dir, page_number, text, args.model_id, notes)
             summary["processed"] += 1
+            if hard_failure:
+                summary["failed"] += 1
+                summary["failures"].append({"page": page_number, "error": "empty OCR result"})
             print(
                 f"[batch-ocr] page={page_number} lines={len(texts)} chars={len(text)} elapsed={elapsed:.2f}s",
                 flush=True,

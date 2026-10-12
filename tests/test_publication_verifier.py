@@ -34,6 +34,18 @@ from publication_verifier import (
 
 
 class PublicationVerifierTests(unittest.TestCase):
+    def test_actual_reader_groups_are_checked_even_without_old_translation_checkpoint(self):
+        from types import SimpleNamespace
+        from publication_verifier import _check_translation_punctuation
+        with tempfile.TemporaryDirectory() as folder:
+            output=Path(folder); (output/'pages').mkdir(); (output/'audit').mkdir()
+            (output/'pages/page_0001.json').write_text(json.dumps({'pdf_page':1,'text':'「原文」'}),encoding='utf-8')
+            (output/'audit/reader-page-groups.json').write_text(json.dumps({'1':{'source_pages':[1],'text':'“中文”'}}),encoding='utf-8')
+            result=_check_translation_punctuation(SimpleNamespace(output_dir=output))
+            self.assertEqual(result['metrics']['reader_groups_checked'],1)
+            self.assertEqual(result['metrics']['reader_groups_with_mismatch'],1)
+            self.assertEqual(result['issues'][0]['code'],'reader_group_punctuation_mismatch')
+
     book_title = "测试书"
 
     def test_expected_frontmatter_range_stops_before_trailing_toc(self) -> None:
@@ -493,6 +505,16 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(check["status"], "failed")
         self.assertEqual(check["issues"][0]["code"], "docx_foreign_language")
         self.assertEqual(check["metrics"]["pending_count"], 1)
+
+    def test_docx_chinese_gate_rejects_japanese_quote_inside_chinese_prose(self) -> None:
+        from docx import Document
+        path = self.output / f"{self.book_title}.docx"
+        document = Document(str(path))
+        document.add_paragraph('中文正文。' * 40 + '「彼は本を読んだ。私は彼の家へ行った。」')
+        document.save(str(path))
+        check = self._checks(self._verify(report_name='mixed-quote-docx.json'))['docx.chinese']
+        self.assertEqual(check['status'], 'failed')
+        self.assertEqual(check['metrics']['pending_count'], 1)
 
     def test_docx_chinese_gate_exempts_reference_chapter_paragraphs(self) -> None:
         from docx import Document
@@ -1315,6 +1337,215 @@ class PublicationVerifierTests(unittest.TestCase):
             {issue["code"] for issue in check["issues"]},
         )
 
+    def test_v6_ocr_release_blocks_without_hash_bound_human_review(self) -> None:
+        from book_pipeline import load_page_records
+
+        source_hash = hashlib.sha256(self.source_pdf.read_bytes()).hexdigest()
+        model = (
+            f"paddleocr-local/PP-OCRv6-medium-dpi200-max3000-jpeg90-horizontal-"
+            f"src{source_hash}-v2"
+        )
+        for record in load_page_records(self.output):
+            if 2 <= record.pdf_page <= 5:
+                record.ocr_model = model
+                record.notes = json.dumps(
+                    {"source_image_sha256": f"image-{record.pdf_page}"}
+                )
+                from book_pipeline import save_page_record
+
+                save_page_record(self.output, record)
+        fallback_path = self.output / "audit" / "ocr-fallbacks.json"
+        fallback_path.write_text(
+            json.dumps(
+                {
+                    "source_pdf_sha256": source_hash,
+                    "primary_model_id": model,
+                    "attempted_pages": [],
+                    "review_pages": [],
+                    "pages": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        report = self._verify(report_name="ocr-human-review-required.json")
+        check = self._checks(report)["ocr.human_review"]
+        self.assertEqual(check["status"], "failed")
+        self.assertIn(
+            "ocr_human_review_missing",
+            {issue["code"] for issue in check["issues"]},
+        )
+
+    def test_chinese_page_translation_must_keep_source_punctuation_glyphs(self) -> None:
+        from book_pipeline import load_page_records, save_page_record
+        from ocr_quality_gate import sha256_text
+
+        manifest_path = self.output / "chapters.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest[0]["reviewed_override"] = False
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        record = next(item for item in load_page_records(self.output) if item.pdf_page == 2)
+        record.text = "日本語の「引用」。"
+        record.language = "ja"
+        source_hash = hashlib.sha256(self.source_pdf.read_bytes()).hexdigest()
+        record.ocr_model = (
+            f"paddleocr-local/PP-OCRv6-medium-dpi200-max3000-jpeg90-horizontal-"
+            f"src{source_hash}-v2"
+        )
+        record.translated_text = "中文的“引文”。"
+        record.translation_source_sha256 = sha256_text(record.text)
+        record.translation_provider = "deepseek"
+        record.translation_model = "deepseek-flash"
+        record.translation_target_language = "简体中文"
+        record.translation_prompt_version = "fixture"
+        record.translation_fingerprint = "fixture"
+        save_page_record(self.output, record)
+
+        report = self._verify(report_name="source-punctuation.json")
+        check = self._checks(report)["translation.punctuation"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(
+            check["issues"][0]["code"], "translation_source_punctuation_mismatch"
+        )
+
+    def test_translation_punctuation_gate_requires_exact_source_glyphs_and_rejects_v10(self) -> None:
+        from book_pipeline import load_page_records, save_page_record
+        from ocr_quality_gate import sha256_text
+        record = next(item for item in load_page_records(self.output) if item.pdf_page == 2)
+        record.text = "日本語の「引用」、本文。"
+        record.language = "ja"
+        record.ocr_model = "paddleocr-local/PP-OCRv6-medium-vertical-fixture"
+        record.translated_text = "日语的「引文」、正文。"
+        record.translation_source_sha256 = sha256_text(record.text)
+        record.translation_target_language = "简体中文"
+        record.translation_prompt_version = "book-translation-v11-paragraph-context-v1"
+        save_page_record(self.output, record)
+        self.assertEqual(self._checks(self._verify(report_name="exact-marks.json"))["translation.punctuation"]["status"], "passed")
+        record.translated_text = "日语的「引文」，正文。"
+        save_page_record(self.output, record)
+        mismatch = self._checks(self._verify(report_name="changed-comma.json"))["translation.punctuation"]
+        self.assertEqual(mismatch["status"], "failed")
+        record.translated_text = "日语的「引文」、正文。"
+        record.translation_prompt_version = "book-translation-v10-adaptive-punctuation-segments"
+        save_page_record(self.output, record)
+        self.assertEqual(self._checks(self._verify(report_name="legacy-segments.json"))["translation.punctuation"]["status"], "failed")
+
+    def test_v6_ocr_review_passes_with_matching_human_attestations(self) -> None:
+        from book_pipeline import load_page_records, save_page_record
+        from ocr_quality_gate import review_sample_pages, sha256_text
+
+        source_hash = hashlib.sha256(self.source_pdf.read_bytes()).hexdigest()
+        model = (
+            f"paddleocr-local/PP-OCRv6-medium-dpi200-max3000-jpeg90-horizontal-"
+            f"src{source_hash}-v2"
+        )
+        records = {record.pdf_page: record for record in load_page_records(self.output)}
+        body_pages = [2, 3, 4, 5]
+        for page in body_pages:
+            records[page].ocr_model = model
+            records[page].notes = json.dumps(
+                {"source_image_sha256": f"image-{page}"}
+            )
+            save_page_record(self.output, records[page])
+        sample = review_sample_pages(body_pages, source_sha256=source_hash)
+        additional_page = next(page for page in body_pages if page not in sample)
+        fallback_path = self.output / "audit" / "ocr-fallbacks.json"
+        fallback_path.write_text(
+            json.dumps(
+                {
+                    "source_pdf_sha256": source_hash,
+                    "primary_model_id": model,
+                    "attempted_pages": [],
+                    "review_pages": [],
+                    "pages": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        additional_record = records[additional_page]
+        (self.output / "audit" / "ocr-review-suggestions.json").write_text(
+            json.dumps(
+                {
+                    "source_pdf_sha256": source_hash,
+                    "primary_model_id": model,
+                    "pages": [
+                        {
+                            "pdf_page": additional_page,
+                            "image_sha256": f"image-{additional_page}",
+                            "ocr_text_sha256": sha256_text(additional_record.text),
+                            "suggestion": "fixture visual anomaly",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        reviews = []
+        for page in sample:
+            record = records[page]
+            reviews.append(
+                {
+                    "pdf_page": page,
+                    "confirmed": True,
+                    "reviewer": "fixture-human",
+                    "reviewed_at": "2026-10-11T00:00:00+00:00",
+                    "source_pdf_sha256": source_hash,
+                    "image_sha256": f"image-{page}",
+                    "ocr_text_sha256": sha256_text(record.text),
+                    "matches_image": True,
+                }
+            )
+        review_path = self.output / "audit" / "ocr-human-review.json"
+        pending_plan = {
+            "source_pdf_sha256": source_hash,
+            "primary_model_id": model,
+            "sample_pages": sample,
+            "additional_review_pages": [additional_page],
+            "human_reviews": reviews,
+        }
+        review_path.write_text(
+            json.dumps(pending_plan, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        pending_report = self._verify(report_name="ocr-agent-suggestion-pending.json")
+        pending_check = self._checks(pending_report)["ocr.human_review"]
+        self.assertEqual(pending_check["status"], "failed")
+        self.assertIn(additional_page, pending_check["metrics"]["required_review_pages"])
+
+        record = records[additional_page]
+        reviews.append(
+            {
+                "pdf_page": additional_page,
+                "confirmed": True,
+                "reviewer": "fixture-human",
+                "reviewed_at": "2026-10-11T00:00:00+00:00",
+                "source_pdf_sha256": source_hash,
+                "image_sha256": f"image-{additional_page}",
+                "ocr_text_sha256": sha256_text(record.text),
+                "matches_image": True,
+            }
+        )
+        review_path.write_text(
+            json.dumps(
+                {
+                    "source_pdf_sha256": source_hash,
+                    "primary_model_id": model,
+                    "sample_pages": sample,
+                    "additional_review_pages": [additional_page],
+                    "human_reviews": reviews,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        report = self._verify(report_name="ocr-human-review-passed.json")
+        check = self._checks(report)["ocr.human_review"]
+        self.assertEqual(check["status"], "passed", check["issues"])
+        self.assertEqual(check["metrics"]["additional_review_pages"], [additional_page])
+
     def test_required_non_chinese_translation_must_be_source_fresh(self) -> None:
         manifest_path = self.output / "chapters.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1433,6 +1664,22 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(report["metrics"]["error_count"], len(report["errors"]))
         self.assertEqual(report["checks"][-1]["id"], "report.write")
         self.assertEqual(report["errors"][-1]["check_id"], "report.write")
+
+    def test_quality_report_delivery_failure_blocks_release(self) -> None:
+        with mock.patch(
+            "ingestion_quality.write_ingestion_quality_report",
+            side_effect=OSError("simulated quality report failure"),
+        ):
+            report = self._verify(report_name="quality-delivery.json")
+
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["release_ready"])
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["checks"][-1]["id"], "report.write")
+        persisted = json.loads(
+            (self.output / "audit" / "quality-delivery.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(persisted["release_ready"])
 
     def test_unmanifested_epub_xhtml_is_rejected(self) -> None:
         epub = self.output / f"{self.book_title}.epub"

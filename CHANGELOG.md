@@ -5,6 +5,16 @@
 
 ## 未发布
 
+- 扫描 PDF 入库统一为 PP-OCRv6 medium 主路径，固定检测/识别配置，横排与日文
+  竖排共用渲染、页级检查点和导入契约；源 PDF 哈希绑定缓存身份，空识别作为硬失败
+  保存，不再伪装成空白页。普通电子 PDF、EPUB 和文本入口保持独立。
+- Xiaomi-OCR-0 保留为硬失败页或经至少 10 个人工标注页校准后的低置信页的单次备用
+  识别。主备结果仅作比较，不自动择优或拼接；任意标点差异或超过校准 CER 阈值的差异
+  进入人工核图。新增 `tools/ocr_review.py` 与 `ocr.human_review` 发布门，核图记录绑定
+  源 PDF、页图和原始 OCR 哈希，DeepSeek 参考及代理建议不能作为人工验收证据。
+- 简体中文翻译提示和机器验收保留源文标点字形及顺序（日文「」、『』等），标点被
+  增删替换或译文自行增加省略号时不提交该页。PaddleOCR 默认模型下载收敛为 PP-OCRv6
+  medium；PP-OCRv5 仅保留供旧实验使用。
 - 新增四个 DSH/Cordis 入库插件与配套 skill：源文件入库与中文 Word 保真交付
   （`dsh-kb-ingest`）、竖排日语扫描书（`dsh-jp-vertical-kb`）、中文横排扫描
   正文重建（`dsh-chinese-pdf-kb`）、英文选文译中（`dsh-english-pdf-kb`）；另有

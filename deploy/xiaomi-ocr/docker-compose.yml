@@ -1,0 +1,31 @@
+# Xiaomi-OCR-0 本地部署（vLLM GPU）
+# 镜像为本机已存在的 vllm/vllm-openai:v0.27.1（含 Qwen3_5ForConditionalGeneration
+# 原生支持，torch 2.13.0+cu130 兼容 RTX 5090 sm_120），无需构建。
+# 用法：
+#   常驻容器（交互调试）: docker compose --profile gpu up -d
+#   一次性批量 OCR 建议 run 而非常驻（脚本在运行时以只读卷挂入，见 tools 侧调用）：
+#     docker compose --profile gpu run --rm --volume <batch_ocr.py>:/opt/xiaomi-ocr-tools/batch_ocr.py:ro \
+#       xiaomi-ocr python3 /opt/xiaomi-ocr-tools/batch_ocr.py --help
+#
+# 与 deploy/paddleocr 同构：models/ 权重宿主下载后挂载，io/ 为图片/结果交换目录，
+# cache/ 持久化 vLLM 编译缓存（torch.compile / CUDA graph，复跑省 1-2 分钟启动）。
+
+services:
+  xiaomi-ocr:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:v0.27.1
+    container_name: xiaomi-ocr
+    gpus: all
+    shm_size: "4gb"
+    stdin_open: true
+    tty: true
+    working_dir: /workspace
+    volumes:
+      - ./models:/workspace/models        # 模型权重（宿主机下载后挂载进容器）
+      - ./io:/workspace/io                # 输入图片 / 输出结果交换目录
+      - ./cache:/root/.cache              # vLLM 编译缓存（跨 run 复用）
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - VLLM_LOGGING_LEVEL=INFO
+    command: ["sleep", "infinity"]
+    restart: unless-stopped

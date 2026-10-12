@@ -1,6 +1,8 @@
 # PaddleOCR 本地 GPU 部署（RTX 5090 / Docker）
 
-本目录包含在本机（AMD Ryzen 7 9700X / RTX 5090 D 32GB / Windows + Docker Desktop WSL2 后端）部署 PaddleOCR 的全部配置：GPU 容器环境、官方模型权重的自由下载清单与脚本、部署验证脚本。
+本目录是扫描 PDF 的主 OCR 部署：RTX 5090 D 上使用 PaddleOCR 3.7.0 + **PP-OCRv6 medium**（检测与识别均为 v6 medium），支持横排和日文竖排。已下载的权重放在忽略跟踪的 `models/` 目录；新机器运行 `python download_models.py --only v6-medium` 下载。PP-OCRv5 仅为兼容旧实验与缓存保留，不再作为默认内核。
+
+> `deploy/xiaomi-ocr/` 只由扫描 PDF 导入器对硬失败页或已校准低置信页复识一次。它不会替代 PP-OCRv6 主结果；达到校准 CER 差异或出现任意标点差异时，页面进入人工核图队列。
 
 > 分支说明：本分支 `deploy/paddleocr-rtx5090` 面向本机 RTX 5090（Blackwell sm_120）的单卡部署，基于 master 独立演进；A100 双卡后端的流水线集成在另一分支 `paddleOCR`（含 backend 接入与测试），两条分支按硬件与用途分开维护，合并时注意本目录会产生冲突需人工取舍。
 
@@ -25,8 +27,12 @@ docker compose --profile gpu run --rm paddleocr python /opt/paddleocr-tools/benc
 
 ### 推荐配置
 
-- **精度优先（默认，翻译流水线用）**：`PP-OCRv5_server` 检测 fp32 + 识别 fp16，`text_recognition_batch_size=16`，`text_det_limit_side_len=736 / limit_type=min`。相对全 fp32 提速约 30%，识别质量完全一致（rec 的 fp16 在本机无损）。
-- **吞吐优先（批量预筛/草稿）**：`PP-OCRv5_mobile` 全 fp16，b32。约 2.5 页/秒，CER 从 0.73% 升到 1.07%（CJK 密集文本），显存只需 4GB。
+本机扫描 PDF 主路径固定使用 **PP-OCRv6 medium** 检测 fp32 + 识别 fp16、识别 batch 16、检测边长 736。模型目录由默认 `download_models.py` 下载，运行入口不再暴露版本或检测/识别调参组合。原书正文前 10 页对照 DeepSeek Flash 图像参考：v6 CER 7.37%，v5 server 10.09%；参考文本由模型生成，不能当作人工真值或全书无错证明。
+
+下表和以下 PP-OCRv5 API 示例是旧版 RTX 5090 参数实验记录，只供对照复现，不是当前入库建议。
+
+- `PP-OCRv5_server` 检测 fp32 + 识别 fp16，batch 16、检测边长 736：相对全 fp32 快约 30%。
+- `PP-OCRv5_mobile` 全 fp16，batch 32：约 2.5 页/秒，密集 CJK 样本 CER 从 0.73% 升到 1.07%。
 
 ### 本机特有的坑（Blackwell sm_120）
 
@@ -35,10 +41,10 @@ docker compose --profile gpu run --rm paddleocr python /opt/paddleocr-tools/benc
 - **rec batch 加大无收益**：管线逐页串行，批大小只作用于单页内行数；b16-b32 最优，b96 更慢且显存+2GB。
 - 运行间吞吐波动约 ±15%（宿主负载/显存分配），结论按相对差距理解。
 
-### Python API 用法（推荐配置）
+### Python API 用法（旧版 PP-OCRv5 基准）
 
 ```python
-# 精度优先：server det fp32 + rec fp16（经 paddlex engine_config 分级设精度）
+# 仅用于复现旧版 PP-OCRv5 对照基准；正式入库调用 v6 固定配置
 from paddlex import create_pipeline
 from paddleocr import PaddleOCR
 import copy
@@ -80,7 +86,7 @@ result = list(ocr.predict("/workspace/io/images/page.png"))
 | 基础镜像 | `ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.3.0-gpu-cuda12.9-cudnn9.9` | RTX 5090 为 Blackwell 架构（sm_120），要求 PaddlePaddle ≥3.2 且 CUDA 12.9 构建；3.1.x 及更早版本不支持 50 系 |
 | registry | 百度 CCR（官方文档现用源） | 本机直连 Docker Hub 超时；`registry.baidubce.com` 只有 2.x 旧版 |
 | PaddleOCR | `paddleocr==3.7.0`（PyPI 最新） | 兼容 paddlepaddle 3.3.0 |
-| 模型 | PP-OCRv5 server + mobile（det/rec）+ 文档方向分类 | 权重从官方 `paddle-model-ecology.bj.bcebos.com` 自由下载，manifest 可自行增删 |
+| 模型 | PP-OCRv6 medium 主用；PP-OCRv5 server/mobile 仅旧实验兼容 | 权重由 manifest 管理，默认只下载 v6 medium |
 
 ## 目录说明
 

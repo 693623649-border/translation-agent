@@ -6,7 +6,7 @@
 
 验证内容：
   1. paddlepaddle GPU 可用且识别到 RTX 5090（sm_120 需 cuda12.9 构建）
-  2. 使用 models/ 下本地权重的 PP-OCRv5 检测+识别链路输出正确文本
+  2. 使用 models/ 下本地 PP-OCRv6 medium 检测+识别权重输出正确文本
 """
 
 from __future__ import annotations
@@ -55,25 +55,21 @@ def make_test_image(path: Path) -> str:
     return text
 
 
-def run_ocr(image: Path, models_dir: Path, variant: str) -> str:
+def run_ocr(image: Path, models_dir: Path) -> str:
     from paddleocr import PaddleOCR
 
-    det = models_dir / f"PP-OCRv5_{variant}_det"
-    rec = models_dir / f"PP-OCRv5_{variant}_rec"
-    doc_ori = models_dir / "PP-LCNet_x1_0_doc_ori"
+    det = models_dir / "PP-OCRv6_medium_det"
+    rec = models_dir / "PP-OCRv6_medium_rec"
     kwargs = dict(
         device="gpu:0",
         text_detection_model_name=det.name,
         text_detection_model_dir=str(det),
         text_recognition_model_name=rec.name,
         text_recognition_model_dir=str(rec),
-        use_doc_orientation_classify=bool(doc_ori.exists()),
+        use_doc_orientation_classify=False,
         use_textline_orientation=False,
         use_doc_unwarping=False,
     )
-    if doc_ori.exists():
-        kwargs["doc_orientation_classify_model_name"] = doc_ori.name
-        kwargs["doc_orientation_classify_model_dir"] = str(doc_ori)
     ocr = PaddleOCR(**kwargs)
     result = ocr.predict(str(image))
     lines: list[str] = []
@@ -87,7 +83,6 @@ def run_ocr(image: Path, models_dir: Path, variant: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="验证本地 PaddleOCR 部署")
     parser.add_argument("--models-dir", default=None, help="模型权重目录（默认：脚本旁的 models/）")
-    parser.add_argument("--variant", default="server", choices=["server", "mobile"], help="使用的模型变体")
     args = parser.parse_args()
 
     here = Path(__file__).resolve().parent
@@ -103,9 +98,9 @@ def main() -> int:
     expected = make_test_image(test_img)
     print(f"测试图已生成: {test_img}")
 
-    print(f"使用 {args.variant} 变体权重推理（首次推理含显存预热，耗时偏长）...")
+    print("使用 PP-OCRv6 medium 权重推理（首次推理含显存预热，耗时偏长）...")
     t0 = time.perf_counter()
-    recognized = run_ocr(test_img, models_dir, args.variant)
+    recognized = run_ocr(test_img, models_dir)
     elapsed = time.perf_counter() - t0
     print(f"识别结果: {recognized!r}")
     print(f"耗时: {elapsed:.1f}s")

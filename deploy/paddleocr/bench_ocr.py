@@ -150,7 +150,7 @@ class VramSampler:
         self._thread.join(timeout=5)
 
 
-def build_ocr(models_dir: Path, det_variant: str, rec_variant: str, det_mode: str, rec_mode: str, rec_batch: int, det_len: int):
+def build_ocr(models_dir: Path, det_variant: str, rec_variant: str, det_mode: str, rec_mode: str, rec_batch: int, det_len: int, model_family: str = "v5"):
     """先经 paddleocr 封装层组装正确的管线配置，再按需以指定精度重建。
 
     支持检测/识别独立选择权重变体与精度。注意（sm_120 实测）：
@@ -161,12 +161,20 @@ def build_ocr(models_dir: Path, det_variant: str, rec_variant: str, det_mode: st
 
     from paddleocr import PaddleOCR
 
+    if model_family not in {"v5", "v6-medium"}:
+        raise ValueError(f"Unsupported PaddleOCR model family: {model_family}")
+    if model_family == "v6-medium":
+        det_name, rec_name = "PP-OCRv6_medium_det", "PP-OCRv6_medium_rec"
+    else:
+        det_name = f"PP-OCRv5_{det_variant}_det"
+        rec_name = f"PP-OCRv5_{rec_variant}_rec"
+
     base = PaddleOCR(
         device="gpu:0",
-        text_detection_model_name=f"PP-OCRv5_{det_variant}_det",
-        text_detection_model_dir=str(models_dir / f"PP-OCRv5_{det_variant}_det"),
-        text_recognition_model_name=f"PP-OCRv5_{rec_variant}_rec",
-        text_recognition_model_dir=str(models_dir / f"PP-OCRv5_{rec_variant}_rec"),
+        text_detection_model_name=det_name,
+        text_detection_model_dir=str(models_dir / det_name),
+        text_recognition_model_name=rec_name,
+        text_recognition_model_dir=str(models_dir / rec_name),
         text_recognition_batch_size=rec_batch,
         text_det_limit_side_len=det_len,
         text_det_limit_type="min" if det_len <= 960 else "max",

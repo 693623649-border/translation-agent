@@ -454,7 +454,10 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
             }
             audit_path = output_dir / "audit" / "semantic-reconstruction.json"
             _atomic_json(audit_path, audit)
-            return {"status": "blocked", "release_blocked": True, "chapter_count": 0, "audit": str(audit_path)}
+            result = {"status": "blocked", "release_blocked": True, "chapter_count": 0, "audit": str(audit_path), "source": str(source), "source_sha256": source_record["sha256"]}
+            from ingestion_quality import write_ingestion_quality_report
+            result["quality_report"] = str(write_ingestion_quality_report(output_dir, result, evidence=(str(audit_path),)))
+            return result
 
         boundaries, outline_issues = _chapter_boundaries(document, book_title)
         issues.extend(outline_issues)
@@ -621,7 +624,7 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
     )
     _atomic_json(output_dir / "audit" / "semantic-reconstruction.json", audit)
     _atomic_text(output_dir / "semantic" / "translation-units.jsonl", "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units))
-    return {
+    result = {
         "status": audit["status"],
         "release_blocked": audit["release_blocked"],
         "chapter_count": len(manifest),
@@ -634,6 +637,9 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
         "translation_units": str((output_dir / "semantic" / "translation-units.jsonl").resolve()),
         "audit": str((output_dir / "audit" / "semantic-reconstruction.json").resolve()),
     }
+    from ingestion_quality import write_ingestion_quality_report
+    result["quality_report"] = str(write_ingestion_quality_report(output_dir, result, evidence=(result["audit"],)))
+    return result
 
 
 def apply_translations(

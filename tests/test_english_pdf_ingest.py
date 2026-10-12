@@ -148,7 +148,7 @@ class EnglishPdfIngestTests(unittest.TestCase):
         manifest = english.read(self.workspace / english.MANIFEST)
         verified = english.verify(self.workspace, manifest)
         self.assertTrue(verified["release_ready"], verified["failed_checks"])
-        self.assertEqual(verified["summary"]["passed"], 16)
+        self.assertEqual(verified["summary"]["passed"], 18)
         candidate = Path(verified["candidate"])
         review_path = self.root / "layout-review.json"
         english.write(review_path, {

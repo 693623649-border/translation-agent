@@ -7,9 +7,11 @@ PaddleOCR 的 *_model_dir 参数使用。
 
 用法：
     python download_models.py --list            # 查看清单
+    python download_models.py                    # 仅下载默认 PP-OCRv6 medium
+    python download_models.py --only v6-medium   # 指定下载默认模型
     python download_models.py --only server     # 仅下载 server 变体（det+rec）
     python download_models.py --only mobile     # 仅下载 mobile 变体
-    python download_models.py --all             # 下载全部（默认行为）
+    python download_models.py --all             # 下载 v6 与旧版全部模型
     python download_models.py --only PP-OCRv5_server_det --force  # 按名称下载并重新解压
 """
 
@@ -78,7 +80,7 @@ def extract(tar_path: Path, model_dir: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="下载 PaddleOCR 官方模型权重")
-    parser.add_argument("--all", action="store_true", help="下载全部模型（默认行为）")
+    parser.add_argument("--all", action="store_true", help="包括旧版 PP-OCRv5 在内的全部模型")
     parser.add_argument("--only", default=None, help="server / mobile / common 或具体模型名；缺省即全部")
     parser.add_argument("--force", action="store_true", help="已解压的模型也重新下载解压")
     parser.add_argument("--list", action="store_true", help="仅列出清单")
@@ -91,7 +93,7 @@ def main() -> int:
             print(f"{m['name']:<28} variant={m['variant']:<8} {m['note']}")
         return 0
 
-    models = select_models(manifest, args.only or "all")
+    models = select_models(manifest, args.only or ("all" if args.all else "v6-medium"))
     if not models:
         print(f"未匹配到模型（--only {args.only}）", file=sys.stderr)
         return 1

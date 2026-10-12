@@ -13,6 +13,74 @@ from product_contracts import RunSpec
 
 
 class DocumentPipelineTests(unittest.TestCase):
+    def test_pdf_run_quality_report_preserves_verifier_failure_details(self) -> None:
+        class FakeRun:
+            run_id = "run-test"
+            plan = ("core.publication.verify",)
+            executed = ("core.publication.verify",)
+            skipped = ()
+            state_path = Path("state.json")
+            events_path = Path("events.jsonl")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            audit = output / "audit"
+            audit.mkdir()
+            source_pdf = output / "book.pdf"
+            source_pdf.write_bytes(b"book-source")
+            source_hash = __import__("hashlib").sha256(b"book-source").hexdigest()
+            (audit / "release-report.json").write_text(json.dumps({
+                "status": "failed", "release_ready": False, "mode": "full",
+                "source": {"path": str(source_pdf), "sha256": source_hash},
+                "summary": {"failed": 1},
+                "checks": [{"id": "ocr.human_review", "status": "failed",
+                            "summary": "needs image review",
+                            "metrics": {"confirmed_review_count": 0}}],
+                "issues": [{"code": "ocr_human_review_missing", "message": "missing human review"}],
+            }), encoding="utf-8")
+            spec = RunSpec(source=source_pdf, source_mode="scanned-pdf", output_dir=output)
+            with patch("translation_agent_api.run_graph", return_value=FakeRun()):
+                result = document_pipeline.run_pdf_spec(spec)
+            report = Path(result["quality_report"]).read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "passed")  # graph execution completed
+        self.assertEqual(result["quality_status"], "failed")
+        self.assertFalse(result["release_ready"])
+        self.assertIn("状态：**failed**", report)
+        self.assertIn("ocr.human_review", report)
+        self.assertIn("ocr_human_review_missing", report)
+        self.assertIn("confirmed_review_count=0", report)
+
+    def test_partial_pdf_run_ignores_old_release_report(self) -> None:
+        class FakeRun:
+            run_id = "run-partial"
+            plan = ("core.pages.ocr",)
+            executed = ("core.pages.ocr",)
+            skipped = ()
+            state_path = Path("state.json")
+            events_path = Path("events.jsonl")
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            source_pdf = output / "book.pdf"
+            source_pdf.write_bytes(b"new-source")
+            audit = output / "audit"
+            audit.mkdir()
+            (audit / "release-report.json").write_text(json.dumps({
+                "status": "passed", "release_ready": True, "mode": "full",
+                "checks": [{"id": "old.check", "status": "passed"}],
+            }), encoding="utf-8")
+            spec = RunSpec(source=source_pdf, source_mode="scanned-pdf",
+                           output_dir=output, phase="ocr", verify=False)
+            with patch("translation_agent_api.run_graph", return_value=FakeRun()):
+                result = document_pipeline.run_pdf_spec(spec)
+            report = Path(result["quality_report"]).read_text(encoding="utf-8")
+
+        self.assertFalse(result["release_ready"])
+        self.assertEqual(result["quality_status"], "unverified")
+        self.assertNotIn("old.check", report)
+        self.assertIn("verification not current", report)
+
     def test_epub_plan_exposes_semantic_quality_gate(self) -> None:
         plan = document_pipeline.plan_spec(
             RunSpec(

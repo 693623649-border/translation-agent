@@ -7,11 +7,15 @@ import sys
 import tempfile
 import threading
 import unittest
+import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
+
+from ocr_quality_gate import punctuation_signature
+from paragraph_translation import TranslationQualityError
 
 import fitz
 from PIL import Image
@@ -58,6 +62,8 @@ from book_pipeline import (
     translate_non_chinese_pages,
     write_json,
 )
+
+
 
 
 class UtilityTests(unittest.TestCase):
@@ -125,7 +131,7 @@ class UtilityTests(unittest.TestCase):
                 max_tokens: int = 16384,
             ) -> str:
                 self.prompts.append(prompt)
-                return f"译文{len(self.prompts)}。"
+                return f"译文{len(self.prompts)}."
 
         client = RecordingClient()
         translator = ChatTranslator(client)
@@ -138,66 +144,73 @@ class UtilityTests(unittest.TestCase):
 
         self.assertEqual(
             translated,
-            "# 审定标题\n\n译文1。\n\n## 御宅世界影像\n\n译文2。",
+            "# 审定标题\n\n译文1.\n\n## 御宅世界影像\n\n译文2.",
         )
         self.assertEqual(len(client.prompts), 2)
         for prompt in client.prompts:
-            self.assertIn("源语言标签：en", prompt)
-            self.assertIn("依据源语言的语法和上下文", prompt)
+            self.assertIn("从en完整翻译", prompt)
+            self.assertIn("完整段落理解", prompt)
             self.assertNotIn("日语语法", prompt)
-            self.assertIn("Markdown 标题已由程序保护", prompt)
             self.assertNotIn("审定标题", prompt)
             self.assertNotIn("御宅世界影像", prompt)
 
-    def test_translation_prompt_requires_every_numbered_footnote_definition(self) -> None:
-        class RecordingClient:
-            def __init__(self) -> None:
-                self.prompts: list[str] = []
+    def test_translation_preserves_japanese_punctuation_glyphs(self) -> None:
+        class ExactMarksClient:
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                return "中文「引文」、以及『另一处引文』。"
 
-            def chat_text(
-                self,
-                prompt: str,
-                *,
-                system: str,
-                max_tokens: int = 16384,
-            ) -> str:
-                self.prompts.append(prompt)
-                source = prompt.split("\n原文：\n", 1)[1]
-                label = source.split(maxsplit=1)[0]
-                return f"{label} 第{label}条脚注全文。\n第{label}条续行。"
-
-        client = RecordingClient()
-        translated = ChatTranslator(client).translate(
-            "1 First footnote definition in full.\nFirst continuation.\n"
-            "2 Second footnote definition in full.\nSecond continuation.\n"
-            "3 Third footnote definition in full.\nThird continuation.\n"
-            "4 Fourth footnote definition in full.\nFourth continuation.",
-            source_language="en",
+        source = "日本語の「引用」、そして『別の引用』。"
+        result = ChatTranslator(ExactMarksClient()).translate(
+            source,
+            source_language="ja",
             target_language="简体中文",
         )
+        self.assertEqual("".join(c for c in result if c in "「」『』"), "「」『』")
+        self.assertIn("、", result)
 
-        self.assertEqual(len(client.prompts), 4)
-        sources = [prompt.split("\n原文：\n", 1)[1] for prompt in client.prompts]
-        self.assertEqual(
-            sources,
-            [
-                "1 First footnote definition in full.\nFirst continuation.",
-                "2 Second footnote definition in full.\nSecond continuation.",
-                "3 Third footnote definition in full.\nThird continuation.",
-                "4 Fourth footnote definition in full.\nFourth continuation.",
-            ],
-        )
-        self.assertEqual(
-            translated,
-            "1 第1条脚注全文。\n第1条续行。\n\n"
-            "2 第2条脚注全文。\n第2条续行。\n\n"
-            "3 第3条脚注全文。\n第3条续行。\n\n"
-            "4 第4条脚注全文。\n第4条续行。",
-        )
-        for index, prompt in enumerate(client.prompts, start=1):
-            self.assertIn("每一个行首脚注编号及其对应定义全文", prompt)
-            self.assertIn("严禁合并、跳号、截断、只保留编号或省略出处", prompt)
-            self.assertIn(f"必须逐项原样保留）：{index}", prompt)
+    def test_translation_rejects_replaced_japanese_quote_marks(self):
+        class Client:
+            def chat_text(self, prompt, **kwargs):
+                return '中文“引文”、以及‘另一处引文’。'
+        with self.assertRaisesRegex(TranslationQualityError, 'quotation'):
+            ChatTranslator(Client()).translate('日本語の「引用」、そして『別の引用』。', source_language='ja', target_language='简体中文')
+
+    def test_translation_does_not_silently_delete_isolated_kana(self):
+        class Client:
+            def __init__(self): self.prompts = []
+            def chat_text(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                return '这是正文。へ“引用正文。'
+        client = Client()
+        with self.assertRaisesRegex(ValueError, 'Japanese'):
+            ChatTranslator(client).translate('日本語の本文です。へ“引用文です。', source_language='ja', target_language='简体中文')
+        self.assertEqual(len(client.prompts), 2)
+        self.assertTrue(all('へ“引用文です。' in prompt for prompt in client.prompts))
+
+    def test_translation_structured_response_gets_one_full_prose_retry(self):
+        class Client:
+            def __init__(self): self.prompts = []
+            def chat_text(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                return '{"segments":["错误数量"]}' if len(self.prompts) == 1 else '完整，连贯的译文，完成。'
+        client = Client()
+        result = ChatTranslator(client).translate('甲一，乙二，丙三。', source_language='ja', target_language='简体中文')
+        self.assertEqual(result, '完整，连贯的译文，完成。')
+        self.assertEqual(len(client.prompts), 2)
+        for prompt in client.prompts: self.assertIn('甲一，乙二，丙三。', prompt)
+
+    def test_translation_preserves_every_numbered_footnote_in_one_request(self):
+        class Client:
+            def __init__(self): self.prompts = []
+            def chat_text(self, prompt, **kwargs):
+                self.prompts.append(prompt)
+                return '\n'.join(f'{i} 第{i}条脚注全文。\n续行。' for i in range(1, 5))
+        client = Client()
+        source = '\n'.join(f'{i} Full footnote.\nContinuation.' for i in range(1, 5))
+        result = ChatTranslator(client).translate(source, source_language='en', target_language='简体中文')
+        self.assertEqual(len(client.prompts), 1)
+        self.assertIn(source, client.prompts[0])
+        for i in range(1,5): self.assertIn(f'{i} 第{i}条脚注全文。', result)
 
     def test_dotted_numbers_are_not_footnotes_or_strict_labels(self) -> None:
         class RecordingClient:
@@ -212,7 +225,7 @@ class UtilityTests(unittest.TestCase):
                 max_tokens: int = 16384,
             ) -> str:
                 self.prompts.append(prompt)
-                return "这是包含年代和列表编号的译文。"
+                return "这是包含年代.和列表.编号.的译文."
 
         client = RecordingClient()
         translated = ChatTranslator(client).translate(
@@ -221,67 +234,29 @@ class UtilityTests(unittest.TestCase):
             target_language="简体中文",
         )
 
-        self.assertEqual(translated, "这是包含年代和列表编号的译文。")
+        self.assertIn("年代", translated)
+        self.assertEqual(
+            punctuation_signature(translated),
+            punctuation_signature("1853. A year in prose.\n240. A dotted list item."),
+        )
         self.assertEqual(len(client.prompts), 1)
         self.assertNotIn("本分块检测到的行首编号", client.prompts[0])
 
-    def test_parenthesized_number_is_strict_but_year_is_not(self) -> None:
-        class RecordingClient:
-            def __init__(self) -> None:
-                self.prompts: list[str] = []
+    def test_parenthesized_number_is_strict_but_year_is_not(self):
+        class Client:
+            def chat_text(self, prompt, **kwargs): return '(7) 保留编号。\n年代已译。'
+        result = ChatTranslator(Client()).translate('(7) A numbered item.\n(1853) A bibliographic year.', source_language='en', target_language='简体中文')
+        self.assertIn('(7)', result)
 
-            def chat_text(
-                self,
-                prompt: str,
-                *,
-                system: str,
-                max_tokens: int = 16384,
-            ) -> str:
+    def test_numbered_item_retained_without_splitting_indented_volume(self):
+        class Client:
+            def __init__(self): self.prompts = []
+            def chat_text(self, prompt, **kwargs):
                 self.prompts.append(prompt)
-                return "(7) 保留的编号条目。\n年代出处已翻译。"
-
-        client = RecordingClient()
-        ChatTranslator(client).translate(
-            "(7) A parenthesized numbered item.\n(1853) A bibliographic year.",
-            source_language="en",
-            target_language="简体中文",
-        )
-
-        self.assertEqual(len(client.prompts), 2)
-        self.assertIn("必须逐项原样保留）：7。", client.prompts[0])
-        self.assertNotIn("本分块检测到的行首编号", client.prompts[1])
-
-    def test_numbered_item_isolated_but_indented_volume_is_not_strict(self) -> None:
-        class RecordingClient:
-            def __init__(self) -> None:
-                self.prompts: list[str] = []
-
-            def chat_text(
-                self,
-                prompt: str,
-                *,
-                system: str,
-                max_tokens: int = 16384,
-            ) -> str:
-                self.prompts.append(prompt)
-                source = prompt.split("\n原文：\n", 1)[1]
-                if source.startswith("(2) "):
-                    return "(2) 第二项。"
-                return "译文。"
-
-        client = RecordingClient()
-        ChatTranslator(client).translate(
-            "Introductory prose.\n"
-            "(2) Second enumerated body item.\n\n"
-            "2016. The International Encyclopedia (Volume\n"
-            "     2) (Malden: Wiley-Blackwell)",
-            source_language="en",
-            target_language="简体中文",
-        )
-
-        self.assertEqual(len(client.prompts), 2)
-        self.assertIn("必须逐项原样保留）：2", client.prompts[1])
-        self.assertNotIn("必须逐项原样保留）：2、2", client.prompts[1])
+                return '介绍正文。\n(2) 第二项。\n百科全书第二卷。'
+        client = Client()
+        ChatTranslator(client).translate('Introductory prose.\n(2) Second item.\n\n2016. Encyclopedia (Volume\n     2) (Malden: Wiley-Blackwell)', source_language='en', target_language='简体中文')
+        self.assertEqual(len(client.prompts), 1)
 
     def test_translation_rejects_missing_numbered_definition(self) -> None:
         class DroppingClient:
@@ -310,7 +285,7 @@ class UtilityTests(unittest.TestCase):
                 system: str,
                 max_tokens: int = 16384,
             ) -> str:
-                return "全部正文翻译完成。"
+                return "全部正文翻译完成。标记均已翻译。"
 
         # Two-column chronology rows: the ``|`` artifact marks a table page,
         # so stray leading numbers are OCR noise, not omitted footnotes.
@@ -353,7 +328,7 @@ class UtilityTests(unittest.TestCase):
             ) -> str:
                 return "文芸時評、大衆時評をはじめいろいろな時評が、元来輿論の代表者として責めるべきところを。"
 
-        with self.assertRaisesRegex(RuntimeError, "retained Japanese text"):
+        with self.assertRaisesRegex(TranslationQualityError, "untranslated Japanese"):
             ChatTranslator(EchoClient()).translate(
                 "文芸時評、大衆時評をはじめいろいろな時評が、元来輿論の代表者として責めるべきところを。",
                 source_language="ja",
@@ -369,11 +344,11 @@ class UtilityTests(unittest.TestCase):
                 system: str,
                 max_tokens: int = 16384,
             ) -> str:
-                return "在文学上给予基里尔（キイ）最强烈刺激的朋友，是父亲的朋友。"
+                return "在文学上给予基里尔（キイ）最强烈刺激的朋友是父亲的朋友。"
 
         translator = ChatTranslator(GlossClient())
         result = translator.translate(
-            "文学上キリルに最も強い刺激を与へた友は父の友であつた。",
+            "文学上キリル（キイ）に最も強い刺激を与へた友は父の友であつた。",
             source_language="ja",
             target_language="简体中文",
         )
@@ -1350,7 +1325,7 @@ M.E.Sharpe, Inc., 1983.
                 return ""
 
         translator = ChatTranslator(EmptyClient())
-        with self.assertRaisesRegex(RuntimeError, "empty result"):
+        with self.assertRaisesRegex(TranslationQualityError, "empty"):
             translator.translate(
                 "日文の本文です。",
                 source_language="ja",
@@ -1363,14 +1338,14 @@ M.E.Sharpe, Inc., 1983.
                 return "中文已经译好。\n\nLadies and Gentlemen: Humanity is hopeless!"
 
         translator = ChatTranslator(ForeignQuoteClient())
-        with self.assertRaisesRegex(RuntimeError, "foreign-language prose"):
+        with self.assertRaisesRegex(TranslationQualityError, "foreign-language prose"):
             translator.translate(
                 "日本語の本文です。",
                 source_language="ja",
                 target_language="简体中文",
             )
 
-    def test_translation_repairs_only_foreign_residual_paragraphs(self) -> None:
+    def test_translation_repairs_full_paragraph_with_foreign_residual(self) -> None:
         class FocusedRepairClient:
             def __init__(self) -> None:
                 self.requests: list[str] = []
@@ -1379,7 +1354,7 @@ M.E.Sharpe, Inc., 1983.
                 self.requests.append(prompt)
                 if len(self.requests) == 1:
                     return "中文译文保留原文引文。\n\nLadies and Gentlemen: Humanity is hopeless!"
-                return "女士们、先生们：人类毫无希望！"
+                return "中文译文保留原文引文女士们先生们人类毫无希望。"
 
         client = FocusedRepairClient()
         translated = ChatTranslator(client).translate(
@@ -1387,10 +1362,10 @@ M.E.Sharpe, Inc., 1983.
             source_language="ja",
             target_language="简体中文",
         )
-        self.assertEqual(
-            translated,
-            "中文译文保留原文引文。\n\n女士们、先生们：人类毫无希望！",
-        )
+        self.assertIn("中文译文保留原文引文", translated)
+        self.assertIn("女士们先生们人类毫无希望", translated)
+        self.assertNotIn("Ladies", translated)
+        self.assertIn("日文の本文です。", client.requests[1])
         self.assertEqual(len(client.requests), 2)
 
     def test_translation_repairs_invented_ellipsis_from_the_original_chunk(self) -> None:
@@ -1402,7 +1377,7 @@ M.E.Sharpe, Inc., 1983.
                 self.requests.append(prompt)
                 if len(self.requests) == 1:
                     return "这是一段完整的中文……但模型误加省略号。"
-                return "这是一段完整的中文。原文写道：「我并不打算离开这里。」"
+                return "这是一段完整的中文。这里是完整译文。"
 
         client = SourceGroundedClient()
         translated = ChatTranslator(client).translate(
@@ -1419,7 +1394,7 @@ M.E.Sharpe, Inc., 1983.
                 return "源文没有省略的地方……却被译文省略了。"
 
         translator = ChatTranslator(ElidingClient())
-        with self.assertRaisesRegex(RuntimeError, "introduced ellipses"):
+        with self.assertRaisesRegex(TranslationQualityError, "introduced an ellipsis"):
             translator.translate(
                 "日文の本文です。",
                 source_language="ja",
@@ -1428,21 +1403,32 @@ M.E.Sharpe, Inc., 1983.
 
     def test_translation_accepts_equivalent_english_ellipses(self) -> None:
         class QuotingClient:
-            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
-                return "他说……然后她回答……所有原文内容都完整保留。"
+            def __init__(self) -> None:
+                self.system = ""
 
-        translated = ChatTranslator(QuotingClient()).translate(
+            def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+                self.system = system
+                return "他说 . . . 然后她回答 ... 所有原文内容都完整保留."
+
+        client = QuotingClient()
+        translated = ChatTranslator(client).translate(
             "He said . . . then she replied ... All source prose remains intact.",
             source_language="en", target_language="简体中文",
         )
-        self.assertIn("他说……", translated)
+        self.assertTrue(translated.startswith("他说"))
+        self.assertIn("其他标点可按目标语言自然表达", client.system)
+        self.assertNotIn("日语译为中文时", client.system)
+        self.assertEqual(
+            punctuation_signature(translated),
+            punctuation_signature("He said . . . then she replied ... All source prose remains intact."),
+        )
 
     def test_translation_rejects_invented_ascii_ellipses(self) -> None:
         class ElidingClient:
             def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
                 return "源文没有省略的地方...却被译文省略了。"
 
-        with self.assertRaisesRegex(RuntimeError, "introduced ellipses"):
+        with self.assertRaisesRegex(TranslationQualityError, "introduced an ellipsis"):
             ChatTranslator(ElidingClient()).translate(
                 "This complete source has no omitted content.",
                 source_language="en", target_language="简体中文",
@@ -1601,6 +1587,7 @@ M.E.Sharpe, Inc., 1983.
 
     def test_detect_language(self) -> None:
         self.assertEqual(detect_language("这是一本中文书籍，包含足够多的中文文字用于判断。"), "zh")
+        self.assertEqual(detect_language("文学亚・文化化，保留日文中点作为源标点。"), "zh")
         self.assertEqual(detect_language("これは日本語の文章です。日本語として判定されます。"), "ja")
         self.assertEqual(detect_language("This is a sufficiently long English sentence for language detection."), "en")
 
@@ -2094,6 +2081,23 @@ for line in sys.stdin:
 
 
 class MappingAndCompilationTests(unittest.TestCase):
+    def test_draft_source_groups_preserve_complete_cross_page_sentence_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output = Path(folder)
+            records = [PageRecord(1, '从亚文化的'), PageRecord(2, '一侧记录。')]
+            entry = TocEntry('body', '', '正文', 1, 'chapter', 1, pdf_page=1)
+            groups = {1: {'source_pages':[1,2], 'text':'从亚文化的一侧记录。'}}
+            manifest, rows = compile_chapters(Path('source.pdf'), output, records,
+                {'page_offset':0,'entries':[entry.__dict__]}, granularity='chapter', reader_page_groups=groups)
+            body = (output/'chapters'/manifest[0]['filename']).read_text(encoding='utf-8')
+            self.assertEqual(body.count('从亚文化的一侧记录。'), 1)
+            self.assertEqual(records[1].text, '一侧记录。')
+            self.assertEqual(rows[0]['content'], '从亚文化的一侧记录。')
+            with self.assertRaisesRegex(ValueError, 'cannot bypass'):
+                compile_chapters(Path('source.pdf'), output, records,
+                    {'page_offset':0,'entries':[entry.__dict__]}, granularity='chapter',
+                    require_translation=True, reader_page_groups=groups)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

@@ -2085,7 +2085,7 @@ def ingest_source(
 
     gate = language_gate(rows)
     if gate["pending_count"] and not allow_foreign:
-        return {
+        report = {
             "status": "blocked",
             "ok": False,
             "stage": "language_gate",
@@ -2105,6 +2105,11 @@ def ingest_source(
                 ),
             },
         }
+        # Persist the blocked result as well; callers must never lose the
+        # reason an ingestion stopped before corpus publication.
+        from ingestion_quality import write_ingestion_quality_report
+        report["quality_report"] = str(write_ingestion_quality_report(workspace, report, status="blocked"))
+        return report
 
     artifacts = write_corpus(workspace, rows, sidecar)
 
@@ -2191,6 +2196,10 @@ def ingest_source(
             newline="\n",
         )
         report["fidelity_report_path"] = str(fidelity_path)
+    from ingestion_quality import write_ingestion_quality_report
+    report["quality_report"] = str(
+        write_ingestion_quality_report(workspace, report, evidence=(str(report_path),))
+    )
     return report
 
 

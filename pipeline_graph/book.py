@@ -802,14 +802,15 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
         identity = {
             "backend": backend,
             "model": legacy.paddle_local_model_id(
-                det_variant=args.paddle_det_variant,
-                rec_variant=args.paddle_rec_variant,
-                det_mode=args.paddle_det_mode,
-                rec_mode=args.paddle_rec_mode,
-                rec_batch=args.paddle_rec_batch,
-                det_len=args.paddle_det_len,
                 dpi=args.dpi,
                 max_image_side=args.max_image_side,
+                jpeg_quality=args.jpeg_quality,
+                source_pdf_sha256=(
+                    legacy._sha256_file(Path(args.input).expanduser().resolve())
+                    if getattr(args, "input", None)
+                    and Path(args.input).expanduser().is_file()
+                    else ""
+                ),
             ),
             "workers": args.paddle_workers,
         }

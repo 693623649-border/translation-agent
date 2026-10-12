@@ -3,6 +3,20 @@
   "base_url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0",
   "models": [
     {
+      "name": "PP-OCRv6_medium_det",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv6_medium_det_infer.tar",
+      "variant": "v6-medium",
+      "role": "det",
+      "note": "PP-OCRv6 medium 主用检测模型，适用于日文识别"
+    },
+    {
+      "name": "PP-OCRv6_medium_rec",
+      "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv6_medium_rec_infer.tar",
+      "variant": "v6-medium",
+      "role": "rec",
+      "note": "PP-OCRv6 medium 主用识别模型，支持日文"
+    },
+    {
       "name": "PP-OCRv5_server_det",
       "url": "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0/PP-OCRv5_server_det_infer.tar",
       "variant": "server",

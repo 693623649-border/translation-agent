@@ -928,13 +928,14 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         "chapters": audit_chapters,
     }
     _atomic_write_json(output_dir / "chapters.json", manifest)
-    _atomic_write_json(output_dir / "audit" / "semantic-reconstruction.json", audit)
+    audit_path = output_dir / "audit" / "semantic-reconstruction.json"
+    _atomic_write_json(audit_path, audit)
     units_path = output_dir / "semantic" / "translation-units.jsonl"
     _atomic_write_text(
         units_path,
         "".join(json.dumps(unit, ensure_ascii=False) + "\n" for unit in units),
     )
-    return {
+    result = {
         "status": audit["status"],
         "release_blocked": audit["release_blocked"],
         "chapter_count": len(manifest),
@@ -946,8 +947,11 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         "manifest": str((output_dir / "chapters.json").resolve()),
         "chapters": str(chapter_dir.resolve()),
         "translation_units": str(units_path.resolve()),
-        "audit": str((output_dir / "audit" / "semantic-reconstruction.json").resolve()),
+        "audit": str(audit_path.resolve()),
     }
+    from ingestion_quality import write_ingestion_quality_report
+    result["quality_report"] = str(write_ingestion_quality_report(output_dir, result, evidence=(str(audit_path),)))
+    return result
 
 
 def apply_translations(

@@ -6,10 +6,24 @@
 
 | 文件 | 用途 | 维护状态 |
 |---|---|---|
-| `local_paddleocr_import.py` | 渲染 PDF → Docker GPU PaddleOCR 分片识别 → 导入 PageRecord。支持 `--start-page/--end-page` 页范围，作为 `book_pipeline --ocr-backend paddleocr-local` 的执行体 | **活跃**（book_pipeline 内建后端依赖它） |
+| `local_paddleocr_import.py` | 固定 PP-OCRv6 medium 主识别，渲染 PDF、页级缓存、横竖排排序并导入 PageRecord；硬失败/已校准低置信页由 Xiaomi 复识一次。支持 `--start-page/--end-page` 页范围 | **活跃** |
+| `ocr_review.py` | 生成正文人工抽样/异常页核图清单，登记哈希绑定的人类确认，并按人工标注校准阈值；发布报告只接受人工确认 | **活跃** |
 | `summarize_verify_report.py` | 把 `word-release-report.json`/`release-report.json` 折叠成一行结论 + 失败代码 | 活跃 |
 | `note_reflow.py` | 章节注释重组（论文型 PDF 的注释定义与正文交错导入时用） | 历史，单书适配过 |
 | `repair_epub_footnote_anchors.py` | 修复 EPUB noteref/锚点关系 | 历史 |
+
+扫描 PDF 完成目录与页映射后，用 `ocr_review.py init` 生成正文抽样和异常页清单。人类
+对照 PDF 页图逐页确认；完全一致用 `--matches-image`，有误则通过 `--corrected-text`
+提供整页人工转录。仅这些确认可放行；标注累计达到 10 页后运行 `calibrate`，才会启用
+低置信度和主备 CER 阈值。
+
+规则抽样或模型差异之外的疑点可写入 `audit/ocr-review-suggestions.json`，并绑定源 PDF、模型、页图和 OCR 文本哈希。`init` 会把这些页另加到必审清单；建议只触发人工核图，不构成人工确认。
+
+```bash
+python tools/ocr_review.py init --output-dir outputs/book --source-pdf book.pdf
+python tools/ocr_review.py confirm --output-dir outputs/book --page 12 --reviewer "姓名" --confirm-page 12 --matches-image
+python tools/ocr_review.py calibrate --output-dir outputs/book
+```
 
 ## 宿主插件（tools/*_plugin/）
 

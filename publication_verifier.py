@@ -29,6 +29,19 @@ from publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
 )
+from scan_layout import prepare_scan_pages, translation_input_sha256, reader_layout_issues
+from paragraph_translation import untranslated_japanese_paragraphs
+
+from ocr_quality_gate import (
+    ocr_structure_anomalies,
+    comparison_reasons,
+    parse_ocr_notes,
+    punctuation_signature,
+    quotation_signature,
+    read_json_object,
+    review_sample_pages,
+    sha256_text,
+)
 
 try:
     import fcntl
@@ -39,6 +52,7 @@ except ImportError:  # pragma: no cover - Windows compatibility path.
 SCHEMA_VERSION = "1.2"
 CHECK_IDS = (
     "checkpoints.complete",
+    "ocr.human_review",
     "manifest.valid",
     "chapters.files",
     "reviewed.exact",
@@ -51,6 +65,7 @@ CHECK_IDS = (
     "knowledge_base.structure",
     "pdf.bookmarks",
     "runtime.hygiene",
+    "translation.punctuation",
 )
 KB_FIELDS = frozenset({"id", "title", "chapter_id", "chapter_order", "content"})
 DOCX_BOOK_TITLE_STYLES = frozenset({"Title", "Codex Book Title"})
@@ -1002,7 +1017,14 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
                 )
             )
             continue
-        if not isinstance(payload.get("text"), str) or not payload["text"].strip():
+        raw_text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+        human_correction_is_fresh = bool(
+            str(payload.get("proofread_text") or "").strip()
+            and payload.get("proofread_provider") == "human-ocr-review"
+            and payload.get("proofread_source_sha256") == _sha256_text(raw_text)
+            and payload.get("proofread_model")
+        )
+        if not raw_text.strip() and not human_correction_is_fresh:
             issues.append(
                 _issue(
                     "checkpoint_text_empty",
@@ -1087,6 +1109,7 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
     translation_required_pages: list[int] = []
     stale_translation_pages: list[int] = []
     non_chinese_languages = {"ja", "en", "ko", "ru", "other"}
+    prepared_inputs = prepare_scan_pages(list(records.values()))
     for page_number, payload in sorted(records.items()):
         text = str(payload.get("text") or "")
         effective_text = text
@@ -1125,6 +1148,10 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
             != context.expected_translation_fingerprint
         ):
             fresh = False
+        if fresh and str(payload.get("translation_prompt_version") or "").startswith("book-translation-v11-"):
+            fresh = payload.get("translation_input_sha256") == translation_input_sha256(payload, prepared_inputs)
+        if "unreviewed-draft" in str(payload.get("translation_prompt_version") or ""):
+            fresh = False
         if fresh:
             translated_page_count += 1
         else:
@@ -1154,6 +1181,336 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
         },
         issues=issues,
         warnings=warnings,
+    )
+
+
+def _check_ocr_human_review(context: _VerificationContext) -> dict[str, Any]:
+    """Require source-bound human approval for PP-OCRv6 scanned-page releases."""
+
+    pages_dir = context.output_dir / "pages"
+    records: dict[int, dict[str, Any]] = {}
+    for path in pages_dir.glob("page_*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        page = value.get("pdf_page") if isinstance(value, dict) else None
+        if isinstance(page, int):
+            records[page] = value
+    v6_records = {
+        page: item
+        for page, item in records.items()
+        if str(item.get("ocr_model") or "").startswith(
+            "paddleocr-local/PP-OCRv6-medium-"
+        )
+    }
+    if not v6_records:
+        return _result("本书未使用 PP-OCRv6 扫描页 OCR，无需此项人工核图验收。")
+
+    issues: list[dict[str, Any]] = []
+    model_ids = sorted({str(item.get("ocr_model") or "") for item in v6_records.values()})
+    if len(model_ids) != 1:
+        issues.append(
+            _issue(
+                "ocr_primary_model_mixed",
+                "PP-OCRv6 OCR 检查点使用了多个主模型身份。",
+                path=pages_dir,
+                model_ids=model_ids,
+            )
+        )
+    model_id = model_ids[0]
+    if context.source_pdf is None or not context.source_pdf.is_file():
+        return _result(
+            "无法将 OCR 人工验收绑定到源 PDF。",
+            issues=issues
+            + [_issue("ocr_source_pdf_missing", "核图验收要求可读取的源 PDF。", path=context.source_pdf)],
+        )
+    source_hash = _sha256_file(context.source_pdf)
+    if f"src{source_hash}" not in model_id:
+        issues.append(
+            _issue(
+                "ocr_model_source_binding_missing",
+                "PP-OCRv6 主模型身份没有绑定当前源 PDF 哈希，缓存可能来自其他来源。",
+                path=pages_dir,
+                source_pdf_sha256=source_hash,
+                model_id=model_id,
+            )
+        )
+    body_pages: set[int] = set()
+    for item in context.manifest:
+        start = item.get("pdf_page")
+        end = item.get("end_pdf_page") or start
+        if isinstance(start, int) and isinstance(end, int) and start > 0 and end >= start:
+            body_pages.update(range(start, end + 1))
+    body_pages &= set(v6_records)
+    if not body_pages:
+        issues.append(
+            _issue(
+                "ocr_review_body_pages_missing",
+                "章节清单未映射到可核验的 PP-OCRv6 正文页。",
+                path=context.output_dir / "chapters.json",
+            )
+        )
+
+    calibration = read_json_object(context.output_dir / "audit" / "ocr-calibration.json")
+    if (
+        calibration.get("source_pdf_sha256") != source_hash
+        or calibration.get("primary_model_id") != model_id
+    ):
+        calibration = {}
+    confidence_threshold = calibration.get("confidence_threshold")
+    if not isinstance(confidence_threshold, (int, float)) or isinstance(confidence_threshold, bool):
+        confidence_threshold = None
+    disagreement_threshold = calibration.get("disagreement_cer_threshold")
+    if not isinstance(disagreement_threshold, (int, float)) or isinstance(disagreement_threshold, bool):
+        disagreement_threshold = None
+
+    fallback_path = context.output_dir / "audit" / "ocr-fallbacks.json"
+    fallback = read_json_object(fallback_path)
+    fallback_pages: set[int] = set()
+    fallback_attempted = {
+        int(page)
+        for page in fallback.get("attempted_pages", [])
+        if isinstance(page, int) or (isinstance(page, str) and page.isdigit())
+    }
+    if fallback and (
+        fallback.get("source_pdf_sha256") != source_hash
+        or fallback.get("primary_model_id") != model_id
+    ):
+        issues.append(
+            _issue(
+                "ocr_fallback_report_stale",
+                "Xiaomi 复识记录的源 PDF 或主 OCR 身份已过期。",
+                path=fallback_path,
+            )
+        )
+        fallback = {}
+    fallback_by_page = {
+        int(item["pdf_page"]): item
+        for item in fallback.get("pages", [])
+        if isinstance(item, dict) and isinstance(item.get("pdf_page"), int)
+    }
+    for page in body_pages:
+        record = v6_records[page]
+        notes = parse_ocr_notes(record.get("notes"))
+        low_confidence = bool(
+            confidence_threshold is not None
+            and isinstance(notes.get("score_avg"), (int, float))
+            and notes["score_avg"] <= confidence_threshold
+        )
+        hard_failure = notes.get("hard_failure") is True
+        if (hard_failure or low_confidence) and page not in fallback_attempted:
+            issues.append(
+                _issue(
+                    "ocr_fallback_not_attempted",
+                    "硬失败页或已校准低置信页缺少一次 Xiaomi 复识记录。",
+                    path=pages_dir / f"page_{page:04d}.json",
+                    page=page,
+                    hard_failure=hard_failure,
+                    low_confidence=low_confidence,
+                )
+            )
+        item = fallback_by_page.get(page)
+        if item is None:
+            if hard_failure:
+                fallback_pages.add(page)
+            continue
+        if item.get("image_sha256") != notes.get("source_image_sha256"):
+            issues.append(
+                _issue(
+                    "ocr_fallback_image_mismatch",
+                    "复识结果没有绑定到当前 PP-OCRv6 页图。",
+                    path=fallback_path,
+                    page=page,
+                )
+            )
+        primary_text = str(record.get("text") or "")
+        if item.get("primary_text_sha256") != _sha256_text(primary_text):
+            issues.append(
+                _issue(
+                    "ocr_fallback_text_mismatch",
+                    "复识差异报告没有绑定到当前 PP-OCRv6 OCR 文本。",
+                    path=fallback_path,
+                    page=page,
+                )
+            )
+        fallback_text = str(item.get("fallback_text") or "")
+        reasons = list(
+            comparison_reasons(
+                primary_text,
+                fallback_text,
+                cer_threshold=disagreement_threshold,
+                hard_failure=hard_failure,
+            )
+        )
+        if item.get("fallback_error"):
+            reasons.append("fallback_hard_failure")
+        if reasons:
+            fallback_pages.add(page)
+        if reasons and item.get("review_required") is not True:
+            issues.append(
+                _issue(
+                    "ocr_fallback_review_flag_missing",
+                    "应人工核图的主备 OCR 差异未进入复核队列。",
+                    path=fallback_path,
+                    page=page,
+                    reasons=reasons,
+                )
+            )
+
+    sample_pages = review_sample_pages(body_pages, source_sha256=source_hash)
+    suggestions_path = context.output_dir / "audit" / "ocr-review-suggestions.json"
+    suggestions = read_json_object(suggestions_path)
+    additional_review_pages: set[int] = set()
+    if suggestions:
+        if (
+            suggestions.get("source_pdf_sha256") != source_hash
+            or suggestions.get("primary_model_id") != model_id
+        ):
+            issues.append(
+                _issue(
+                    "ocr_review_suggestions_stale",
+                    "额外 OCR 复核建议不再对应当前源 PDF 和主模型。",
+                    path=suggestions_path,
+                )
+            )
+        else:
+            for item in suggestions.get("pages", []):
+                if not isinstance(item, dict) or not isinstance(item.get("pdf_page"), int):
+                    continue
+                page = int(item["pdf_page"])
+                record = v6_records.get(page)
+                notes = parse_ocr_notes(record.get("notes")) if record else {}
+                current_image_hash = str(notes.get("source_image_sha256") or "")
+                current_text_hash = _sha256_text(str(record.get("text") or "")) if record else ""
+                if (
+                    page not in body_pages
+                    or item.get("image_sha256") != current_image_hash
+                    or item.get("ocr_text_sha256") != current_text_hash
+                ):
+                    issues.append(
+                        _issue(
+                            "ocr_review_suggestion_binding_stale",
+                            "额外 OCR 复核建议未绑定到当前页图和 OCR 文本。",
+                            path=suggestions_path,
+                            page=page,
+                        )
+                    )
+                    continue
+                additional_review_pages.add(page)
+    prepared = prepare_scan_pages(list(v6_records.values()))
+    additional_review_pages.update(ocr_structure_anomalies({page: prepared[page]["text"] for page in body_pages}))
+    required_pages = sorted(set(sample_pages) | fallback_pages | additional_review_pages)
+    review_path = context.output_dir / "audit" / "ocr-human-review.json"
+    review = read_json_object(review_path)
+    if not review:
+        issues.append(
+            _issue(
+                "ocr_human_review_missing",
+                "缺少人类逐页核图确认记录；代理检查或 DeepSeek 结果不能替代人工证据。",
+                path=review_path,
+                required_pages=required_pages,
+            )
+        )
+        reviews_by_page: dict[int, dict[str, Any]] = {}
+    else:
+        reviews_by_page = {
+            int(item["pdf_page"]): item
+            for item in review.get("human_reviews", [])
+            if isinstance(item, dict) and isinstance(item.get("pdf_page"), int)
+        }
+        if review.get("source_pdf_sha256") != source_hash or review.get("primary_model_id") != model_id:
+            issues.append(
+                _issue(
+                    "ocr_human_review_stale",
+                    "人工核图记录不再对应当前源 PDF 和 PP-OCRv6 模型。",
+                    path=review_path,
+                )
+            )
+        if review.get("sample_pages") != sample_pages:
+            issues.append(
+                _issue(
+                    "ocr_human_sample_mismatch",
+                    "人工核图抽样页与发布器按正文页数计算的样本不一致。",
+                    path=review_path,
+                    expected=sample_pages,
+                    actual=review.get("sample_pages"),
+                )
+            )
+        if review.get("additional_review_pages", []) != sorted(additional_review_pages):
+            issues.append(
+                _issue(
+                    "ocr_human_additional_review_mismatch",
+                    "人工核图计划未包含当前所有额外 OCR 复核建议。",
+                    path=review_path,
+                    expected=sorted(additional_review_pages),
+                    actual=review.get("additional_review_pages", []),
+                )
+            )
+
+    pending: list[int] = []
+    for page in required_pages:
+        record = v6_records.get(page)
+        review_item = reviews_by_page.get(page)
+        if record is None or review_item is None:
+            pending.append(page)
+            continue
+        notes = parse_ocr_notes(record.get("notes"))
+        raw_text = str(record.get("text") or "")
+        image_hash = str(notes.get("source_image_sha256") or "")
+        valid = (
+            review_item.get("confirmed") is True
+            and bool(str(review_item.get("reviewer") or "").strip())
+            and review_item.get("source_pdf_sha256") == source_hash
+            and review_item.get("image_sha256") == image_hash
+            and review_item.get("ocr_text_sha256") == _sha256_text(raw_text)
+            and isinstance(review_item.get("matches_image"), bool)
+        )
+        try:
+            dt.datetime.fromisoformat(str(review_item.get("reviewed_at") or ""))
+        except ValueError:
+            valid = False
+        if review_item.get("matches_image") is False:
+            correction = str(review_item.get("corrected_text") or "")
+            valid = bool(
+                valid
+                and correction.strip()
+                and review_item.get("corrected_text_sha256") == _sha256_text(correction.strip())
+                and record.get("proofread_provider") == "human-ocr-review"
+                and record.get("proofread_model") == review_item.get("reviewer")
+                and record.get("proofread_source_sha256") == _sha256_text(raw_text)
+                and record.get("proofread_text") == correction.strip()
+            )
+        elif not raw_text.strip():
+            valid = False
+        if not valid:
+            pending.append(page)
+    if pending:
+        issues.append(
+            _issue(
+                "ocr_human_review_pending_or_stale",
+                "必需正文页尚未由人类完成与当前页图及 OCR 文本哈希绑定的核验。",
+                path=review_path,
+                pages=pending,
+                sample_pages=sample_pages,
+                fallback_review_pages=sorted(fallback_pages),
+            )
+        )
+    return _result(
+        "PP-OCRv6 正文页的抽样和所有异常页均有当前人工核图记录。"
+        if not issues
+        else "PP-OCRv6 正文 OCR 尚未满足人工核图发布门。",
+        metrics={
+            "body_page_count": len(body_pages),
+            "sample_page_count": len(sample_pages),
+            "sample_pages": sample_pages,
+            "fallback_review_pages": sorted(fallback_pages),
+            "additional_review_pages": sorted(additional_review_pages),
+            "required_review_pages": required_pages,
+            "confirmed_review_count": len(required_pages) - len(pending),
+            "calibration_available": bool(calibration),
+        },
+        issues=issues,
     )
 
 
@@ -2065,6 +2422,20 @@ def _check_content_hygiene(context: _VerificationContext) -> dict[str, Any]:
     issues: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     suspicious_english_count = 0
+    page_records = []
+    for page_path in sorted((context.output_dir / 'pages').glob('page_*.json')):
+        try:
+            record = json.loads(page_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue  # checkpoint validity is checked separately
+        if isinstance(record, dict):
+            page_records.append(record)
+    ranges = {str(item['id']): (item['pdf_page'], item['end_pdf_page']) for item in context.selected
+              if isinstance(item.get('pdf_page'), int) and isinstance(item.get('end_pdf_page'), int)}
+    layout_issues = reader_layout_issues(page_records, context.chapter_texts, ranges)
+    for item in layout_issues:
+        issues.append(_issue(item['code'], '原书页眉、页脚或页码碎片进入读者正文，须按源图结构分离后重建。',
+                             chapter_id=item['chapter_id'], text=item['text']))
     for item in context.selected:
         chapter_id = str(item.get("id") or "")
         text = context.chapter_texts.get(chapter_id)
@@ -2092,6 +2463,7 @@ def _check_content_hygiene(context: _VerificationContext) -> dict[str, Any]:
         metrics={
             "checked_chapter_count": len(context.chapter_texts),
             "suspicious_english_paragraph_count": suspicious_english_count,
+            "reader_header_footer_issue_count": len(layout_issues),
         },
         issues=issues,
         warnings=warnings,
@@ -3984,11 +4356,13 @@ def _check_knowledge_base_chinese(context: _VerificationContext) -> dict[str, An
             continue
         chunk_count += 1
         verdict = classify_row(str(row.get("title") or ""), str(row.get("content") or ""))
-        if verdict["needs_translation"]:
+        japanese_residue = (verdict["reason"] != "reference_material" and
+                            bool(untranslated_japanese_paragraphs(str(row.get("content") or ""))))
+        if verdict["needs_translation"] or japanese_residue:
             pending.append({
                 "line": line_number,
                 "title": str(row.get("title") or ""),
-                "language": verdict["language"],
+                "language": "ja" if japanese_residue else verdict["language"],
             })
         else:
             reason = verdict["reason"]
@@ -4090,7 +4464,7 @@ def _check_docx_chinese(context: _VerificationContext) -> dict[str, Any]:
             reference_exempt_count += 1
             continue
         paragraph_count += 1
-        if needs_translation(text):
+        if needs_translation(text) or untranslated_japanese_paragraphs(text):
             pending_count += 1
             if len(pending_samples) < 5:
                 pending_samples.append(text[:60])
@@ -4170,6 +4544,15 @@ def _check_translation_ellipsis(context: _VerificationContext) -> dict[str, Any]
         if not isinstance(record, dict):
             continue
         source = str(record.get("text") or "")
+        proofread = str(record.get("proofread_text") or "")
+        if (
+            proofread.strip()
+            and record.get("proofread_source_sha256") == _sha256_text(source)
+            and record.get("proofread_provider")
+            and record.get("proofread_model")
+            and record.get("proofread_language")
+        ):
+            source = proofread
         target = str(record.get("translated_text") or "")
         if len(source.strip()) < 30 or not target.strip():
             continue
@@ -4230,6 +4613,136 @@ def _check_translation_ellipsis(context: _VerificationContext) -> dict[str, Any]
             "invented_ellipsis_pairs": excess_total,
             "pages_with_doubt_markers": len({item["pdf_page"] for item in marker_hits}),
         },
+        issues=issues,
+    )
+
+
+def _check_translation_punctuation(context: _VerificationContext) -> dict[str, Any]:
+    """Check quotation glyphs independently; legacy segmented output cannot release."""
+
+    pages_dir = context.output_dir / "pages"
+    if not pages_dir.is_dir():
+        return _result("没有逐页翻译检查点；跳过源文标点核验。")
+    layout_records = []
+    for layout_path in sorted(pages_dir.glob("page_*.json")):
+        item = read_json_object(layout_path)
+        if item:
+            layout_records.append(item)
+    prepared = prepare_scan_pages(layout_records)
+    records_by_page = {
+        int(item["pdf_page"]): item
+        for item in layout_records
+        if isinstance(item.get("pdf_page"), int)
+    }
+
+    def is_japanese_source(source_record: dict[str, Any]) -> bool:
+        notes = parse_ocr_notes(source_record.get("notes"))
+        language = str(source_record.get("language") or notes.get("source_language") or "").casefold()
+        model = str(source_record.get("ocr_model") or "")
+        return (
+            language in {"ja", "jp", "jpn", "japanese", "日语", "日文"}
+            or notes.get("reading_direction") == "vertical"
+            or "-vertical" in model
+        )
+
+    def signature(text: str, source_record: dict[str, Any]) -> tuple[str, ...]:
+        return punctuation_signature(text) if is_japanese_source(source_record) else quotation_signature(text)
+
+    offenders: list[dict[str, Any]] = []
+    pages_checked = 0
+    for path in sorted(pages_dir.glob("page_*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        if not str(record.get("ocr_model") or "").startswith(
+            "paddleocr-local/PP-OCRv6-medium-"
+        ):
+            continue
+        source = str(record.get("text") or "")
+        proofread = str(record.get("proofread_text") or "")
+        if (
+            proofread.strip()
+            and record.get("proofread_source_sha256") == _sha256_text(source)
+            and record.get("proofread_provider")
+            and record.get("proofread_model")
+            and record.get("proofread_language")
+        ):
+            source = proofread
+        target = str(record.get("translated_text") or "")
+        target_language = str(record.get("translation_target_language") or "").casefold()
+        if (
+            not source.strip()
+            or not target.strip()
+            or target_language not in {"简体中文", "zh-cn", "zh_cn"}
+            or record.get("translation_source_sha256") != _sha256_text(source)
+        ):
+            continue
+        source_record = records_by_page.get(record.get("pdf_page"), record)
+        expected = signature(prepared.get(record.get("pdf_page"), {}).get("text", source), source_record)
+        actual = signature(target, source_record)
+        pages_checked += 1
+        if expected != actual or record.get("translation_prompt_version") == "book-translation-v10-adaptive-punctuation-segments":
+            mismatch = next(
+                (
+                    index
+                    for index in range(max(len(expected), len(actual)))
+                    if index >= len(expected)
+                    or index >= len(actual)
+                    or expected[index] != actual[index]
+                ),
+                None,
+            )
+            offenders.append(
+                {
+                    "pdf_page": record.get("pdf_page"),
+                    "source_punctuation_count": len(expected),
+                    "translation_punctuation_count": len(actual),
+                    "first_mismatch_index": mismatch,
+                }
+            )
+    group_offenders = []
+    groups_checked = 0
+    group_path = context.output_dir / 'audit/reader-page-groups.json'
+    for group in read_json_object(group_path).values():
+        if not isinstance(group, dict):
+            continue
+        pages = group.get('source_pages', [])
+        if not pages or any(page not in prepared for page in pages):
+            group_offenders.append({'pages':pages, 'reason':'source_missing'})
+            continue
+        groups_checked += 1
+        japanese_group = any(
+            is_japanese_source(records_by_page.get(page, {}))
+            for page in pages
+        )
+        group_signature = punctuation_signature if japanese_group else quotation_signature
+        expected = group_signature(''.join(prepared[p]['text'] for p in pages))
+        if expected != group_signature(str(group.get('text') or '')):
+            group_offenders.append({'pages':pages, 'reason':'quotation_glyph_order_or_count'})
+    issues = []
+    if group_offenders:
+        issues.append(_issue('reader_group_punctuation_mismatch',
+            '实际跨页联译稿的标点字形、顺序或数量与源正文不一致，须核图校订；不能只用旧检查点推定新稿通过。',
+            path=group_path, affected_groups=len(group_offenders), samples=group_offenders))
+    if offenders:
+        issues.append(
+            _issue(
+                "translation_source_punctuation_mismatch",
+                "中文页译文改变了源文标点，或仍使用已废弃的标点碎片翻译。",
+                path=pages_dir,
+                affected_pages=len(offenders),
+                samples=offenders[:12],
+            )
+        )
+    return _result(
+        "中文页译文保留了源文标点字形与顺序。"
+        if not issues
+        else "中文页译文的源文标点核验失败。",
+        metrics={"pages_checked": pages_checked, "pages_with_mismatch": len(offenders),
+                 'reader_groups_checked':groups_checked, 'reader_groups_with_mismatch':len(group_offenders)},
         issues=issues,
     )
 
@@ -4707,6 +5220,7 @@ def verify_publication(
 
     full_checks: tuple[tuple[str, bool, Callable[[_VerificationContext], dict[str, Any]]], ...] = (
         ("checkpoints.complete", True, _check_checkpoints),
+        ("ocr.human_review", True, _check_ocr_human_review),
         ("epub.structure", require_epub, _check_epub),
         ("docx.structure", require_docx, _check_docx),
         (
@@ -4718,6 +5232,7 @@ def verify_publication(
         ("knowledge_base.chinese", require_knowledge_base, _check_knowledge_base_chinese),
         ("docx.chinese", require_docx, _check_docx_chinese),
         ("translation.ellipsis", True, _check_translation_ellipsis),
+        ("translation.punctuation", True, _check_translation_punctuation),
         ("pdf.bookmarks", require_bookmarked_pdf, _check_pdf),
         ("runtime.hygiene", True, _check_runtime_hygiene),
     )
@@ -4758,6 +5273,7 @@ def verify_publication(
             # A Word-only recipe publishes targets that carry no page layer at
             # all, so the anti-elision gate has nothing to compare against.
             "translation.ellipsis",
+            "translation.punctuation",
             "pdf.bookmarks",
         }
         if publication_profile == "word"
@@ -4828,6 +5344,12 @@ def verify_publication(
         ),
         "pdf_bookmarks": metric("pdf.bookmarks", "bookmark_count"),
     }
+    source_digest = None
+    if source_path is not None and source_path.is_file():
+        try:
+            source_digest = _sha256_file(source_path)
+        except OSError:
+            pass  # source/readability checks own the failure; do not suppress the QC report
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": status,
@@ -4837,6 +5359,7 @@ def verify_publication(
         "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "output_dir": str(output_path),
         "source_pdf": str(source_path) if source_path is not None else None,
+        "source_sha256": source_digest,
         "book_title": (
             book_title
             or context.artifact_titles.get("epub")
@@ -4887,6 +5410,49 @@ def verify_publication(
         report["metrics"]["check_count"] = len(report["checks"])
         report["metrics"]["failed_check_count"] = report["summary"]["failed"]
         report["metrics"]["error_count"] = len(report["errors"])
+    # Keep the machine-readable verifier report as the source of truth and
+    # emit a small human-readable summary for every direct verifier caller
+    # (including book_pipeline and the vertical-Japanese plugin).  Incremental
+    # chapter reports use a separate filename so they cannot replace the
+    # whole-book quality report.
+    try:
+        from ingestion_quality import write_ingestion_quality_report
+
+        quality_path = write_ingestion_quality_report(
+            output_path,
+            report,
+            evidence=(str(destination),),
+        )
+        report["quality_report_path"] = str(quality_path)
+    except Exception as exc:
+        issue = _issue(
+            "quality_report_write_failed",
+            f"{type(exc).__name__}: {exc}",
+            path=output_path / "audit" / "quality-report.md",
+        )
+        exceptional = {
+            "id": "report.write",
+            "status": "failed",
+            "summary": "人类可读入库质检报告写入失败。",
+            "metrics": {},
+            "issues": [issue],
+            "warnings": [],
+        }
+        report.setdefault("checks", []).append(exceptional)
+        report.setdefault("errors", []).append({"check_id": "report.write", **issue})
+        report["status"] = "failed"
+        report["ok"] = False
+        report["release_ready"] = False
+        report.setdefault("summary", {})["failed"] = int(report.get("summary", {}).get("failed", 0)) + 1
+        report.setdefault("metrics", {})["check_count"] = len(report["checks"])
+        report["metrics"]["failed_check_count"] = report["summary"]["failed"]
+        report["metrics"]["error_count"] = len(report["errors"])
+        # Preserve the machine-readable evidence even when the human report
+        # cannot be delivered; this is an exceptional verifier failure.
+        try:
+            _write_report(destination, report)
+        except Exception:
+            pass
     return report
 
 

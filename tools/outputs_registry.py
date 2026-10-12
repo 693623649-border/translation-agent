@@ -53,7 +53,7 @@ def _kb_status(book: Path) -> dict:
 
 def _report_status(book: Path) -> dict:
     payload: dict = {}
-    for name in ("word-release-report.json", "release-report.json"):
+    for name in ("word-release-report.json", "release-report.json", "draft-verification.json"):
         report = book / "audit" / name
         if not report.is_file():
             continue
@@ -123,6 +123,8 @@ def _book_entry(book: Path) -> dict:
         "knowledge_base": _kb_status(book),
         "publication": _report_status(book),
         "source": _source_identity(book),
+        "quality_report": ("audit/quality-report.md"
+                           if (book / "audit" / "quality-report.md").is_file() else None),
     }
 
 
@@ -133,8 +135,8 @@ def _markdown(entries: list[dict]) -> str:
         f"生成时间：{datetime.now(timezone.utc).isoformat(timespec='seconds')}（UTC）",
         "重新生成：`python tools/outputs_registry.py`。",
         "",
-        "| 书 | 章 | OCR页 | 交付物 | 知识库 | 发布门 | 来源 |",
-        "|---|---|---|---|---|---|---|",
+        "| 书 | 章 | OCR页 | 交付物 | 知识库 | 发布门 | 质检报告 | 来源 |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for entry in entries:
         kb = entry["knowledge_base"]
@@ -166,12 +168,14 @@ def _markdown(entries: list[dict]) -> str:
         src_text = src.get("source_mode") or "EPUB/外部"
         chapter_count = entry.get("chapter_count")
         ocr_pages = entry.get("ocr_page_checkpoints")
+        quality_report = "有" if entry.get("quality_report") else "无"
         lines.append(
             f"| {entry['name'][:38]} | {chapter_count if chapter_count is not None else '-'} "
             f"| {ocr_pages if ocr_pages is not None else '-'} "
             f"| {', '.join(entry['deliverables'])[:42] or '-'} "
             f"| {', '.join(kb_text)} "
             f"| {pub_text} "
+            f"| {quality_report} "
             f"| {src_text} |"
         )
     lines.append("")

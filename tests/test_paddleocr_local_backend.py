@@ -41,36 +41,26 @@ def _record(page: int, model: str) -> PageRecord:
 
 
 class PaddleOcrLocalBackendTests(unittest.TestCase):
-    def test_model_id_is_stable_and_variant_sensitive(self) -> None:
-        common = dict(
-            det_variant="server",
-            rec_variant="server",
-            det_mode="paddle_fp32",
-            rec_mode="paddle_fp16",
-            rec_batch=16,
-            det_len=736,
-            dpi=200,
-            max_image_side=3000,
-        )
+    def test_model_id_binds_source_render_and_reading_direction(self) -> None:
+        common = dict(dpi=200, max_image_side=3000, reading_direction="vertical")
         first = paddle_local_model_id(**common)
         second = paddle_local_model_id(**common)
         self.assertEqual(first, second)
-        self.assertTrue(first.startswith("paddleocr-local/PP-OCRv5-server-det-"))
-        mobile = paddle_local_model_id(**{**common, "det_variant": "mobile"})
-        self.assertNotEqual(first, mobile)
+        self.assertTrue(first.startswith("paddleocr-local/PP-OCRv6-medium-"))
+        source_changed = paddle_local_model_id(**common, source_pdf_sha256="a" * 64)
+        self.assertNotEqual(first, source_changed)
+        direction_changed = paddle_local_model_id(**{**common, "reading_direction": "horizontal"})
+        self.assertNotEqual(first, direction_changed)
         self.assertEqual(
             paddle_local_model_id(**{**common, "dpi": 300}),
             first.replace("dpi200", "dpi300"),
         )
+        self.assertNotEqual(
+            paddle_local_model_id(**{**common, "jpeg_quality": 85}), first
+        )
 
     def test_pending_pages_respect_cache_identity_and_force(self) -> None:
         model = paddle_local_model_id(
-            det_variant="server",
-            rec_variant="server",
-            det_mode="paddle_fp32",
-            rec_mode="paddle_fp16",
-            rec_batch=16,
-            det_len=736,
             dpi=200,
             max_image_side=3000,
         )
@@ -110,12 +100,18 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             thinking="disabled",
         )
         args = _book_parser().parse_args([])
-
         self.assertEqual(
-            resolve_expected_ocr_model_prefix(args, profile), "paddleocr-local/"
+            resolve_expected_ocr_model_prefix(args, profile),
+            "paddleocr-local/PP-OCRv6-medium-",
         )
-        exact = resolve_expected_ocr_model_exact(args, profile)
-        self.assertTrue(exact.startswith("paddleocr-local/PP-OCRv5-server-det-"))
+        self.assertIsNone(resolve_expected_ocr_model_exact(args, profile))
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.pdf"
+            source.write_bytes(b"source pdf identity")
+            args = _book_parser().parse_args([str(source)])
+            exact = resolve_expected_ocr_model_exact(args, profile)
+        self.assertTrue(exact.startswith("paddleocr-local/PP-OCRv6-medium-"))
+        self.assertIn("src", exact)
 
     def test_auto_backend_prefers_local_then_falls_back(self) -> None:
         args = _book_parser().parse_args([])
@@ -135,14 +131,16 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
             self.assertEqual(backend, "paddleocr-local")
             self.assertIn("local", reason)
+        with patch("book_pipeline.paddle_local_available", return_value=True):
+            backend, reason = resolve_ocr_backend_name(args, remote_profile)
+            self.assertEqual(backend, "paddleocr-local")
+            self.assertIn("local", reason)
         with patch("book_pipeline.paddle_local_available", return_value=False):
-            # Cloud fallback is gone: an OCR run fails closed, while
-            # introspection callers assume the local cache identity.
-            with self.assertRaises(ValueError):
+            with self.assertRaisesRegex(ValueError, "Xiaomi cannot replace"):
                 resolve_ocr_backend_name(args, remote_profile, strict=True)
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
             self.assertEqual(backend, "paddleocr-local")
-            self.assertIn("unavailable", reason)
+            self.assertIn("primary OCR cache identity", reason)
         # The CLI itself rejects the removed backends at parse time, so
         # exercise the resolver's rejection with a hand-built namespace.
         removed = argparse.Namespace(ocr_backend="coding-plan-mcp")
@@ -153,6 +151,9 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             backend, reason = resolve_ocr_backend_name(explicit, remote_profile)
             self.assertEqual(backend, "tesseract")
             self.assertEqual(reason, "explicit --ocr-backend")
+        explicit_xiaomi = _book_parser().parse_args(["--ocr-backend", "xiaomi-ocr-local"])
+        with self.assertRaisesRegex(ValueError, "only run once as the scanned-page fallback"):
+            resolve_ocr_backend_name(explicit_xiaomi, remote_profile)
 
     def test_cloud_rerun_protects_local_paddle_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

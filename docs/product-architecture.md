@@ -40,24 +40,26 @@ EPUB-native release profile。因此产品壳不会给 EPUB 草稿签发
 ```mermaid
 flowchart TB
     subgraph IN["① 源接入（显式 Source Adapter）"]
-        SPDF["扫描 PDF"] --> OCRSEL{"--ocr-backend<br/>auto（默认）"}
+        SPDF["扫描 PDF"] --> OCRSEL["PP-OCRv6 medium 主用<br/>横排 / 竖排"]
         TPDF["文本层 PDF"] --> TEXT["PDF 文本层 Graph"]
         EPUBF["EPUB"] --> EIMP["EPUB 语义导入<br/>例：畏怖する人間（36 章 → 70 块）"]
     end
 
     subgraph DK["本机视觉层 · Docker GPU 容器（书页图像不出机器 · 不消耗 API 配额）"]
         IMG["local/paddleocr:3.7.0-gpu<br/>48.3 GB · RTX 5090 D sm_120<br/>paddle 3.3.0-gpu-cuda12.9"]
-        WGT["挂载 deploy/paddleocr/models<br/>PP-OCRv5 server + mobile（193 MB）"]
+        WGT["挂载 deploy/paddleocr/models<br/>PP-OCRv6 medium（138 MB）"]
         IO["挂载 deploy/paddleocr/io<br/>文件式请求 / 结果交换"]
         IMG --- WGT
         IMG --- IO
-        IO --> OCRP["PaddleOCR 竖排/横排推理<br/>例：私小説論（376 页 → 51 块）"]
+        IO --> OCRP["PaddleOCR 页级推理<br/>完整原文 + 页图哈希 + 置信度"]
     end
 
-    OCRSEL -->|"docker 引擎 + 镜像 + 权重齐备"| OCRP
-    OCRP -->|"每段连续页一次 docker run<br/>tools/local_paddleocr_import.py<br/>checkpoint 身份 paddleocr-local/&lt;fingerprint&gt;"| DAG
-    OCRSEL -->|"本地不可用 → fail-closed 报错终止<br/>（云端补页分支已删除）"| STOP["OCR 阶段失败<br/>不发送页图"]
-    OCRSEL -->|"显式离线引擎"| TESS["Tesseract（本地）"]
+    OCRSEL -->|"源 PDF 哈希绑定缓存"| OCRP
+    OCRP -->|"硬失败或已校准低置信页<br/>Xiaomi 最多复识一次"| OQ["主备对比<br/>CER + 标点字形/顺序"]
+    OQ -->|"阈值超标 / 任意标点差异"| HR["人工核图队列<br/>不自动择优或拼接"]
+    OCRP -->|"连续页分段导入<br/>tools/local_paddleocr_import.py"| DAG
+    OCRP -->|"Paddle 不可用 → fail-closed<br/>不发送页图到云端"| STOP["OCR 阶段失败"]
+    OCRSEL -->|"显式离线诊断"| TESS["Tesseract（本地）"]
     TESS --> DAG
 
     DAG["PipelineGraph 执行器<br/>声明输入 · 深度隔离 · 缓存指纹"]
@@ -77,11 +79,12 @@ flowchart TB
     KR --> KBJ["knowledge_base.jsonl<br/>五字段权威语料"]
     KBJ --> RG["RAG 旁车：apparatus / rag.json<br/>vectors（zhipu embedding-3）/ meta"]
 
-    CH --> VF["publication_verifier<br/>发布校验（13 项检查）"]
+    CH --> VF["publication_verifier<br/>版面/中文/知识库质量门"]
     KBJ --> VF
     DO --> VF
     EO --> VF
     PO --> VF
+    HR --> VF
     VF --> LANG1{"★ knowledge_base.chinese<br/>★ docx.chinese"}
     LANG1 -->|"外文正文 → failed"| TRK["translation-agent-kb translate-kb<br/>docx_translation.translate_docx<br/>（含备份与还原）"]
     TRK --> VF

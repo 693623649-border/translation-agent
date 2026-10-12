@@ -22,14 +22,15 @@ class RecordingClient:
 
 class OCRPromptFidelityTests(unittest.TestCase):
     def test_translation_preserves_source_evidence_and_partial_sentences(self):
-        client = RecordingClient("跨页残句（原文缺损）")
         source = "先の列\n次の列（原文缺损）"
+
+        client = RecordingClient("跨页残句（原文缺损）")
         translated = ChatTranslator(client).translate(
             source, source_language="ja", target_language="简体中文"
         )
         self.assertEqual(translated, client.output)
         prompt = client.prompts[0]
-        self.assertEqual(prompt.split("\n原文：\n", 1)[1], source)
+        self.assertIn("<source>\n" + source + "\n</source>", prompt)
         for requirement in (
             "不总结、不删减、不扩写",
             "严格按提供的源文顺序翻译",

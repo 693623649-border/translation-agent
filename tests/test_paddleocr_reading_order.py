@@ -60,6 +60,18 @@ class ReadingOrderTests(unittest.TestCase):
         horizontal = importer._parse_args(['source.pdf', '--output-dir', 'out'])
         vertical = importer._parse_args(['source.pdf', '--output-dir', 'out', '--reading-direction', 'vertical'])
         self.assertNotEqual(importer._model_id(horizontal), importer._model_id(vertical))
+        base = Path('jobs')
+        self.assertNotEqual(
+            importer._range_work_dir(base, horizontal, 1, 10),
+            importer._range_work_dir(base, vertical, 1, 10),
+        )
+        higher_quality = importer._parse_args(
+            ['source.pdf', '--output-dir', 'out', '--jpeg-quality', '95']
+        )
+        self.assertNotEqual(
+            importer._range_work_dir(base, horizontal, 1, 10),
+            importer._range_work_dir(base, higher_quality, 1, 10),
+        )
         expected = importer._expected_manifest(horizontal, {'sha256': 'test'})
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'manifest.json'
