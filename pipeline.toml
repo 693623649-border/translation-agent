@@ -44,11 +44,26 @@ concurrency = 32
 thinking = "enabled"
 reasoning_effort = "max"
 
+# 本地 vLLM 翻译后端（deploy/local-llm/docker-compose.yml）。
+# 切回云端只需把 [pipeline].translation_profile 改回 "deepseek_flash"。
+[profiles.local_hymt2]
+adapter = "openai-chat"
+provider = "local"
+base_url = "http://127.0.0.1:8010/v1"
+model = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
+# vLLM 未以 --api-key 启动时无需真实凭据；缺失时自动使用占位符。
+credential_env = "LOCAL_LLM_API_KEY"
+timeout = 600
+concurrency = 16
+thinking = "omit"
+
 [pipeline]
 ocr_profile = "glm_vision"
 toc_profile = "glm_toc"
-translation_profile = "deepseek_flash"
-# Optional. When omitted, proofreading safely reuses translation_profile.
+# 本分支默认走本地 vLLM（替代分支语义）；原分支保持 deepseek_flash。
+translation_profile = "local_hymt2"
+# OCR 校勘不是翻译：按"只替换翻译阶段"的边界保留在 DeepSeek 上。
+# 若要连校勘也走本地，改回 "local_hymt2" 即可。
 proofread_profile = "deepseek_flash"
 
 [profiles.paddleocr_local]

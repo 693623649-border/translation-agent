@@ -91,6 +91,8 @@ DEFAULT_STANDARD_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 DEFAULT_DEEPSEEK_MAX_EFFORT_OUTPUT_TOKENS = 131072
+DEFAULT_LOCAL_LLM_API_BASE = "http://127.0.0.1:8010/v1"
+DEFAULT_LOCAL_LLM_MODEL = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
 TRANSLATION_PROMPT_VERSION = "book-translation-v11-paragraph-context-v2"
@@ -1003,6 +1005,47 @@ class DeepSeekClient(GlmClient):
 
     def chat_json(self, prompt: str, *, system: str, max_tokens: int | None = None) -> dict[str, Any]:
         return parse_json_response(self._chat(prompt, system=system, max_tokens=max_tokens))
+
+
+class LocalClient(DeepSeekClient):
+    """OpenAI-compatible client for a local vLLM endpoint (deploy/local-llm).
+
+    Reuses the DeepSeek request/retry plumbing, but reports ``provider_name``
+    as ``local`` so cache fingerprints never collide with the cloud DeepSeek
+    profile, and never sends DeepSeek-only payload fields (``thinking`` /
+    ``reasoning_effort``) that strict OpenAI-compatible servers reject.  A
+    credential is accepted for servers started with ``--api-key`` but is not
+    required: callers pass a placeholder when the endpoint is unauthenticated.
+    """
+
+    service_name = "LocalLLM"
+
+    def __init__(
+        self,
+        *,
+        api_key: str = "local",
+        api_base: str = DEFAULT_LOCAL_LLM_API_BASE,
+        text_model: str = DEFAULT_LOCAL_LLM_MODEL,
+        timeout: int = 600,
+        retries: int = 6,
+        thinking: str = "omit",
+        adapter_name: str = "openai-chat",
+        reasoning_effort: str = "",
+    ) -> None:
+        if reasoning_effort and reasoning_effort not in {"none", "low", "high", "max"}:
+            raise ValueError("reasoning_effort must be none, low, high, or max")
+        GlmClient.__init__(
+            self,
+            api_key=api_key,
+            api_base=api_base,
+            text_model=text_model,
+            timeout=timeout,
+            retries=retries,
+            provider_name="local",
+            adapter_name=adapter_name,
+            thinking=thinking,
+        )
+        self.reasoning_effort = reasoning_effort
 
 
 class McpStdioClient:
@@ -6325,9 +6368,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--translate-non-chinese", action="store_true")
     parser.add_argument(
         "--translation-provider",
-        choices=["deepseek", "glm"],
+        choices=["deepseek", "glm", "local"],
         default=os.getenv("TRANSLATION_PROVIDER", "deepseek"),
-        help="Independent text translation provider; OCR and automatic TOC remain on the selected GLM path.",
+        help="Independent text translation provider; OCR and automatic TOC remain on the selected GLM path. 'local' targets the deploy/local-llm vLLM endpoint.",
     )
     parser.add_argument(
         "--translation-api-key",
@@ -6591,7 +6634,17 @@ def build_translation_client(
     glm_api_base: str,
     profile: ModelProfile | None = None,
 ) -> TextChatBackend | None:
+    provider = (
+        profile.provider.strip().lower()
+        if profile is not None
+        else args.translation_provider
+    )
     key = resolve_translation_api_key(args, profile)
+    if provider == "local":
+        # A local vLLM endpoint normally requires no credential, but the HTTP
+        # layer always sends an Authorization header, so fall back to a
+        # placeholder instead of silently skipping the stage.
+        key = key or "local"
     if not key:
         return None
     timeout = int(
@@ -6604,11 +6657,29 @@ def build_translation_client(
             or "120"
         )
     )
-    provider = (
-        profile.provider.strip().lower()
-        if profile is not None
-        else args.translation_provider
-    )
+    if provider == "local":
+        return LocalClient(
+            api_key=key,
+            api_base=(
+                args.translation_api_base
+                or (profile.base_url if profile is not None else "")
+                or os.getenv("LOCAL_LLM_API_BASE")
+                or DEFAULT_LOCAL_LLM_API_BASE
+            ),
+            text_model=(
+                args.translation_model
+                or (profile.model if profile is not None else "")
+                or os.getenv("LOCAL_LLM_MODEL")
+                or DEFAULT_LOCAL_LLM_MODEL
+            ),
+            timeout=timeout,
+            # Cloud-only knobs stay in the profile identity; never forward
+            # them to a strict OpenAI-compatible server.
+            thinking="omit",
+            reasoning_effort="",
+            adapter_name=(profile.adapter if profile is not None else "openai-chat"),
+            retries=1,
+        )
     if provider == "deepseek":
         return DeepSeekClient(
             api_key=key,
@@ -6687,6 +6758,19 @@ def resolve_translation_identity(
             or (profile.model if profile is not None else "")
             or os.getenv("DEEPSEEK_MODEL")
             or DEFAULT_DEEPSEEK_MODEL
+        )
+    elif provider == "local":
+        base_url = (
+            args.translation_api_base
+            or (profile.base_url if profile is not None else "")
+            or os.getenv("LOCAL_LLM_API_BASE")
+            or DEFAULT_LOCAL_LLM_API_BASE
+        )
+        model = (
+            args.translation_model
+            or (profile.model if profile is not None else "")
+            or os.getenv("LOCAL_LLM_MODEL")
+            or DEFAULT_LOCAL_LLM_MODEL
         )
     else:
         base_url = (

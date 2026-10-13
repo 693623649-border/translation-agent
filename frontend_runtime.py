@@ -680,6 +680,7 @@ def _run_epub_workflow(spec: RunSpec) -> str | None:
     from semantic_translation_runner import _deepseek_request, load_glossary, translate_units
     from pipeline_profiles import load_pipeline_profiles
     from translation_agent_api import run_graph
+    from book_pipeline import DEFAULT_LOCAL_LLM_API_BASE
 
     output = Path(spec.output_dir).resolve()
     if spec.verify:
@@ -697,17 +698,23 @@ def _run_epub_workflow(spec: RunSpec) -> str | None:
         profile = load_pipeline_profiles(spec.config).for_stage(
             "translation", options.get("translation_profile")
         )
+        provider = (profile.provider or "deepseek").strip().lower()
         credential = os.getenv(profile.credential_env or "", "")
-        if not credential:
+        if not credential and provider != "local":
             raise RuntimeError(
                 f"missing credential environment variable: {profile.credential_env}"
             )
+        base_url = (
+            profile.base_url
+            or (DEFAULT_LOCAL_LLM_API_BASE if provider == "local" else "https://api.deepseek.com")
+        )
         request = _deepseek_request(
-            api_key=credential,
-            base_url=profile.base_url or "https://api.deepseek.com",
+            api_key=credential or "local",
+            base_url=base_url,
             model=profile.model,
             timeout=profile.timeout,
-            thinking=profile.thinking,
+            # Local OpenAI-compatible servers reject DeepSeek-only fields.
+            thinking="omit" if provider == "local" else profile.thinking,
         )
         translations = output / "semantic" / "translations.jsonl"
         glossary_value = options.get("glossary")
@@ -719,7 +726,7 @@ def _run_epub_workflow(spec: RunSpec) -> str | None:
             glossary=glossary,
             model=profile.model,
             provider=profile.provider,
-            base_url=profile.base_url or "https://api.deepseek.com",
+            base_url=base_url,
             prompt_profile=profile.name,
             thinking=profile.thinking,
             cache_dir=output / ".translation_cache",

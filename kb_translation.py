@@ -123,6 +123,10 @@ _SYSTEM_PROMPT = (
     "只输出段落与标记，不要任何解释或代码围栏。"
 )
 
+# Kept in lockstep with book_pipeline.DEFAULT_LOCAL_LLM_* (deploy/local-llm).
+LOCAL_LLM_API_BASE = "http://127.0.0.1:8010/v1"
+LOCAL_LLM_MODEL = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
+
 
 class KbTranslationError(ValueError):
     """The translation step could not produce a trustworthy 1:1 mapping."""
@@ -141,6 +145,8 @@ class DeepSeekTranslator:
     """OpenAI-compatible chat completions client, mirroring the embedding adapter."""
 
     provider_name = "deepseek"
+    # Cloud endpoints require a real credential; a local vLLM endpoint does not.
+    require_credential = True
 
     def __init__(
         self,
@@ -168,9 +174,11 @@ class DeepSeekTranslator:
     def translate(self, prompt: str) -> str:
         api_key = os.getenv(self.api_key_env, "").strip()
         if not api_key:
-            raise KbTranslationError(
-                f"Missing translation API key; set the {self.api_key_env} environment variable"
-            )
+            if self.require_credential:
+                raise KbTranslationError(
+                    f"Missing translation API key; set the {self.api_key_env} environment variable"
+                )
+            api_key = "local"
         payload = {
             "model": self.model,
             "temperature": 0.0,
@@ -205,6 +213,38 @@ class DeepSeekTranslator:
         if not isinstance(value, str) or not value.strip():
             raise KbTranslationError(f"{self.provider_name} returned empty content")
         return value
+
+
+class LocalTranslator(DeepSeekTranslator):
+    """OpenAI-compatible client for a local vLLM endpoint (deploy/local-llm).
+
+    Same request shape as :class:`DeepSeekTranslator` minus the cloud-only
+    ``thinking`` payload field: local OpenAI-compatible servers reject it, so
+    the constructor pins the "don't send" sentinel ("default" in this module).
+    No credential is required unless the server was started with ``--api-key``.
+    """
+
+    provider_name = "local"
+    require_credential = False
+
+    def __init__(
+        self,
+        *,
+        api_key_env: str = "LOCAL_LLM_API_KEY",
+        base_url: str = LOCAL_LLM_API_BASE,
+        model: str = LOCAL_LLM_MODEL,
+        timeout: int = 600,
+        thinking: str = "default",
+    ) -> None:
+        super().__init__(
+            api_key_env=api_key_env,
+            base_url=base_url,
+            model=model,
+            timeout=timeout,
+            # Never forward the DeepSeek-only thinking field to a strict
+            # OpenAI-compatible server.
+            thinking="default",
+        )
 
 
 def _prose_mass(text: str) -> int:

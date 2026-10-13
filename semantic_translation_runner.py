@@ -21,6 +21,9 @@ from semantic_apply import SemanticApplyError, validate_translation_pair
 
 
 RUNNER_VERSION = "semantic-provider-batch-v4"
+# Kept in lockstep with book_pipeline.DEFAULT_LOCAL_LLM_* (deploy/local-llm).
+DEFAULT_LOCAL_LLM_API_BASE = "http://127.0.0.1:8010/v1"
+DEFAULT_LOCAL_LLM_MODEL = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
 TOKEN_PATTERN = re.compile(
     r"\[\^[^\]\s]+\]"
     r"|\[\[[A-Z]+:[^\]]+\]\]"
@@ -450,19 +453,26 @@ def main(argv: list[str] | None = None) -> int:
     load_env_file(Path(args.env_file).expanduser())
     if args.config:
         profile = load_pipeline_profiles(args.config).for_stage("translation", args.translation_profile)
-    model = args.model or (profile.model if profile else "deepseek-v4-flash")
-    base_url = args.api_base or (profile.base_url if profile else "https://api.deepseek.com")
     provider = args.provider or (profile.provider if profile else "deepseek")
+    model = args.model or (profile.model if profile else (DEFAULT_LOCAL_LLM_MODEL if provider == "local" else "deepseek-v4-flash"))
+    base_url = args.api_base or (profile.base_url if profile else None) or (
+        DEFAULT_LOCAL_LLM_API_BASE if provider == "local" else "https://api.deepseek.com"
+    )
     prompt_profile = args.prompt_profile or (profile.name if profile else RUNNER_VERSION)
     thinking = args.thinking or (profile.thinking if profile else "disabled")
-    credential_env = args.api_key_env or (profile.credential_env if profile else "DEEPSEEK_API_KEY")
+    if provider == "local" and not args.thinking:
+        # Local OpenAI-compatible servers reject the DeepSeek ``thinking`` field.
+        thinking = "omit"
+    credential_env = args.api_key_env or (profile.credential_env if profile else (
+        "LOCAL_LLM_API_KEY" if provider == "local" else "DEEPSEEK_API_KEY"
+    ))
     concurrency = args.concurrency or (profile.concurrency if profile else 16)
     request = None
     if args.command == "run":
         api_key = os.getenv(credential_env, "")
-        if not api_key:
+        if not api_key and provider != "local":
             raise SystemExit(f"missing credential environment variable: {credential_env}")
-        request = _deepseek_request(api_key=api_key, base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=thinking, temperature=args.temperature)
+        request = _deepseek_request(api_key=api_key or "local", base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=thinking, temperature=args.temperature)
     result = translate_units(
         Path(args.units).expanduser(),
         Path(args.output).expanduser(),

@@ -44,6 +44,18 @@ concurrency = 32
 thinking = "enabled"
 reasoning_effort = "max"
 
+# 可选：本地 vLLM 翻译后端（deploy/local-llm/docker-compose.yml）。
+# 启用方式：把 [pipeline].translation_profile / proofread_profile 改为 "local_hymt2"。
+[profiles.local_hymt2]
+adapter = "openai-chat"
+provider = "local"
+base_url = "http://127.0.0.1:8010/v1"
+model = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
+credential_env = "LOCAL_LLM_API_KEY"
+timeout = 600
+concurrency = 16
+thinking = "omit"
+
 [pipeline]
 ocr_profile = "glm_vision"
 toc_profile = "glm_toc"

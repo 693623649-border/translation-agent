@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 from collections.abc import Sequence
@@ -11,6 +12,8 @@ from typing import Any, TextIO
 
 from book_pipeline import (
     DEFAULT_DEEPSEEK_MODEL as DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_LOCAL_LLM_API_BASE,
+    DEFAULT_LOCAL_LLM_MODEL,
     load_env_file,
     split_text,
     write_knowledge_base,
@@ -348,7 +351,7 @@ def _command_annotate_apparatus(args: argparse.Namespace, stdout: TextIO) -> int
 
 
 def _command_translate_kb(args: argparse.Namespace, stdout: TextIO) -> int:
-    from kb_translation import DeepSeekTranslator, normalise_corpus_file
+    from kb_translation import DeepSeekTranslator, LocalTranslator, normalise_corpus_file
 
     root = Path(args.path).expanduser().resolve()
     paths = (
@@ -358,11 +361,20 @@ def _command_translate_kb(args: argparse.Namespace, stdout: TextIO) -> int:
     )
     if not paths:
         raise ValueError("No knowledge bases found")
-    translator = None if args.dry_run else DeepSeekTranslator(
-        api_key_env=args.api_key_env,
-        base_url=args.api_base,
-        model=args.model,
-    )
+    if args.dry_run:
+        translator = None
+    elif args.provider == "local":
+        translator = LocalTranslator(
+            api_key_env=args.api_key_env or "LOCAL_LLM_API_KEY",
+            base_url=args.api_base or DEFAULT_LOCAL_LLM_API_BASE,
+            model=args.model or DEFAULT_LOCAL_LLM_MODEL,
+        )
+    else:
+        translator = DeepSeekTranslator(
+            api_key_env=args.api_key_env or "DEEPSEEK_API_KEY",
+            base_url=args.api_base or "https://api.deepseek.com",
+            model=args.model or DEFAULT_TRANSLATION_MODEL,
+        )
     results = [
         normalise_corpus_file(path, translator, batch_chars=args.batch_chars,
                               concurrency=args.concurrency, dry_run=args.dry_run)
@@ -667,14 +679,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Parallel translation requests; lower it when the provider rate-limits",
     )
-    translate_kb.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
-    translate_kb.add_argument("--api-base", default="https://api.deepseek.com")
+    translate_kb.add_argument(
+        "--provider",
+        choices=("deepseek", "local"),
+        default=os.getenv("TRANSLATION_PROVIDER", "deepseek"),
+        help=(
+            "Translation backend: deepseek (cloud API) or local "
+            "(deploy/local-llm vLLM endpoint, no credential required)."
+        ),
+    )
+    translate_kb.add_argument("--api-key-env", default=None,
+                              help="Credential env var (default: DEEPSEEK_API_KEY, or LOCAL_LLM_API_KEY with --provider local)")
+    translate_kb.add_argument("--api-base", default=None,
+                              help="API base URL (default: https://api.deepseek.com, or the local vLLM endpoint with --provider local)")
     # Pinned to the project-wide translation model. ``kb_translation`` and
     # ``book_pipeline`` both default to this value; hardcoding a different name
     # here silently translated the corpus with a model no other translation path
     # uses, and the resulting chunks carried the wrong ``model`` field in their
     # provenance sidecar.
-    translate_kb.add_argument("--model", default=DEFAULT_TRANSLATION_MODEL)
+    translate_kb.add_argument("--model", default=None,
+                              help="Model name (default: project translation model for the selected provider)")
     translate_kb.set_defaults(func=_command_translate_kb)
 
     retrieve = subparsers.add_parser("retrieve", parents=[provider])

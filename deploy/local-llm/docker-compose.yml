@@ -1,0 +1,54 @@
+# 本地翻译模型服务栈（Hy-MT2-30B-A3B INT4 · vLLM）
+# 与 deploy/xiaomi-ocr 同构：权重在宿主机下载到 models/ 后挂载进容器，
+# cache/ 持久化 vLLM 编译缓存（torch.compile / CUDA graph，复跑省启动时间）。
+# 镜像沿用本机已验证的 vllm/vllm-openai:v0.27.1（torch 2.13.0+cu130，RTX 5090 sm_120）。
+# 若 vLLM 报该模型架构不支持，升级 tag 为更新版本即可（模型仓库与镜像解耦）。
+#
+# 用法：
+#   首次下载权重（约 16GB；默认走 hf-mirror，需要代理时先设 HTTPS_PROXY）：
+#     docker compose --profile gpu run --rm download
+#   常驻服务（占约 17GB 显存，剩余留给 PaddleOCR）：
+#     docker compose --profile gpu up -d
+#   验证：
+#     curl http://127.0.0.1:8010/v1/models
+#   停止：
+#     docker compose --profile gpu down
+
+services:
+  download:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:v0.27.1
+    container_name: local-llm-download
+    volumes:
+      - ./models:/workspace/models
+      - ./cache:/root/.cache
+    environment:
+      # 直连 HuggingFace 失败时的镜像站；如仍失败，在宿主机 export HTTPS_PROXY 后重试。
+      - HF_ENDPOINT=https://hf-mirror.com
+    command: >
+      python -c "from huggingface_hub import snapshot_download;
+      snapshot_download('Intel/Hy-MT2-30B-A3B-int4-AutoRound',
+      local_dir='/workspace/models/Hy-MT2-30B-A3B-int4-AutoRound')"
+
+  vllm:
+    profiles: ["gpu"]
+    image: vllm/vllm-openai:v0.27.1
+    container_name: local-llm
+    gpus: all
+    shm_size: "4gb"
+    ports:
+      # 只绑定回环：端点仅限本机流水线访问。
+      - "127.0.0.1:8010:8010"
+    volumes:
+      - ./models:/workspace/models
+      - ./cache:/root/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - VLLM_LOGGING_LEVEL=INFO
+    command: >
+      vllm serve /workspace/models/Hy-MT2-30B-A3B-int4-AutoRound
+      --served-model-name Intel/Hy-MT2-30B-A3B-int4-AutoRound
+      --host 0.0.0.0 --port 8010
+      --max-model-len 32768
+      --gpu-memory-utilization 0.92
+    restart: unless-stopped

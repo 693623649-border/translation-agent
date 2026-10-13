@@ -16,12 +16,20 @@ from book_pipeline import (
 
 
 class PipelineProfileTests(unittest.TestCase):
-    def test_project_flash_profile_returns_visible_translation_content(self) -> None:
+    def test_project_translation_profile_defaults_local_on_this_branch(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "pipeline.toml"
-        translation = load_pipeline_profiles(config_path).for_stage("translation")
+        loaded = load_pipeline_profiles(config_path)
+        translation = loaded.for_stage("translation")
         assert translation is not None
-        self.assertEqual(translation.name, "deepseek_flash")
-        self.assertEqual(translation.thinking, "disabled")
+        # Branch deploy/vllm-translation-rtx5090 defaults translation to the
+        # local vLLM endpoint (deploy/local-llm); the cloud profile stays
+        # available as a one-line fallback.
+        self.assertEqual(translation.name, "local_hymt2")
+        self.assertEqual(translation.provider, "local")
+        self.assertEqual(translation.thinking, "omit")
+        flash = loaded.get("deepseek_flash")
+        self.assertEqual(flash.provider, "deepseek")
+        self.assertEqual(flash.thinking, "enabled")
 
     def test_example_config_defaults_to_deepseek_flash(self) -> None:
         config_path = Path(__file__).resolve().parents[1] / "pipeline.example.toml"
@@ -35,7 +43,8 @@ class PipelineProfileTests(unittest.TestCase):
         )
         translation = loaded.for_stage("translation")
         assert translation is not None
-        self.assertEqual(translation.model, "deepseek-v4-flash")
+        # Kept in lockstep with the committed deepseek_flash model rename.
+        self.assertEqual(translation.model, "deepseek-flash")
         self.assertEqual(loaded.get("deepseek_pro").model, "deepseek-v4-pro")
         self.assertEqual(loaded.schema_version, 1)
 
