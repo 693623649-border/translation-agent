@@ -74,5 +74,7 @@ curl http://127.0.0.1:8010/v1/models
 
 - 单测：`python -m pytest tests/test_local_translation_provider.py -q`
   （payload 兼容层、无凭据可用、身份指纹与云端隔离）。
-- 端到端冒烟：服务起来后用 `book_pipeline` 的真实装配路径翻译一段日文，
-  并确认请求只打到 `127.0.0.1:8010`。
+- 端到端冒烟：服务起来后运行
+  `python deploy/local-llm/smoke_translate.py`——
+  走 `pipeline.toml → build_translation_client → ChatTranslator` 的真实装配路径
+  翻译一段含『』「」的日文，校验 LocalClient、回环端点、中文输出与引号序列。

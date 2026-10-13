@@ -19,16 +19,18 @@ services:
     profiles: ["gpu"]
     image: vllm/vllm-openai:v0.27.1
     container_name: local-llm-download
+    # 镜像 ENTRYPOINT 是 vllm CLI，这里显式覆盖为 bash，避免误入 vllm 参数解析。
+    entrypoint: ["/bin/bash", "-lc"]
     volumes:
       - ./models:/workspace/models
       - ./cache:/root/.cache
     environment:
       # 直连 HuggingFace 失败时的镜像站；如仍失败，在宿主机 export HTTPS_PROXY 后重试。
       - HF_ENDPOINT=https://hf-mirror.com
-    command: >
-      python -c "from huggingface_hub import snapshot_download;
-      snapshot_download('Intel/Hy-MT2-30B-A3B-int4-AutoRound',
-      local_dir='/workspace/models/Hy-MT2-30B-A3B-int4-AutoRound')"
+    command:
+      - >-
+        huggingface-cli download Intel/Hy-MT2-30B-A3B-int4-AutoRound
+        --local-dir /workspace/models/Hy-MT2-30B-A3B-int4-AutoRound
 
   vllm:
     profiles: ["gpu"]
@@ -45,10 +47,12 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - VLLM_LOGGING_LEVEL=INFO
-    command: >
-      vllm serve /workspace/models/Hy-MT2-30B-A3B-int4-AutoRound
-      --served-model-name Intel/Hy-MT2-30B-A3B-int4-AutoRound
-      --host 0.0.0.0 --port 8010
-      --max-model-len 32768
-      --gpu-memory-utilization 0.92
+    entrypoint: ["/bin/bash", "-lc"]
+    command:
+      - >-
+        vllm serve /workspace/models/Hy-MT2-30B-A3B-int4-AutoRound
+        --served-model-name Intel/Hy-MT2-30B-A3B-int4-AutoRound
+        --host 0.0.0.0 --port 8010
+        --max-model-len 32768
+        --gpu-memory-utilization 0.92
     restart: unless-stopped
