@@ -5,9 +5,16 @@ import unittest
 from unittest.mock import patch
 
 import book_pipeline as b
-from work import critical_tradition_selection_edition as edition
+
+try:
+    from work import critical_tradition_selection_edition as edition
+except ModuleNotFoundError as exc:
+    if exc.name not in {"work", "work.critical_tradition_selection_edition"}:
+        raise
+    edition = None
 
 
+@unittest.skipIf(edition is None, "requires the local, ignored work/ book-repair script")
 class InlineEditorNoteTests(unittest.TestCase):
     def convert(self, page, text, count):
         record = b.PageRecord(page, ({110: "Aeschylus, Oreithia. ", 103: "Choerilus ", 191: "1665 "}.get(page, "")) + "Source note. [Ed.] " * count, translated_text=text)
