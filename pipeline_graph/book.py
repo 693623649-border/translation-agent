@@ -737,6 +737,11 @@ def _profile_model_semantics(profile: Any) -> dict[str, Any] | None:
         "base_url": _safe_endpoint(profile.base_url),
         "model": profile.model,
         "thinking": profile.thinking,
+        **(
+            {"reasoning_effort": profile.reasoning_effort}
+            if profile.reasoning_effort
+            else {}
+        ),
         # A command can select a different adapter implementation.  Hash it so
         # command contents (which should never contain credentials) are not
         # copied into graph metadata.

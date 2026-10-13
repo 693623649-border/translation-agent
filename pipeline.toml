@@ -39,11 +39,10 @@ provider = "deepseek"
 base_url = "https://api.deepseek.com"
 model = "deepseek-flash"
 credential_env = "DEEPSEEK_API_KEY"
-timeout = 120
+timeout = 600
 concurrency = 32
-# This endpoint returns reasoning separately; enabling reasoning can leave the
-# published message content empty even when the API call succeeds.
-thinking = "disabled"
+thinking = "enabled"
+reasoning_effort = "max"
 
 [pipeline]
 ocr_profile = "glm_vision"

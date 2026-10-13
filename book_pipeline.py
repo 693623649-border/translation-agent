@@ -33,7 +33,7 @@ import ssl
 import xml.etree.ElementTree as ET
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Protocol
@@ -90,6 +90,7 @@ DEFAULT_CODING_API_BASE = "https://open.bigmodel.cn/api/coding/paas/v4"
 DEFAULT_STANDARD_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+DEFAULT_DEEPSEEK_MAX_EFFORT_OUTPUT_TOKENS = 131072
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
 TRANSLATION_PROMPT_VERSION = "book-translation-v11-paragraph-context-v2"
@@ -942,6 +943,7 @@ class DeepSeekClient(GlmClient):
         retries: int = 6,
         thinking: str = "disabled",
         adapter_name: str = "openai-chat",
+        reasoning_effort: str = "",
     ) -> None:
         super().__init__(
             api_key=api_key,
@@ -953,29 +955,53 @@ class DeepSeekClient(GlmClient):
             adapter_name=adapter_name,
             thinking=thinking,
         )
+        if reasoning_effort and reasoning_effort not in {"none", "low", "high", "max"}:
+            raise ValueError("reasoning_effort must be none, low, high, or max")
+        self.reasoning_effort = reasoning_effort
 
-    def _chat(self, prompt: str, *, system: str, max_tokens: int) -> str:
+    def model_identity(
+        self,
+        *,
+        target_language: str,
+        prompt_version: str,
+    ) -> ModelIdentity:
+        identity = super().model_identity(
+            target_language=target_language,
+            prompt_version=prompt_version,
+        )
+        return replace(identity, reasoning_effort=self.reasoning_effort)
+
+    def _chat(self, prompt: str, *, system: str, max_tokens: int | None = None) -> str:
+        output_budget = max_tokens
+        if output_budget is None:
+            output_budget = (
+                DEFAULT_DEEPSEEK_MAX_EFFORT_OUTPUT_TOKENS
+                if self.reasoning_effort == "max"
+                else 16384
+            )
         payload: dict[str, Any] = {
             "model": self.text_model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": max_tokens,
+            "max_tokens": output_budget,
             "temperature": 0.1,
         }
         if self.thinking != "omit":
             payload["thinking"] = {"type": self.thinking}
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         response = self._post("chat/completions", payload)
         try:
             return str(response["choices"][0]["message"]["content"]).strip()
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError("Unexpected DeepSeek chat response.") from exc
 
-    def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
+    def chat_text(self, prompt: str, *, system: str, max_tokens: int | None = None) -> str:
         return self._chat(prompt, system=system, max_tokens=max_tokens)
 
-    def chat_json(self, prompt: str, *, system: str, max_tokens: int = 16384) -> dict[str, Any]:
+    def chat_json(self, prompt: str, *, system: str, max_tokens: int | None = None) -> dict[str, Any]:
         return parse_json_response(self._chat(prompt, system=system, max_tokens=max_tokens))
 
 
@@ -6601,6 +6627,7 @@ def build_translation_client(
             ),
             timeout=timeout,
             thinking=(profile.thinking if profile is not None else "disabled"),
+            reasoning_effort=(profile.reasoning_effort if profile is not None else ""),
             adapter_name=(profile.adapter if profile is not None else "openai-chat"),
             retries=1,
         )
@@ -6680,6 +6707,7 @@ def resolve_translation_identity(
         target_language=args.target_language,
         prompt_version=TRANSLATION_PROMPT_VERSION,
         thinking=profile.thinking if profile is not None else "disabled",
+        reasoning_effort=profile.reasoning_effort if profile is not None else "",
     )
 
 
@@ -6741,6 +6769,7 @@ def resolve_proofread_identity(
         target_language=args.proofread_language,
         prompt_version=PROOFREAD_PROMPT_VERSION,
         thinking=fallback.thinking,
+        reasoning_effort=fallback.reasoning_effort,
     )
 
 

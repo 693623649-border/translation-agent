@@ -23,6 +23,7 @@ PROFILE_FIELDS = frozenset(
         "timeout",
         "concurrency",
         "thinking",
+        "reasoning_effort",
         "command",
         "reading_direction",
     }
@@ -62,6 +63,7 @@ class ModelIdentity:
     target_language: str
     prompt_version: str
     thinking: str = "disabled"
+    reasoning_effort: str = ""
 
     @property
     def fingerprint(self) -> str:
@@ -74,6 +76,8 @@ class ModelIdentity:
             "prompt_version": self.prompt_version.strip(),
             "thinking": self.thinking.strip().lower(),
         }
+        if self.reasoning_effort.strip():
+            payload["reasoning_effort"] = self.reasoning_effort.strip().lower()
         encoded = json.dumps(
             payload,
             ensure_ascii=False,
@@ -96,6 +100,7 @@ class ModelProfile:
     thinking: str = "disabled"
     command: tuple[str, ...] = ()
     reading_direction: str = ""
+    reasoning_effort: str = ""
 
     def __post_init__(self) -> None:
         if self.credential_env and not ENV_NAME_PATTERN.fullmatch(self.credential_env):
@@ -106,6 +111,15 @@ class ModelProfile:
         if self.reading_direction not in {"", "horizontal", "vertical"}:
             raise ValueError(
                 f"Profile {self.name!r} reading_direction must be horizontal or vertical."
+            )
+        if self.reasoning_effort and self.reasoning_effort not in {
+            "none",
+            "low",
+            "high",
+            "max",
+        }:
+            raise ValueError(
+                f"Profile {self.name!r} reasoning_effort must be none, low, high, or max."
             )
 
     def resolve_credential(
@@ -137,6 +151,7 @@ class ModelProfile:
             target_language=target_language,
             prompt_version=prompt_version,
             thinking=self.thinking,
+            reasoning_effort=self.reasoning_effort,
         )
 
 
@@ -225,6 +240,16 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
             raise ValueError(
                 f"Profile {name!r} thinking must be enabled, disabled, or omit."
             )
+        reasoning_effort = str(raw.get("reasoning_effort", "")).strip().lower()
+        if reasoning_effort and reasoning_effort not in {
+            "none",
+            "low",
+            "high",
+            "max",
+        }:
+            raise ValueError(
+                f"Profile {name!r} reasoning_effort must be none, low, high, or max."
+            )
         profiles[name] = ModelProfile(
             name=name,
             adapter=adapter,
@@ -235,6 +260,7 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
             timeout=timeout,
             concurrency=concurrency,
             thinking=thinking,
+            reasoning_effort=reasoning_effort,
             command=command,
             reading_direction=str(raw.get("reading_direction") or "").strip().lower(),
         )
