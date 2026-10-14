@@ -68,6 +68,54 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         self.kb = self.output / "knowledge_base.jsonl"
         write_knowledge_base(self.kb, ROWS)
 
+    def test_global_hybrid_is_one_entrypoint_with_book_sources_and_partial_coverage(self) -> None:
+        other = self.root / "unindexed" / "knowledge_base.jsonl"
+        write_knowledge_base(other, ROWS)
+        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+            self.assertEqual(main(["register", str(self.output)], io.StringIO()), 0)
+        metadata_sidecar_path_for(self.kb).write_text(
+            json.dumps({"id": "a" * 40, "book_title": "量子理论入门", "author": "测试作者"},
+                       ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        with patch("rag_knowledge_base.ZhipuEmbeddingProvider", FakeZhipuProvider):
+            stdout = io.StringIO()
+            self.assertEqual(main(["retrieve", str(self.root), "量子", "--mode", "hybrid"], stdout), 0)
+            payload = _json(stdout)
+            self.assertFalse(payload["routing"]["automatic"])
+            self.assertTrue(all(hit["retrieval_mode"] == "hybrid" for hit in payload["hits"]))
+            hit = payload["hits"][0]
+            self.assertEqual(hit["book"], "book")
+            self.assertEqual(hit["book_title"], "量子理论入门")
+            self.assertEqual(hit["author"], "测试作者")
+            self.assertEqual(hit["source_path"], str(self.kb.resolve()))
+            self.assertTrue(payload["workspaces"]["partial_coverage"])
+            self.assertEqual(payload["workspaces"]["lexical_only"], ["unindexed"])
+            self.assertEqual(payload["workspaces"]["workspaces_searched"], ["book"])
+
+            narrowed = io.StringIO()
+            self.assertEqual(main(["retrieve", str(self.root), "量子", "--mode", "hybrid",
+                                   "--no-auto-route", "--book", "book"], narrowed), 0)
+            self.assertEqual(_json(narrowed)["workspaces"]["workspaces_searched"], ["book"])
+            self.assertFalse(_json(narrowed)["workspaces"]["partial_coverage"])
+
+    def test_global_hybrid_keeps_nested_book_sources_distinct_and_exact_filter(self) -> None:
+        nested = self.root / "other" / "book" / "knowledge_base.jsonl"
+        write_knowledge_base(nested, ROWS)
+        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+            main(["register", str(self.kb)], io.StringIO())
+            main(["register", str(nested)], io.StringIO())
+        with patch("rag_knowledge_base.ZhipuEmbeddingProvider", FakeZhipuProvider):
+            stdout = io.StringIO()
+            main(["retrieve", str(self.root), "量子", "--mode", "hybrid"], stdout)
+            payload = _json(stdout)
+            self.assertEqual(payload["workspaces"]["workspaces_searched"], ["book", "other/book"])
+            self.assertEqual(payload["hits"][0]["source_path"], str(self.kb.resolve()))
+            self.assertTrue(any(source.startswith("other/book/")
+                                for source in payload["hits"][0]["duplicate_sources"]))
+            narrowed = io.StringIO()
+            main(["retrieve", str(self.root), "量子", "--mode", "hybrid", "--book", "book"], narrowed)
+            self.assertEqual(_json(narrowed)["workspaces"]["workspaces_searched"], ["book"])
+
     def test_evaluate_runs_lexical_cases_and_writes_report(self) -> None:
         cases = self.root / "cases.jsonl"
         cases.write_text(

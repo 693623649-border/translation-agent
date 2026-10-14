@@ -1,0 +1,54 @@
+import sys
+
+sys.path.insert(0, r"E:\Deeplearning\translation-agent")
+
+from book_pipeline import build_parser, build_translation_client
+from paragraph_translation import validate_translation
+from pipeline_profiles import load_pipeline_profiles
+
+profiles = load_pipeline_profiles("pipeline.toml")
+profile = profiles.for_stage("translation")
+args = build_parser().parse_args(["sample.pdf"])
+client = build_translation_client(args, glm_api_base="unused", profile=profile)
+
+SRC = (
+    "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。"
+    "「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。"
+)
+SRC_HARD = (
+    "「本当ですか」と彼は言った。『秘密や社会――その光と影』（2015年刊）は、"
+    "彼の代表作であり…多くの読者（特に若い世代）に愛されている。これは、事実である。"
+)
+
+SYSTEM = (
+    "你是严谨的ja到简体中文图书译者。保留原文意义、引文边界与段落，输出流畅译文。"
+    "正文和引文必须全部译成简体中文，包括书名、作品名与人名；不得整段复制源文。"
+    "只译source，不译context。"
+)
+
+WORKED_EXAMPLE = (
+    "下面是一个已完成的标准翻译示例——注意：所有标点符号（「」、。……等）在译文中逐一对应保留，"
+    "同时包括书名在内的全部内容都译成了简体中文：\n"
+    "<source>「彼は来ない」、それは確かな事実である…『怪しい隣人』は彼の著書である。</source>\n"
+    "<translation>「他不来了」、这是确凿的事实……『可疑的邻居』是他的著作。</translation>\n"
+    "现在按完全相同的方式翻译下面的正文："
+)
+
+
+def build_prompt(source: str) -> str:
+    return (
+        WORKED_EXAMPLE
+        + f"\n<source>\n{source}\n</source>"
+    )
+
+
+for tag, source in (("normal", SRC), ("hard", SRC_HARD)):
+    out = client.chat_text(build_prompt(source), system=SYSTEM).strip()
+    try:
+        validate_translation(source, out, preserve_punctuation=True)
+        verdict = "PASS"
+    except Exception as exc:
+        verdict = f"FAIL: {exc}"
+    with open(f"_dbg_out_V11_{tag}.txt", "w", encoding="utf-8") as fh:
+        fh.write(out)
+    print(f"== V11/{tag}: {verdict}", flush=True)

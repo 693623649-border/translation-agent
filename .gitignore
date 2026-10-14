@@ -25,6 +25,11 @@ translation_cache/
 .agents/
 .claude/
 .learnings/
+# DSH 会话中的书籍摘录、OCR 核图与临时修复材料，保留本机
+.dsh/
+dsh-session-*.zip
+# Xiaomi OCR 的本机单页验证图，正式证据另行整理
+/deploy/xiaomi-ocr/verify_page.png
 
 # 历史书籍专用脚本只保留在本机
 archive/states_of_injury/

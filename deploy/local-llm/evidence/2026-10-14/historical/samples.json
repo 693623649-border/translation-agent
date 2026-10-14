@@ -1,0 +1,602 @@
+[
+  {
+    "variant": "V2-clarified",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界の終りとハードボイルド・ワンダーランド』是村上春树创作的长篇小说。「墙」这一概念贯穿整部作品，读者需要在两个故事之间来回切换阅读。",
+    "source_file": "V2-clarified.source.txt",
+    "translation_file": "V2-clarified.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "9e938d47568a524e7055c154bea9db93ee33932041fc3e59a4b80867fd2918d2",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 845,
+      "seq": 843,
+      "time_asia_shanghai": "2026-10-13T15:35:59.828000+08:00"
+    },
+    "script_event": {
+      "session_line": 839,
+      "seq": 837,
+      "time_asia_shanghai": "2026-10-13T15:35:43.681000+08:00"
+    },
+    "script_snapshot": "script-line-839.py.txt",
+    "script_sha256": "03857a427dd660aaf8d7d2e36f6526e6c0e69871ad5e6968e2dee4ffb444687f",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V3-no-example",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界の終りとハードボイルド・ワンダーランド』是村上春树创作的长篇小说。「墙」这一概念贯穿全篇，读者需要在两个故事之间来回切换阅读。",
+    "source_file": "V3-no-example.source.txt",
+    "translation_file": "V3-no-example.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "8a6430e9e9b9158643c1721931cf2c6df15edca646bad912382c131d0f3c8cd8",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 845,
+      "seq": 843,
+      "time_asia_shanghai": "2026-10-13T15:35:59.828000+08:00"
+    },
+    "script_event": {
+      "session_line": 839,
+      "seq": 837,
+      "time_asia_shanghai": "2026-10-13T15:35:43.681000+08:00"
+    },
+    "script_snapshot": "script-line-839.py.txt",
+    "script_sha256": "03857a427dd660aaf8d7d2e36f6526e6c0e69871ad5e6968e2dee4ffb444687f",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V4-no-quote-line",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界の終りとハードボイルド・ワンダーランド』是村上春樹创作的长篇小説。「壁」这一概念贯穿全篇，读者需要在两个故事之间来回切换才能继续阅读。",
+    "source_file": "V4-no-quote-line.source.txt",
+    "translation_file": "V4-no-quote-line.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "a021e7a2a16c6ab6079ab41628df4f7043856ea0710cde9e279f458f265acb82",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 855,
+      "seq": 853,
+      "time_asia_shanghai": "2026-10-13T15:36:47.804000+08:00"
+    },
+    "script_event": {
+      "session_line": 849,
+      "seq": 847,
+      "time_asia_shanghai": "2026-10-13T15:36:35.548000+08:00"
+    },
+    "script_snapshot": "script-line-849.py.txt",
+    "script_sha256": "18f752908cc4c807ca5e57dddd6dbf45b5f327c401582034cdc82d6f048d3191",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V5-no-punct-rule",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界の終りとハードボイルド・ワンダーランド』是村上春树创作的长篇小说。作品中“墙”这一概念处于核心地位，读者则需要在两个故事之间来回切换阅读。",
+    "source_file": "V5-no-punct-rule.source.txt",
+    "translation_file": "V5-no-punct-rule.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "3f80100c447d573ce15d6c184ba62343087acae94943d5ce977d7bc1f0da94e1",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 855,
+      "seq": 853,
+      "time_asia_shanghai": "2026-10-13T15:36:47.804000+08:00"
+    },
+    "script_event": {
+      "session_line": 849,
+      "seq": 847,
+      "time_asia_shanghai": "2026-10-13T15:36:35.548000+08:00"
+    },
+    "script_snapshot": "script-line-849.py.txt",
+    "script_sha256": "18f752908cc4c807ca5e57dddd6dbf45b5f327c401582034cdc82d6f048d3191",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V6-neither",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "《世界尽头与冷酷仙境》是村上春树的长篇小说。作品中以“墙”这一概念为核心，读者需要在两个故事之间来回切换阅读。",
+    "source_file": "V6-neither.source.txt",
+    "translation_file": "V6-neither.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "abb0615376d7bf41c99f481857a80d5ca4e4210f7dd8e8bb993b1d5091709a21",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 855,
+      "seq": 853,
+      "time_asia_shanghai": "2026-10-13T15:36:47.804000+08:00"
+    },
+    "script_event": {
+      "session_line": 849,
+      "seq": 847,
+      "time_asia_shanghai": "2026-10-13T15:36:35.548000+08:00"
+    },
+    "script_snapshot": "script-line-849.py.txt",
+    "script_sha256": "18f752908cc4c807ca5e57dddd6dbf45b5f327c401582034cdc82d6f048d3191",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V7-full-positive",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界的尽头与冷酷仙境』是村上春树创作的长篇小说。「墙」这一概念贯穿全篇，读者需要在两个故事之间来回切换阅读。",
+    "source_file": "V7-full-positive.source.txt",
+    "translation_file": "V7-full-positive.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "835670e24d167e13a88f86737f87ff634d849b96a579c360a7ed274b39d82f7e",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 865,
+      "seq": 863,
+      "time_asia_shanghai": "2026-10-13T15:38:06.334000+08:00"
+    },
+    "script_event": {
+      "session_line": 859,
+      "seq": 857,
+      "time_asia_shanghai": "2026-10-13T15:37:59.663000+08:00"
+    },
+    "script_snapshot": "script-line-859.py.txt",
+    "script_sha256": "35ff99a10795499a7c718c1bcf64ea3ada3d68fb3db3d6c10806d9428db36a0e",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V8-minimal-positive",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "《世界尽头与冷酷仙境》是村上春树创作的长篇小说。作品中以“墙”这一概念为核心，读者需要在两个故事之间来回切换阅读。",
+    "source_file": "V8-minimal-positive.source.txt",
+    "translation_file": "V8-minimal-positive.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "5c836afdbbc13e72fc4374954ff24f4432b096d54d216a9f4f5b342750bbafba",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 865,
+      "seq": 863,
+      "time_asia_shanghai": "2026-10-13T15:38:06.334000+08:00"
+    },
+    "script_event": {
+      "session_line": 859,
+      "seq": 857,
+      "time_asia_shanghai": "2026-10-13T15:37:59.663000+08:00"
+    },
+    "script_snapshot": "script-line-859.py.txt",
+    "script_sha256": "35ff99a10795499a7c718c1bcf64ea3ada3d68fb3db3d6c10806d9428db36a0e",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V9_normal",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界的尽头与硬派・奇幻仙境』是村上春树创作的长篇小说。「墙」这一概念贯穿整部作品，读者需要在两个故事之间来回切换才能继续阅读。",
+    "source_file": "V9_normal.source.txt",
+    "translation_file": "V9_normal.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "614159775dcda390153a72d102aa46986f2a6d1b6536cd41fd608f0b14614e7c",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 948,
+      "seq": 946,
+      "time_asia_shanghai": "2026-10-13T16:03:55.447000+08:00"
+    },
+    "script_event": {
+      "session_line": 911,
+      "seq": 909,
+      "time_asia_shanghai": "2026-10-13T15:41:32.126000+08:00"
+    },
+    "script_snapshot": "script-line-911.py.txt",
+    "script_sha256": "5610a6f8666d0f56071d0e48430cb2d05cbf316e43253249244f22199d2230b4",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V9_hard",
+    "sample": "hard",
+    "source": "「本当ですか」と彼は言った。『秘密や社会――その光と影』（2015年刊）は、彼の代表作であり…多くの読者（特に若い世代）に愛されている。これは、事実である。",
+    "translation": "「真的吗？」他说道。『秘密与社会——其光明与阴影』（2015年出版）是他的代表作……深受众多读者（尤其是年轻一代）的喜爱。这确为事实。",
+    "source_file": "V9_hard.source.txt",
+    "translation_file": "V9_hard.translation.txt",
+    "source_sha256": "2abd313558db81156263030a4fabbc0fd1766cf8e50abf77cc4281db34e0e18d",
+    "translation_sha256": "93e8769f21cc4a5d93461b1700b5cd68e7793baad3146f4b020454682d3e18bd",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 948,
+      "seq": 946,
+      "time_asia_shanghai": "2026-10-13T16:03:55.447000+08:00"
+    },
+    "script_event": {
+      "session_line": 911,
+      "seq": 909,
+      "time_asia_shanghai": "2026-10-13T15:41:32.126000+08:00"
+    },
+    "script_snapshot": "script-line-911.py.txt",
+    "script_sha256": "5610a6f8666d0f56071d0e48430cb2d05cbf316e43253249244f22199d2230b4",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V10_normal",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界の終りとハードボイルド・ワンダーランド』是村上春樹创作的长篇小説。「牆壁」这一概念是作品的核心，讀者需要在兩個故事之間來回切換才能繼續閱讀。",
+    "source_file": "V10_normal.source.txt",
+    "translation_file": "V10_normal.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "1dcdf125bbdcca853f632e1804675374e11051ae6667de8affb6d744c29f88f5",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 958,
+      "seq": 956,
+      "time_asia_shanghai": "2026-10-13T16:05:01.605000+08:00"
+    },
+    "script_event": {
+      "session_line": 952,
+      "seq": 950,
+      "time_asia_shanghai": "2026-10-13T16:04:53.355000+08:00"
+    },
+    "script_snapshot": "script-line-952.py.txt",
+    "script_sha256": "a9d5cc68e7207a51f56a9d7d5716b4492cd3cca9ae6450e64991af093cb44ea1",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V10_hard",
+    "sample": "hard",
+    "source": "「本当ですか」と彼は言った。『秘密や社会――その光と影』（2015年刊）は、彼の代表作であり…多くの読者（特に若い世代）に愛されている。これは、事実である。",
+    "translation": "「真的吗？」他说道。『秘密や社会――その光と影』（2015年出版）乃是他的代表作……深受众多读者——尤其是年轻一代的喜爱。这确为事实。",
+    "source_file": "V10_hard.source.txt",
+    "translation_file": "V10_hard.translation.txt",
+    "source_sha256": "2abd313558db81156263030a4fabbc0fd1766cf8e50abf77cc4281db34e0e18d",
+    "translation_sha256": "39e4070e1452dfc121fae7b4008b3e393cf7fc940422eff2094a6f76887bdfad",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 958,
+      "seq": 956,
+      "time_asia_shanghai": "2026-10-13T16:05:01.605000+08:00"
+    },
+    "script_event": {
+      "session_line": 952,
+      "seq": 950,
+      "time_asia_shanghai": "2026-10-13T16:04:53.355000+08:00"
+    },
+    "script_snapshot": "script-line-952.py.txt",
+    "script_sha256": "a9d5cc68e7207a51f56a9d7d5716b4492cd3cca9ae6450e64991af093cb44ea1",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V11_normal",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "《世界尽头与冷酷仙境》是村上春树的长篇小说。整部作品以“墙”这一概念为核心，读者需要在两个截然不同的故事之间来回穿梭，逐步读完全书。",
+    "source_file": "V11_normal.source.txt",
+    "translation_file": "V11_normal.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "f7c0ddfd9a52e119a77c5dffdb237a0d199b5e3a6199241be7272da9f4f31edb",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 968,
+      "seq": 966,
+      "time_asia_shanghai": "2026-10-13T16:05:51.374000+08:00"
+    },
+    "script_event": {
+      "session_line": 962,
+      "seq": 960,
+      "time_asia_shanghai": "2026-10-13T16:05:44.522000+08:00"
+    },
+    "script_snapshot": "script-line-962.py.txt",
+    "script_sha256": "3d9cfbbbd2a298795ec766c43a41a4f96be4eef46272d2991d21b240de656a8d",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V11_hard",
+    "sample": "hard",
+    "source": "「本当ですか」と彼は言った。『秘密や社会――その光と影』（2015年刊）は、彼の代表作であり…多くの読者（特に若い世代）に愛されている。これは、事実である。",
+    "translation": "「真的吗？」他说道。《秘密与社会——其光明与阴影》（2015年出版）是他的代表作……深受众多读者（尤其是年轻一代）的喜爱。这是确凿的事实。",
+    "source_file": "V11_hard.source.txt",
+    "translation_file": "V11_hard.translation.txt",
+    "source_sha256": "2abd313558db81156263030a4fabbc0fd1766cf8e50abf77cc4281db34e0e18d",
+    "translation_sha256": "5bf246cc8f4ee177f018d730a7cce6307e06a96870b23eba561e93c838718470",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 968,
+      "seq": 966,
+      "time_asia_shanghai": "2026-10-13T16:05:51.374000+08:00"
+    },
+    "script_event": {
+      "session_line": 962,
+      "seq": 960,
+      "time_asia_shanghai": "2026-10-13T16:05:44.522000+08:00"
+    },
+    "script_snapshot": "script-line-962.py.txt",
+    "script_sha256": "3d9cfbbbd2a298795ec766c43a41a4f96be4eef46272d2991d21b240de656a8d",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V12_normal",
+    "sample": "normal",
+    "source": "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。",
+    "translation": "『世界的尽头与冷酷仙境』是村上春树的长篇小说。「墙」这一概念贯穿整部作品，读者需要在两个故事之间来回切换才能继续阅读。",
+    "source_file": "V12_normal.source.txt",
+    "translation_file": "V12_normal.translation.txt",
+    "source_sha256": "e117e5879860357d9c469e417a5e6479059b8883980389ff5140abb959052c1f",
+    "translation_sha256": "90d817b2baaf5dab0beb59efaf4d51cc92b4616e978ff4ff3fd74809a9341fa2",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 978,
+      "seq": 976,
+      "time_asia_shanghai": "2026-10-13T16:07:00.382000+08:00"
+    },
+    "script_event": {
+      "session_line": 972,
+      "seq": 970,
+      "time_asia_shanghai": "2026-10-13T16:06:52.033000+08:00"
+    },
+    "script_snapshot": "script-line-972.py.txt",
+    "script_sha256": "c8f8cf4a460b7a7fc9417dc654b39a590a3cc5096fde4ea47fd18dbba95f903a",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  },
+  {
+    "variant": "V12_hard",
+    "sample": "hard",
+    "source": "「本当ですか」と彼は言った。『秘密や社会――その光と影』（2015年刊）は、彼の代表作であり…多くの読者（特に若い世代）に愛されている。これは、事実である。",
+    "translation": "「真的吗」他说道。《秘密与社会——其光明与阴影》（2015年出版）是他的代表作……深受众多读者（尤其是年轻一代）的喜爱。这是事实。",
+    "source_file": "V12_hard.source.txt",
+    "translation_file": "V12_hard.translation.txt",
+    "source_sha256": "2abd313558db81156263030a4fabbc0fd1766cf8e50abf77cc4281db34e0e18d",
+    "translation_sha256": "371663658157ccffcdb5657281aad32caabba4aec516714e50788cf307862cbf",
+    "archive_sha256": "9ac8feac2f317ac064652c978cad91f0a259093165e11f668383f96867f96a15",
+    "archive_member": "session.v4.jsonl",
+    "output_event": {
+      "session_line": 978,
+      "seq": 976,
+      "time_asia_shanghai": "2026-10-13T16:07:00.382000+08:00"
+    },
+    "script_event": {
+      "session_line": 972,
+      "seq": 970,
+      "time_asia_shanghai": "2026-10-13T16:06:52.033000+08:00"
+    },
+    "script_snapshot": "script-line-972.py.txt",
+    "script_sha256": "c8f8cf4a460b7a7fc9417dc654b39a590a3cc5096fde4ea47fd18dbba95f903a",
+    "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+    "model_attribution": {
+      "profile_write": {
+        "session_line": 298,
+        "seq": 296,
+        "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+      },
+      "server_models_response": {
+        "session_line": 810,
+        "seq": 808,
+        "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+      },
+      "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+    },
+    "human_acceptance": "pending",
+    "machine_observation": "not_recomputed"
+  }
+]

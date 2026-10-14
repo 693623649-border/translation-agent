@@ -18,6 +18,7 @@ from unittest.mock import patch
 from book_pipeline import (
     DEFAULT_LOCAL_LLM_API_BASE,
     DEFAULT_LOCAL_LLM_MODEL,
+    ChatTranslator,
     LocalClient,
     build_parser,
     build_translation_client,
@@ -67,7 +68,7 @@ class LocalClientTests(unittest.TestCase):
 
     def test_local_profile_builds_client_without_credential(self) -> None:
         profiles = load_pipeline_profiles(Path("pipeline.example.toml"))
-        profile = profiles.for_stage("translation", "local_hymt2")
+        profile = profiles.for_stage("translation", "local_llm")
         self.assertIsNotNone(profile)
         self.assertEqual(profile.provider, "local")
         args = build_parser().parse_args(["sample.pdf"])
@@ -84,7 +85,7 @@ class LocalClientTests(unittest.TestCase):
 
     def test_identity_resolution_matches_client(self) -> None:
         profiles = load_pipeline_profiles(Path("pipeline.example.toml"))
-        profile = profiles.for_stage("translation", "local_hymt2")
+        profile = profiles.for_stage("translation", "local_llm")
         args = build_parser().parse_args(["sample.pdf"])
         with patch.dict(os.environ, {}, clear=True):
             identity = resolve_translation_identity(
@@ -168,6 +169,53 @@ class KbTranslatorTests(unittest.TestCase):
         self.assertTrue(sent["url"].startswith("http://127.0.0.1:8010/v1/"))
         self.assertEqual(sent["auth"], "Bearer local")
         self.assertFalse(sent["payload_thinking"])
+
+
+class ProviderScopedGateTests(unittest.TestCase):
+    """provider=local 放行标点字形规范化；云端 provider 维持逐字形门禁。"""
+
+    SRC = "「彼は来ない」、彼はそう言った。『怪しい隣人』は彼の著書である。"
+    # 内容全译、引号原样、标点规范化（、→，）——正是本地 MT 模型的自然输出形态。
+    NORMALIZED = "「他不来了」，他这么说了。『可疑的邻居』是他的著作。"
+
+    class FakeProviderClient:
+        def __init__(self, provider_name: str, reply: str) -> None:
+            self.provider_name = provider_name
+            self.reply = reply
+            self.calls: list[tuple[str, str]] = []
+
+        def chat_text(self, prompt: str, *, system: str, max_tokens=None) -> str:
+            self.calls.append((prompt, system))
+            return self.reply
+
+    def test_local_provider_accepts_normalized_punctuation(self) -> None:
+        client = self.FakeProviderClient("local", self.NORMALIZED)
+        out = ChatTranslator(client).translate(self.SRC, source_language="ja", target_language="简体中文")
+        self.assertEqual(out, self.NORMALIZED)
+
+    def test_local_japanese_provider_uses_selected_v12_prompt(self) -> None:
+        client = self.FakeProviderClient("local", self.NORMALIZED)
+        ChatTranslator(client).translate(self.SRC, source_language="ja", target_language="简体中文")
+        prompt, system = client.calls[0]
+        self.assertIn("已完成的标准示例", prompt)
+        self.assertIn("符号内是译文，不是原文", prompt)
+        self.assertIn("包括书名、作品名与人名", system)
+
+    def test_cloud_provider_keeps_exact_punctuation_gate(self) -> None:
+        client = self.FakeProviderClient("deepseek", self.NORMALIZED)
+        with self.assertRaises(Exception) as caught:
+            ChatTranslator(client).translate(self.SRC, source_language="ja", target_language="简体中文")
+        self.assertIn("punctuation", str(caught.exception))
+        prompt, system = client.calls[0]
+        self.assertIn("必须原样保留", prompt)
+        self.assertIn("硬性引文约束", system)
+
+    def test_cloud_provider_still_requires_full_translation(self) -> None:
+        # 引号序列不一致在两种 provider 下都必须失败（语义级约束不放宽）。
+        client = self.FakeProviderClient("local", "「他不来了」，他这么说了。《可疑的邻居》是他的著作。")
+        with self.assertRaises(Exception) as caught:
+            ChatTranslator(client).translate(self.SRC, source_language="ja", target_language="简体中文")
+        self.assertIn("quotation", str(caught.exception))
 
 
 if __name__ == "__main__":

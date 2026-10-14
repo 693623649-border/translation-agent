@@ -1,0 +1,40 @@
+{
+  "full_pytest": {
+    "passed": 971,
+    "skipped": 3,
+    "subtests_passed": 170,
+    "duration_seconds": 57.21,
+    "exit_code": 0
+  },
+  "focused_translation_tests": {
+    "passed": 187,
+    "exit_code": 0
+  },
+  "publication_and_integration_tests": {
+    "passed": 74,
+    "skipped": 1,
+    "subtests_passed": 17,
+    "exit_code": 0
+  },
+  "human_acceptance": "pending",
+  "live_collection": {
+    "source_samples": 3,
+    "raw_responses": 4,
+    "current_pipeline_passed_samples": 2,
+    "current_pipeline_failed_samples": 1,
+    "exit_code": 1
+  },
+  "historical_collection": {
+    "responses": 15,
+    "unique_sources": 2
+  },
+  "fixes": [
+    "Pass required target_language in four provider gate tests",
+    "Validate v12 neighbor-context input hashes in publication checkpoints"
+  ],
+  "limits": [
+    "No real DeepSeek API request; compatibility covered by tests and profile checks",
+    "No whole-book translation or publication acceptance",
+    "Machine checks do not decide translation quality"
+  ]
+}

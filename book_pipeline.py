@@ -95,7 +95,7 @@ DEFAULT_LOCAL_LLM_API_BASE = "http://127.0.0.1:8010/v1"
 DEFAULT_LOCAL_LLM_MODEL = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
 DEFAULT_OCR_CONCURRENCY = 4
 DEFAULT_TRANSLATION_CONCURRENCY = 16
-TRANSLATION_PROMPT_VERSION = "book-translation-v11-paragraph-context-v2"
+TRANSLATION_PROMPT_VERSION = "book-translation-v13-paragraph-context-language-v1"
 PROOFREAD_PROMPT_VERSION = "book-ocr-proofread-ja-v2"
 TOC_KINDS = {"part", "chapter", "section", "subsection", "frontmatter", "other"}
 NON_CONTENT_MARKERS = {"[无法辨认]", "[空白页]"}
@@ -2090,6 +2090,7 @@ class ChatTranslator(ParagraphTranslator):
                     for key in ("requests", "retries", "chunks", "elapsed_seconds"):
                         totals[key] += stats.get(key, 0)
                     totals["request_seconds"].extend(stats.get("request_seconds", []))
+                    totals["language_prompt_version"] = stats.get("language_prompt_version")
             joined = "\n\n".join(output)
             expected = Counter(_enforceable_numbered_labels(text))
             actual = Counter(_leading_numbered_line_labels(joined))
@@ -3002,6 +3003,7 @@ def translate_non_chinese_pages(
                     event["requests"] += stats.get("requests", 0)
                     event["retries"] += stats.get("retries", 0)
                     event["request_seconds"].extend(stats.get("request_seconds", []))
+                    event["language_prompt_version"] = stats.get("language_prompt_version")
             translated_text = join_physical_page_texts(translated_physical_pages)
             event["prepared_source_sha256"] = hashlib.sha256("\n\n".join(source_physical_pages).encode("utf-8")).hexdigest()
             committed = store.commit_translation(

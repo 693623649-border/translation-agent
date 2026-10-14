@@ -128,6 +128,30 @@ class RetrieveMultiBookTests(unittest.TestCase):
         self.assertEqual(report["lexical_only"], ["history"])
         self.assertEqual(report["per_workspace"]["history"]["fallback_reason"], "embedding_provider_unavailable")
 
+    def test_formal_hybrid_excludes_unindexed_books_and_discloses_partial_coverage(self):
+        provider = CountingEmbeddingProvider()
+        build_embedding_index(self.physics, provider, batch_size=1)
+        context = retrieve_multi_book(
+            [("physics", self.physics), ("history", self.history)],
+            "量子 历史", mode="hybrid", strict_hybrid=True, top_k=4,
+            embedding_provider=provider,
+        )
+        self.assertEqual(provider.query_calls, 1)
+        self.assertTrue(all(hit.retrieval_mode == "hybrid" for hit in context.hits))
+        report = context.diagnostics["multi_book"]
+        self.assertEqual(report["workspaces_searched"], ["physics"])
+        self.assertEqual(report["lexical_only"], ["history"])
+        self.assertTrue(report["partial_coverage"])
+
+    def test_formal_hybrid_does_not_turn_provider_failure_into_lexical_hits(self):
+        class FailingProvider(CountingEmbeddingProvider):
+            def embed_query(self, text): raise RuntimeError("provider unavailable")
+        provider = FailingProvider()
+        build_embedding_index(self.physics, provider, batch_size=1)
+        with self.assertRaises(RagError):
+            retrieve_multi_book([("physics", self.physics)], "量子", mode="hybrid",
+                                strict_hybrid=True, embedding_provider=provider)
+
     def test_hybrid_without_any_ready_index_fails_loud(self):
         with self.assertRaises(RagEmbeddingUnavailableError):
             retrieve_multi_book(

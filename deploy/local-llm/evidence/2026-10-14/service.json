@@ -1,0 +1,28 @@
+{
+  "checked_at": "2026-10-14T00:45:19.954850+08:00",
+  "container": "local-llm",
+  "image": "vllm/vllm-openai:v0.31.0",
+  "image_id": "sha256:c1c9f6fd5c109ba7f0546a59f5b2f15fb87f64c77782e90a27b648b42a8e67c3",
+  "running": true,
+  "restart_count": 0,
+  "started_at_utc": "2026-10-13T16:35:44.386307206Z",
+  "gpu_memory_csv": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n32607 MiB, 26951 MiB, 5237 MiB\n",
+  "compose_sha256": "e0cc6de35feb6f978f32a53accb2848af07c885458c14bf6958587e320276cc0",
+  "gpu_memory_utilization": 0.7,
+  "max_model_len": 32768,
+  "max_num_seqs": 16,
+  "enforce_eager": true,
+  "observations": [
+    {
+      "budget": 0.82,
+      "result": "failed",
+      "error": "KV cache allocation: CUDA out of memory; tried to allocate 10.12 GiB"
+    },
+    {
+      "budget": 0.7,
+      "result": "ready",
+      "evidence": "current/review.json contains actual HTTP response model and raw translations"
+    }
+  ],
+  "human_acceptance": "pending"
+}

@@ -1,40 +1,45 @@
 # 本地翻译模型服务栈（Hy-MT2-30B-A3B INT4 · vLLM）
-# 与 deploy/xiaomi-ocr 同构：权重在宿主机下载到 models/ 后挂载进容器，
-# cache/ 持久化 vLLM 编译缓存（torch.compile / CUDA graph，复跑省启动时间）。
-# 镜像沿用本机已验证的 vllm/vllm-openai:v0.27.1（torch 2.13.0+cu130，RTX 5090 sm_120）。
-# 若 vLLM 报该模型架构不支持，升级 tag 为更新版本即可（模型仓库与镜像解耦）。
+# 镜像 v0.31.0（2026-10-04 稳定版）：v0.27.1 的 INC 解析器无法处理本模型
+# AutoRound 量化中 "MoE gate 保持 FP16、其余 4-bit" 的融合层配置，必须用新版。
+#
+# 权重与编译缓存放 Docker 命名卷（WSL2 内部 ext4）。历史测试中卷加载更快；
+# Windows 绑定挂载曾出现 device not ready，但尚无驱动证据确认 TDR 根因。
 #
 # 用法：
-#   首次下载权重（约 16GB；默认走 hf-mirror，需要代理时先设 HTTPS_PROXY）：
+#   首次下载权重（约 15GB；本机容器可直连 huggingface.co）：
 #     docker compose --profile gpu run --rm download
-#   常驻服务（占约 17GB 显存，剩余留给 PaddleOCR）：
-#     docker compose --profile gpu up -d
+#   常驻服务（显存预算 0.70；实际占用以运行记录为准）：
+#     docker compose --profile gpu up -d vllm
 #   验证：
 #     curl http://127.0.0.1:8010/v1/models
 #   停止：
 #     docker compose --profile gpu down
+#   清空权重重下（谨慎）：
+#     docker compose --profile gpu down -v
 
 services:
   download:
     profiles: ["gpu"]
-    image: vllm/vllm-openai:v0.27.1
+    image: vllm/vllm-openai:v0.31.0
     container_name: local-llm-download
     # 镜像 ENTRYPOINT 是 vllm CLI，这里显式覆盖为 bash，避免误入 vllm 参数解析。
     entrypoint: ["/bin/bash", "-lc"]
     volumes:
-      - ./models:/workspace/models
-      - ./cache:/root/.cache
+      - local-llm-models:/workspace/models
+      - local-llm-cache:/root/.cache
     environment:
-      # 直连 HuggingFace 失败时的镜像站；如仍失败，在宿主机 export HTTPS_PROXY 后重试。
-      - HF_ENDPOINT=https://hf-mirror.com
+      # 实测本机容器可直连 huggingface.co 下载本模型（15GB 约 4-8 分钟）。
+      # Xet 存储后端（cas-server）在部分国内网络会卡死，禁用后走普通 HTTP 分块。
+      # 若直连失败：恢复 HF_ENDPOINT=https://hf-mirror.com，或设 HTTPS_PROXY 走代理。
+      - HF_HUB_DISABLE_XET=1
     command:
       - >-
-        huggingface-cli download Intel/Hy-MT2-30B-A3B-int4-AutoRound
+        hf download Intel/Hy-MT2-30B-A3B-int4-AutoRound
         --local-dir /workspace/models/Hy-MT2-30B-A3B-int4-AutoRound
 
   vllm:
     profiles: ["gpu"]
-    image: vllm/vllm-openai:v0.27.1
+    image: vllm/vllm-openai:v0.31.0
     container_name: local-llm
     gpus: all
     shm_size: "4gb"
@@ -42,11 +47,13 @@ services:
       # 只绑定回环：端点仅限本机流水线访问。
       - "127.0.0.1:8010:8010"
     volumes:
-      - ./models:/workspace/models
-      - ./cache:/root/.cache
+      - local-llm-models:/workspace/models
+      - local-llm-cache:/root/.cache
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - VLLM_LOGGING_LEVEL=INFO
+      # 32GB 卡：降低碎片化，保证 KV cache 大块分配成功率。
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     entrypoint: ["/bin/bash", "-lc"]
     command:
       - >-
@@ -54,5 +61,11 @@ services:
         --served-model-name Intel/Hy-MT2-30B-A3B-int4-AutoRound
         --host 0.0.0.0 --port 8010
         --max-model-len 32768
-        --gpu-memory-utilization 0.92
+        --gpu-memory-utilization 0.70
+        --max-num-seqs 16
+        --enforce-eager
     restart: unless-stopped
+
+volumes:
+  local-llm-models:
+  local-llm-cache:

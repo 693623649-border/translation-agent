@@ -24,7 +24,7 @@ class PipelineProfileTests(unittest.TestCase):
         # Branch deploy/vllm-translation-rtx5090 defaults translation to the
         # local vLLM endpoint (deploy/local-llm); the cloud profile stays
         # available as a one-line fallback.
-        self.assertEqual(translation.name, "local_hymt2")
+        self.assertEqual(translation.name, "local_llm")
         self.assertEqual(translation.provider, "local")
         self.assertEqual(translation.thinking, "omit")
         flash = loaded.get("deepseek_flash")

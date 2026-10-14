@@ -1,0 +1,56 @@
+import re
+import sys
+
+sys.path.insert(0, r"E:\Deeplearning\translation-agent")
+
+from book_pipeline import build_parser, build_translation_client
+from pipeline_profiles import load_pipeline_profiles
+
+profiles = load_pipeline_profiles("pipeline.toml")
+profile = profiles.for_stage("translation")
+args = build_parser().parse_args(["sample.pdf"])
+client = build_translation_client(args, glm_api_base="unused", profile=profile)
+
+src = (
+    "『世界の終りとハードボイルド・ワンダーランド』は村上春樹の長編小説である。"
+    "「壁」という概念が作品の中心にあり、読者は二つの物語を行き来しながら読み進める。"
+)
+
+V7_SYSTEM = (
+    "你是严谨的ja到简体中文图书译者。保留原文意义、引文边界与段落，输出流畅译文。"
+    "引号符号必须保持原样：译文使用与源文相同的『』「」〈〉等符号包裹对应译文；"
+    "符号内的内容必须全部译成简体中文，包括书名、作品名与人名。"
+    "正文和引文必须翻译成目标语言，不得整段复制源文。只译source，不译context。"
+)
+V7_PROMPT = (
+    "将正文从ja完整翻译为简体中文。按完整段落理解修饰关系、引文和主句。"
+    "只输出正文译文，不输出解释、JSON、数组或代码块。"
+    "原文的每一个标点符号（包括『』「」〈〉引号与。、！？……省略号等）"
+    "都要在译文的对应位置保留相同的符号，同时符号之间的文字全部译成简体中文。"
+    "示例：『怪しい隣人』という小説 →『可疑的邻居』这部小说；「彼は来ない」→「他不来了」。"
+    "不得省略、总结、扩写；严格按源文顺序翻译。\n"
+    "<context_before>\n\n</context_before>\n<context_after>\n\n</context_after>\n"
+    f"\n以下是唯一需要翻译的正文，翻译到source结束立即停止：\n<source>\n{src}\n</source>"
+)
+
+V8_SYSTEM = (
+    "你是严谨的ja到简体中文图书译者。保留原文意义、引文边界与段落，输出流畅译文。"
+    "引号符号保持原样，符号内的内容全部译成简体中文。不得整段复制源文。"
+)
+V8_PROMPT = (
+    "将正文从ja完整翻译为简体中文。只输出正文译文，不输出解释。"
+    "原文的标点符号（包括『』「」引号与。、！？等）在译文的对应位置保留相同符号，"
+    "符号之间的文字全部译成简体中文。"
+    "示例：『怪しい隣人』→『可疑的邻居』；「彼は来ない」→「他不来了」。"
+    f"\n<source>\n{src}\n</source>"
+)
+
+variants = {"V7-full-positive": (V7_SYSTEM, V7_PROMPT), "V8-minimal-positive": (V8_SYSTEM, V8_PROMPT)}
+
+for name, (system, prompt) in variants.items():
+    out = client.chat_text(prompt, system=system).strip()
+    kana = re.findall(r"[ぁ-ゖァ-ヺーー]", out)
+    quotes = "".join(c for c in out if c in "「」『』〈〉")
+    print(f"== {name} kana_count={len(kana)} quotes={quotes}")
+    with open(f"_dbg_out_{name}.txt", "w", encoding="utf-8") as fh:
+        fh.write(out)

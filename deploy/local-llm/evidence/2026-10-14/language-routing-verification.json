@@ -1,0 +1,35 @@
+{
+  "verified_at": "2026-10-14T01:47:51.988987+08:00",
+  "user_selected_japanese_prompt": "V12_hard / ja-v12-hard-context-v1",
+  "english_prompt": "en-book-prose-context-v1",
+  "cache_version": "book-translation-v13-paragraph-context-language-v1",
+  "historical_template_comparison": "exact match for empty context; archived code interpreted as string-only AST, not executed",
+  "final_tests": {
+    "passed": 978,
+    "skipped": 3,
+    "subtests_passed": 170,
+    "seconds": 63.31
+  },
+  "first_full_test_attempt": {
+    "passed": 977,
+    "failed": 1,
+    "test": "tests/test_book_graph.py::BookGraphExecutionTests::test_text_stage_identity_tracks_chunking_and_thinking",
+    "cause": "unknown; not reproduced in isolated test, whole module (72 passed) or final full run"
+  },
+  "retrieval_tests": "strict global hybrid, missing vector disclosure, provider failure, query embedding reuse, exact book filtering, nested workspace and source attribution",
+  "ocr_calls": "none; sample command arguments parsed only",
+  "actual_global_corpus_queries": "none; tests use temporary fixture corpora and fake embedding provider",
+  "new_model_samples": "not collected; local service in repeated KV cache OOM restart loop was stopped",
+  "human_acceptance": {
+    "japanese_template": "selected by user",
+    "english_translation_quality": "pending",
+    "whole_book": "pending"
+  },
+  "source_sha256": {
+    "paragraph_translation.py": "b384c16be1d3e69762afda085518c506973c9a7598c95ba31de0f20a292e1747",
+    "book_pipeline.py": "c10ffd4847845e5634cf62166d4c179b601b5674acdc63d8499b849f160e4e85",
+    "knowledge_base_cli.py": "591a3e8bda3b067c6268fef335b65f0f0155df9e5e8657e0023501a2125853ad",
+    "rag_knowledge_base.py": "2dc35912e18a9d156e1b1ee8c7d02a113028d7af0b737d6c30e58f59eae7fdc9",
+    "publication_verifier.py": "7c7857442e5a27df35fb0dac949723f1b59fc77477efa552489d6658dbcb8cd6"
+  }
+}

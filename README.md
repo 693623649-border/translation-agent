@@ -1,393 +1,499 @@
 # 影印书编译 Agent
 
-将扫描 PDF、文字层 PDF 与 EPUB 整理为中文章节、知识库和出版物的本地优先工具。
-项目通过显式 Source Adapter 接入文档，以 DAG 管理执行依赖、缓存和断点，
-以发布验证报告区分草稿与正式交付。
+把扫描 PDF、文字层 PDF 与 EPUB 整理为中文章节、出版物和可检索知识库。
+本分支的正文翻译使用 **Hy-MT2**，兼容 DeepSeek API；扫描 OCR、校勘和 RAG 向量服务分别配置。
+从输入到检索都保留来源与校验信息，翻译质量由用户对照原文判断。
 
-适合需要保留章节结构、来源证据、脚注关系，并反复审校长篇文档的工作流。
-OCR 在本地运行；文本翻译和可选向量生成按配置调用模型服务。
+**处理顺序：准备环境 → 配置模型 → 导入 → 翻译与审校 → 发布 → 注册与向量 → 全局索引 → retrieve 与引文核验。**
 
-## 快速开始
+| 现在要做什么 | 从哪里开始 |
+| --- | --- |
+| 第一次处理一本书 | [01 准备环境](#prepare) |
+| 本地翻译部署与云端切换 | [02 配置模型](#models) |
+| 检查实际翻译结果 | [04 翻译与审校](#translation) |
+| 已有知识库，准备提问 | [08 retrieve 与引用取证](#retrieve) |
+| 查看版本演进 | [按日期排列的记录](docs/workflow-history.md) |
 
-需要 Python 3.11+，推荐 Python 3.12。以下命令在仓库根目录的 Windows
-PowerShell 执行；输入书稿和输出目录由用户提供，仓库不附带实际语料。
+## 整体 workflow
+
+```mermaid
+flowchart TB
+    A[准备环境与阶段配置] --> B[选择输入模式并预览计划]
+    B --> C[导入正文与来源结构]
+    C --> D[按需校勘与 Hy-MT2 翻译]
+    D --> E[保留原文译文与用户审校]
+    E --> F[编译候选产物与发布检查]
+    F --> G[单书注册与 RAG 向量侧车]
+    G --> H[统一全库 hybrid 检索与可选书籍过滤]
+    G -. 显式 sync .-> I[全局 SQLite 候选索引]
+    I --> J[跨书发现后单书 hybrid 精读]
+    H --> K[核验引文与带来源作答]
+    J --> K
+```
+
+这是操作先后顺序，人工审校不会由 DAG 自动签署。
+已是中文的输入按所选流程跳过翻译；文字层 PDF 和 EPUB 不经过扫描 OCR。
+发布检查通过、用户接受译文和检索取得证据，是分别记录的状态。
+
+<a id="prepare"></a>
+## 01 · 准备 Python 环境
+
+需要 Python 3.11+，推荐 Python 3.12。以下命令在仓库根目录的 Windows PowerShell 执行；
+`book/input.pdf` 和 `outputs/input` 均为示例，替换成实际源文件与工作区。
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e '.[web]'
 .\.venv\Scripts\translation-agent-doctor.exe --web
-Copy-Item pipeline.example.toml pipeline.toml
+if (-not (Test-Path pipeline.toml)) { Copy-Item pipeline.example.toml pipeline.toml }
+.\.venv\Scripts\Activate.ps1
 ```
 
-如已有 `pipeline.toml`，保留现有配置。后续示例使用激活环境后的命令：
+已有 `pipeline.toml` 时保留原配置。若执行策略不允许激活，直接使用 `.venv\Scripts\` 下的可执行文件。
+Python 包安装不会提供 GPU 驱动、OCR 服务或翻译权重；对应服务在下一步分别准备。
+
+需要图形工作台时启动：
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-translation-agent --help
 translation-agent-web
 ```
 
-工作台默认地址为 [http://127.0.0.1:8501](http://127.0.0.1:8501)。
-若执行策略不允许激活，可直接使用 `.venv\Scripts\` 下的同名可执行文件。
-WebUI 仅接受 loopback 监听；远程访问应使用带认证的本地隧道。
+默认地址为 [http://127.0.0.1:8501](http://127.0.0.1:8501)。WebUI 仅允许 loopback 监听，
+远程访问需使用带认证的本地隧道。
 
-先预览计划，不调用模型、不生成出版物：
+<a id="models"></a>
+## 02 · 配置模型与启动翻译服务
 
-```powershell
-translation-agent plan book/input.pdf -o outputs/input --source-mode text-pdf --config pipeline.toml
-```
-
-确认输入模式、模型配置与本地依赖后执行：
-
-```powershell
-translation-agent run book/input.pdf -o outputs/input --source-mode text-pdf --config pipeline.toml
-```
-
-扫描 PDF 使用 `--source-mode scanned-pdf`。该模式需要可用的本地 GPU OCR
-环境；Python 包安装本身不提供 GPU 驱动或 OCR 服务。OCR 本地不可用时失败，
-不回退到云端 OCR。文字层 PDF 和 EPUB 的导入不需要 OCR。
-
-模型密钥通过设置页面或对应环境变量提供，例如 `DEEPSEEK_API_KEY`、
-`ZHIPU_API_KEY`；不要把密钥写入 README、版本库或共享命令记录。
-实际模型、端点与 profile 以 `pipeline.example.toml` 和本地配置为准。
-
-## 输入与发布边界
-
-| 输入模式 | 输入要求 | 处理路径 | 交付边界 |
-| --- | --- | --- | --- |
-| `scanned-pdf` | 扫描 PDF | 本地 OCR → 校勘/翻译 → 章节 → 发布 | 必须通过对应发布门 |
-| `text-pdf` | 正文页具有完整可复制文字层 | 文字提取 → 翻译 → 章节 → 发布 | 必须通过对应发布门 |
-| `epub` | 可解析的 OPF spine/XHTML | 原生语义导入 → 翻译单元 → 回填 → 草稿 | EPUB-native 发布门尚未接入 |
-
-输入模式由用户显式选择，不根据扩展名或少量文字自动推断扫描/文字层 PDF。
-混合型 PDF 应先检查文字层完整性，不能把缺失文字当成空白正文。
-
-EPUB 导入维护章节顺序及脚注引用—定义关系，翻译回填检查源哈希和结构标记。
-结构校验通过仍不等于 EPUB-native 正式发布：当前这条路径保留草稿标识，
-不能将生成成功解释为 `release_ready`。
-
-正式交付还要满足相应的结构、中文质量和渲染/视觉检查要求。
-执行成功、缓存命中、存在 DOCX 文件，都不足以单独证明出版质量通过。
-
-详见 [统一语义 DAG](docs/unified-semantic-dag.md)、
-[EPUB 语义输入](docs/epub-semantic-input.md) 和
-[产品架构与公共契约](docs/product-architecture.md)。
-
-## 扫描 PDF 的 OCR→中文质量流程（2026-10）
-
-扫描书主用本机 GPU PP-OCRv6 medium；只有硬失败或经本书人工标注校准的低置信页才调用 Xiaomi 复识一次；结构异常直接进入人工核图队列，不额外触发模型调用。Xiaomi 候选与 Paddle 主结果分开保存，空结果、截断或重复退化不会被当成空白页或有效识别；触发差异门后需人工核图。
-
-OCR 原文、行框、置信度、PDF 页号和源摘要保留在审计层。竖排按几何坐标恢复右起列序；页眉、页脚、重复书眉和纸页码按版面区域从正文分离，不按字符全局删。文本层 PDF、EPUB 和纯文本继续走各自适配器，不调用扫描 OCR。
-
-日语译中文时，DeepSeek Flash 按完整段落翻译并严格保留源标点字形与顺序；其他源语按目标语言自然句读处理，同时保留引文符号。所有路径检查外文残留、截断及新增省略号。当前常规页级翻译会把相邻页作为理解上下文，但仍分别提交页译文；跨页合并目前是可追溯的阅读稿修复路径，尚不能代替正式逐页检查点。不要把邻页上下文称为自动跨页联译。
-
-发布前检查全页机器证据、异常页人工核图、按规则抽样、中文/结构/标点门和 Word 实际渲染。每次入库都交付 `audit/quality-report.md`；报告区分机器通过、失败、跳过和人工决定。详见[扫描入库修正](docs/scan-ingest-repair.md)及[竖排日语入库 skill](skills/japanese-vertical-kb/SKILL.md)。
-
-## 架构与审查工作台
-
-打开工作台导航中的“架构与审查”，或访问
-[架构页面](http://127.0.0.1:8501/architecture)。
-页面使用等宽字符和 Unicode 框线绘制终端风格树图，提供项目、任务和发布
-工作区三个观察入口。
-
-![字符版架构与审查面板](docs/images/architecture-ascii.jpg)
-
-上图为界面快照。下面是布局示意；实际页面中的节点与状态来自项目定义和本地记录：
-
-```text
-┌──────────────────┐     ┌──────────────────────────────────────┐
-│ 审查与证据       │     │ translation-agent · 项目总览         │
-│                  │     └───────────────────┬──────────────────┘
-│ 源码位置         │                         │
-│ 节点状态         │     ┌───────────────────┴──────────────────┐
-│ 发布报告         │     │ 输入适配 / DAG 规划 / 工作区          │
-│ 快照时间         │     └───────────────────┬──────────────────┘
-│                  │             ┌───────────┼───────────┐
-│ 点击节点查看详情 │             ▼           ▼           ▼
-│                  │         文档导入     翻译编译     出版与检索
-│                  │             └───────────┼───────────┘
-│                  │                         ▼
-│                  │                 验证报告与产物审查
-└──────────────────┘
-┌─────────────────────────────────────────────────────────────┐
-│ 最近事件 · 开始 / 完成 / 失败 / 缓存复用                      │
-└─────────────────────────────────────────────────────────────┘
-```
-
-- 点击节点查看职责、节点 ID、源码位置、状态和证据；支持 Tab/Enter 操作。
-- “刷新快照”重新读取本地记录；JSON 导出适合审查归档，TXT 导出保留字符树。
-- 图中的连接表达模块分组；具体执行依赖由所选 recipe 决定。
-- 没有事件的节点显示“未记录”，页面不猜测进度或生成模型调用统计。
-- 页面读取任务登记、工作区状态和事件尾部，不启动任务或更改模型配置。
-- 历史评测或发布报告是带时间的快照；缺失本机评测材料不影响基本架构查看。
-
-完整操作与数据边界见 [架构与审查面板](docs/architecture-review.md)，
-界面设计约定见 [DESIGN.md](DESIGN.md)。
-
-## 命令入口与执行流程
-
-| 命令 | 用途 |
-| --- | --- |
-| `translation-agent` | 产品 CLI：规划、执行、导入、翻译、回填、发布、审查和状态 |
-| `translation-agent-web` | 启动本地任务工作台 |
-| `translation-agent-doctor` | 环境预检 |
-| `translation-agent-kb` | 单书知识库注册、检索、装置注释与派生产物 |
-| `translation-agent-global-kb` | 全局 SQLite 索引同步、检索与验证 |
-| `translation-agent-repo-guard` | 检查本地书稿、大文件和密钥的仓库边界 |
-
-产品 CLI 子命令为 `plan`、`run`、`ingest`、`translate`、`apply`、
-`publish`、`review`、`status`、`doctor`。使用子命令的 `--help` 查看参数。
-`graph_pipeline.py` 提供直接 DAG 入口，`book_pipeline.py` 保留阶段式兼容入口；
-旧检查点兼容入口 `pdf_text_agent.py` 不作为新任务的首选。
-
-```mermaid
-flowchart LR
-    S[显式 Source Adapter] --> G[DAG / 任务服务]
-    G --> C[章节与语义结构]
-    C --> P[JSONL / DOCX / EPUB]
-    P --> V[对应发布验证]
-    P --> R[单书 RAG 侧车]
-    P -. 手动 sync .-> Q[全局 SQLite 索引]
-    G --> A[架构与任务审查]
-    V --> A
-    Q --> A
-```
-
-DAG 根据目标选择依赖闭包，并记录 `.pipeline_graph/state.json` 与事件。
-版本、输入和模型配置参与缓存身份判断；缓存复用不能代替最终发布验证。
-全局索引通过独立 `sync` 命令更新，目前不自动挂接到每次 pipeline 发布。
-
-内置 recipe：
-
-| Recipe | 使用场景 | 最终验收目标 |
+| 阶段 | 当前配置 | 前置条件 |
 | --- | --- | --- |
-| `recipes/full-publication.toml` | 完整多格式出版 | `publication.report` |
-| `recipes/chinese-pdf-word.toml` | 中文 PDF 到 Word | `publication.word_report` |
-| `recipes/outline-word.toml` | 使用已有 PDF 书签生成 Word | `publication.word_report` |
+| 正文翻译 | `local_llm`，Hy-MT2 INT4 | 本地 vLLM 服务就绪 |
+| DeepSeek API 兼容 | `deepseek_flash` / `deepseek_pro` | 显式选择 profile，提供 `DEEPSEEK_API_KEY` |
+| OCR 校勘 | 本地配置的 `proofread_profile = "deepseek_flash"` | 独立于翻译 profile |
+| 扫描 OCR | 本地 GPU PP-OCRv6 medium | 对应本地 OCR 环境与扫描任务配置 |
+| 目录解析 | `toc_profile` | 按任务与 profile 提供服务 |
+| RAG 向量 | 智谱 `embedding-3` | 注册与 hybrid 查询需要匹配的 embedding 配置 |
+
+本地 `pipeline.toml` 默认选择 `local_llm`；`pipeline.example.toml` 仍默认 DeepSeek。
+首次复制示例后需改选 `local_llm`，或在运行命令中显式传入 `--translation-profile local_llm`。
+本地失败不会自动转用云端；兼容 DeepSeek 指保留显式切换能力。
+
+Hy-MT2 检查点为 `Intel/Hy-MT2-30B-A3B-int4-AutoRound`，API 地址为
+`http://127.0.0.1:8010/v1`。已有完整权重时只启动推理服务：
 
 ```powershell
-translation-agent plan book/input.pdf -o outputs/input --recipe recipes/full-publication.toml --config pipeline.toml
+docker compose -f deploy/local-llm/docker-compose.yml --profile gpu up -d vllm
+(Invoke-RestMethod http://127.0.0.1:8010/v1/models).data | Select-Object id
 ```
 
-`outline-word` 要求源 PDF 有可用书签。只选择 `publication.docx` 生成的是
-未验收中间产物，正式 Word 交付应包含 `publication.word_report`。
+模型列表返回预期检查点才表示服务可用。首次下载、显存参数、代理及停止方式见
+[本地翻译部署说明](deploy/local-llm/README.md)。密钥通过本机设置或环境变量提供，
+不要写入 README、TOML 或共享命令。翻译与 embedding 使用不同配置，Hy-MT2 不承担向量生成。
 
-## 知识库数据契约
+<a id="ingest"></a>
+## 03 · 选择输入并预览计划
 
-`knowledge_base.jsonl` 是发布与验证层拥有的规范正文，每行严格使用五字段：
+| 输入模式 | 导入过程 | 应先确认 |
+| --- | --- | --- |
+| `scanned-pdf` | 本地 OCR、版面整理、正文重建 | GPU OCR 可用，页序与横竖排方向正确 |
+| `text-pdf` | 提取文字层、页信息和章节线索 | 正文文字层完整，混合型 PDF 没有缺失页 |
+| `epub` | 导入 OPF spine 与 XHTML 语义结构 | 章节次序、脚注引用与定义关系可解析 |
+
+模式由用户显式选择，不根据扩展名或少量文字自动推断。
+先预览目标、配置与依赖；`plan` 不调用模型、不生成出版物：
+
+```powershell
+translation-agent plan book/input.pdf -o outputs/input `
+  --source-mode text-pdf --config pipeline.toml `
+  --translation-profile local_llm
+```
+
+需要自定义发布目标时，选择已有 recipe：
+
+| Recipe | 场景 | 验收目标 |
+| --- | --- | --- |
+| `recipes/full-publication.toml` | 多格式出版 | `publication.report` |
+| `recipes/chinese-pdf-word.toml` | 中文 PDF 到 Word | `publication.word_report` |
+| `recipes/outline-word.toml` | 从现有 PDF 书签生成 Word | `publication.word_report` |
+
+`outline-word` 需要有效书签。只选择 `publication.docx` 得到的是待验收中间产物。
+
+<a id="translation"></a>
+## 04 · 执行导入、校勘与翻译
+
+计划符合输入和目标后执行：
+
+```powershell
+translation-agent run book/input.pdf -o outputs/input `
+  --source-mode text-pdf --config pipeline.toml `
+  --translation-profile local_llm
+translation-agent status -o outputs/input
+```
+
+上面两条依次执行任务、读取状态。需要云端翻译时，把运行命令的 profile 显式改为
+`deepseek_flash` 或 `deepseek_pro`，其他阶段仍按各自配置执行。
+
+### OCR 比较只抽样，正式全文识别走本地
+
+整书主 OCR 使用本地 PP-OCRv6，不能把远端视觉 API 作为整书后端。
+OCR 比较只取少量精确 PDF 页，与原图对照；抽样清单不自动发起 API 调用。
+DeepSeek `proofread` 是文本校勘，收到的是文字，不是图像；若选用它，只对明确的
+抽样页运行，常规流程不启用整书 proofread 节点。
+
+当前视觉处理为整页 RGB JPEG、200 DPI 目标、最长边 3000、质量 90，
+Paddle 返回文字、置信度与行框；竖排按右起列序恢复，横排按行恢复。
+图像缩放、上下版块分离、几何段落重建、精确单页调用及例外复核见
+[OCR 抽样与视觉处理](docs/ocr-sampling-and-vision.md)。
+
+### 扫描书的处理顺序
+
+本地 PP-OCRv6 medium 识别后，按坐标恢复阅读顺序与正文段落。
+竖排恢复右起列序；页眉、页脚、书眉和纸页码按版面区域分离，不按字符全局删除。
+原始 OCR、行框、置信度、PDF 页号与源摘要保留在审计层。
+
+Xiaomi 只对硬失败页或经本书人工标注校准的低置信页复识一次；候选独立保存。
+结构异常进入人工核图，空输出、截断和重复退化均按失败处理，不当作空白正文。
+
+正文按完整段落翻译。常规页级流程分别提交各页，相邻页仅用于理解上下文，
+不等于自动跨页联译。源文或邻页上下文变化后，应使相关译文检查点失效。
+
+### 按源语言选择提示词
+
+Hy-MT2 日文正文采用你选定的 V12_hard 模板，版本为 `ja-v12-hard-context-v1`；
+英文正文使用独立的 `en-book-prose-context-v1`，不复用日文 few-shot 和标点示例。
+该选择适用于页/段落链，EPUB 与知识库批量翻译保留自己的结构协议。
+原模板、语言范围、缓存身份与完整英文模板见[提示词说明](docs/translation-language-prompts.md)。
+
+### 把译文交给用户检查
+
+当前本地段落门保留引号字形、顺序和数量检查，以及中文存在、日文残留和新增省略号检查；
+普通标点签名被跳过，标点的增删与重排也不由该项检查拦截。
+DeepSeek 的日译中段落路径仍要求严格源标点签名一致。
+
+实际原文、译文、重试与机器观察见[翻译证据入口](deploy/local-llm/evidence/2026-10-14/README.md)。
+需要保存新的一轮样例时使用尚不存在的输出目录：
+
+```powershell
+python deploy/local-llm/smoke_translate.py --output-dir outputs/hy-mt2-review-new
+```
+
+被机器拒绝的原始响应同样保存。译意、术语、书名、人名、文风与句读由用户判断；
+机器通过、局部冒烟与整书人工验收分别记录。
+
+EPUB 翻译回填校验源哈希和结构标记。需要分阶段操作时使用 `ingest`、`translate` 和
+`apply --translations`，具体参数以子命令的 `--help` 为准。纯文本、Markdown 与 DOCX
+使用各自入库入口，不强行经过扫描 OCR。
+
+<a id="publication"></a>
+## 05 · 编译产物并完成发布审查
+
+翻译回填后编译章节和候选 JSONL、DOCX、EPUB，再执行对应发布检查。
+发布层继续独立检查标点、检查点、中文质量、结构和实际渲染，
+本地段落门通过不能跳过这些检查，也不代替人工决定。
+
+| 检查结果 | 接下来做什么 |
+| --- | --- |
+| 机器失败或证据缺失 | 保留候选、定位源数据与检查点问题，修正后重建 |
+| 机器通过、人工尚未审校 | 对照源页、原文译文和 Word 实际版面，保存真实决定 |
+| 满足对应发布要求 | 交付产物，再继续单书注册 |
+
+扫描入库保留 `audit/quality-report.md`，区分通过、失败、跳过与人工决定。
+存在 DOCX、命中缓存或进程成功退出，均不足以单独证明出版质量通过。
+**EPUB-native 发布门尚未接入，当前仍交付草稿，不能宣称 `release_ready`。**
+
+详见[扫描入库修正](docs/scan-ingest-repair.md)、[EPUB 语义输入](docs/epub-semantic-input.md)
+及[产品架构与公共契约](docs/product-architecture.md)。
+
+<a id="register"></a>
+## 06 · 注册单书并准备 RAG 向量
+
+### 先保留规范正文，再生成侧车
+
+`knowledge_base.jsonl` 由发布与验证层拥有，每行严格使用五字段：
 
 | 字段 | 含义 |
 | --- | --- |
 | `id` | 稳定块 ID |
 | `title` | 标题 |
-| `chapter_id` | 所属章节 |
+| `chapter_id` | 章节 ID |
 | `chapter_order` | 章节顺序 |
-| `content` | 块正文 |
+| `content` | 正文 |
 
-RAG 不向这些行追加向量、评分或装置注释。检索清单、向量、可选路由元数据
-和装置标注由独立 sidecar 保存，并按各自契约关联正文与校验信息。
-正文改变后必须重新验证或重建关联侧车，不能沿用过期向量。
+| 文件 | 用途 |
+| --- | --- |
+| `knowledge_base.jsonl` | 规范正文与稳定块 ID |
+| `knowledge_base.rag.json` | RAG 清单、索引状态与 embedding 身份 |
+| `knowledge_base.vectors.jsonl` | 块向量，与正文和清单校验信息关联 |
+| `knowledge_base.meta.jsonl` | 可选书名、作者、语言等路由元数据 |
+| `knowledge_base.apparatus.json` | 目录、索引等装置角色与降权信息 |
 
-目录、索引、参考材料等可以通过装置注释降权；正文仍保留在规范语料中。
-中文语言门默认阻止未经翻译的外文正文注册或进入全局库，参考材料按规则豁免。
-`--allow-foreign` 是显式绕过选项，不代表达到中文交付要求。
+向量、评分、路由和装置注释不写入规范正文。
+正文或依赖来源改变后重新验证或重建相关侧车，不能沿用过期向量。
 
-### 单书检索
+### 依次注册与检查状态
 
-以下注册只建立词法路径，不调用 embedding API：
+下面假定实际产物是 `outputs/input/knowledge_base.jsonl`；若位于其他产物目录，替换为实际路径。
+配置好 `ZHIPU_API_KEY` 与 embedding 参数后执行：
+
+```powershell
+translation-agent-kb register outputs/input/knowledge_base.jsonl --model embedding-3
+translation-agent-kb status outputs/input/knowledge_base.jsonl
+```
+
+默认注册生成向量并调用 embedding 服务；确认清单、正文和向量有效后，才能进行正式 hybrid。
+未经翻译的外文正文默认被语言门阻止，参考材料按规则豁免。
+`--allow-foreign` 是显式绕过，不能当成符合中文交付要求。
+
+装置标注使用独立侧车，结构性内容通常为 `0.25`、说明性内容为 `0.7`、正文为 `1.0`。
+需要刷新标注时使用 `annotate-apparatus`；检索参数 `--apparatus-weight 0` 排除已标注内容，
+`1` 关闭其降权。它们是检索配置，不删除正文。
+
+<details>
+<summary>离线准备与诊断</summary>
 
 ```powershell
 translation-agent-kb register outputs/input/knowledge_base.jsonl --lexical-only
-translation-agent-kb status outputs/input/knowledge_base.jsonl
-translation-agent-kb retrieve outputs/input/knowledge_base.jsonl '社会 个人 文学' --mode hybrid --top-k 5
 translation-agent-kb annotate-apparatus outputs/input/knowledge_base.jsonl
 ```
 
-省略 `--lexical-only` 的注册可以调用配置的 embedding 服务。正式检索统一
-`--mode hybrid`，需要有效向量和匹配的 embedding 配置；上面的词法注册只用于
-准备正文清单或离线诊断，正式 hybrid 前需完成向量注册。缺资源或服务异常时
-明确报告，不以纯 BM25 降级冒充 hybrid。`--mode lexical/semantic` 仅用于诊断。
+词法注册不生成正式 hybrid 所需向量。随后需要省略 `--lexical-only` 重新注册并检查状态；
+不能把缺向量的词法结果作为正式 hybrid 答复。
 
-单书 CLI 的实际子命令包括：`register`、`annotate-apparatus`、`translate-kb`、
-`retrieve`、`status`、`evaluate`、`derive-docx`。例如先检查外文翻译范围：
+</details>
 
-```powershell
-translation-agent-kb translate-kb outputs/input/knowledge_base.jsonl --dry-run
-translation-agent-kb retrieve --help
-translation-agent-kb evaluate --help
-```
+<a id="index"></a>
+## 07 · 显式同步全局 SQLite 索引
 
-单书打开时合并正文解析与校验、只加载一次 ready 向量；对象预计算并复用
-规范化正文。适用路径用 `heapq` 选择 top-k，保留 BM25、子串加分、装置权重
-和并列顺序；跨书限额等需要完整排序的路径保留原语义。
-首次打开仍做完整校验和预计算，没有跨 API 请求缓存或懒加载承诺。
-Python 高层 API 默认及显式 `mode=None` 均使用真实 hybrid；完整入口与失败
-规则见 [知识库正式调用规则](docs/knowledge-base-call-policy.md)。
-
-### 全局 SQLite 索引
-
-SQLite 是可重建的运行索引，规范 JSONL 与发布文件仍是来源。默认数据库
-路径由程序管理，也可用顶层 `--db` 指定本地数据库文件。
+需要跨书发现候选时，同步已经准备好的工作区：
 
 ```powershell
-translation-agent-global-kb sync --outputs outputs
-translation-agent-global-kb status
-translation-agent-global-kb search '自然' --limit 10
-translation-agent-global-kb search '资本主义' --per-book-cap 2
-translation-agent-global-kb verify
+translation-agent-global-kb --db global_knowledge_base.sqlite3 sync --outputs outputs
+translation-agent-global-kb --db global_knowledge_base.sqlite3 status
+translation-agent-global-kb --db global_knowledge_base.sqlite3 verify
 ```
 
-全局 CLI 子命令为 `sync`、`status`、`verify`、`evaluate`、`search`。
-此处 `search` 是跨书候选发现/诊断接口。正式跨书取证通过模型工具 `kb_ask`
-或 `python tools/kb_qa_plugin/kb_qa.py ask "<问题>" --mode hybrid` 完成单书精读，
-最终证据不混入只经过 FTS 的发现片段。
-`search` 支持 `reader`、`pages`、`archive`、`all` 范围和工作区过滤。
-全局 reader 查询默认每书最多一条；`--per-book-cap 0` 关闭限额。
+单书检索不需要全局索引；`sync` 也不会自动生成各书的 RAG 向量。
+数据库是可重建的派生运行索引，规范 JSONL、源文件和发布记录仍是来源。
+同步当前为显式操作，不自动挂接到每次发布。
 
-schema 4 使用长词 trigram FTS5，加上一字/二字的 contentless FTS5 倒排索引，
-支持中文、假名和韩文短词。短词索引不另存一份编码 token 正文；混合查询
-继续遵守既有召回规则。评分和每书限额在 SQL 内完成，Python 只接收最终
-结果；SQL 内部仍可能排序，不把这一变化描述为所有排序成本消失。
+当前 schema 4 使用 trigram FTS5 处理长查询，用 contentless 短词 FTS5 支持短中文词等检索。
+增量同步按严格 SHA 清单检测变化；变化工作区重新导入，完整性检查后原子替换。
+`unchanged` 只表示来源清单未变，不代表刚完成全部数据库核验。
 
-增量同步对来源执行严格 SHA 清单比较，仅重新导入变化工作区；未变时
-复用已有数据。新增、删除、报告依赖、装置标注和资产变化也纳入检测。
-变化同步通过 backup 临时快照和原子替换完成；旧 schema 自动重建迁移。
+<details>
+<summary>索引维护与性能边界</summary>
 
 ```powershell
-# 修复或重新建立全部索引
-translation-agent-global-kb sync --outputs outputs --full-rebuild
-
-# 使用自己审定的 JSON 题集评估
-translation-agent-global-kb evaluate --cases retrieval-cases.json --report retrieval-report.json
+translation-agent-global-kb --db global_knowledge_base.sqlite3 sync --outputs outputs --full-rebuild
+translation-agent-global-kb --db global_knowledge_base.sqlite3 evaluate `
+  --cases retrieval-cases.json --report retrieval-report.json
 ```
 
-`unchanged` 只说明来源清单未变，不表示刚执行完整数据库检查。
-用 `verify` 检查当前来源及数据库，用 `--full-rebuild` 恢复或重建。
-严格哈希仍随输入字节数增长；变化同步的 backup 与完整性检查仍随数据库
-规模增长。精确向量搜索仍为 O(ND)，普通 SQLite 索引不会消除这个成本。
-
-## 2026-10-13 版本说明
-
-本轮聚焦扫描 PDF 的 OCR→中文入库质量与执行路径；文字层 PDF、EPUB 和纯文本继续走各自入口。
-
-### OCR 与正文整理
-
-- 扫描 OCR 主路固定为 GPU PP-OCRv6 medium。Xiaomi 只对硬失败页或经本书人工标注校准的低置信页
-  复识一次；结构异常直接进入人工核图，不额外调用模型。复识候选单独保存，不自动择优或拼接；空、截断
-  或重复退化输出按失败处理，不能当成空白页。
-- 原始 OCR、行框、置信度和源摘要保留在审计层。竖排按几何坐标恢复右起列序；重复书眉、页眉页脚和纸页码
-  凭版面区域从正文分离，正文标题、编号与脚注保留，不按字符全局删除。
-
-### 翻译与发布验收
-
-- 使用 DeepSeek Flash 按完整段落翻译。日语译中文时，源文全部标点的字形、顺序和数量必须保留；空译文、
-  截断、外文残留或新增省略号会阻断该页。每个段落翻译批次最多两次模型请求，不再递归二分重试。
-- 机器全页检查、异常页人工核图和人工抽样分别留证；抽样按 `ceil(N/20)`，至少 3 页、最多 10 页。
-  只有人类确认计入正式核图。产物目标为中文知识库与读者版；未过发布门的候选保持草稿/阻断状态，
-  不注册为正式语料。每次入库均生成 `audit/quality-report.md`，并检查 Word 实际渲染。
-- 常规翻译仍按 PDF 页分别提交，邻页只提供理解上下文；跨页组稿目前只用于可追溯阅读稿修复，不能代替正式
-  逐页检查点。本轮不以局部冒烟推断整本无遗漏，也不宣称未经基准验证的速度提升。
-
-本轮的入口、关卡与验收细节见[扫描入库修正](docs/scan-ingest-repair.md)和
-[竖排日语入库 skill](skills/japanese-vertical-kb/SKILL.md)。GitHub Actions 的 Python 3.11/3.12
-单元测试、仓库守卫和 wheel 构建均通过。
-
-## 2026-10-09 版本说明
-
-本轮把分语种入库流程固化为一组可安装的 DSH/Cordis 插件与配套 skill,
-并把知识库正式调用规则、中文质量门、竖排 OCR 与扫描书翻译的修复一并合入。
-
-### 新增入库插件与 skill
-
-| 入口 | 插件 | 配套 skill | 用途 |
-| --- | --- | --- | --- |
-| `dsh-kb-ingest` | `tools/kb_ingest_plugin/` | `source-to-kb-word-workflow` | Markdown/纯文本/DOCX/EPUB/带文字层 PDF 入库,产出逐字校对通过的中文 Word |
-| `dsh-jp-vertical-kb` | `tools/jp_vertical_kb_plugin/` | `japanese-vertical-kb` | 竖排日语扫描书分阶段入库:OCR → 逐页翻译 → 出版验收 → 单书注册 |
-| `dsh-chinese-pdf-kb` | `tools/chinese_pdf_kb_plugin/` | `chinese-pdf-body-kb` | 中文横排扫描 PDF 正文重建与入库,分离页下注、编者材料与版面噪声 |
-| `dsh-english-pdf-kb` | `tools/english_pdf_kb_plugin/` | `english-pdf-kb` | 英文原文 PDF 译为中文选文知识库,区分编者导言与选文 |
-| `kb-reader` | `tools/kb_qa_plugin/` | — | 会话问答工具:检索取证 → 引文核验 → 再作答,书内论断须标《书名》·章节出处 |
-
-插件只做入口与参数校验,各阶段质量仍由本仓库的发布门与检索验收决定;
-工具注册成功不代表某本实书已通过质量门。书籍修复脚本继续收拢在
-`tools/books/`(本轮新增施米特两册正文重建/读者版与《私小説論》验证目录)。
-
-### 检索调用规则
-
-- Python 高层 API 与 `kb_ask` 默认真实 hybrid;向量缺失、embedding 身份
-  不一致或 provider 失败时显式报错,不以纯 BM25 降级冒充 hybrid。
-  `--mode lexical/semantic` 仅用于诊断。
-- 正式入口与失败规则见[知识库正式调用规则](docs/knowledge-base-call-policy.md);
-  分书语料/全局索引两条链路与存储设计见
-  [全局知识库数据流](docs/global-knowledge-base-dataflow.md)。
-
-### 质量门与修复
-
-- 发布校验器新增 `knowledge_base.chinese` 与 `docx.chinese` 检查,复用
-  kb_translation/docx_translation 的离线中文判定;对照表、书目、索引等
-  双语装置豁免。管线图与门说明更新于 `docs/product-architecture.md`。
-- `kb_translation` 新增汉字主导判据:假名占比低于 20% 且汉字足够时按
-  "中文带引注残留"豁免,修复日文引注残留把中文块判为外文、语言门永久
-  卡住的假阴性;阈值来自 202 页竖排日文样本的实测分布。
-- 竖排 OCR 按页检测方向(`--reading-direction auto`),日文纵排按右起
-  列序、上起行序输出并保留原始行框;OCR 检查点记住方向参数。
-- 扫描书逐页翻译默认请求可见译文,拒绝空译文、残留外文段落与原文没有
-  的省略号,复杂页仅对失败段落定点补译;`translate-kb` 新增 `--concurrency`
-  应对 provider 限速。
-- 新增 10 个测试模块,覆盖四个入库入口、hybrid 调用策略(离线,不调
-  embedding 服务)、竖排阅读顺序与 OCR 提示保真。
-
-## 2026-10-03 版本说明
-
-本轮增加终端字符风格架构与审查面板，并优化知识库重复加载、规范化、
-候选选择、短词检索和增量同步。原始语料未因这些索引优化而改写。
-
-以下为开发机已有语料的本地样本验证，不是首次 clone 自动复现的基准，
-也不代表所有查询或生产延迟分布：
-
-| 样本 | 优化前 | 优化后 |
-| --- | ---: | ---: |
-| 鲁迅全集，已打开对象查询“社会 个人 文学” | 517 ms | 31 ms |
-| 全局查询“自然” | 164 ms | 48 ms |
-
-46 条本机评测查询的 ID、分数及顺序与基线一致，301 个正文和侧车文件
-哈希不变。鲁迅全集首次打开仍约 2.5 秒；短词索引让样本数据库额外增加
-约 37 MiB。这是以磁盘换检索成本的明确取舍。
-
-完整数据、适用条件与实现边界见
+重建用于明确的恢复或迁移；评测使用自己审定的题集。严格哈希仍随输入字节数增长，
+变化同步的备份与完整性检查仍受数据库规模影响；精确向量搜索为 O(ND)，SQLite 不消除其成本。
+首次打开单书仍完整校验，没有跨请求缓存或懒加载承诺。历史性能样本见
 [知识库运行内核与性能验证](docs/knowledge-base-performance.md)。
 
-## 开发与验证
+</details>
+
+<a id="retrieve"></a>
+## 08 · 统一全库 retrieve 与引用取证
+
+### 统一入口：默认全库，单书是过滤条件
+
+把 `outputs` 根目录作为检索范围，同一个 `retrieve` 入口遍历所有发现的书库：
+
+```powershell
+translation-agent-kb retrieve outputs '社会 个人 文学' `
+  --mode hybrid --top-k 10 --per-book-cap 3
+
+# 同一入口限定一本书，填写返回结果中的实际工作区名称。
+translation-agent-kb retrieve outputs '社会 个人 文学' `
+  --mode hybrid --book '<实际工作区名称>'
+```
+
+全库范围默认不按查询中出现的书名自动缩小范围；显式 `--book` 用于限定书库。
+`--auto-route` 是可选的主动路由，直接传单书路径时仍默认开启；要始终保留全库范围，
+不启用它。单书与跨书共用 hybrid，区别是传入的检索范围。
+
+```mermaid
+flowchart TB
+    Q[同一个 retrieve 问题入口] --> S[发现全库来源或显式 book 过滤]
+    S --> C[逐书校验规范正文与侧车]
+    C --> V{有效向量与身份一致的 provider}
+    V -->|部分缺失| X[报告未就绪书库与部分覆盖]
+    V -->|全部缺失| F[报告 hybrid 不可用]
+    V -->|有效| L[逐书 BM25 与向量召回及 RRF]
+    L --> R[跨书融合去重与每书限额]
+    R --> O[Top K 上下文与每条书籍来源]
+```
+
+正式 CLI 开启严格 hybrid：未生成向量的书库列入 `lexical_only` 与部分覆盖诊断，
+不把这些库的纯词法命中混入正式结果；provider 失败也不能静默降级。
+对可用书逐一检索，查询 embedding 在同一次请求内复用，再融合全局 Top K。
+因此最终返回的书籍数不等于全库书籍数，覆盖状态见 `workspaces`。
+底层库 API 的兼容诊断路径仍可显式使用，不能把它的词法结果冒充正式 hybrid。
+
+| 参数或结果 | 用途 |
+| --- | --- |
+| `--book` | 全库范围按工作区名过滤，可重复 |
+| `--chapter-id` / `--author` / `--language` | 按章节及现有元数据过滤，可重复 |
+| `--candidate-depth` | 各通道候选深度，CLI 默认 `30` |
+| `--per-book-cap` | 每书结果限额，默认 `3`，`0` 关闭 |
+| `--max-chars` | 上下文字符预算，默认 `12000` |
+| `book` / `book_title` / `author` | 工作区相对路径、书名与可用作者信息；缺书名元数据时回退工作区标识 |
+| `chapter_id` / `title` / `id` | 章节、标题与块 ID |
+| `source_path` / `duplicate_sources` | 规范正文路径与去重前其他来源 |
+| `hits` / `context` / `workspaces` | 原文命中、带来源的上下文与覆盖诊断 |
+
+命中时明确标注来自哪一本书；书名缺失时不编造译名，使用工作区与源路径追溯。
+同一正文跨书重复时保留 `duplicate_sources`。相似度分数不是论证证据，仍需阅读命中正文。
+retrieve CLI 不默认调用 LLM reranker；Hy-MT2 不参与 embedding 召回。
+
+### 可选快速入口：SQLite 发现与候选书精读
+
+只想发现可能相关的书与章节，可以离线使用 SQLite：
+
+```powershell
+translation-agent-global-kb --db global_knowledge_base.sqlite3 search '自然主义' --scope reader --limit 10
+```
+
+这一步是候选发现，不能把 FTS 摘要直接当成正式回答证据。
+`kb_ask` 保留以下两段式入口，适合先缩小候选范围的取证：
+
+```powershell
+python tools/kb_qa_plugin/kb_qa.py `
+  --db global_knowledge_base.sqlite3 --outputs outputs `
+  ask '自然主义如何理解文学与社会的关系？' --mode hybrid
+```
+
+```mermaid
+flowchart TB
+    Q[问题与显式 workspace 或书名线索] --> D[SQLite FTS 候选发现与书目路由]
+    D --> W[选择候选工作区与章节]
+    W --> H[打开候选书并执行单书 hybrid]
+    H --> G[核对词法与章节依据的证据门]
+    G --> B[去重与上下文预算]
+    B --> C[仅交付 hybrid 精读命中]
+    C --> V[逐字核验直接引用]
+    W -. 部分书不可用 .-> P[保留 skipped 与部分覆盖诊断]
+    P --> C
+```
+
+`kb_ask` 对应这一流程，正式使用 `mode="hybrid"`，保持 `reader`、向量召回和精读开启。
+这个入口不是全库逐书 hybrid：默认精读候选上限为 2，FTS 未发现的书可能不进入精读。
+需要完整全库范围时使用上面的统一 retrieve；其中 FTS 只确定候选，正式 `hits/context` 来自单书 hybrid，证据门进一步检查
+命中与已发现章节、命名书籍或明确词法依据的关系，不以相似度分数代替出处。
+
+`reader` 用于读者正文；`pages`、`archive`、`all` 是原页或存档诊断范围，
+没有等同 reader 的现成向量契约，不把它们伪称正式 hybrid 精读。
+全局 search 的 reader 默认每书一条，与单书 CLI 的默认限额不同。
+统一 retrieve 不经过 SQLite 候选门，也不需要预先同步数据库；逐字引文核验仍依赖已同步的全局 reader 正文。
+
+### 返回状态：无依据与不可用分别处理
+
+| 情况 | 正式结果与下一步 |
+| --- | --- |
+| 向量、密钥或匹配的 provider 缺失 | 报告 hybrid 不可用，先补配置或注册 |
+| 正文、向量、侧车陈旧或身份不匹配 | 报告校验问题，重新验证或重建对应侧车 |
+| embedding 服务失败 | 明确失败，不静默降级 BM25 |
+| 部分候选书不可用 | 可交付其余成功的 hybrid 证据，保留 skipped 与部分覆盖说明 |
+| 所有已尝试候选书都不可用 | 报告 hybrid 不可用，不能用 FTS 摘要补回正式证据 |
+| 成功检索但无可交付依据 | 报告未找到依据，不把发现摘要补进正式 context |
+
+查询不自动批量重建向量；`lexical`、`semantic`、`--no-deep` 等只用于显式诊断。
+这些结果不能冒充正常 hybrid 问答。完整契约见[知识库正式调用规则](docs/knowledge-base-call-policy.md)。
+
+### 最后核验引文，再组织答案
+
+从命中正文取引文，至少 8 个字符；限定已命中的工作区，核对完整 reader 块：
+
+```powershell
+python tools/kb_qa_plugin/kb_qa.py --db global_knowledge_base.sqlite3 `
+  verify-quote '把命中的原文逐字粘贴到这里' `
+  --workspace '<实际工作区名称>'
+```
+
+| 引文核验结果 | 如何引用 |
+| --- | --- |
+| `verbatim` | 按工具允许的空白与全角标点归一化匹配，可引用 |
+| `verbatim_normalized` | 按工具给出的差异与语料写法调整后引用 |
+| `mismatch` | 找到相关段落，但这段引文不存在，改为转述 |
+| `not_found` | 当前 reader 库未找到，不声称原书必然没有 |
+
+`kb_verify_quote` 是对应的模型工具。它是独立精确核验，不需要借道 hybrid，
+依赖全局索引中的完整 reader 正文，因此正文改变后也应先同步索引。
+回答注明《书名》·章节，区分作者正文、译者措辞和编者材料；推论单独说明。
+
+## 命令入口与执行流程
+
+| 入口 | 职责 |
+| --- | --- |
+| `translation-agent` | `plan`、`run`、`ingest`、`translate`、`apply`、`publish`、`review`、`status`、`doctor` |
+| `translation-agent-web` | 本地工作台 |
+| `translation-agent-doctor` | 环境预检 |
+| `translation-agent-kb` | 单书注册、retrieve、状态、装置注释与派生产物 |
+| `translation-agent-global-kb` | 全局 SQLite sync、search、verify 与评测 |
+| `tools/kb_qa_plugin/kb_qa.py` | 跨书发现与 hybrid 精读、书目状态、逐字引文核验 |
+| `translation-agent-repo-guard` | 本地书稿、大文件与密钥边界检查 |
+
+DAG 按目标选择依赖闭包，在 `.pipeline_graph/state.json` 和事件记录执行与缓存状态。
+`graph_pipeline.py` 是直接 DAG 入口，`book_pipeline.py` 保留阶段式兼容入口，
+`pdf_text_agent.py` 不作为新任务首选。命令参数以各自的 `--help` 为准。
+
+<details>
+<summary>分语种入库插件与 skill</summary>
+
+| 入口 | 用途 |
+| --- | --- |
+| `dsh-kb-ingest` | Markdown、纯文本、DOCX、EPUB、带文字层 PDF 入库 |
+| `dsh-jp-vertical-kb` | 日文竖排扫描书 OCR、翻译与发布 |
+| `dsh-chinese-pdf-kb` | 中文扫描正文重建，注释与版面噪声分离 |
+| `dsh-english-pdf-kb` | 英文 PDF 选文翻译与入库 |
+| `kb-reader` | 检索取证与逐字引文核验 |
+
+插件与 skill 的注册不是某本书的质量验收；实际边界仍由源文件、各阶段检查和人工记录决定。
+
+</details>
+
+<details>
+<summary>架构与审查工作台</summary>
+
+打开工作台“架构与审查”，或访问[架构页面](http://127.0.0.1:8501/architecture)。
+它读取项目定义、任务、工作区状态与事件，不启动任务或更改模型配置；无事件的节点显示未记录。
+
+![字符版架构与审查面板](docs/images/architecture-ascii.jpg)
+
+节点可查看源码位置、状态与证据，支持 Tab/Enter；快照可导出 JSON/TXT。
+图中的分组不等于所有 recipe 的执行依赖，详见[架构与审查面板](docs/architecture-review.md)与 [DESIGN.md](DESIGN.md)。
+
+</details>
+
+## 版本记录与开发验证
+
+历史记录按日期从旧到新整理至[版本与 workflow 演进](docs/workflow-history.md)，
+保留旧性能样本与当时检查的适用范围；当前操作以上面的 01 至 08 步为准。
 
 ```powershell
 python -m pip install -e '.[dev]'
-python -m unittest tests.test_rag_performance tests.test_global_kb_search_performance tests.test_global_kb_incremental
-python -m unittest tests.test_architecture_ascii tests.test_architecture_dashboard tests.test_architecture_page
 python -m unittest discover -s tests -q
 git diff --check
 ```
 
-功能验证采用本地 fixture 与可注入 provider；实际 GPU OCR、模型调用和
-Word 渲染属于各自环境验收，不应由单元测试通过推断其可用。
-修改发布规则时还应检查正文、脚注、中文质量及报告 freshness。
+单元测试使用本地 fixture 与可注入 provider，不能据此确认实机 GPU、在线模型或整书渲染通过。
+修改发布规则时检查正文、脚注、中文质量及报告 freshness；检索评测分别看候选召回、最终排名与上下文证据覆盖。
 
-| 目录 / 模块 | 职责 |
+| 代码位置 | 职责 |
 | --- | --- |
-| `document_pipeline.py` / `product_contracts.py` | 产品命令与版本化运行契约 |
-| `pipeline_graph/` / `recipes/` | DAG 节点、执行器、缓存与目标组合 |
-| `book_pipeline.py` / `publication_verifier.py` | 编译发布与质量门 |
+| `document_pipeline.py` / `product_contracts.py` | 产品命令与运行契约 |
+| `pipeline_graph/` / `recipes/` | DAG、缓存与目标组合 |
+| `book_pipeline.py` / `publication_verifier.py` | 编译与发布检查 |
 | `semantic_ir.py` / `semantic_apply.py` | 语义结构与翻译回填 |
-| `rag_knowledge_base.py` / `rag_apparatus.py` | 单书检索、向量与装置标注 |
-| `global_knowledge_base.py` | 全局 SQLite 索引 |
-| `frontend_runtime.py` / `application_service.py` | 任务登记与应用服务 |
-| `architecture_dashboard.py` / `architecture_ascii.py` | 架构快照与字符树 |
-| `skills/` / `tools/*_plugin/` | 分语种入库 skill 与 DSH/Cordis 插件 bundle |
-| `app_pages/` / `streamlit_app.py` | 工作台页面 |
-| `tests/` / `docs/` | 回归测试与专题文档 |
+| `rag_knowledge_base.py` / `rag_apparatus.py` | 单书 hybrid、向量、装置与上下文 |
+| `global_knowledge_base.py` / `tools/kb_qa_plugin/` | 全局发现、精读编排与引文核验 |
+| `frontend_runtime.py` / `application_service.py` | 任务与应用服务 |
+| `skills/` / `tools/*_plugin/` | 入库与阅读工具 |
+| `tests/` / `docs/` | 验证与专题说明 |
 
-更多说明：[产品架构](docs/product-architecture.md) ·
-[语义 DAG](docs/unified-semantic-dag.md) ·
-[EPUB 输入](docs/epub-semantic-input.md) ·
-[架构审查](docs/architecture-review.md) ·
-[性能验证](docs/knowledge-base-performance.md) ·
-[调用规则](docs/knowledge-base-call-policy.md) ·
-[全局数据流](docs/global-knowledge-base-dataflow.md)。
+继续阅读：[语义 DAG](docs/unified-semantic-dag.md) · [产品架构](docs/product-architecture.md) ·
+[EPUB 输入](docs/epub-semantic-input.md) · [检索调用规则](docs/knowledge-base-call-policy.md) ·
+[全局数据流历史分析](docs/global-knowledge-base-dataflow.md) · [性能验证](docs/knowledge-base-performance.md)。

@@ -1148,7 +1148,9 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
             != context.expected_translation_fingerprint
         ):
             fresh = False
-        if fresh and str(payload.get("translation_prompt_version") or "").startswith("book-translation-v11-"):
+        if fresh and str(payload.get("translation_prompt_version") or "").startswith(
+            ("book-translation-v11-", "book-translation-v12-", "book-translation-v13-")
+        ):
             fresh = payload.get("translation_input_sha256") == translation_input_sha256(payload, prepared_inputs)
         if "unreviewed-draft" in str(payload.get("translation_prompt_version") or ""):
             fresh = False

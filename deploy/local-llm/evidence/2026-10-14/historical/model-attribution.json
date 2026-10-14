@@ -1,0 +1,47 @@
+{
+  "model": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+  "evidence": {
+    "profile_write": {
+      "session_line": 298,
+      "seq": 296,
+      "time_asia_shanghai": "2026-10-13T12:56:14.808000+08:00"
+    },
+    "server_models_response": {
+      "session_line": 810,
+      "seq": 808,
+      "time_asia_shanghai": "2026-10-13T15:32:12.766000+08:00"
+    },
+    "basis": "各实验脚本从 pipeline.toml 的 translation profile 创建客户端；行298设置 local_hymt2 与该模型，行810服务 /v1/models 返回该模型。本组实验范围内未见改写 pipeline.toml 的 write/edit 事件。属于会话配置与端点证据归属，未保存逐请求 HTTP 响应 model 字段。"
+  },
+  "selected_profile_lines": "[profiles.local_hymt2]\nprovider = \"local\"\nbase_url = \"http://127.0.0.1:8010/v1\"\nmodel = \"Intel/Hy-MT2-30B-A3B-int4-AutoRound\"\ntranslation_profile = \"local_hymt2\"",
+  "models_response": {
+    "object": "list",
+    "data": [
+      {
+        "id": "Intel/Hy-MT2-30B-A3B-int4-AutoRound",
+        "object": "model",
+        "created": 1791876732,
+        "owned_by": "vllm",
+        "root": "/workspace/models/Hy-MT2-30B-A3B-int4-AutoRound",
+        "parent": null,
+        "max_model_len": 32768,
+        "permission": [
+          {
+            "id": "modelperm-83f9120f274a73be",
+            "object": "model_permission",
+            "created": 1791876732,
+            "allow_create_engine": false,
+            "allow_sampling": true,
+            "allow_logprobs": true,
+            "allow_search_indices": false,
+            "allow_view": true,
+            "allow_fine_tuning": false,
+            "organization": "*",
+            "group": null,
+            "is_blocking": false
+          }
+        ]
+      }
+    ]
+  }
+}

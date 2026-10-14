@@ -1,0 +1,2 @@
+# 原始响应与历史脚本按字节留证，禁止 Git 自动转换换行导致 SHA256 漂移。
+deploy/local-llm/evidence/** -text whitespace=cr-at-eol

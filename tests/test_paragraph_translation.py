@@ -1,9 +1,12 @@
 import unittest
+import ast
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 from paragraph_translation import (
     ParagraphTranslator, TranslationQualityError, split_paragraph_chunks,
     validate_source_quotes, validate_translation,
+    selected_language_prompt, JAPANESE_PROMPT_VERSION, ENGLISH_PROMPT_VERSION,
 )
 
 
@@ -21,6 +24,52 @@ class Client:
 
 
 class ParagraphTranslationTests(unittest.TestCase):
+    def test_selected_japanese_prompt_matches_historical_v12_template(self):
+        path = Path(__file__).resolve().parents[1] / "deploy/local-llm/evidence/2026-10-14/historical/script-line-972.py.txt"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assignments = {n.targets[0].id: n.value for n in tree.body
+                       if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)}
+        source = ast.literal_eval(assignments["SRC_HARD"])
+        system = ast.literal_eval(assignments["SYSTEM"])
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "build_prompt")
+        values = {"source": source, "expected_quotes": "".join(c for c in source if c in "「」『』〈〉《》")}
+
+        def literal(node):
+            # Interpret string-only AST nodes; never execute the archived script.
+            if isinstance(node, ast.Constant): return node.value
+            if isinstance(node, ast.Name): return values[node.id]
+            if isinstance(node, ast.JoinedStr): return "".join(str(literal(v)) for v in node.values)
+            if isinstance(node, ast.FormattedValue): return literal(node.value)
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                return literal(node.left) + literal(node.right)
+            raise AssertionError(type(node).__name__)
+
+        expected = literal(function.body[0].value)
+        prompt, actual_system, version = selected_language_prompt(
+            source, "ja", "简体中文", "", "", local_provider=True,
+        )
+        self.assertEqual((prompt, actual_system), (expected, system))
+        self.assertEqual(version, JAPANESE_PROMPT_VERSION)
+
+    def test_english_prompt_is_independent_of_japanese_examples_and_tracks_version(self):
+        class LocalClient(Client):
+            provider_name = "local"
+        client = LocalClient(["作者区分描述与判断。"])
+        translator = ParagraphTranslator(client)
+        translator.translate("The author distinguishes description from judgment.", source_language="en")
+        prompt, system = client.calls[0]
+        self.assertIn("否定、比较、条件", prompt)
+        self.assertNotIn("怪しい隣人", prompt)
+        self.assertNotIn("从ja", prompt)
+        self.assertIn("英文", system)
+        self.assertEqual(translator.last_telemetry["language_prompt_version"], ENGLISH_PROMPT_VERSION)
+
+    def test_selected_japanese_prompt_uses_context_without_translating_it(self):
+        prompt, _, _ = selected_language_prompt("彼が話した。", "Japanese", "简体中文", "前文", "后文", local_provider=True)
+        self.assertIn("<context_before>\n前文\n</context_before>", prompt)
+        self.assertIn("<context_after>\n后文\n</context_after>", prompt)
+        self.assertTrue(prompt.endswith("<source>\n彼が話した。\n</source>"))
+
     def test_short_japanese_book_title_inside_quotes_must_be_translated(self):
         with self.assertRaisesRegex(TranslationQualityError, 'Japanese'):
             validate_translation('『花を持てる女』', '他读了『花を持てる女』。')

@@ -392,9 +392,15 @@ def _command_translate_kb(args: argparse.Namespace, stdout: TextIO) -> int:
     return 0
 
 
-def _hits_payload(hits: Sequence[Any]) -> list[dict[str, Any]]:
-    return [
-        {
+def _hits_payload(hits: Sequence[Any], *, source_paths=None, default_source=None) -> list[dict[str, Any]]:
+    metadata = {}
+    rows = []
+    for hit in hits:
+        source = (source_paths or {}).get(getattr(hit, "book", ""), default_source)
+        if source and source not in metadata:
+            metadata[source] = load_metadata_sidecar(source)
+        book_metadata = metadata.get(source, {}).get(hit.id, {})
+        rows.append({
             "id": hit.id,
             "title": hit.title,
             "chapter_id": hit.chapter_id,
@@ -402,11 +408,14 @@ def _hits_payload(hits: Sequence[Any]) -> list[dict[str, Any]]:
             "score": hit.score,
             "retrieval_mode": hit.retrieval_mode,
             "book": getattr(hit, "book", ""),
+            "book_title": book_metadata.get("book_title") or getattr(hit, "book", ""),
+            "author": book_metadata.get("author", ""),
+            "source_path": str(source or ""),
+            "duplicate_sources": list(getattr(hit, "duplicate_sources", ())),
             "channels": getattr(hit, "channels", ""),
             "content": hit.content,
-        }
-        for hit in hits
-    ]
+        })
+    return rows
 
 
 def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
@@ -417,7 +426,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
         discovered = _discover_workspace_knowledge_bases(root)
         if not discovered:
             raise RagFormatError(f"No {DEFAULT_KNOWLEDGE_BASE} found under {root}")
-        multi_sources = [(path.parent.name, path) for path in discovered]
+        multi_sources = [(path.parent.relative_to(root).as_posix(), path) for path in discovered]
     # Explicit --mode wins; the legacy --semantic flag keeps its meaning;
     # otherwise default to hybrid ranking per the retrieval plan.
     mode = getattr(args, "mode", None) or ("semantic" if args.semantic else "hybrid")
@@ -425,15 +434,17 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
     if multi_sources is not None:
         if getattr(args, "book", None):
             wanted = [name.casefold() for name in args.book]
+            exact_labels = {label.casefold() for label, _ in multi_sources}
             multi_sources = [
-                (label, path)
-                for label, path in multi_sources
-                if any(name in label.casefold() for name in wanted)
+                (label, path) for label, path in multi_sources
+                if any(label.casefold() == name if name in exact_labels else name in label.casefold()
+                       for name in wanted)
             ]
             if not multi_sources:
                 raise RagError(f"No workspace matches --book {sorted(args.book)}")
         per_book_cap = max(0, int(getattr(args, "per_book_cap", 3) or 0)) or None
-        auto_route = bool(getattr(args, "auto_route", True))
+        route_option = getattr(args, "auto_route", None)
+        auto_route = False if route_option is None else bool(route_option)
         provider_kwargs = (
             {"api_key_env": args.api_key_env, "base_url": args.base_url}
             if mode in ("semantic", "hybrid")
@@ -453,6 +464,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             languages=set(args.language) or None,
             auto_route=auto_route,
             provider_kwargs=provider_kwargs,
+            strict_hybrid=mode == "hybrid",
         )
         _json_line(
             {
@@ -470,7 +482,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
                 "semantic_used": bool(context.diagnostics.get("semantic_used")),
                 "semantic_error": None,
                 "apparatus": context.diagnostics.get("apparatus", {}),
-                "hits": _hits_payload(context.hits),
+                "hits": _hits_payload(context.hits, source_paths=dict(multi_sources)),
                 "context": context.text,
             },
             stdout,
@@ -489,7 +501,8 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
     )
     per_book_cap = max(0, int(getattr(args, "per_book_cap", 3) or 0)) or None
     inferred_routes = {"book_ids": frozenset(), "authors": frozenset()}
-    auto_route = bool(getattr(args, "auto_route", True))
+    route_option = getattr(args, "auto_route", None)
+    auto_route = True if route_option is None else bool(route_option)
     if auto_route and not args.book and not args.author:
         inferred_routes = knowledge_base.infer_query_routes(args.query)
     filters = {
@@ -551,7 +564,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             "semantic_used": bool(context.hits and context.hits[0].retrieval_mode in ("semantic", "hybrid")),
             "semantic_error": semantic_error,
             "apparatus": context.diagnostics.get("apparatus", {}),
-            "hits": _hits_payload(context.hits),
+            "hits": _hits_payload(context.hits, default_source=knowledge_base_path),
             "context": context.text,
         },
         stdout,
@@ -766,7 +779,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-route",
         dest="auto_route",
         action="store_true",
-        help="Route explicit book/author mentions before ranking (default).",
+        help="Route explicit book/author mentions before ranking (default for a single corpus, off for global scope).",
     )
     auto_route.add_argument(
         "--no-auto-route",
@@ -774,7 +787,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Disable automatic query routing.",
     )
-    retrieve.set_defaults(auto_route=True)
+    retrieve.set_defaults(auto_route=None)
     retrieve.set_defaults(func=_command_retrieve)
 
     status = subparsers.add_parser("status")

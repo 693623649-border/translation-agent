@@ -1667,8 +1667,13 @@ def retrieve_multi_book(
     auto_route: bool = True,
     embedding_provider: EmbeddingProvider | None = None,
     provider_kwargs: Mapping[str, Any] | None = None,
+    strict_hybrid: bool = False,
 ) -> RagContext:
     """Search many workspace libraries at once and fuse comparable scores.
+
+    Formal CLI calls set strict_hybrid: unindexed workspaces are disclosed but
+    excluded, and provider failures cannot silently yield lexical evidence.
+    The default preserves the low-level diagnostic compatibility path.
 
     Each workspace runs the ordinary single-library ranking (hybrid by
     default). Inner hybrid scores are themselves rank-based RRF sums, so
@@ -1766,6 +1771,8 @@ def retrieve_multi_book(
     fused: list[tuple[float, str, RagHit]] = []
     searched: list[str] = []
     for label, knowledge_base in opened:
+        if strict_hybrid and mode == "hybrid" and not knowledge_base.embedding_ready:
+            continue
         if mode == "semantic" and knowledge_base.embedding_metadata is None:
             continue
         book_diag: dict[str, Any] = {}
@@ -1784,6 +1791,8 @@ def retrieve_multi_book(
             apparatus_weight=apparatus_weight,
             diagnostics=book_diag,
         )
+        if strict_hybrid and mode == "hybrid" and book_diag.get("effective_mode") != "hybrid":
+            raise RagProviderError(f"Hybrid retrieval unavailable for {label}: {book_diag.get('fallback_reason')}")
         searched.append(label)
         per_workspace[label] = {
             "effective_mode": book_diag.get("effective_mode"),
@@ -1860,6 +1869,8 @@ def retrieve_multi_book(
             "lexical_only": lexical_only,
             "errored": errored,
             "per_workspace": per_workspace,
+            "strict_hybrid": strict_hybrid,
+            "partial_coverage": bool(errored or (strict_hybrid and lexical_only)),
         },
     }
     return _assemble_context(query, selected, max_chars, diag)
