@@ -26,8 +26,8 @@ description: 把一个源文件（Markdown/纯文本/DOCX/EPUB/带文字层的 P
    先完成有源图依据的 OCR、目录和译文核验，不要在文本适配器里硬凑。
    中文横排扫描书需要正文/注释分离与原书分段时，使用 `chinese-pdf-body-kb` skill 和
    `dsh-chinese-pdf-kb` 插件；清理后的 Markdown 才能作为本入口的源文件。
-   英文原文 PDF 需要翻译为中文并区分选文、编者导言与脚注时，使用 `english-pdf-kb` skill
-   和 `dsh-english-pdf-kb` 插件，先审阅目录角色和原页边界，再发布五字段语料与 Word。
+   英文原文 PDF 先按 README 选定 `scanned-pdf` 或 `text-pdf`。扫描走本地 PP-OCRv6 与 `local_llm`。`english-pdf-kb` skill
+   和 `dsh-english-pdf-kb` 插件只在这之后处理选文、编者导言与脚注，不能改 OCR 或翻译后端。
 
 3. **入库并出 Word。** 调用 `kb_ingest_source`，传 `source` / `title` / `author` /
    `output_dir`。工具会依次：解析源 → 建五字段语料与路由侧表 → 跑中文语言门 →

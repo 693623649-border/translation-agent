@@ -6526,31 +6526,17 @@ def resolve_api_key(
     args: argparse.Namespace,
     profile: ModelProfile | None = None,
 ) -> str:
+    """Return an explicit chat key. Never pick up a Zhipu vision or TOC key.
+
+    Embedding uses its own credential. A missing profile must not turn
+    ``GLM_CODING_API_KEY`` or ``GLM_API_KEY`` into a model call.
+    """
+
     explicit_env = _credential_from_env(getattr(args, "api_key_env", None))
-    profile_key = (
-        profile.resolve_credential(required=False).get_secret_value()
-        if profile is not None
-        else ""
-    )
-    if profile is not None:
-        return str(args.api_key or explicit_env or profile_key).strip()
-    if args.api_mode == "coding-plan":
-        return str(
-            args.api_key
-            or explicit_env
-            or profile_key
-            or os.getenv("GLM_CODING_API_KEY")
-            or os.getenv("Z_AI_API_KEY")
-            or ""
-        ).strip()
-    return str(
-        args.api_key
-        or explicit_env
-        or profile_key
-        or os.getenv("GLM_API_KEY")
-        or os.getenv("ZAI_API_KEY")
-        or ""
-    ).strip()
+    if profile is None:
+        return str(args.api_key or explicit_env or "").strip()
+    profile_key = profile.resolve_credential(required=False).get_secret_value()
+    return str(args.api_key or explicit_env or profile_key).strip()
 
 
 def resolve_translation_api_key(
@@ -6605,12 +6591,7 @@ def resolve_ocr_api_key(
     )
     if profile is not None:
         return str(args.ocr_api_key or explicit_env or profile_key).strip()
-    return str(
-        args.ocr_api_key
-        or explicit_env
-        or os.getenv("GLM_OCR_API_KEY")
-        or (resolve_api_key(args) if args.api_mode == "standard" else "")
-    ).strip()
+    return str(args.ocr_api_key or explicit_env or "").strip()
 
 
 def resolve_worker_counts(args: argparse.Namespace) -> tuple[int, int]:

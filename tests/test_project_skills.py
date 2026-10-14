@@ -17,6 +17,16 @@ def _frontmatter_value(text: str, key: str) -> str:
 
 
 class ProjectSkillContractTests(unittest.TestCase):
+    def test_ingest_instructions_block_cloud_defaults(self) -> None:
+        agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        rule = (ROOT / ".cursor" / "rules" / "ingest-workflow.mdc").read_text(encoding="utf-8")
+        english = (SKILLS_ROOT / "english-pdf-kb" / "SKILL.md").read_text(encoding="utf-8")
+        for text in (agents, rule, english):
+            self.assertIn("local_llm", text)
+            self.assertIn("embedding-3", text)
+            self.assertIn("PP-OCRv6", text)
+        self.assertIn("alwaysApply: true", rule)
+
     def test_project_skills_are_discoverable_and_self_contained(self) -> None:
         skill_dirs = sorted(path for path in SKILLS_ROOT.iterdir() if path.is_dir())
         self.assertTrue(skill_dirs, "the project must expose at least one skill")

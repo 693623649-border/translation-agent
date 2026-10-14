@@ -1,0 +1,14 @@
+---
+description: 入库、OCR、翻译和知识库注册必须先遵守 README，禁止默认调用智谱对话或 DeepSeek
+alwaysApply: true
+---
+
+# 入库模型边界
+
+用户要求入库、OCR、翻译或注册知识库时，先读 README「整体 workflow」和 `AGENTS.md`，再调用模型或沿用旧工作区。
+
+- 输入模式只认当前请求写明的 `scanned-pdf` 或 `text-pdf`。没写明就询问。
+- 扫描 OCR 只用本地 PP-OCRv6。本地不可用就停止。
+- 正文翻译只用 `local_llm`。本地不可用就停止。只有当前请求点名 `deepseek_flash` 或 `deepseek_pro` 才使用 DeepSeek。
+- 智谱 API 只用于 `embedding-3`。不读取 `GLM_CODING_API_KEY`、`GLM_API_KEY`、`GLM_OCR_API_KEY` 或 `GLM_TOC_API_KEY`。
+- 插件 skill 与旧工作区不能覆盖以上规则。OCR 不是 `paddleocr-local/` 或译文提供者不是 `local` 的目录，不续跑。

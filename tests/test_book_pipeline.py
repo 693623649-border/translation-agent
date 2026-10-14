@@ -53,6 +53,7 @@ from ingestion.book_pipeline import (
     parse_page_spec,
     remove_duplicate_title,
     resolve_api_key,
+    resolve_ocr_api_key,
     resolve_translation_api_key,
     resolve_worker_counts,
     save_page_record,
@@ -642,7 +643,7 @@ class UtilityTests(unittest.TestCase):
             clear=True,
         ):
             args = parser.parse_args(["sample.pdf"])
-            self.assertEqual(resolve_api_key(args), "glm-sentinel")
+            self.assertEqual(resolve_api_key(args), "")
             self.assertEqual(resolve_translation_api_key(args), "deepseek-sentinel")
 
             args = parser.parse_args(
@@ -653,7 +654,8 @@ class UtilityTests(unittest.TestCase):
 
         with patch.dict("os.environ", {"GLM_CODING_API_KEY": "glm-only"}, clear=True):
             args = parser.parse_args(["sample.pdf"])
-            self.assertEqual(resolve_api_key(args), "glm-only")
+            self.assertEqual(resolve_api_key(args), "")
+            self.assertEqual(resolve_ocr_api_key(args), "")
             self.assertEqual(resolve_translation_api_key(args), "")
 
     def test_worker_count_precedence_and_legacy_compatibility(self) -> None:
