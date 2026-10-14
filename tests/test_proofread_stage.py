@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     PROOFREAD_PROMPT_VERSION,
     ChatOCRProofreader,
     ModelIdentity,
@@ -312,7 +312,7 @@ class ProofreadExecutionTests(unittest.TestCase):
                 PageRecord(1, "これは誤つた本文です。", language="ja"),
             )
             client = FakeChatClient()
-            with patch("book_pipeline.build_proofread_client", return_value=client):
+            with patch("ingestion.book_pipeline.build_proofread_client", return_value=client):
                 code = main(
                     [
                         "-o",

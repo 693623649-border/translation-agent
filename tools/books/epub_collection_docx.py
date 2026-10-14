@@ -21,7 +21,7 @@ import unicodedata
 from pathlib import Path
 
 import epub_collection_kb as splitter
-import book_pipeline as legacy
+import ingestion.book_pipeline as legacy
 
 
 def _safe_filename(title: str) -> str:

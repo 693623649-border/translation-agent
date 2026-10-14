@@ -14,9 +14,9 @@ from unittest.mock import patch
 
 import fitz
 
-import book_pipeline
-import graph_pipeline
-from publication_verifier import verify_publication
+import ingestion.book_pipeline as book_pipeline
+import orchestration.graph_pipeline as graph_pipeline
+from publication.publication_verifier import verify_publication
 from pipeline_graph import (
     GraphContext,
     GraphExecutor,
@@ -1331,7 +1331,7 @@ class BookGraphExecutionTests(unittest.TestCase):
 
             with OutputDirectoryLock(output / ".pipeline_graph" / "output.lock"):
                 with (
-                    patch("book_pipeline.build_docx") as build_docx,
+                    patch("ingestion.book_pipeline.build_docx") as build_docx,
                     self.assertRaises(OutputDirectoryLockedError),
                 ):
                     book_pipeline.main(argv)
@@ -1378,7 +1378,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 )
                 output_path.write_bytes(b"docx")
 
-            with patch("book_pipeline.build_docx", side_effect=fake_docx):
+            with patch("ingestion.book_pipeline.build_docx", side_effect=fake_docx):
                 result = prepared.execute()
 
             self.assertEqual(
@@ -3957,7 +3957,7 @@ translation_profile = "translation"
                     + "\n",
                     encoding="utf-8",
                 )
-                from rag_knowledge_base import initialize_rag_manifest
+                from knowledge.rag_knowledge_base import initialize_rag_manifest
 
                 initialize_rag_manifest(output_path)
 

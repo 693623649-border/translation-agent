@@ -20,10 +20,10 @@ import pymupdf
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-import book_pipeline as book
-from publication_verifier import verify_publication
-from rag_apparatus import annotate_apparatus
-import rag_knowledge_base
+import ingestion.book_pipeline as book
+from publication.publication_verifier import verify_publication
+from knowledge.rag_apparatus import annotate_apparatus
+import knowledge.rag_knowledge_base as rag_knowledge_base
 
 
 MANIFEST = "english-pdf-ingest.json"
@@ -355,7 +355,7 @@ def _run_pipeline(workspace: Path, manifest: dict[str, Any], args: dict[str, Any
                 "workspace": str(workspace), "method": "reviewed-file",
                 "entries": len(toc["entries"]), "toc_sha256": sha(target)}
     command = [
-        sys.executable, str(ROOT / "book_pipeline.py"), str(source),
+        sys.executable, "-m", "ingestion.book_pipeline", str(source),
         "--output-dir", str(workspace), "--phase", stage,
         "--config", str(_config(args, manifest)),
     ]
@@ -458,8 +458,10 @@ def _candidate_key(
         "source": manifest["source_sha256"], "plan": sha(plan_path),
         "publisher": {
             path.name: sha(path) for path in (
-                ROOT / "book_pipeline.py", ROOT / "publication_semantics.py",
-                ROOT / "publication_verifier.py", Path(__file__),
+                ROOT / "ingestion" / "book_pipeline.py",
+                ROOT / "publication" / "publication_semantics.py",
+                ROOT / "publication" / "publication_verifier.py",
+                Path(__file__),
             )
         },
         "pages": [
@@ -742,7 +744,7 @@ def register(args: dict[str, Any], workspace: Path, manifest: dict[str, Any]) ->
     key_available = bool(os.getenv("ZHIPU_API_KEY"))
     require(mode != "on" or key_available, "ZHIPU_API_KEY is required for embedding_mode=on")
     lexical_only = mode == "off" or (mode == "auto" and not key_available)
-    command = [sys.executable, str(ROOT / "knowledge_base_cli.py"), "register", str(candidate)]
+    command = [sys.executable, "-m", "knowledge.knowledge_base_cli", "register", str(candidate)]
     if lexical_only:
         command.append("--lexical-only")
     seconds = args.get("timeout_seconds", 1800)

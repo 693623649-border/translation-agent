@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import rag_knowledge_base as rag
-from book_pipeline import write_knowledge_base
-from rag_apparatus import annotate_apparatus
+import knowledge.rag_knowledge_base as rag
+from ingestion.book_pipeline import write_knowledge_base
+from knowledge.rag_apparatus import annotate_apparatus
 
 
 class Provider:

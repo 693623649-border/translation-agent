@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from ocr_quality_gate import (
+from ingestion.ocr_quality_gate import (
     ocr_structure_anomalies,
     quotation_signature,
     calibrated_confidence_threshold,

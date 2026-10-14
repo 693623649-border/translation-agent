@@ -7,10 +7,10 @@ from typing import Iterable
 
 import streamlit as st
 
-from application_service import ApplicationService
-from pipeline_profiles import ModelProfile, PipelineProfiles, load_pipeline_profiles
-from product_contracts import RunSpec
-from product_paths import default_profile_path
+from orchestration.application_service import ApplicationService
+from orchestration.pipeline_profiles import ModelProfile, PipelineProfiles, load_pipeline_profiles
+from orchestration.product_contracts import RunSpec
+from orchestration.product_paths import default_profile_path
 
 
 OCR_ADAPTERS = frozenset({"coding-plan-mcp", "glm-ocr", "tesseract"})

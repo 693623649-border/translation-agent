@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from kb_translation import DeepSeekTranslator
+from translation.kb_translation import DeepSeekTranslator
 
 PAGE_DIRECTIVE = (
     "【本书为 OCR 扫描件，对译文另有硬性要求】\n"

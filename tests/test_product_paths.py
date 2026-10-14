@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from product_paths import (
+from orchestration.product_paths import (
     default_profile_path,
     installed_data_root,
     recipe_paths,

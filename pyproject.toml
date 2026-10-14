@@ -26,62 +26,27 @@ dev = [
 ]
 
 [project.scripts]
-translation-agent = "document_pipeline:cli"
-translation-agent-doctor = "doctor:main"
-translation-agent-web = "launch_frontend:main"
-translation-agent-repo-guard = "repository_guard:main"
-translation-agent-kb = "knowledge_base_cli:main"
-translation-agent-global-kb = "global_knowledge_base:main"
+translation-agent = "orchestration.document_pipeline:cli"
+translation-agent-doctor = "orchestration.doctor:main"
+translation-agent-web = "frontend.launch_frontend:main"
+translation-agent-repo-guard = "orchestration.repository_guard:main"
+translation-agent-kb = "knowledge.knowledge_base_cli:main"
+translation-agent-global-kb = "knowledge.global_knowledge_base:main"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = [
-  "architecture_ascii",
-  "architecture_dashboard",
-  "book_pipeline",
-  "born_digital_pdf_import",
-  "document_pipeline",
-  "doctor",
-  "docx_footnotes",
-  "docx_render_gate",
-  "docx_translation",
-  "docx_semantic_migration",
-  "epub_semantic_import",
-  "extract_textbook_layer",
-  "frontend_app",
-  "frontend_service",
-  "frontend_runtime",
-  "global_knowledge_base",
-  "scan_layout",
-  "paragraph_translation",
-  "ocr_quality_gate",
-  "ingestion_quality",
-  "graph_pipeline",
-  "kb_translation",
-  "knowledge_base_cli",
-  "launch_frontend",
-  "patch_translations",
-  "pdf_text_agent",
-  "pipeline_profiles",
-  "pipeline_runtime",
-  "product_contracts",
-  "product_paths",
-  "publication_semantics",
-  "publication_verifier",
-  "rag_knowledge_base",
-  "rag_apparatus",
-  "repository_guard",
-  "regenerate_reviewed_chapters",
-  "semantic_translation_runner",
-  "semantic_apply",
-  "semantic_ir",
-  "application_service",
-  "streamlit_app",
-  "translation_agent_api",
-]
 
 [tool.setuptools.packages.find]
-include = ["pipeline_graph*", "app_pages*"]
+include = [
+  "pipeline_graph*",
+  "app_pages*",
+  "orchestration*",
+  "ingestion*",
+  "translation*",
+  "publication*",
+  "knowledge*",
+  "frontend*",
+]
 
 [tool.setuptools.data-files]
 "share/translation-agent" = ["pipeline.example.toml"]

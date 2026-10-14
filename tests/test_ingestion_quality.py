@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ingestion_quality import write_ingestion_quality_report
+from ingestion.ingestion_quality import write_ingestion_quality_report
 
 
 class IngestionQualityReportTests(unittest.TestCase):

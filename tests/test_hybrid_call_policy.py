@@ -5,10 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import translation_agent_api as api
-import rag_knowledge_base as rag
-from book_pipeline import write_knowledge_base
-from knowledge_base_cli import main
+import frontend.translation_agent_api as api
+import knowledge.rag_knowledge_base as rag
+from ingestion.book_pipeline import write_knowledge_base
+from knowledge.knowledge_base_cli import main
 from tests.test_knowledge_base_cli import ROWS, FakeZhipuProvider, MissingKeyProvider
 
 
@@ -71,7 +71,7 @@ class HybridCallPolicyTests(unittest.TestCase):
     def test_cli_provider_failure_does_not_fallback(self):
         self.ready()
         stderr = io.StringIO()
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", MissingKeyProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", MissingKeyProvider):
             self.assertNotEqual(main(["retrieve", str(self.output), "量子"],
                                      stdout=stderr), 0)
         self.assertIn("missing key", stderr.getvalue())

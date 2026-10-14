@@ -17,7 +17,7 @@ from local_paddleocr_import import (  # noqa: E402
     _write_fallback_report,
     select_xiaomi_fallback_pages,
 )
-from ocr_quality_gate import read_json_object
+from ingestion.ocr_quality_gate import read_json_object
 from PIL import Image, ImageDraw
 
 

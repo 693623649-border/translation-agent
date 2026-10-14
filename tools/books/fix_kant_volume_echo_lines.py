@@ -21,8 +21,8 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from book_pipeline import normalize_match_text
-from publication_semantics import (
+from ingestion.book_pipeline import normalize_match_text
+from publication.publication_semantics import (
     markdown_footnote_contract_sha256,
     parse_markdown_footnotes,
 )

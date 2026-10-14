@@ -14,9 +14,9 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from scan_layout import prepare_scan_pages
+from ingestion.scan_layout import prepare_scan_pages
 
-from ocr_quality_gate import (
+from ingestion.ocr_quality_gate import (
     ocr_structure_anomalies,
     quotation_signature,  # noqa: E402
     calibrated_confidence_threshold,
@@ -238,7 +238,7 @@ def confirm_page(
     if not matches_image and not corrected_text.strip():
         raise ValueError("a full corrected transcription is required when OCR differs")
 
-    from book_pipeline import PageRecord, load_page_records, save_page_record
+    from ingestion.book_pipeline import PageRecord, load_page_records, save_page_record
 
     current = next((item for item in load_page_records(output_dir) if item.pdf_page == page), None)
     if current is None:

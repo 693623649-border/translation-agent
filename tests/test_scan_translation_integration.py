@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from book_pipeline import ChatTranslator, PageRecord, PageStore, translate_non_chinese_pages
-from publication_verifier import _check_checkpoints
+from ingestion.book_pipeline import ChatTranslator, PageRecord, PageStore, translate_non_chinese_pages
+from publication.publication_verifier import _check_checkpoints
 
 
 class RecordingClient:

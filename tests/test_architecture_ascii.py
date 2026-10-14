@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import unicodedata
 
-import architecture_dashboard as dashboard
+import frontend.architecture_dashboard as dashboard
 
 
 class DashboardMarkup(HTMLParser):

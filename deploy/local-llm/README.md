@@ -27,7 +27,7 @@ vLLM 提供 OpenAI 兼容接口 `http://127.0.0.1:8010/v1`。
 | 扫描 OCR | 本地 PP-OCRv6 medium；候选复识按书稿计划配置 | 独立于翻译 profile |
 | 单书 RAG | 独立配置，智谱 `embedding-3` | 正式取证显式用 hybrid；缺向量时报告不可用 |
 
-旧入口 `pdf_text_agent.py` 没有纳入本次本地翻译接入。
+旧入口 `ingestion/pdf_text_agent.py` 没有纳入本次本地翻译接入。
 本地翻译不代表整个项目离线：校勘、目录解析、embedding 是否联网取决于各自配置。
 
 ## 02 · 检查环境与显存配置
@@ -125,9 +125,9 @@ translation-agent run book/input.pdf -o outputs/input --source-mode text-pdf --c
 其他入口需要按其参数显式配置，不假定所有 CLI 都自动读取 `pipeline.toml`：
 
 ```powershell
-python knowledge_base_cli.py translate-kb outputs/book --provider local
-python knowledge_base_cli.py translate-kb outputs/book --provider deepseek
-python semantic_translation_runner.py --help
+python -m knowledge.knowledge_base_cli translate-kb outputs/book --provider local
+python -m knowledge.knowledge_base_cli translate-kb outputs/book --provider deepseek
+python -m translation.semantic_translation_runner --help
 ```
 
 EPUB 语义 runner 支持 `--config pipeline.toml --translation-profile local_llm`；
@@ -163,7 +163,7 @@ python deploy/local-llm/smoke_translate.py --output-dir outputs/hy-mt2-review-ne
 
 ## 06 · 理解机器检查与人工判断
 
-`paragraph_translation.py` 对本地 `provider=local` 使用正向表述与示例，
+`translation/paragraph_translation.py` 对本地 `provider=local` 使用正向表述与示例，
 保留引号字形、顺序和数量检查，以及中文存在、日文残留和新增省略号检查。
 普通标点签名比对被跳过，因此其增删、重排与替换不由该项检查拦截。
 这项行为适用于全部 local provider，不只是 Hy-MT2。

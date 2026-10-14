@@ -263,7 +263,7 @@ class SourceAdapterTests(unittest.TestCase):
                 kb_ingest.read_source(path)
         message = str(caught.exception)
         self.assertIn("扫描件", message)
-        self.assertIn("graph_pipeline.py", message)
+        self.assertIn("orchestration.graph_pipeline", message)
 
     def test_unreadable_pdf_fails_with_a_named_cause(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

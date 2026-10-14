@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from book_pipeline import (  # noqa: E402
+from ingestion.book_pipeline import (  # noqa: E402
     PageRecord,
     build_parser as _book_parser,
     resolve_ocr_backend_name,
@@ -27,7 +27,7 @@ from book_pipeline import (  # noqa: E402
     resolve_expected_ocr_model_prefix,
 )
 from local_paddleocr_import import _parse_args  # noqa: E402
-from pipeline_profiles import ModelProfile  # noqa: E402
+from orchestration.pipeline_profiles import ModelProfile  # noqa: E402
 _xiaomi_module_path = Path(__file__).resolve().parents[1] / "deploy" / "xiaomi-ocr" / "batch_ocr.py"
 _xiaomi_spec = importlib.util.spec_from_file_location("xiaomi_ocr_batch", _xiaomi_module_path)
 assert _xiaomi_spec and _xiaomi_spec.loader
@@ -103,11 +103,11 @@ class XiaomiOcrLocalBackendTests(unittest.TestCase):
             thinking="omit",
         )
         # Paddle remains the only primary even when Xiaomi is available.
-        with patch("book_pipeline.paddle_local_available", return_value=True):
+        with patch("ingestion.book_pipeline.paddle_local_available", return_value=True):
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
             self.assertEqual(backend, "paddleocr-local")
         # Xiaomi never replaces a missing Paddle primary.
-        with patch("book_pipeline.paddle_local_available", return_value=False):
+        with patch("ingestion.book_pipeline.paddle_local_available", return_value=False):
             with self.assertRaisesRegex(ValueError, "Xiaomi cannot replace"):
                 resolve_ocr_backend_name(args, remote_profile, strict=True)
             backend, reason = resolve_ocr_backend_name(args, remote_profile)

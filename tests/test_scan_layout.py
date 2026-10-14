@@ -1,7 +1,7 @@
 import json
 import hashlib
 import unittest
-from scan_layout import prepare_scan_pages, reader_layout_issues
+from ingestion.scan_layout import prepare_scan_pages, reader_layout_issues
 
 
 class ScanLayoutTests(unittest.TestCase):

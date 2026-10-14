@@ -2,7 +2,7 @@
 
 import unittest
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     ChatOCRProofreader,
     ChatTranslator,
     PROOFREAD_PROMPT_VERSION,

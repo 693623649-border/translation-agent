@@ -10,9 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
 
-from book_pipeline import PageRecord, load_page_records, save_page_record
+from ingestion.book_pipeline import PageRecord, load_page_records, save_page_record
 from ocr_review import calibrate, confirm_page, initialize
-from ocr_quality_gate import read_json_object
+from ingestion.ocr_quality_gate import read_json_object
 
 
 class OcrReviewTests(unittest.TestCase):

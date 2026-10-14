@@ -3,7 +3,7 @@ from __future__ import annotations
 import streamlit as st
 
 from app_pages._shared import application_service, configured_profile_path
-from product_contracts import APP_VERSION, CONTRACT_SCHEMA_VERSION
+from orchestration.product_contracts import APP_VERSION, CONTRACT_SCHEMA_VERSION
 
 
 st.header("本地运行设置")

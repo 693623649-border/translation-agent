@@ -7,15 +7,15 @@ from pathlib import Path
 import fitz
 from PIL import Image
 
-from book_pipeline import PageStore, TRANSLATION_PROMPT_VERSION
-from extract_textbook_layer import (
+from ingestion.book_pipeline import PageStore, TRANSLATION_PROMPT_VERSION
+from ingestion.extract_textbook_layer import (
     TEXT_LAYER_MODEL,
     extract_page_texts,
     extract_text_layer,
     main,
     reflow_logical_text,
 )
-from pipeline_profiles import ModelIdentity
+from orchestration.pipeline_profiles import ModelIdentity
 
 
 def make_text_pdf(path: Path, pages: list[str]) -> None:

@@ -6,8 +6,8 @@ import unittest
 from pathlib import Path
 from typing import Sequence
 
-from book_pipeline import write_knowledge_base
-from rag_knowledge_base import (
+from ingestion.book_pipeline import write_knowledge_base
+from knowledge.rag_knowledge_base import (
     CachedQueryProvider,
     RagEmbeddingUnavailableError,
     RagError,

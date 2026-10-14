@@ -3,8 +3,8 @@
 ## Source of truth
 Status: Active. Date: 2026-10-03. Surface: translation-agent local Streamlit
 workbench, architecture and review page. Evidence: the user's terminal-style
-agent-tree reference, streamlit_app.py, app_pages/jobs.py, application_service.py,
-pipeline_graph/book.py, frontend_runtime.py and knowledge-base evaluation reports.
+agent-tree reference, frontend/streamlit_app.py, app_pages/jobs.py, orchestration/application_service.py,
+pipeline_graph/book.py, frontend/frontend_runtime.py and knowledge-base evaluation reports.
 The user selected project architecture and task review as the scope.
 The 2026-10-03 correction requires actual monospace character art, replacing
 the initial card grid with the supplied reference's terminal hierarchy.

@@ -75,7 +75,7 @@ def main() -> int:
         proc = subprocess.run(
             [
                 sys.executable,
-                str(ROOT / "knowledge_base_cli.py"),
+                "-m", "knowledge.knowledge_base_cli",
                 "register",
                 str(workspace),
                 "--allow-foreign",

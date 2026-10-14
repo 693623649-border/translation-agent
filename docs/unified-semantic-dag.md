@@ -103,7 +103,7 @@ flowchart LR
 
 下表描述目标契约。当前 Graph 入口已经完成显式选择、全页文字覆盖、来源绑定与
 共同下游；几何栏序证明和 PDF 上标—脚注关系恢复目前仅由独立
-`born_digital_pdf_import.py` 提供，尚未成为 Graph `core.pages.text_extract` 的
+`ingestion/born_digital_pdf_import.py` 提供，尚未成为 Graph `core.pages.text_extract` 的
 发布能力。
 
 | 入口 | 适用判定 | 入口专属工作 | 收敛产物 |
@@ -130,29 +130,29 @@ DOCX 语义迁移属于审定稿导入/回归工具，不计入这三个源书�
 
 ```bash
 # 影印 PDF
-python graph_pipeline.py book.pdf -o outputs/book --phase all --plan
+python -m orchestration.graph_pipeline book.pdf -o outputs/book --phase all --plan
 
 # 带文本层 PDF
-python graph_pipeline.py book.pdf -o outputs/book --phase all \
+python -m orchestration.graph_pipeline book.pdf -o outputs/book --phase all \
   --source-mode text-pdf --translate-non-chinese \
   --recipe recipes/text-pdf-full-publication.toml
 
 # 直接生成标准语义层（适用于独立翻译单元工作流）
-python born_digital_pdf_import.py import book.pdf -o outputs/book-semantic
+python -m ingestion.born_digital_pdf_import import book.pdf -o outputs/book-semantic
 
 # EPUB
-python epub_semantic_import.py import book.epub -o outputs/book
+python -m ingestion.epub_semantic_import import book.epub -o outputs/book
 
 # EPUB 与独立 PDF 语义导入器共享的单元级准备与翻译
-python semantic_translation_runner.py prepare \
+python -m translation.semantic_translation_runner prepare \
   outputs/book/semantic/translation-units.jsonl \
   -o outputs/book/semantic/prepared.jsonl
-python semantic_translation_runner.py run \
+python -m translation.semantic_translation_runner run \
   outputs/book/semantic/translation-units.jsonl \
   -o outputs/book/semantic/translations.jsonl
 ```
 
-`born_digital_pdf_import.py` 是语义抽取与翻译单元工具，不是完整 Graph
+`ingestion/born_digital_pdf_import.py` 是语义抽取与翻译单元工具，不是完整 Graph
 publication recipe：它不会伪造 `pages/page_XXXX.json`。需要正式
 `publication.report` 时应使用上面的 `--source-mode text-pdf` Graph 入口；若
 抽取器检测到不能闭合为定义的可见上标，则以
@@ -234,7 +234,7 @@ token，翻译后逐 token 对账；例如 `158n.5` 不得被不一致地改成 
 `core.pages.text_extract` 产出的 PageRecord 会固定声明
 `ocr_model=text-layer/pymupdf-v1`，随后使用既有页级翻译、目录与章节编译节点。
 该兼容路径不会调用 OCR，也不会自动猜测来源类型。独立
-`born_digital_pdf_import.py` 与 EPUB importer 则生成标准语义翻译单元；未来把
+`ingestion/born_digital_pdf_import.py` 与 EPUB importer 则生成标准语义翻译单元；未来把
 `core.semantic.translate.run` 注册为三入口统一 Provider 时，可以替换这条页级
 翻译兼容边而不改变下游 semantic/sanitize/publisher 契约。
 

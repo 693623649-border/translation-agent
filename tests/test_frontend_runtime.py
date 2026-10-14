@@ -8,9 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import launch_frontend
-from application_service import ApplicationService
-from frontend_runtime import (
+import frontend.launch_frontend as launch_frontend
+from orchestration.application_service import ApplicationService
+from frontend.frontend_runtime import (
     FrontendSettings,
     JobRegistry,
     PathPolicy,
@@ -22,8 +22,8 @@ from frontend_runtime import (
     start_job_process,
     validate_upload_size,
 )
-from pipeline_profiles import ModelProfile
-from product_contracts import RunSpec
+from orchestration.pipeline_profiles import ModelProfile
+from orchestration.product_contracts import RunSpec
 
 
 class FrontendRuntimeTests(unittest.TestCase):
@@ -48,7 +48,7 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             fake_process = type("Process", (), {"pid": 43210})()
             with patch(
-                "frontend_runtime.subprocess.Popen", return_value=fake_process
+                "frontend.frontend_runtime.subprocess.Popen", return_value=fake_process
             ) as popen:
                 started = start_job_process(
                     registry,
@@ -64,14 +64,14 @@ class FrontendRuntimeTests(unittest.TestCase):
             self.assertEqual(started.pid, 43210)
 
     def test_launcher_rejects_non_loopback_bind_address(self) -> None:
-        with patch("launch_frontend.subprocess.Popen") as popen:
+        with patch("frontend.launch_frontend.subprocess.Popen") as popen:
             with self.assertRaises(SystemExit) as caught:
                 launch_frontend.main(["--host", "0.0.0.0", "--no-browser"])
         self.assertEqual(caught.exception.code, 2)
         popen.assert_not_called()
 
     def test_launcher_overrides_global_streamlit_development_mode(self) -> None:
-        with patch("launch_frontend.subprocess.Popen") as popen:
+        with patch("frontend.launch_frontend.subprocess.Popen") as popen:
             popen.return_value.wait.return_value = 0
             self.assertEqual(
                 launch_frontend.main(["--port", "8507", "--no-browser"]),
@@ -413,9 +413,9 @@ class FrontendRuntimeTests(unittest.TestCase):
                 return {"release_blocked": False}
 
             with patch(
-                "epub_semantic_import.import_epub",
+                "ingestion.epub_semantic_import.import_epub",
                 side_effect=fake_import_epub,
-            ), patch("translation_agent_api.run_graph") as run_graph:
+            ), patch("frontend.translation_agent_api.run_graph") as run_graph:
                 run_id = _run_epub_workflow(spec)
 
             self.assertIsNone(run_id)
@@ -461,18 +461,18 @@ class FrontendRuntimeTests(unittest.TestCase):
                 os.environ,
                 {"QA_TRANSLATION_KEY": "secret"},
             ), patch(
-                "epub_semantic_import.import_epub",
+                "ingestion.epub_semantic_import.import_epub",
                 return_value={"release_blocked": False},
             ), patch(
-                "epub_semantic_import.apply_translations",
+                "ingestion.epub_semantic_import.apply_translations",
             ), patch(
-                "pipeline_profiles.load_pipeline_profiles",
+                "orchestration.pipeline_profiles.load_pipeline_profiles",
                 return_value=profiles,
             ), patch(
-                "semantic_translation_runner._deepseek_request",
+                "translation.semantic_translation_runner._deepseek_request",
                 return_value=lambda prompt: prompt,
             ), patch(
-                "semantic_translation_runner.translate_units",
+                "translation.semantic_translation_runner.translate_units",
             ) as translate_units:
                 _run_epub_workflow(spec)
 

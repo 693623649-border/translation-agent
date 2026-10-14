@@ -9,7 +9,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-import global_knowledge_base as kb
+import knowledge.global_knowledge_base as kb
 
 
 class IndexedSearchTests(unittest.TestCase):

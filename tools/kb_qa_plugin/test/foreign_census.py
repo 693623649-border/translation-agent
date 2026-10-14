@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(r"E:\Deeplearning\translation-agent")
 sys.path.insert(0, str(ROOT))
 
-from kb_translation import classify_row  # noqa: E402
+from translation.kb_translation import classify_row  # noqa: E402
 
 rows_out = []
 total_pending = 0

@@ -173,8 +173,8 @@ def _load_pipeline() -> tuple[Any, Any]:
     """
 
     with _stdout_to_stderr():
-        import book_pipeline
-        import publication_verifier
+        import ingestion.book_pipeline as book_pipeline
+        import publication.publication_verifier as publication_verifier
 
     return book_pipeline, publication_verifier
 
@@ -768,7 +768,7 @@ def read_pdf_source(path: Path, *, minimum_characters: int = 200) -> list[Chapte
     if len(text) < minimum_characters:
         raise IngestError(
             f"PDF 文字层为空或过短（{len(text)} 字符），判定为扫描件：{path}。"
-            "请改用带 OCR 的主流水线：python graph_pipeline.py <pdf> -o <输出目录> "
+            "请改用带 OCR 的主流水线：python -m orchestration.graph_pipeline <pdf> -o <输出目录> "
             "--phase all --config pipeline.toml --recipe recipes/chinese-pdf-word.toml"
         )
     return parse_plaintext_chapters(text)
@@ -895,7 +895,7 @@ def write_corpus(
         for row in sidecar:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     with _stdout_to_stderr():
-        from rag_knowledge_base import initialize_rag_manifest
+        from knowledge.rag_knowledge_base import initialize_rag_manifest
 
         initialize_rag_manifest(corpus_path)
     return {
@@ -921,7 +921,7 @@ def language_gate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """
 
     with _stdout_to_stderr():
-        from kb_translation import classify_row
+        from translation.kb_translation import classify_row
 
     pending: list[dict[str, Any]] = []
     exempt: dict[str, int] = {}
@@ -2107,7 +2107,7 @@ def ingest_source(
         }
         # Persist the blocked result as well; callers must never lose the
         # reason an ingestion stopped before corpus publication.
-        from ingestion_quality import write_ingestion_quality_report
+        from ingestion.ingestion_quality import write_ingestion_quality_report
         report["quality_report"] = str(write_ingestion_quality_report(workspace, report, status="blocked"))
         return report
 
@@ -2163,7 +2163,7 @@ def ingest_source(
         "next_steps": [
             f"translation-agent-kb status \"{workspace}\"",
             f"translation-agent-kb retrieve \"{workspace}\" \"<问题>\"",
-            f"python global_knowledge_base.py sync  # 聚合进全库（需目标工作区已通过中文门）",
+            f"python -m knowledge.global_knowledge_base sync  # 聚合进全库（需目标工作区已通过中文门）",
         ],
     }
     if not report["ok"]:
@@ -2196,7 +2196,7 @@ def ingest_source(
             newline="\n",
         )
         report["fidelity_report_path"] = str(fidelity_path)
-    from ingestion_quality import write_ingestion_quality_report
+    from ingestion.ingestion_quality import write_ingestion_quality_report
     report["quality_report"] = str(
         write_ingestion_quality_report(workspace, report, evidence=(str(report_path),))
     )

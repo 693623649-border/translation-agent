@@ -77,14 +77,14 @@ class HybridPolicyTests(unittest.TestCase):
         self.assertEqual([h["id"] for h in result["hits"]], ["hybrid"])
 
     def test_real_rrf_with_fake_provider_and_embedding_failure(self):
-        from book_pipeline import write_knowledge_base
-        from rag_knowledge_base import build_embedding_index, RagProviderError
+        from ingestion.book_pipeline import write_knowledge_base
+        from knowledge.rag_knowledge_base import build_embedding_index, RagProviderError
         from tests.test_rag_knowledge_base import FakeEmbeddingProvider, ROWS
         path = Path(self.tmp.name) / "knowledge_base.jsonl"
         write_knowledge_base(path, ROWS)
         provider = FakeEmbeddingProvider()
         build_embedding_index(path, provider)
-        with patch("knowledge_base_cli._provider_from_manifest", return_value=provider):
+        with patch("knowledge.knowledge_base_cli._provider_from_manifest", return_value=provider):
             result = qa._deep_search(path.parent, "量子", top_k=2, max_chars=2000,
                                      semantic=True, apparatus_weight=None)
             self.assertEqual(result["diagnostics"]["effective_mode"], "hybrid")
@@ -97,13 +97,13 @@ class HybridPolicyTests(unittest.TestCase):
                                     semantic=True, apparatus_weight=None)
 
     def test_deep_missing_provider_cannot_claim_hybrid(self):
-        from rag_knowledge_base import RagKnowledgeBase
+        from knowledge.rag_knowledge_base import RagKnowledgeBase
         base = Path(self.tmp.name)
         path = base / "knowledge_base.jsonl"
         path.touch()
-        with patch("knowledge_base_cli._knowledge_base_path", return_value=path), \
+        with patch("knowledge.knowledge_base_cli._knowledge_base_path", return_value=path), \
              patch.object(RagKnowledgeBase, "open", return_value=SimpleNamespace(embedding_ready=False)), \
-             patch("knowledge_base_cli._provider_from_manifest", return_value=None):
+             patch("knowledge.knowledge_base_cli._provider_from_manifest", return_value=None):
             with self.assertRaisesRegex(qa.CorpusError, "hybrid unavailable"):
                 qa._deep_search(base, "量子", top_k=3, max_chars=100, semantic=True, apparatus_weight=None)
 

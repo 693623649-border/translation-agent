@@ -18,9 +18,9 @@ from typing import Any, Iterable
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
-from scan_layout import prepare_scan_pages
+from ingestion.scan_layout import prepare_scan_pages
 
-from ocr_quality_gate import (
+from ingestion.ocr_quality_gate import (
     ocr_structure_anomalies,
     quotation_signature,  # noqa: E402
     character_error_rate,
@@ -176,7 +176,7 @@ def _render_pages(
     reuse: bool,
     pages: Iterable[int],
 ) -> None:
-    from book_pipeline import render_pdf_page
+    from ingestion.book_pipeline import render_pdf_page
 
     params = _render_params(args)
     page_list = list(pages)
@@ -231,7 +231,7 @@ def _docker_path(host_path: Path, backend: str) -> str:
 
 def _model_id(args: argparse.Namespace, source_pdf_sha256: str = "") -> str:
     if getattr(args, "backend", "paddleocr") == "paddleocr":
-        from book_pipeline import paddle_local_model_id
+        from ingestion.book_pipeline import paddle_local_model_id
 
         return paddle_local_model_id(
             dpi=args.dpi,
@@ -240,7 +240,7 @@ def _model_id(args: argparse.Namespace, source_pdf_sha256: str = "") -> str:
             jpeg_quality=args.jpeg_quality,
             source_pdf_sha256=source_pdf_sha256,
         )
-    from book_pipeline import xiaomi_local_model_id
+    from ingestion.book_pipeline import xiaomi_local_model_id
 
     return xiaomi_local_model_id(
         task=args.xiaomi_task,
@@ -448,7 +448,7 @@ def _record_hard_failures(work_dir: Path, pages: Iterable[int], model_id: str) -
 def _mark_visually_blank_pages(work_dir: Path, pages: Iterable[int]) -> None:
     """Only classify a failed OCR result as blank when the source image is visibly blank."""
 
-    from book_pipeline import is_visually_blank_page
+    from ingestion.book_pipeline import is_visually_blank_page
 
     for page in pages:
         path = work_dir / "pages" / f"page_{page:04d}.json"
@@ -679,7 +679,7 @@ def _write_fallback_report(
 def _import_records(
     work_dir: Path, output_dir: Path, pages: Iterable[int]
 ) -> None:
-    from book_pipeline import import_existing_ocr
+    from ingestion.book_pipeline import import_existing_ocr
 
     expected = len(list(pages))
     imported = import_existing_ocr(work_dir, output_dir)

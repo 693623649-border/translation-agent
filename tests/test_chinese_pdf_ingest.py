@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 import fitz
 from PIL import Image
-from book_pipeline import PageRecord, save_page_record
+from ingestion.book_pipeline import PageRecord, save_page_record
 from tools.chinese_pdf_kb_plugin import reader_ingest as v
 
 

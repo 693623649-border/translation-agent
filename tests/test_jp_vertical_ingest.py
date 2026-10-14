@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import fitz
-from book_pipeline import PageRecord, save_page_record
+from ingestion.book_pipeline import PageRecord, save_page_record
 from tools.jp_vertical_kb_plugin import vertical_ingest as v
 
 

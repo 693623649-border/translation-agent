@@ -8,7 +8,7 @@ import threading
 import time
 import unittest
 
-from semantic_translation_runner import (
+from translation.semantic_translation_runner import (
     SemanticTranslationError,
     build_prompt,
     protect_tokens,

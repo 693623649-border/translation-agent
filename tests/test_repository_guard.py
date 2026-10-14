@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from repository_guard import scan_repository
+from orchestration.repository_guard import scan_repository
 
 
 class RepositoryGuardTests(unittest.TestCase):

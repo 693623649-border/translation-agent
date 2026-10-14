@@ -437,8 +437,8 @@ python tools/kb_qa_plugin/kb_qa.py --db global_knowledge_base.sqlite3 `
 | `translation-agent-repo-guard` | 本地书稿、大文件与密钥边界检查 |
 
 DAG 按目标选择依赖闭包，在 `.pipeline_graph/state.json` 和事件记录执行与缓存状态。
-`graph_pipeline.py` 是直接 DAG 入口，`book_pipeline.py` 保留阶段式兼容入口，
-`pdf_text_agent.py` 不作为新任务首选。命令参数以各自的 `--help` 为准。
+`orchestration/graph_pipeline.py` 是直接 DAG 入口，`ingestion/book_pipeline.py` 保留阶段式兼容入口，
+`ingestion/pdf_text_agent.py` 不作为新任务首选。命令参数以各自的 `--help` 为准。
 
 <details>
 <summary>分语种入库插件与 skill</summary>
@@ -484,13 +484,13 @@ git diff --check
 
 | 代码位置 | 职责 |
 | --- | --- |
-| `document_pipeline.py` / `product_contracts.py` | 产品命令与运行契约 |
+| `orchestration/document_pipeline.py` / `orchestration/product_contracts.py` | 产品命令与运行契约 |
 | `pipeline_graph/` / `recipes/` | DAG、缓存与目标组合 |
-| `book_pipeline.py` / `publication_verifier.py` | 编译与发布检查 |
-| `semantic_ir.py` / `semantic_apply.py` | 语义结构与翻译回填 |
-| `rag_knowledge_base.py` / `rag_apparatus.py` | 单书 hybrid、向量、装置与上下文 |
-| `global_knowledge_base.py` / `tools/kb_qa_plugin/` | 全局发现、精读编排与引文核验 |
-| `frontend_runtime.py` / `application_service.py` | 任务与应用服务 |
+| `ingestion/book_pipeline.py` / `publication/publication_verifier.py` | 编译与发布检查 |
+| `translation/semantic_ir.py` / `translation/semantic_apply.py` | 语义结构与翻译回填 |
+| `knowledge/rag_knowledge_base.py` / `knowledge/rag_apparatus.py` | 单书 hybrid、向量、装置与上下文 |
+| `knowledge/global_knowledge_base.py` / `tools/kb_qa_plugin/` | 全局发现、精读编排与引文核验 |
+| `frontend/frontend_runtime.py` / `orchestration/application_service.py` | 任务与应用服务 |
 | `skills/` / `tools/*_plugin/` | 入库与阅读工具 |
 | `tests/` / `docs/` | 验证与专题说明 |
 

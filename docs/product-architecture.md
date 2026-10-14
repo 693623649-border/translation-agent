@@ -166,7 +166,7 @@ Provider、Source Adapter 和 publisher 可以迭代，但不能绕过这些契�
 
 ## 语义回填不变量
 
-`semantic_apply.py` 是 EPUB 与独立文字 PDF importer 的共享 apply 服务：
+`translation/semantic_apply.py` 是 EPUB 与独立文字 PDF importer 的共享 apply 服务：
 
 - 上游 reconstruction audit 必须明确 `passed`，且不能有 root/chapter blocker；
 - unit schema、ID、章节顺序、source SHA 和 locator 必须完整一致；

@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from architecture_dashboard import collect_snapshot, discover_workspaces, render_dashboard
+from frontend.architecture_dashboard import collect_snapshot, discover_workspaces, render_dashboard
 
 class ArchitectureDashboardTests(unittest.TestCase):
     def setUp(self):
@@ -59,7 +59,7 @@ class ArchitectureDashboardTests(unittest.TestCase):
     def test_sqlite_counts_and_benchmark_whitelist(self):
         import sqlite3
         from contextlib import closing
-        with closing(sqlite3.connect(self.repo / 'global_knowledge_base.sqlite3')) as db:
+        with closing(sqlite3.connect(self.repo / 'knowledge.global_knowledge_base.sqlite3')) as db:
             db.executescript("CREATE TABLE meta(key TEXT,value TEXT); INSERT INTO meta VALUES ('secret','private'); CREATE TABLE workspaces(name TEXT); INSERT INTO workspaces VALUES ('book'); CREATE TABLE chunks(id TEXT); INSERT INTO chunks VALUES ('one');")
             db.commit()
         report = self.repo / 'work/kb-core-optimization'

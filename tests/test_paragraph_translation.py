@@ -3,7 +3,7 @@ import ast
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from paragraph_translation import (
+from translation.paragraph_translation import (
     ParagraphTranslator, TranslationQualityError, split_paragraph_chunks,
     validate_source_quotes, validate_translation,
     selected_language_prompt, JAPANESE_PROMPT_VERSION, ENGLISH_PROMPT_VERSION,

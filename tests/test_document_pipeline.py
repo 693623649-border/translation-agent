@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import document_pipeline
-from product_contracts import RunSpec
+import orchestration.document_pipeline as document_pipeline
+from orchestration.product_contracts import RunSpec
 
 
 class DocumentPipelineTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class DocumentPipelineTests(unittest.TestCase):
                 "issues": [{"code": "ocr_human_review_missing", "message": "missing human review"}],
             }), encoding="utf-8")
             spec = RunSpec(source=source_pdf, source_mode="scanned-pdf", output_dir=output)
-            with patch("translation_agent_api.run_graph", return_value=FakeRun()):
+            with patch("frontend.translation_agent_api.run_graph", return_value=FakeRun()):
                 result = document_pipeline.run_pdf_spec(spec)
             report = Path(result["quality_report"]).read_text(encoding="utf-8")
 
@@ -72,7 +72,7 @@ class DocumentPipelineTests(unittest.TestCase):
             }), encoding="utf-8")
             spec = RunSpec(source=source_pdf, source_mode="scanned-pdf",
                            output_dir=output, phase="ocr", verify=False)
-            with patch("translation_agent_api.run_graph", return_value=FakeRun()):
+            with patch("frontend.translation_agent_api.run_graph", return_value=FakeRun()):
                 result = document_pipeline.run_pdf_spec(spec)
             report = Path(result["quality_report"]).read_text(encoding="utf-8")
 
@@ -146,7 +146,7 @@ class DocumentPipelineTests(unittest.TestCase):
 
         from unittest.mock import patch
 
-        with patch("translation_agent_api.run_graph", return_value=FakeRun()):
+        with patch("frontend.translation_agent_api.run_graph", return_value=FakeRun()):
             report = document_pipeline.publish_spec(
                 RunSpec(
                     source_mode="epub",
@@ -160,14 +160,14 @@ class DocumentPipelineTests(unittest.TestCase):
         self.assertEqual(report["publication_status"], "draft")
 
     def test_doctor_flags_are_delegated_without_double_dash(self) -> None:
-        with patch("doctor.main", return_value=0) as doctor_main:
+        with patch("orchestration.doctor.main", return_value=0) as doctor_main:
             code = document_pipeline.main(["doctor", "--json", "--web"])
 
         self.assertEqual(code, 0)
         doctor_main.assert_called_once_with(["--json", "--web"])
 
     def test_epub_run_requires_explicit_draft_authorization(self) -> None:
-        with patch("document_pipeline.ingest_spec") as ingest:
+        with patch("orchestration.document_pipeline.ingest_spec") as ingest:
             with self.assertRaisesRegex(ValueError, "--no-verify"):
                 document_pipeline.main(
                     [
@@ -190,10 +190,10 @@ class DocumentPipelineTests(unittest.TestCase):
             verify=False,
         )
         with patch(
-            "semantic_translation_runner.load_glossary",
+            "translation.semantic_translation_runner.load_glossary",
             return_value={"state": "国家"},
         ) as load_glossary, patch(
-            "epub_semantic_import.apply_translations",
+            "ingestion.epub_semantic_import.apply_translations",
             return_value={"status": "passed"},
         ) as apply_translations:
             report = document_pipeline.apply_spec(
@@ -230,9 +230,9 @@ class DocumentPipelineTests(unittest.TestCase):
 
     def test_epub_run_stops_when_semantic_ingest_is_blocked(self) -> None:
         with patch(
-            "document_pipeline.ingest_spec",
+            "orchestration.document_pipeline.ingest_spec",
             return_value={"status": "blocked", "release_blocked": True},
-        ), patch("document_pipeline.publish_spec") as publish:
+        ), patch("orchestration.document_pipeline.publish_spec") as publish:
             with contextlib.redirect_stdout(io.StringIO()):
                 with self.assertRaisesRegex(ValueError, "semantic ingest is blocked"):
                     document_pipeline.main(
@@ -250,7 +250,7 @@ class DocumentPipelineTests(unittest.TestCase):
 
     def test_standalone_ingest_returns_nonzero_for_blocked_result(self) -> None:
         with patch(
-            "document_pipeline.ingest_spec",
+            "orchestration.document_pipeline.ingest_spec",
             return_value={"status": "blocked", "release_blocked": True},
         ):
             stdout = io.StringIO()

@@ -8,7 +8,7 @@ from collections import Counter
 from contextlib import closing
 from pathlib import Path
 
-from global_knowledge_base import (
+from knowledge.global_knowledge_base import (
     _assert_sources_stable,
     _stat,
     evaluate_retrieval,

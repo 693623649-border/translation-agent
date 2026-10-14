@@ -42,7 +42,7 @@ def main(argv: list[str]) -> int:
     if not key:
         return 2
     stripped = [a for a in argv if a != "--load-env"]
-    command = [sys.executable, str(ROOT / "knowledge_base_cli.py"), *stripped]
+    command = [sys.executable, "-m", "knowledge.knowledge_base_cli", *stripped]
     print(f"[run] {' '.join(stripped)}", flush=True)
     proc = subprocess.run(command, cwd=ROOT, env=os.environ)
     return proc.returncode

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import book_pipeline as b
+import ingestion.book_pipeline as b
 
 try:
     from work import critical_tradition_selection_edition as edition

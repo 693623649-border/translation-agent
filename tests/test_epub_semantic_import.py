@@ -9,14 +9,14 @@ import unittest
 from unittest import mock
 import zipfile
 
-from book_pipeline import build_docx, build_epub
-from epub_semantic_import import (
+from ingestion.book_pipeline import build_docx, build_epub
+from ingestion.epub_semantic_import import (
     EpubSemanticError,
     apply_translations,
     import_epub,
     prune_long_footnotes,
 )
-from publication_semantics import parse_markdown_footnotes
+from publication.publication_semantics import parse_markdown_footnotes
 
 
 def _write_epub(path: Path, *, broken_note: bool = False) -> None:
@@ -511,7 +511,7 @@ class EpubSemanticImportTests(unittest.TestCase):
             chapter_path = output / "chapters" / manifest[0]["filename"]
             chapter_before = chapter_path.read_bytes()
 
-            import semantic_apply
+            import translation.semantic_apply as semantic_apply
 
             real_replace = semantic_apply._replace_file
             calls = 0
@@ -523,7 +523,7 @@ class EpubSemanticImportTests(unittest.TestCase):
                     raise OSError("injected commit failure")
                 real_replace(source_path, target_path)
 
-            with mock.patch("semantic_apply._replace_file", side_effect=fail_once):
+            with mock.patch("translation.semantic_apply._replace_file", side_effect=fail_once):
                 with self.assertRaisesRegex(EpubSemanticError, "rolled back"):
                     apply_translations(output, translated)
 

@@ -6,7 +6,7 @@ HTML 交互面板与纯文本导出使用同一份 118 列字符布局。
 本版本用于项目架构与任务证据检查，不更改模型配置或启动任务。
 
 ```powershell
-python -m streamlit run streamlit_app.py --server.address 127.0.0.1
+python -m streamlit run frontend/streamlit_app.py --server.address 127.0.0.1
 ```
 
 在工作台导航中选择“架构与审查”，或访问 `/architecture`。

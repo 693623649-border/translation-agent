@@ -10,9 +10,9 @@ from types import SimpleNamespace
 from typing import Sequence
 from unittest.mock import patch
 
-from book_pipeline import build_parser, write_knowledge_base
+from ingestion.book_pipeline import build_parser, write_knowledge_base
 from pipeline_graph.book import _knowledge_base_is_current
-from rag_knowledge_base import (
+from knowledge.rag_knowledge_base import (
     RagEmbeddingUnavailableError,
     RagFormatError,
     RagIndexStaleError,
@@ -26,7 +26,7 @@ from rag_knowledge_base import (
     vector_index_path_for,
     zhipu_embedding_enabled,
 )
-from translation_agent_api import (
+from frontend.translation_agent_api import (
     build_knowledge_base_embedding_index,
     retrieve_knowledge_base_context,
 )
@@ -109,7 +109,7 @@ class RagKnowledgeBaseTests(unittest.TestCase):
         self._write()
         kb = RagKnowledgeBase.open(self.knowledge_path)
         self.assertEqual(kb.retrieve("量子", authors={"不存在"}), [])
-        with patch("rag_knowledge_base._tokens", wraps=__import__("rag_knowledge_base")._tokens) as tokenize:
+        with patch("knowledge.rag_knowledge_base._tokens", wraps=__import__("knowledge.rag_knowledge_base", fromlist=["_tokens"])._tokens) as tokenize:
             context = kb.retrieve_context("quantum", aliases={"quantum": ["量子"]})
             self.assertEqual(context.hits[0].id, ROWS[0]["id"])
             self.assertTrue(all(len(call.args[0]) < 30 for call in tokenize.call_args_list))
@@ -319,7 +319,7 @@ class RagKnowledgeBaseTests(unittest.TestCase):
         # environment instead.
         with (
             patch.dict("os.environ", {}, clear=True),
-            patch("book_pipeline.load_env_file", lambda path: None),
+            patch("ingestion.book_pipeline.load_env_file", lambda path: None),
         ):
             self.assertTrue(
                 _knowledge_base_is_current(context, {"publication.knowledge_base": saved})

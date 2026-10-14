@@ -3,8 +3,8 @@ import json
 import streamlit as st
 import streamlit.components.v1 as components
 from app_pages._shared import application_service, job_label
-from architecture_dashboard import collect_snapshot, discover_workspaces
-from architecture_ascii import render_ascii, render_dashboard
+from frontend.architecture_dashboard import collect_snapshot, discover_workspaces
+from frontend.architecture_ascii import render_ascii, render_dashboard
 
 st.header("架构与审查")
 st.caption("检查项目模块与已记录的任务证据；刷新时采集快照。")

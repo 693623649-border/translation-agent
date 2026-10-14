@@ -63,7 +63,7 @@ The project backend is english_ingest.py. prepare binds an independent workspace
 to the source PDF hash, verified Chinese title, editor/author and page count.
 extract imports embedded English text and original block rectangles into
 immutable page checkpoints; low-text pages are reported for exact-page OCR.
-ocr, toc and translate call the existing book_pipeline.py phases. toc_file
+ocr, toc and translate call the existing ingestion/book_pipeline.py phases. toc_file
 imports a reviewed TOC without a model call, while toc_pages selects exact
 source pages for automatic TOC generation.
 

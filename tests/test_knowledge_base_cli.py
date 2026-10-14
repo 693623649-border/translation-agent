@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Sequence
 from unittest.mock import patch
 
-from book_pipeline import write_knowledge_base
-from knowledge_base_cli import main
-from rag_knowledge_base import metadata_sidecar_path_for, vector_index_path_for
+from ingestion.book_pipeline import write_knowledge_base
+from knowledge.knowledge_base_cli import main
+from knowledge.rag_knowledge_base import metadata_sidecar_path_for, vector_index_path_for
 
 
 ROWS = [
@@ -71,13 +71,13 @@ class KnowledgeBaseCliTests(unittest.TestCase):
     def test_global_hybrid_is_one_entrypoint_with_book_sources_and_partial_coverage(self) -> None:
         other = self.root / "unindexed" / "knowledge_base.jsonl"
         write_knowledge_base(other, ROWS)
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             self.assertEqual(main(["register", str(self.output)], io.StringIO()), 0)
         metadata_sidecar_path_for(self.kb).write_text(
             json.dumps({"id": "a" * 40, "book_title": "量子理论入门", "author": "测试作者"},
                        ensure_ascii=False) + "\n", encoding="utf-8",
         )
-        with patch("rag_knowledge_base.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.rag_knowledge_base.ZhipuEmbeddingProvider", FakeZhipuProvider):
             stdout = io.StringIO()
             self.assertEqual(main(["retrieve", str(self.root), "量子", "--mode", "hybrid"], stdout), 0)
             payload = _json(stdout)
@@ -101,10 +101,10 @@ class KnowledgeBaseCliTests(unittest.TestCase):
     def test_global_hybrid_keeps_nested_book_sources_distinct_and_exact_filter(self) -> None:
         nested = self.root / "other" / "book" / "knowledge_base.jsonl"
         write_knowledge_base(nested, ROWS)
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             main(["register", str(self.kb)], io.StringIO())
             main(["register", str(nested)], io.StringIO())
-        with patch("rag_knowledge_base.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.rag_knowledge_base.ZhipuEmbeddingProvider", FakeZhipuProvider):
             stdout = io.StringIO()
             main(["retrieve", str(self.root), "量子", "--mode", "hybrid"], stdout)
             payload = _json(stdout)
@@ -190,10 +190,10 @@ class KnowledgeBaseCliTests(unittest.TestCase):
                 reranker_calls.append((query, tuple(hits)))
                 return list(hits)
 
-        import rag_reranking
+        import knowledge.rag_reranking as rag_reranking
 
         with (
-            patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider),
+            patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider),
             patch.object(rag_reranking, "OpenAICompatibleReranker", return_value=FakeReranker()),
         ):
             stdout = io.StringIO()
@@ -229,7 +229,7 @@ class KnowledgeBaseCliTests(unittest.TestCase):
     def test_register_builds_zhipu_embedding_index_without_network(self) -> None:
         stdout = io.StringIO()
 
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             code = main(["register", str(self.output), "--dimensions", "2048"], stdout)
 
         payload = _json(stdout)
@@ -252,7 +252,7 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         write_knowledge_base(self.kb, foreign)
         stdout = io.StringIO()
 
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             code = main(["register", str(self.output)], stdout)
 
         payload = _json(stdout)
@@ -274,7 +274,7 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         write_knowledge_base(self.kb, foreign)
         stdout = io.StringIO()
 
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             code = main(["register", str(self.output), "--allow-foreign"], stdout)
 
         payload = _json(stdout)
@@ -283,7 +283,7 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         self.assertTrue(vector_index_path_for(self.kb).is_file())
 
     def test_retrieve_uses_semantic_when_requested_and_index_ready(self) -> None:
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             self.assertEqual(main(["register", str(self.output)], io.StringIO()), 0)
             stdout = io.StringIO()
             code = main(
@@ -312,11 +312,11 @@ class KnowledgeBaseCliTests(unittest.TestCase):
         self.assertEqual(payload["hits"][0]["id"], "b" * 40)
 
     def test_retrieve_falls_back_to_lexical_when_query_provider_fails(self) -> None:
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", FakeZhipuProvider):
             self.assertEqual(main(["register", str(self.output)], io.StringIO()), 0)
         stdout = io.StringIO()
 
-        with patch("knowledge_base_cli.ZhipuEmbeddingProvider", MissingKeyProvider):
+        with patch("knowledge.knowledge_base_cli.ZhipuEmbeddingProvider", MissingKeyProvider):
             code = main(
                 ["retrieve", str(self.output), "历史档案", "--semantic", "--top-k", "1"],
                 stdout,

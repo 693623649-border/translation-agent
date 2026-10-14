@@ -54,6 +54,7 @@ DSH 宿主插件：`package.json` 声明 `dsh.bundle`，`cordis.patch.yml` 提�
 | `epub_cleanup_wenxue_lilun.py` | 文学理论（耶鲁） | z-lib/Duokan/WeRead 污染清单清理 |
 | `schmitt_body_rebuild.py` | 政治的神学、政治的概念 | 从新 OCR 行坐标和源图页下注分隔线重建正文段落，注释独立归档，恢复已核验的扫描页顺序，生成五字段正文库与 Word |
 | `scan_wenxue_fragments.py` | 文学理论（耶鲁） | 扫描残留标签碎片 |
+| `patch_translations.py` | 共同幻想论 | 内容过滤拦截页的人工译文补丁 |
 
 ## 约定
 

@@ -45,7 +45,7 @@ def evidence(items, expected, label):
 
 
 def load_ocr(workspace, manifest):
-    from book_pipeline import load_page_records
+    from ingestion.book_pipeline import load_page_records
     records = load_page_records(workspace)
     result, issues, low = {}, [], []
     for record in records:
@@ -91,7 +91,7 @@ def validate_plan(plan, count):
 
 
 def reconstruct(workspace, manifest, plan, review, plan_sha, records, ocr_sha, low):
-    from docx_translation import needs_translation
+    from publication.docx_translation import needs_translation
     overrides, budget = validate_plan(plan, manifest["page_count"])
     for key, value in dict(source_sha256=manifest["source_sha256"], plan_sha256=plan_sha, ocr_sha256=ocr_sha).items():
         require(review.get(key) == value, f"Source review {key} is stale")

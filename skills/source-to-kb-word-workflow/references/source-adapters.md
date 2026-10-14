@@ -24,10 +24,10 @@ EPUB 文档里的 `<h1>`–`<h6>` 会被单独取出当作章节名，并**从�
 
 ### 各入口的命令
 
-- 扫描 PDF → `python graph_pipeline.py <pdf> -o <输出目录> --phase all --config pipeline.toml --recipe recipes/chinese-pdf-word.toml`
-- 结构复杂的 EPUB → `python epub_semantic_import.py`
+- 扫描 PDF → `python -m orchestration.graph_pipeline <pdf> -o <输出目录> --phase all --config pipeline.toml --recipe recipes/chinese-pdf-word.toml`
+- 结构复杂的 EPUB → `python -m ingestion.epub_semantic_import`
 - 只有 DOCX 没有上游语义源 → `translation-agent-kb derive-docx`，或
-  `python docx_semantic_migration.py` 建立可审计的 reviewed source
+  `python -m publication.docx_semantic_migration` 建立可审计的 reviewed source
 
 ## 五字段语料契约
 
@@ -74,11 +74,11 @@ translation-agent-kb status "<工作区>"
 translation-agent-kb retrieve "<工作区>" "<问题>" --mode hybrid
 
 # 全库（跨书）
-python global_knowledge_base.py sync
+python -m knowledge.global_knowledge_base sync
 python tools/kb_qa_plugin/kb_qa.py ask "<问题>" --mode hybrid --limit 5
 ```
 
 `sync` 默认拒绝未译外文 reader。正式检索统一 hybrid（BM25 + 向量 RRF），
 向量、provider 或 embedding 配置不可用时明确失败，不以自动 BM25 降级取代。
-`global_knowledge_base.py search` 仍是本地 FTS 候选发现/诊断接口；正式跨书
+`knowledge/global_knowledge_base.py search` 仍是本地 FTS 候选发现/诊断接口；正式跨书
 取证通过 `kb_qa.py ask --mode hybrid` 完成精读。

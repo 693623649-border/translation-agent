@@ -50,7 +50,7 @@ description: 把一个源文件（Markdown/纯文本/DOCX/EPUB/带文字层的 P
 
 6. **报告。** 精确给出工作区、知识库文件、Word 文件、章节数、块数、缺字/多字/相似度、
    逐处 diff 与 warnings 的人工判断。跨书检索前提醒用户跑
-   `python global_knowledge_base.py sync`。
+   `python -m knowledge.global_knowledge_base sync`。
 
 ## 绝不做的四件事
 

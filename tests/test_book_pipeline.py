@@ -14,14 +14,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from ocr_quality_gate import punctuation_signature
-from paragraph_translation import TranslationQualityError
+from ingestion.ocr_quality_gate import punctuation_signature
+from translation.paragraph_translation import TranslationQualityError
 
 import fitz
 from PIL import Image
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     ChatTranslator,
     CodingPlanVisionOCR,
     DeepSeekClient,
@@ -1064,7 +1064,7 @@ M.E.Sharpe, Inc., 1983.
         )
 
     def test_markdown_to_html_restores_named_entities(self) -> None:
-        from book_pipeline import markdown_to_html
+        from ingestion.book_pipeline import markdown_to_html
 
         output = markdown_to_html("“伦敦”①测试")
         self.assertIn("“伦敦”", output)

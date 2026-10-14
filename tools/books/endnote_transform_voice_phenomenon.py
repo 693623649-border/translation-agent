@@ -109,7 +109,7 @@ def transform(text: str) -> tuple[str, dict]:
 
 
 def main() -> int:
-    from publication_semantics import (
+    from publication.publication_semantics import (
         markdown_footnote_contract_sha256,
         parse_markdown_footnotes,
     )

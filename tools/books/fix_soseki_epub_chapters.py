@@ -87,7 +87,7 @@ def split_blob(text: str, count: int) -> list[str]:
 
 
 def main() -> int:
-    from publication_semantics import markdown_footnote_contract_sha256
+    from publication.publication_semantics import markdown_footnote_contract_sha256
 
     manifest = json.loads((WORK / "chapters.json").read_text(encoding="utf-8"))
     audit_path = WORK / "audit" / "semantic-reconstruction.json"

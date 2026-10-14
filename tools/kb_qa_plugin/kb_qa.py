@@ -266,7 +266,7 @@ def global_db_path(override: str | Path | None = None) -> Path:
     from_env = os.environ.get("DSH_KB_GLOBAL_DB")
     if from_env:
         return Path(from_env).expanduser().resolve()
-    return PROJECT_ROOT / "global_knowledge_base.sqlite3"
+    return PROJECT_ROOT / "knowledge.global_knowledge_base.sqlite3"
 
 
 def outputs_root(override: str | Path | None = None) -> Path:
@@ -370,8 +370,8 @@ def _deep_search(
     """
 
     with _stdout_to_stderr():
-        from knowledge_base_cli import _knowledge_base_path  # noqa: PLC0415
-        from rag_knowledge_base import (  # noqa: PLC0415
+        from knowledge.knowledge_base_cli import _knowledge_base_path  # noqa: PLC0415
+        from knowledge.rag_knowledge_base import (  # noqa: PLC0415
             RagEmbeddingUnavailableError,
             RagError,
             RagFormatError,
@@ -397,7 +397,7 @@ def _deep_search(
     semantic_error: str | None = None
     if semantic:
         with _stdout_to_stderr():
-            from knowledge_base_cli import _provider_from_manifest  # noqa: PLC0415
+            from knowledge.knowledge_base_cli import _provider_from_manifest  # noqa: PLC0415
 
             try:
                 provider = _provider_from_manifest(

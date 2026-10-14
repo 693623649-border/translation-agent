@@ -5,8 +5,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from pipeline_profiles import ModelProfile, PipelineProfiles, load_pipeline_profiles
-from book_pipeline import (
+from orchestration.pipeline_profiles import ModelProfile, PipelineProfiles, load_pipeline_profiles
+from ingestion.book_pipeline import (
     TRANSLATION_PROMPT_VERSION,
     build_parser,
     build_translation_client,

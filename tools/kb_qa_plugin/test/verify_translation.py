@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kb_translation import classify_row, source_backup_path_for  # noqa: E402
-from rag_knowledge_base import load_knowledge_rows  # noqa: E402
+from translation.kb_translation import classify_row, source_backup_path_for  # noqa: E402
+from knowledge.rag_knowledge_base import load_knowledge_rows  # noqa: E402
 
 
 def main() -> int:
@@ -53,9 +53,9 @@ def main() -> int:
 
     print()
     print("== global index ==")
-    db = ROOT / "global_knowledge_base.sqlite3"
+    db = ROOT / "knowledge.global_knowledge_base.sqlite3"
     if not db.is_file():
-        print("  MISSING: run global_knowledge_base.py sync")
+        print("  MISSING: run python -m knowledge.global_knowledge_base sync")
     else:
         import sqlite3
 

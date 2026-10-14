@@ -8,7 +8,7 @@ import unittest
 
 import fitz
 
-from born_digital_pdf_import import apply_translations, import_born_digital_pdf
+from ingestion.born_digital_pdf_import import apply_translations, import_born_digital_pdf
 
 
 def _text_pdf(path: Path, pages: list[str], *, outline: list[list[object]] | None = None) -> None:

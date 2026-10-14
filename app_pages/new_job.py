@@ -13,8 +13,8 @@ from app_pages._shared import (
     profile_label,
     profiles_for_stage,
 )
-from frontend_runtime import validate_upload_size
-from product_paths import default_source_placeholder, recipe_paths
+from frontend.frontend_runtime import validate_upload_size
+from orchestration.product_paths import default_source_placeholder, recipe_paths
 
 
 st.header("创建翻译任务")

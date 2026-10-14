@@ -17,8 +17,19 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
-import global_knowledge_base as current_global
-import rag_knowledge_base as current_rag
+import knowledge.global_knowledge_base as current_global
+import knowledge.rag_knowledge_base as current_rag
+
+
+
+def _baseline_module(baseline: Path, package: str, filename: str) -> Path:
+    current = baseline / package / filename
+    if current.is_file():
+        return current
+    legacy = baseline / filename
+    if legacy.is_file():
+        return legacy
+    raise FileNotFoundError(current)
 
 
 def _load_module(path: Path, name: str):
@@ -44,8 +55,8 @@ def _hits_key(hits):
 
 def run(args):
     baseline = args.baseline.resolve()
-    old_global = _load_module(baseline / "global_knowledge_base.py", "benchmark_old_global")
-    old_rag = _load_module(baseline / "rag_knowledge_base.py", "benchmark_old_rag")
+    old_global = _load_module(_baseline_module(baseline, "knowledge", "global_knowledge_base.py"), "benchmark_old_global")
+    old_rag = _load_module(_baseline_module(baseline, "knowledge", "rag_knowledge_base.py"), "benchmark_old_rag")
     fixture = json.loads(args.cases.read_text(encoding="utf-8"))
     report = {"scope": "local corpus; lexical queries only; no provider calls",
               "baseline": str(baseline), "database": str(args.db.resolve()),

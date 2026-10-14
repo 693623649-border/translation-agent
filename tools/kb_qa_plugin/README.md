@@ -28,8 +28,8 @@ tools/kb_qa_plugin/
 | `kb_library` | 列出工作区、块数与发布验收状态，确认库里到底有什么 |
 
 插件本身不做检索排序。检索由 `kb_qa.py` 转调仓库里已经过测试的两层实现：
-`global_knowledge_base.py`（仓库级 SQLite + FTS5，含装置降权与每书上限）与
-`rag_knowledge_base.py`（单书 BM25 + 向量 RRF）。在 JavaScript 里重写排序会
+`knowledge/global_knowledge_base.py`（仓库级 SQLite + FTS5，含装置降权与每书上限）与
+`knowledge/rag_knowledge_base.py`（单书 BM25 + 向量 RRF）。在 JavaScript 里重写排序会
 让检索契约分叉，并与已发布的 `evaluate` 基线悄悄脱节，所以插件刻意只做一层
 薄而可取消的适配。
 

@@ -12,11 +12,11 @@
 
 ## 仓库实现
 
-- `scan_layout.py`：原文不改写，凭竖排框分离边栏/页码，列软换行不等于作者段落。无可靠几何不猜列序。
-- `ocr_quality_gate.py`：跨页结构检查和模型差异。引号两端一起漏掉时平衡检查无法发现。
+- `ingestion/scan_layout.py`：原文不改写，凭竖排框分离边栏/页码，列软换行不等于作者段落。无可靠几何不猜列序。
+- `ingestion/ocr_quality_gate.py`：跨页结构检查和模型差异。引号两端一起漏掉时平衡检查无法发现。
 - `tools/local_paddleocr_import.py`：GPU OCR 与一次复识；保存两套候选而非拼接。
 - `tools/ocr_review.py`：人类决定绑定原图与原文 SHA；校订放旁层。
-- `paragraph_translation.py` / `book_pipeline.ChatTranslator`：整段自然正文，前后上下文各最多 800 字。
+- `translation/paragraph_translation.py` / `book_pipeline.ChatTranslator`：整段自然正文，前后上下文各最多 800 字。
   prompt 对日语译中文要求所有标点逐字保留，并约束书名『』不可改《》、对话「」不可改弯引号、跨页不补闭合、不译入上下文。
   首次加一次完整重译，拒绝失败结果，不机械移动标点。
 - 页缓存分开绑定真实模型、原文、版面/最多三邻页上下文及物理页边界；发布器独立复算。

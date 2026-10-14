@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     DEFAULT_LOCAL_LLM_API_BASE,
     DEFAULT_LOCAL_LLM_MODEL,
     ChatTranslator,
@@ -24,8 +24,8 @@ from book_pipeline import (
     build_translation_client,
     resolve_translation_identity,
 )
-from kb_translation import DeepSeekTranslator, KbTranslationError, LocalTranslator
-from pipeline_profiles import load_pipeline_profiles
+from translation.kb_translation import DeepSeekTranslator, KbTranslationError, LocalTranslator
+from orchestration.pipeline_profiles import load_pipeline_profiles
 
 
 class RecordingLocalClient(LocalClient):
@@ -160,7 +160,7 @@ class KbTranslatorTests(unittest.TestCase):
 
             return Response()
 
-        import kb_translation as module
+        import translation.kb_translation as module
 
         with patch.dict(os.environ, {}, clear=True):
             with patch.object(module.urllib.request, "urlopen", fake_urlopen):

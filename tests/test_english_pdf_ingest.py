@@ -6,7 +6,7 @@ import unittest
 
 import pymupdf
 
-import book_pipeline as book
+import ingestion.book_pipeline as book
 from tools.english_pdf_kb_plugin import english_ingest as english
 
 

@@ -9,7 +9,7 @@ from unittest import mock
 from docx import Document
 from lxml import etree
 
-from docx_footnotes import (
+from publication.docx_footnotes import (
     CONTENT_TYPE_FOOTNOTES,
     CT_NS,
     PKGREL_NS,
@@ -67,8 +67,8 @@ class DocxFootnoteTests(unittest.TestCase):
                 raise PermissionError("held by Word renderer")
             return real_replace(src, dst)
 
-        with mock.patch("docx_footnotes.os.replace", side_effect=flaky_replace):
-            with mock.patch("docx_footnotes.time.sleep") as sleep:
+        with mock.patch("publication.docx_footnotes.os.replace", side_effect=flaky_replace):
+            with mock.patch("publication.docx_footnotes.time.sleep") as sleep:
                 replace_with_retry(source, target, attempts=3, delay=0.01)
 
         self.assertEqual(calls["count"], 2)
@@ -81,10 +81,10 @@ class DocxFootnoteTests(unittest.TestCase):
         source.write_bytes(b"new")
 
         with mock.patch(
-            "docx_footnotes.os.replace",
+            "publication.docx_footnotes.os.replace",
             side_effect=PermissionError("held by Word renderer"),
         ):
-            with mock.patch("docx_footnotes.time.sleep"):
+            with mock.patch("publication.docx_footnotes.time.sleep"):
                 with self.assertRaises(PermissionError):
                     replace_with_retry(source, target, attempts=3, delay=0.01)
 

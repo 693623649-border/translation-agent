@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kb_translation import classify_row  # noqa: E402
+from translation.kb_translation import classify_row  # noqa: E402
 
 LOG = ROOT / "work" / "translate_kb_batch.log"
 MODEL = "deepseek-flash"
@@ -102,7 +102,7 @@ def main() -> int:
         log(f"[{index}/{len(targets)}] translating {pending} chunk(s): {workspace.name[:70]}")
         command = [
             sys.executable,
-            str(ROOT / "knowledge_base_cli.py"),
+            "-m", "knowledge.knowledge_base_cli",
             "translate-kb",
             str(workspace),
             "--model",

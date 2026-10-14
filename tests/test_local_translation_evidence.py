@@ -5,7 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from book_pipeline import LocalClient
+from ingestion.book_pipeline import LocalClient
 
 SPEC = importlib.util.spec_from_file_location(
     "local_smoke", Path(__file__).resolve().parents[1] / "deploy/local-llm/smoke_translate.py"

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kb_translation import classify_row  # noqa: E402
+from translation.kb_translation import classify_row  # noqa: E402
 
 KANA = re.compile(r"[\u3040-\u30ff]")
 HAN = re.compile(r"[\u3400-\u9fff]")

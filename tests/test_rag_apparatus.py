@@ -7,8 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rag_apparatus import annotate_apparatus, classify_apparatus, load_apparatus
-from rag_knowledge_base import (
+from knowledge.rag_apparatus import annotate_apparatus, classify_apparatus, load_apparatus
+from knowledge.rag_knowledge_base import (
     RagIndexStaleError, RagKnowledgeBase, build_embedding_index,
     initialize_rag_manifest, vector_index_path_for,
 )
@@ -187,7 +187,7 @@ class ApparatusTests(unittest.TestCase):
         self.assertEqual(after[0].id, self.rows[1]["id"])
 
     def test_cli_annotation_and_recursive_parser(self):
-        from knowledge_base_cli import build_parser, main
+        from knowledge.knowledge_base_cli import build_parser, main
         args = build_parser().parse_args(["annotate-apparatus", str(self.path.parent), "--recursive"])
         self.assertTrue(args.recursive)
         self.path.with_suffix(".apparatus.json").unlink()
@@ -198,12 +198,12 @@ class ApparatusTests(unittest.TestCase):
         self.assertEqual(report["tagged_chunks"], 1)
 
     def test_cli_fallback_preserves_weight_override(self):
-        from knowledge_base_cli import main
+        from knowledge.knowledge_base_cli import main
         class BrokenQuery(ConstantProvider):
             def embed_query(self, text):
                 raise RuntimeError("test provider unavailable")
         output = io.StringIO()
-        with patch("knowledge_base_cli._provider_from_manifest", return_value=BrokenQuery()):
+        with patch("knowledge.knowledge_base_cli._provider_from_manifest", return_value=BrokenQuery()):
             result = main(["retrieve", str(self.path), "目录", "--mode", "semantic", "--apparatus-weight", "1"], stdout=output)
         self.assertEqual(result, 0)
         report = json.loads(output.getvalue())

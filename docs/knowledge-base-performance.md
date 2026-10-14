@@ -27,16 +27,16 @@
 
 ```powershell
 # 自动迁移旧 schema，之后按工作区增量同步
-python global_knowledge_base.py sync --outputs outputs
+python -m knowledge.global_knowledge_base sync --outputs outputs
 
 # 强制重建，用于恢复或比较
-python global_knowledge_base.py sync --outputs outputs --full-rebuild
+python -m knowledge.global_knowledge_base sync --outputs outputs --full-rebuild
 
 # 完整来源与数据库校验
-python global_knowledge_base.py verify
+python -m knowledge.global_knowledge_base verify
 
 # 本机已审查题集的质量门
-python global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrieval_cases.local.json
+python -m knowledge.global_knowledge_base evaluate --cases tests/fixtures/global_kb_retrieval_cases.local.json
 ```
 
 同步报告包含 `mode`、`updated_workspaces`、`reused_workspaces` 和

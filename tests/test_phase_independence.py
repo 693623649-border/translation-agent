@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     ModelIdentity,
     PageRecord,
     TocEntry,
@@ -84,7 +84,7 @@ class IndependentPhaseTests(unittest.TestCase):
                 PageRecord(1, "これは本文です。", language="ja", ocr_model="test"),
             )
             with patch(
-                "book_pipeline.build_translation_client",
+                "ingestion.book_pipeline.build_translation_client",
                 return_value=FakeTextClient(),
             ):
                 code = main(

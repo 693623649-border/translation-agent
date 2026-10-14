@@ -63,8 +63,8 @@ def prepare(args):
 
 
 def snapshot(workspace):
-    from book_pipeline import load_page_records
-    from docx_translation import needs_translation
+    from ingestion.book_pipeline import load_page_records
+    from publication.docx_translation import needs_translation
     manifest = read(workspace / MANIFEST)
     source = Path(manifest["source"])
     records = load_page_records(workspace)
@@ -202,7 +202,7 @@ def run(args):
     require(stage in {"ocr", "translate", "compile", "verify", "register"}, "Unknown stage")
     timeout = args.get("timeout_seconds", 600)
     require(type(timeout) is int and 1 <= timeout <= 3600, "timeout_seconds must be 1..3600")
-    base = [sys.executable, str(ROOT / "book_pipeline.py"), manifest["source"], "-o", str(workspace), "--title", manifest["title"], "--author", manifest["author"], "--ocr-profile", "paddleocr_local", "--ocr-reading-direction", "vertical"]
+    base = [sys.executable, "-m", "ingestion.book_pipeline", manifest["source"], "-o", str(workspace), "--title", manifest["title"], "--author", manifest["author"], "--ocr-profile", "paddleocr_local", "--ocr-reading-direction", "vertical"]
     config = Path(args.get("config") or manifest.get("config") or ROOT / "pipeline.toml").resolve()
     require(config.is_file(), "Pipeline config does not exist")
     base += ["--config", str(config)]
@@ -238,7 +238,7 @@ def run(args):
             import fitz
             with fitz.open(rendered) as document:
                 evidence(layout.get("pages"), range(1, len(document) + 1), "Rendered layout")
-            commands.append([sys.executable, str(ROOT / "knowledge_base_cli.py"), "register", str(workspace)])
+            commands.append([sys.executable, "-m", "knowledge.knowledge_base_cli", "register", str(workspace)])
     log = workspace / "vertical-attempts.jsonl"
     manifest["config"] = str(config)
     write(workspace / MANIFEST, manifest)

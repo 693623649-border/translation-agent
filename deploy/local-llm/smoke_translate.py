@@ -15,13 +15,13 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from book_pipeline import (  # noqa: E402
+from ingestion.book_pipeline import (  # noqa: E402
     ChatTranslator, LocalClient, TRANSLATION_PROMPT_VERSION,
     build_parser, build_translation_client,
 )
-from paragraph_translation import QUOTES, validate_translation  # noqa: E402
-from ocr_quality_gate import punctuation_signature  # noqa: E402
-from pipeline_profiles import load_pipeline_profiles  # noqa: E402
+from translation.paragraph_translation import QUOTES, validate_translation  # noqa: E402
+from ingestion.ocr_quality_gate import punctuation_signature  # noqa: E402
+from orchestration.pipeline_profiles import load_pipeline_profiles  # noqa: E402
 
 SAMPLES = [
     {"id": "ja-title", "source_language": "ja", "source": (
@@ -155,7 +155,7 @@ def main() -> int:
         "generated_at": now.isoformat(), "human_acceptance": "pending", "identity": identity,
         "git_commit": commit.stdout.strip(),
         "source_hashes": {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-                          for name in ("book_pipeline.py", "paragraph_translation.py")},
+                          for name in ("ingestion/book_pipeline.py", "translation/paragraph_translation.py")},
         "config_sha256": hashlib.sha256(options.config.read_bytes()).hexdigest(),
         "samples": collect_samples(client, SAMPLES),
     }

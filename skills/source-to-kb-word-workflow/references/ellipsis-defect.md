@@ -15,7 +15,7 @@
 
 ## 性质：提示词违反，不是排版问题
 
-页面翻译的提示词（`book_pipeline.py` 第 4 条）已经明确禁止：
+页面翻译的提示词（`ingestion/book_pipeline.py` 第 4 条）已经明确禁止：
 
 > 严禁用省略号（……）概括、省略或跳过任何内容——原文没有省略号的地方绝不允许出现省略号，
 > 原文自带的省略号原样保留。
@@ -57,7 +57,7 @@ excess > 0  →  该页有原文没有的省略号
 两个结论：
 
 1. 缺陷集中在**经过页面级翻译**的书上，且与 OCR 质量直接相关（`私小説論` 是扫描件）。
-2. 它此前**完全没有门禁**：`publication_verifier.py` 里 `省略`、`存疑`、`……`、
+2. 它此前**完全没有门禁**：`publication/publication_verifier.py` 里 `省略`、`存疑`、`……`、
    `ellipsis` 的出现次数全是 0。`The Downward Spiral` 在 22 页违规的情况下，
    发布报告仍是 `status=passed / release_ready=True`。
 
@@ -106,7 +106,7 @@ python -m unittest tests.test_publication_verifier -k ellipsis   # 门禁自身�
 #    （照 tools/books/shishosetsu_page_retranslate.py 改 ROOT 指向目标工作区）
 
 # 3. 重跑编译与门禁
-python book_pipeline.py "<源>.pdf" -o "outputs/<工作区>" --phase compile
+python -m ingestion.book_pipeline "<源>.pdf" -o "outputs/<工作区>" --phase compile
 ```
 
 ## 不要做的事

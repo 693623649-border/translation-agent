@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import unittest
 
-from semantic_apply import SemanticApplyError, validate_translation_set
-from semantic_ir import ReviewDecision, SemanticContractError, SourceLocator
+from translation.semantic_apply import SemanticApplyError, validate_translation_set
+from translation.semantic_ir import ReviewDecision, SemanticContractError, SourceLocator
 
 
 def _source_unit(markdown: str) -> dict[str, object]:

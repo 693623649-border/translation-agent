@@ -1,6 +1,6 @@
 # 全局知识库：数据流、存储方式与设计评估
 
-本页描述 `global_knowledge_base.py`（全局索引）与 `rag_knowledge_base.py`（分书 RAG 运行时）
+本页描述 `knowledge/global_knowledge_base.py`（全局索引）与 `knowledge/rag_knowledge_base.py`（分书 RAG 运行时）
 之间的真实关系，以及它们各自的存储布局。所有结论均来自代码与磁盘实测。
 
 实测环境：`outputs/` 下 71 个 `knowledge_base.jsonl`、66 个已入全局索引的 workspace、
@@ -19,13 +19,13 @@ flowchart TB
         SRC --> DAG["PipelineGraph 执行器"]
         DAG --> CH["outputs/&lt;book&gt;/chapters/*.md<br/>+ chapters.json"]
         DAG --> PG["outputs/&lt;book&gt;/pages/page_*.json"]
-        CH --> BKR["build_knowledge_rows_from_manifest<br/>book_pipeline.py:3764"]
+        CH --> BKR["build_knowledge_rows_from_manifest<br/>ingestion/book_pipeline.py:3764"]
         PG -.->|页面层, 不进 KB| BKR
-        BKR --> WKB["write_knowledge_base<br/>book_pipeline.py:4163"]
+        BKR --> WKB["write_knowledge_base<br/>ingestion/book_pipeline.py:4163"]
     end
 
     WKB --> KBJ["knowledge_base.jsonl<br/>唯一权威语料 · 5 字段契约"]
-    WKB --> INIT["initialize_rag_manifest<br/>rag_knowledge_base.py:713"]
+    WKB --> INIT["initialize_rag_manifest<br/>knowledge/rag_knowledge_base.py:713"]
 ```
 
 *图 1 说明生产入口只有一处*：`write_knowledge_base` 是所有 KB 写入的收敛点
@@ -69,11 +69,11 @@ sequenceDiagram
 
 | 绑定 | 位置 | 校验内容 |
 | --- | --- | --- |
-| `documents_sha256` | `rag_knowledge_base.py:648-657` | 清单 ↔ KB 字节 + 行数 |
-| `index_sha256` | `rag_knowledge_base.py:681-686` | 清单 ↔ 向量文件字节 |
-| `documents_sha256`（索引头） | `rag_knowledge_base.py:571-575` | 向量文件 ↔ KB 字节 |
-| 向量 id 顺序 | `rag_knowledge_base.py:614-617` | 向量 ↔ KB 行顺序 |
-| 标注 id 集合 | `rag_apparatus.py:78-84` | 标注 ↔ KB 行 id 集合 |
+| `documents_sha256` | `knowledge/rag_knowledge_base.py:648-657` | 清单 ↔ KB 字节 + 行数 |
+| `index_sha256` | `knowledge/rag_knowledge_base.py:681-686` | 清单 ↔ 向量文件字节 |
+| `documents_sha256`（索引头） | `knowledge/rag_knowledge_base.py:571-575` | 向量文件 ↔ KB 字节 |
+| 向量 id 顺序 | `knowledge/rag_knowledge_base.py:614-617` | 向量 ↔ KB 行顺序 |
+| 标注 id 集合 | `knowledge/rag_apparatus.py:78-84` | 标注 ↔ KB 行 id 集合 |
 
 ## 3. 全局索引链路（单向聚合，无回写）
 
@@ -82,7 +82,7 @@ flowchart TB
     subgraph IN["输入：只扫一层 outputs/*/"]
         SOL["workspaces = 顶层目录中<br/>含 chapters.json 或<br/>knowledge_base.jsonl 者"]
     end
-    SOL --> ING["_ingest_workspace<br/>global_knowledge_base.py:260"]
+    SOL --> ING["_ingest_workspace<br/>knowledge/global_knowledge_base.py:260"]
 
     ING --> T1["reader tier<br/>knowledge_base + chapter_fallback"]
     ING --> T2["pages tier<br/>source_page / page_translation / raw_ocr"]
@@ -163,30 +163,30 @@ content_sha256, source_path, source_row_id, source_metadata, apparatus_weight`�
 ### 6.1 合理之处
 
 1. **契约层与派生层分离干净。**`knowledge_base.jsonl` 严格 5 字段
-   （`rag_knowledge_base.py:424-429` 用集合相等校验，多一个字段就报错），
+   （`knowledge/rag_knowledge_base.py:424-429` 用集合相等校验，多一个字段就报错），
    所有增强信息走 sidecar。这是本设计最有价值的一点：语料契约稳定，RAG 能力可替换。
 2. **发布与校验是双向绑定的。**生产者写 5 字段，校验器反向重导出稳定 id 并核对
-   无损分块覆盖（`publication_verifier.py:3812-3874`），生产者与校验器不能各自漂移。
+   无损分块覆盖（`publication/publication_verifier.py:3812-3874`），生产者与校验器不能各自漂移。
 3. **全链路原子发布。**KB 写入、sidecar、向量、全局库替换都走
    `_atomic_write_text` / `os.replace`；全局库先建临时库、`integrity_check`
-   通过且 `chunks == chunks_fts` 才替换（`global_knowledge_base.py:451-457`）。
+   通过且 `chunks == chunks_fts` 才替换（`knowledge/global_knowledge_base.py:451-457`）。
 4. **陈旧检测是哈希驱动而非时间戳。**三处 `sha256` 绑定 + 标注 id 集合校验，
    使"改了语料但忘了重建索引"变成显式错误而不是静默错配。
 5. **向量重建是内容寻址增量的。**`build_embedding_index` 按
-   `sha256(title + content)` 命中 `.embedding-cache.json`（`rag_knowledge_base.py:795-811`），
+   `sha256(title + content)` 命中 `.embedding-cache.json`（`knowledge/rag_knowledge_base.py:795-811`），
    只对缺失批次调 API；`rag_indexing` 的相同重建会保留向量文件。
 6. **检索分层与角色降权是有依据的。**reader/pages/archive 三档、apparatus 权重
-   在排序**内部**生效（`global_knowledge_base.py:612-617`、`rag_knowledge_base.py:1483-1486`），
+   在排序**内部**生效（`knowledge/global_knowledge_base.py:612-617`、`knowledge/rag_knowledge_base.py:1483-1486`），
    避免了"先截断后降权"的经典错误；测试同时锁定了有/无 sidecar 两种结果。
 
 ### 6.2 主要问题
 
 #### P1 · 两条链路没有任何连接（最严重）
 
-`global_knowledge_base.py` 在运行时代码中**零引用**：全仓库只有
+`knowledge/global_knowledge_base.py` 在运行时代码中**零引用**：全仓库只有
 `pyproject.toml:34` 的 console script、`tests/test_global_knowledge_base.py:10`
-和 README。而 `translation_agent_api.py:367 retrieve_knowledge_base_context`
-也没有生产调用方，`app_pages/` 四个页面与 `frontend_app.py` 均不涉及检索。
+和 README。而 `frontend/translation_agent_api.py:367 retrieve_knowledge_base_context`
+也没有生产调用方，`app_pages/` 四个页面与 `frontend/frontend_app.py` 均不涉及检索。
 
 后果：项目实际拥有**两个独立实现的 BM25**——SQLite FTS5 trigram（全局）与
 手写纯 Python BM25（分书）。两者分词、IDF 公式、分数尺度都不同
@@ -206,7 +206,7 @@ content_sha256, source_path, source_row_id, source_metadata, apparatus_weight`�
 
 #### P3 · 向量存储形式造成 3.3 倍空间浪费
 
-`build_embedding_index` 把向量写成 JSON 文本（`rag_knowledge_base.py:828-837`），
+`build_embedding_index` 把向量写成 JSON 文本（`knowledge/rag_knowledge_base.py:828-837`），
 每个 float 以完整十进制精度输出，实测每个数约 13.3 字节：
 
 - 实测：最大单文件 48.3 MB / 1,730 chunk / 2048 维 → 每个向量约 27,900 字符。
@@ -214,11 +214,11 @@ content_sha256, source_path, source_row_id, source_metadata, apparatus_weight`�
 - 按 chunk 数是 7,369，而全局 reader 层是 9,821 —— 两者规模相当。
 
 同时 `RagKnowledgeBase.open()` 会 `json.loads` 全部向量行并建 `tuple`
-（`rag_knowledge_base.py:1084-1088`），单次查询前就把整份向量读进内存。
+（`knowledge/rag_knowledge_base.py:1084-1088`），单次查询前就把整份向量读进内存。
 
 #### P4 · 全局索引扫描深度与工作区判定不一致
 
-`sync_outputs` 只用 `root.iterdir()` 扫一层（`global_knowledge_base.py:422-428`），
+`sync_outputs` 只用 `root.iterdir()` 扫一层（`knowledge/global_knowledge_base.py:422-428`），
 且要求目录直接含 `chapters.json` 或 `knowledge_base.jsonl`。实测漏掉了 5 个语料：
 
 ```
@@ -230,7 +230,7 @@ outputs/知识库_日本思想政治/sources/05_去政治化的政治/knowledge_
 ```
 
 其中 3 个已经花过 embedding API 调用建好了向量，却不在任何跨书检索里。
-更值得警惕的是 `verify_sources` 用了同样的扫描方式（`global_knowledge_base.py:509-522`），
+更值得警惕的是 `verify_sources` 用了同样的扫描方式（`knowledge/global_knowledge_base.py:509-522`），
 所以它报 `current=True`——**陈旧检测本身看不见这些语料**。
 
 #### P5 · 质量门当前是失败的，且失败原因是元数据
@@ -251,7 +251,7 @@ chapter    hit@1 0.875 / hit@5 1.000   （阈值 0.85 / 0.90）→ 通过
 #### P6 · 路由元数据只有 21% 覆盖率
 
 71 个语料中只有 15 个有 `knowledge_base.meta.jsonl`。`_book_key` 在缺失时
-回退到 `[书名]` 标题前缀或 `chapter_id` 前缀（`rag_knowledge_base.py:1163-1186`），
+回退到 `[书名]` 标题前缀或 `chapter_id` 前缀（`knowledge/rag_knowledge_base.py:1163-1186`），
 `infer_query_routes` 的按书/按作者路由因此对多数语料失效。
 全局库把 `meta` 的 `book_title/author/language` 塞进 `source_metadata` JSON 文本，
 但 `search()` 的过滤条件只有 `workspace` 和 `report_status`——没有按书/作者/语言的过滤。
@@ -269,13 +269,13 @@ chapter    hit@1 0.875 / hit@5 1.000   （阈值 0.85 / 0.90）→ 通过
 
 #### P8 · 一致性与小缺陷
 
-- `_report_status` 只看 `mtime`（`global_knowledge_base.py:155-157`），
+- `_report_status` 只看 `mtime`（`knowledge/global_knowledge_base.py:155-157`），
   而索引侧全部用 `sha256`；两套陈旧判定语义不统一。
 - `initialize_rag_manifest` 只要清单能被解析就原样返回
-  （`rag_knowledge_base.py:726-731`），不校验 `documents_sha256`；
+  （`knowledge/rag_knowledge_base.py:726-731`），不校验 `documents_sha256`；
   真正的校验推迟到 `read_rag_manifest`。
 - `search()` 把 11 KiB 的 `content` 整行取出后再在 Python 里切 90/230 字符的
-  `excerpt`（`global_knowledge_base.py:634-645`），没有用 SQL `substr`。
+  `excerpt`（`knowledge/global_knowledge_base.py:634-645`），没有用 SQL `substr`。
 - 全局库 `kind='knowledge_base'` 有 4 个 chunk 超过 4,000 字符（最大 11,150），
   说明"分书 4,000 字符上限"这一不变量在全局库里并不成立。
 - `kb_translation` 的就地改写会同时使 `documents_sha256` 与 `index_sha256` 失效，
@@ -285,13 +285,13 @@ chapter    hit@1 0.875 / hit@5 1.000   （阈值 0.85 / 0.90）→ 通过
 
 | 优先级 | 改进 | 落点 | 预期收益 |
 | --- | --- | --- | --- |
-| 高 | 向量改二进制存储（`float32`/`int8`），加载时按需归一化 | `rag_knowledge_base.py:818-837` | 205.7 MB → 约 60 MB / 15 MB |
+| 高 | 向量改二进制存储（`float32`/`int8`），加载时按需归一化 | `knowledge/rag_knowledge_base.py:818-837` | 205.7 MB → 约 60 MB / 15 MB |
 | 高 | 合并单一跨书语义索引：同构向量直接并入全局库 | 新增 `sync` 后处理 + `search` 增加向量通道 | 打通跨 66 本书的语义检索 |
-| 高 | 全局扫描改 `rglob` 并用"含 KB 文件"判定工作区，`verify_sources` 同步 | `global_knowledge_base.py:422-428, 509-522` | 找回 5 个语料，且陈旧检测不再有盲区 |
+| 高 | 全局扫描改 `rglob` 并用"含 KB 文件"判定工作区，`verify_sources` 同步 | `knowledge/global_knowledge_base.py:422-428, 509-522` | 找回 5 个语料，且陈旧检测不再有盲区 |
 | 高 | 质量门的 `expected_workspaces` 改为下限或去掉硬等值 | `tests/fixtures/global_kb_retrieval_cases.local.json` | 门恢复有效 |
-| 中 | `search()` 增加 `book_id/author/language` 过滤，把 meta 提升为一等列 | `global_knowledge_base.py:178-186, 584-596` | 路由能力对齐分书链路 |
-| 中 | 统一 `_report_status` 为哈希判定；`search` 用 SQL `substr` 出摘要 | `global_knowledge_base.py:137-160, 612-617` | 语义统一 + 降低取数开销 |
-| 中 | 把分书 BM25 换成与全局一致的 FTS5（或反之），只保留一套评分实现 | `rag_knowledge_base.py:942-1023` | 消除两套 BM25 的漂移 |
+| 中 | `search()` 增加 `book_id/author/language` 过滤，把 meta 提升为一等列 | `knowledge/global_knowledge_base.py:178-186, 584-596` | 路由能力对齐分书链路 |
+| 中 | 统一 `_report_status` 为哈希判定；`search` 用 SQL `substr` 出摘要 | `knowledge/global_knowledge_base.py:137-160, 612-617` | 语义统一 + 降低取数开销 |
+| 中 | 把分书 BM25 换成与全局一致的 FTS5（或反之），只保留一套评分实现 | `knowledge/rag_knowledge_base.py:942-1023` | 消除两套 BM25 的漂移 |
 | 低 | 给 corpus 加显式 `role`（book / aggregate / intermediate）字段，不再靠目录名 | 生产者 + `workspaces` 表 | 引用与过滤可靠 |
 | 低 | 为嵌套与聚合语料补写 `meta.jsonl`，覆盖率从 21% 提升 | `tools/books/*` | 按书/作者路由在全部语料生效 |
 

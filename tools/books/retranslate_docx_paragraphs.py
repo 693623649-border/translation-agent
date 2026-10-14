@@ -34,8 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from docx import Document
 
-from docx_translation import _paragraph_text, _write_paragraph
-from kb_translation import DeepSeekTranslator, KbTranslationError, translate_texts
+from publication.docx_translation import _paragraph_text, _write_paragraph
+from translation.kb_translation import DeepSeekTranslator, KbTranslationError, translate_texts
 
 DIRECTIVE = (
     "【本书为 OCR 扫描件，对译文另有硬性要求】\n"

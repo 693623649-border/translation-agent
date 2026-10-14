@@ -3,7 +3,7 @@ import unittest
 import hashlib
 from pathlib import Path
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     PageRecord,
     PageStore,
     StalePageSourceError,
@@ -11,7 +11,7 @@ from book_pipeline import (
     load_page_records,
     save_page_record,
 )
-from pipeline_profiles import ModelProfile
+from orchestration.pipeline_profiles import ModelProfile
 
 
 class TranslationCheckpointRaceTests(unittest.TestCase):

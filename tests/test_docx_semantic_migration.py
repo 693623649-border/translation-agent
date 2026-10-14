@@ -6,14 +6,14 @@ from pathlib import Path
 
 from docx import Document
 
-from docx_footnotes import patch_docx_footnotes
-from docx_semantic_migration import (
+from publication.docx_footnotes import patch_docx_footnotes
+from publication.docx_semantic_migration import (
     DocxSemanticMigrationError,
     apply_semantic_migration,
     extract_docx_semantic_markdown,
     write_semantic_migration,
 )
-from publication_semantics import parse_markdown_footnotes
+from publication.publication_semantics import parse_markdown_footnotes
 
 
 class DocxSemanticMigrationTests(unittest.TestCase):

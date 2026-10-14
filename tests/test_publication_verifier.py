@@ -8,7 +8,7 @@ from unittest import mock
 
 import fitz
 
-from book_pipeline import (
+from ingestion.book_pipeline import (
     PageRecord,
     TocEntry,
     _main_unlocked,
@@ -19,7 +19,7 @@ from book_pipeline import (
     save_page_record,
     write_knowledge_base,
 )
-from publication_verifier import (
+from publication.publication_verifier import (
     _canonical_docx_body_text,
     _canonical_visible_text,
     _citation_inventory,
@@ -36,7 +36,7 @@ from publication_verifier import (
 class PublicationVerifierTests(unittest.TestCase):
     def test_actual_reader_groups_are_checked_even_without_old_translation_checkpoint(self):
         from types import SimpleNamespace
-        from publication_verifier import _check_translation_punctuation
+        from publication.publication_verifier import _check_translation_punctuation
         with tempfile.TemporaryDirectory() as folder:
             output=Path(folder); (output/'pages').mkdir(); (output/'audit').mkdir()
             (output/'pages/page_0001.json').write_text(json.dumps({'pdf_page':1,'text':'「原文」'}),encoding='utf-8')
@@ -77,7 +77,7 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(_docx_markdown_body(source), "# 章节\n\n人心!\n")
 
     def test_docx_expected_text_mirrors_soft_wrap_merge(self) -> None:
-        from book_pipeline import _normalize_wrapped_markdown_for_docx
+        from ingestion.book_pipeline import _normalize_wrapped_markdown_for_docx
 
         source = (
             "# 章节\n\n"
@@ -143,7 +143,7 @@ class PublicationVerifierTests(unittest.TestCase):
         )
 
     def test_docx_style_expectations_use_the_publishers_soft_wrap_merge(self) -> None:
-        from publication_verifier import _docx_expectations
+        from publication.publication_verifier import _docx_expectations
 
         source = (
             "# 章节\n\n"
@@ -175,7 +175,7 @@ class PublicationVerifierTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.render_gate = mock.patch(
-            "publication_verifier._check_docx_render",
+            "publication.publication_verifier._check_docx_render",
             return_value={
                 "summary": "fixture render passed",
                 "metrics": {"page_count": 1},
@@ -1338,7 +1338,7 @@ class PublicationVerifierTests(unittest.TestCase):
         )
 
     def test_v6_ocr_release_blocks_without_hash_bound_human_review(self) -> None:
-        from book_pipeline import load_page_records
+        from ingestion.book_pipeline import load_page_records
 
         source_hash = hashlib.sha256(self.source_pdf.read_bytes()).hexdigest()
         model = (
@@ -1351,7 +1351,7 @@ class PublicationVerifierTests(unittest.TestCase):
                 record.notes = json.dumps(
                     {"source_image_sha256": f"image-{record.pdf_page}"}
                 )
-                from book_pipeline import save_page_record
+                from ingestion.book_pipeline import save_page_record
 
                 save_page_record(self.output, record)
         fallback_path = self.output / "audit" / "ocr-fallbacks.json"
@@ -1377,8 +1377,8 @@ class PublicationVerifierTests(unittest.TestCase):
         )
 
     def test_chinese_page_translation_must_keep_source_punctuation_glyphs(self) -> None:
-        from book_pipeline import load_page_records, save_page_record
-        from ocr_quality_gate import sha256_text
+        from ingestion.book_pipeline import load_page_records, save_page_record
+        from ingestion.ocr_quality_gate import sha256_text
 
         manifest_path = self.output / "chapters.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1409,8 +1409,8 @@ class PublicationVerifierTests(unittest.TestCase):
         )
 
     def test_translation_punctuation_gate_requires_exact_source_glyphs_and_rejects_v10(self) -> None:
-        from book_pipeline import load_page_records, save_page_record
-        from ocr_quality_gate import sha256_text
+        from ingestion.book_pipeline import load_page_records, save_page_record
+        from ingestion.ocr_quality_gate import sha256_text
         record = next(item for item in load_page_records(self.output) if item.pdf_page == 2)
         record.text = "日本語の「引用」、本文。"
         record.language = "ja"
@@ -1431,8 +1431,8 @@ class PublicationVerifierTests(unittest.TestCase):
         self.assertEqual(self._checks(self._verify(report_name="legacy-segments.json"))["translation.punctuation"]["status"], "failed")
 
     def test_v6_ocr_review_passes_with_matching_human_attestations(self) -> None:
-        from book_pipeline import load_page_records, save_page_record
-        from ocr_quality_gate import review_sample_pages, sha256_text
+        from ingestion.book_pipeline import load_page_records, save_page_record
+        from ingestion.ocr_quality_gate import review_sample_pages, sha256_text
 
         source_hash = hashlib.sha256(self.source_pdf.read_bytes()).hexdigest()
         model = (
@@ -1650,7 +1650,7 @@ class PublicationVerifierTests(unittest.TestCase):
 
     def test_report_write_failure_keeps_returned_counts_consistent(self) -> None:
         with mock.patch(
-            "publication_verifier._write_report",
+            "publication.publication_verifier._write_report",
             side_effect=OSError("simulated write failure"),
         ):
             report = self._verify(report_name="unwritable.json")
@@ -1667,7 +1667,7 @@ class PublicationVerifierTests(unittest.TestCase):
 
     def test_quality_report_delivery_failure_blocks_release(self) -> None:
         with mock.patch(
-            "ingestion_quality.write_ingestion_quality_report",
+            "ingestion.ingestion_quality.write_ingestion_quality_report",
             side_effect=OSError("simulated quality report failure"),
         ):
             report = self._verify(report_name="quality-delivery.json")

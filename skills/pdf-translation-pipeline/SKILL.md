@@ -10,10 +10,10 @@ description: 将影印版或文字层 PDF 转换为可审计的逐页文本、�
 
 ## 使用主入口
 
-在仓库根目录运行 `book_pipeline.py`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。
+在仓库根目录运行 `python -m ingestion.book_pipeline`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
+python -m ingestion.book_pipeline SOURCE.pdf -o OUTPUT --phase all \
   --config pipeline.toml --granularity chapter
 ```
 
@@ -29,7 +29,7 @@ python book_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
 只发布 Word 时使用内置 Recipe，并仍把发布报告作为最终目标：
 
 ```bash
-python graph_pipeline.py SOURCE.pdf -o OUTPUT --phase all \
+python -m orchestration.graph_pipeline SOURCE.pdf -o OUTPUT --phase all \
   --config pipeline.toml --recipe recipes/chinese-pdf-word.toml
 ```
 
@@ -55,14 +55,14 @@ OCR 继续使用 GLM/Coding Plan Profile；中文翻译默认使用独立 DeepSe
 3. 先执行一次只更新 Markdown 的本地编译，使审定源稿进入发布章；跳过容器生成和自动全书门：
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase compile --no-verify \
+python -m ingestion.book_pipeline SOURCE.pdf -o OUTPUT --phase compile --no-verify \
   --no-epub --no-docx --no-kb --no-bookmarked-pdf
 ```
 
 4. 再运行增量章节门，只检查改动章：
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
+python -m ingestion.book_pipeline SOURCE.pdf -o OUTPUT --phase verify \
   --chapter-id CHAPTER_ID \
   --report OUTPUT/audit/chapter-report.json
 ```
@@ -78,7 +78,7 @@ OCR 页脚或尾注进入正文语义层时，必须保存“正文引用落点�
 在宣告任务完成前，必须阅读并遵守 [references/release-gate.md](references/release-gate.md)。独立验收命令不调用模型：
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
+python -m ingestion.book_pipeline SOURCE.pdf -o OUTPUT --phase verify \
   --require-translation \
   --report OUTPUT/audit/release-report.json
 ```
@@ -102,4 +102,4 @@ Word publisher 只登记并交付图产物指向的单一 canonical DOCX；不�
 
 ## 兼容入口
 
-`pdf_text_agent.py` 仅保留旧流程兼容。目标包含标题级 Markdown、EPUB 或知识库时，导入旧逐页检查点后仍由 `book_pipeline.py` 完成编译与验收。
+`ingestion/pdf_text_agent.py` 仅保留旧流程兼容。目标包含标题级 Markdown、EPUB 或知识库时，导入旧逐页检查点后仍由 `ingestion/book_pipeline.py` 完成编译与验收。

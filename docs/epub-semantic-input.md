@@ -1,6 +1,6 @@
 # EPUB 文档语义层输入
 
-`epub_semantic_import.py` 为 born-digital EPUB 提供确定性输入层，不运行
+`ingestion/epub_semantic_import.py` 为 born-digital EPUB 提供确定性输入层，不运行
 OCR，也不把 EPUB 的物理文件拆分规则混入 PDF pipeline。它按 OPF spine
 读取正文，将 XHTML 转为仓库现有发布器可接受的 `chapters.json` 和章节
 Markdown，并建立 EPUB `noteref` 与脚注/尾注定义的稳定关系。
@@ -8,7 +8,7 @@ Markdown，并建立 EPUB `noteref` 与脚注/尾注定义的稳定关系。
 ## 1. 导入 EPUB
 
 ```bash
-python epub_semantic_import.py import "book.epub" -o "work/book-semantic"
+python -m ingestion.epub_semantic_import import "book.epub" -o "work/book-semantic"
 ```
 
 主要产物：
@@ -38,7 +38,7 @@ if report["release_blocked"]:
 `prepare` 只生成模型提示，不联网；可先检查所有 protected markers：
 
 ```bash
-python semantic_translation_runner.py prepare \
+python -m translation.semantic_translation_runner prepare \
   work/book-semantic/semantic/translation-units.jsonl \
   -o work/book-semantic/semantic/prepared.jsonl \
   --glossary glossary.json \
@@ -50,7 +50,7 @@ python semantic_translation_runner.py prepare \
 源文本、模型、prompt contract、目标语言和术语表：
 
 ```bash
-DEEPSEEK_API_KEY=... python semantic_translation_runner.py run \
+DEEPSEEK_API_KEY=... python -m translation.semantic_translation_runner run \
   work/book-semantic/semantic/translation-units.jsonl \
   -o work/book-semantic/semantic/translations.jsonl \
   --glossary glossary.json \
@@ -71,14 +71,14 @@ DEEPSEEK_API_KEY=... python semantic_translation_runner.py run \
 ## 3. 回填并发布
 
 ```bash
-python epub_semantic_import.py apply-translations \
+python -m ingestion.epub_semantic_import apply-translations \
   -o work/book-semantic \
   work/book-semantic/semantic/translations.jsonl
 
-python book_pipeline.py -o work/book-semantic --phase epub \
+python -m ingestion.book_pipeline -o work/book-semantic --phase epub \
   --title "译名" --target-language 简体中文
 
-python book_pipeline.py -o work/book-semantic --phase docx \
+python -m ingestion.book_pipeline -o work/book-semantic --phase docx \
   --title "译名" --author "作者"
 ```
 

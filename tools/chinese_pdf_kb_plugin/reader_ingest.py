@@ -196,7 +196,7 @@ def _run(args):
         import fitz
         with fitz.open(receipt["rendered_pdf"]) as pdf:
             evidence(layout.get("pages"), range(1, len(pdf)+1), "Word layout review")
-        execute([sys.executable, str(ROOT / "knowledge_base_cli.py"), "register", str(workspace)], deadline-time.monotonic())
+        execute([sys.executable, "-m", "knowledge.knowledge_base_cli", "register", str(workspace)], deadline-time.monotonic())
         write(workspace / "layout-review.json", layout)
         files = hashes(workspace, ["knowledge_base.rag.json", "knowledge_base.vectors.jsonl", "layout-review.json"])
         require(all(files.values()), "Vector registration artifacts missing")

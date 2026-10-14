@@ -21,10 +21,10 @@ from typing import Any, Iterable, Mapping
 
 import fitz
 
-import book_pipeline as legacy
-import extract_textbook_layer
-import rag_knowledge_base
-from pipeline_profiles import load_pipeline_profiles
+import ingestion.book_pipeline as legacy
+import ingestion.extract_textbook_layer as extract_textbook_layer
+import knowledge.rag_knowledge_base as rag_knowledge_base
+from orchestration.pipeline_profiles import load_pipeline_profiles
 
 from .core import (
     GraphContext,
@@ -3004,7 +3004,7 @@ def _verify_handler(
 
 
 def _status_handler(context: GraphContext) -> NodeResult:
-    legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
+    legacy.load_env_file(Path(legacy.__file__).resolve().parents[1] / ".env")
     args = _parsed_args(context)
     profile_config = load_pipeline_profiles(args.config) if args.config else None
     ocr_profile = (
@@ -3256,7 +3256,7 @@ def prepare_book_graph(
         )
     # Match book_pipeline.main(): parser defaults may be supplied by the repo
     # .env, but resolved secrets themselves are never fingerprinted.
-    legacy.load_env_file(Path(legacy.__file__).with_name(".env"))
+    legacy.load_env_file(Path(legacy.__file__).resolve().parents[1] / ".env")
     argv = list(pipeline_argv)
     args = legacy.build_parser().parse_args(argv)
     if args.ocr_cache_model and args.ocr_cache_model_prefix:

@@ -29,7 +29,7 @@ for backup in translated:
     else:
         awaiting.append(f"{backup.parent.name} ({status})")
 
-db_path = ROOT / "global_knowledge_base.sqlite3"
+db_path = ROOT / "knowledge.global_knowledge_base.sqlite3"
 with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
     meta = dict(db.execute("SELECT key, value FROM meta"))
     reader = db.execute("SELECT count(*) FROM chunks WHERE kind='knowledge_base'").fetchone()[0]
