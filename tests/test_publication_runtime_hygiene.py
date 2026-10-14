@@ -7,13 +7,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from publication_checks import check_runtime_hygiene
+from translation_agent.publication.checks import check_runtime_hygiene
 
 
 class PublicationRuntimeHygieneTests(unittest.TestCase):
     def _check_without_host_proc(self, output_dir: Path) -> dict:
         with mock.patch(
-            "publication_checks.runtime_hygiene._PROC_ROOT",
+            "translation_agent.publication.checks.runtime_hygiene._PROC_ROOT",
             output_dir / "missing-proc",
         ):
             return check_runtime_hygiene(output_dir)
@@ -114,11 +114,11 @@ class PublicationRuntimeHygieneTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "publication_checks.runtime_hygiene._PROC_ROOT",
+                    "translation_agent.publication.checks.runtime_hygiene._PROC_ROOT",
                     proc_root,
                 ),
                 mock.patch(
-                    "publication_checks.runtime_hygiene.os.getpid",
+                    "translation_agent.publication.checks.runtime_hygiene.os.getpid",
                     return_value=101,
                 ),
             ):

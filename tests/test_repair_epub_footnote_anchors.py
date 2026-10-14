@@ -8,7 +8,7 @@ import zipfile
 
 from lxml import etree
 
-from epub_semantic_import import import_epub
+from translation_agent.sources.epub_semantic_import import import_epub
 from tools.repair_epub_footnote_anchors import (
     RepairError,
     repair_epub_footnote_anchors,

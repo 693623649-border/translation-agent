@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from product_contracts import (
+from translation_agent.runtime.product_contracts import (
     CONTRACT_SCHEMA_VERSION,
     ArtifactRecord,
     ContractError,

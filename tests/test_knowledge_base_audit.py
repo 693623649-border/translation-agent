@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from book_pipeline import split_text, write_knowledge_base
-from knowledge_base_audit import (
+from translation_agent.pipeline.book_pipeline import split_text, write_knowledge_base
+from translation_agent.knowledge.knowledge_base_audit import (
     audit_knowledge_base,
     audit_rows,
     chapter_expectation,

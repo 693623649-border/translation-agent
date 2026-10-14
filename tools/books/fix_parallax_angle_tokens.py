@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-import book_pipeline as legacy
+import translation_agent.pipeline.book_pipeline as legacy
 
 WORK = Path(r"outputs/视差之见")
 CHAPTERS = WORK / "chapters"

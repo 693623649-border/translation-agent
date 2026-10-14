@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from publication_semantics import (
+from translation_agent.publication.publication_semantics import (
     append_markdown_footnotes,
     markdown_footnote_contract_sha256,
     markdown_footnotes_to_docx_markers,

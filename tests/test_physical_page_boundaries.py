@@ -6,7 +6,7 @@ from pathlib import Path
 
 import fitz
 
-from book_pipeline import (
+from translation_agent.pipeline.book_pipeline import (
     PROOFREAD_PROMPT_VERSION,
     ModelIdentity,
     PageRecord,

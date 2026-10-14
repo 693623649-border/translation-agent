@@ -8,8 +8,8 @@ import unittest
 
 import fitz
 
-from born_digital_pdf_import import apply_translations, import_born_digital_pdf
-from semantic_review_policy import (
+from translation_agent.sources.born_digital_pdf_import import apply_translations, import_born_digital_pdf
+from translation_agent.semantic.semantic_review_policy import (
     collect_reconstruction_review,
     record_semantic_review_decision,
 )

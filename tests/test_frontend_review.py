@@ -10,9 +10,9 @@ from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
-from application_service import ApplicationService, REVIEW_ACCEPT_REASON
-from frontend_runtime import FrontendSettings
-from product_contracts import RunSpec
+from translation_agent.ui.application_service import ApplicationService, REVIEW_ACCEPT_REASON
+from translation_agent.ui.frontend_runtime import FrontendSettings
+from translation_agent.runtime.product_contracts import RunSpec
 
 
 def _review_report(*, reviewable: bool = True) -> dict:
@@ -144,8 +144,8 @@ class FrontendReviewServiceTests(unittest.TestCase):
             status = {"status": "passed"}
             accepted = {"action": "decision-recorded"}
             with (
-                patch("document_pipeline.review_report", side_effect=[viewed, accepted]) as report,
-                patch("document_pipeline.review_status", return_value=status) as review_status,
+                patch("translation_agent.cli.document_pipeline.review_report", side_effect=[viewed, accepted]) as report,
+                patch("translation_agent.cli.document_pipeline.review_status", return_value=status) as review_status,
             ):
                 self.assertIs(service.review_report(job_id), viewed)
                 self.assertIs(service.review_status(job_id), status)
@@ -175,7 +175,7 @@ class FrontendReviewServiceTests(unittest.TestCase):
             outside.mkdir()
             service, job_id, _output = self._service_with_job(root, output=outside)
             with (
-                patch("document_pipeline.review_report") as report,
+                patch("translation_agent.cli.document_pipeline.review_report") as report,
                 self.assertRaisesRegex(ValueError, "UUID workspace"),
             ):
                 service.review_report(job_id)
@@ -200,8 +200,8 @@ class FrontendReviewPageTests(unittest.TestCase):
 
     def _run_page(self, service: _ReviewService) -> AppTest:
         root = Path(__file__).resolve().parents[1]
-        with patch("app_pages._shared.application_service", return_value=service):
-            return AppTest.from_file(str(root / "app_pages" / "review.py")).run(
+        with patch("translation_agent.ui.pages._shared.application_service", return_value=service):
+            return AppTest.from_file(str(root / "translation_agent" / "ui" / "pages" / "review.py")).run(
                 timeout=20
             )
 
@@ -235,8 +235,8 @@ class FrontendReviewPageTests(unittest.TestCase):
     def test_derived_audit_refresh_is_an_explicit_action(self) -> None:
         root = Path(__file__).resolve().parents[1]
         service = _ReviewService(reviewable=True)
-        with patch("app_pages._shared.application_service", return_value=service):
-            app = AppTest.from_file(str(root / "app_pages" / "review.py")).run(
+        with patch("translation_agent.ui.pages._shared.application_service", return_value=service):
+            app = AppTest.from_file(str(root / "translation_agent" / "ui" / "pages" / "review.py")).run(
                 timeout=20
             )
             refresh_button = next(
@@ -255,8 +255,8 @@ class FrontendReviewPageTests(unittest.TestCase):
     def test_acceptance_requires_confirmation_and_records_bounded_fields(self) -> None:
         root = Path(__file__).resolve().parents[1]
         service = _ReviewService(reviewable=True)
-        with patch("app_pages._shared.application_service", return_value=service):
-            app = AppTest.from_file(str(root / "app_pages" / "review.py")).run(
+        with patch("translation_agent.ui.pages._shared.application_service", return_value=service):
+            app = AppTest.from_file(str(root / "translation_agent" / "ui" / "pages" / "review.py")).run(
                 timeout=20
             )
             app.text_input[0].input(" editor@example.test ")

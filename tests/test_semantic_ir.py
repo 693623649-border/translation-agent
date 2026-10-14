@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from semantic_ir import (
+from translation_agent.semantic.semantic_ir import (
     DocumentSemantic,
     ReviewDecision,
     SemanticBlock,

@@ -5,8 +5,8 @@ import unittest
 from unittest.mock import patch
 from pathlib import Path
 
-from rag_indexing import build_retrieval_corpus, validate_retrieval_sources
-from rag_knowledge_base import load_knowledge_rows, load_metadata_sidecar
+from translation_agent.knowledge.rag_indexing import build_retrieval_corpus, validate_retrieval_sources
+from translation_agent.knowledge.rag_knowledge_base import load_knowledge_rows, load_metadata_sidecar
 
 
 class RetrievalIndexingTests(unittest.TestCase):
@@ -98,7 +98,7 @@ class RetrievalIndexingTests(unittest.TestCase):
     def test_interrupted_first_publication_can_recover(self):
         path = self.source()
         target = self.root / "derived"
-        with patch("rag_indexing.initialize_rag_manifest", side_effect=OSError("interrupted")):
+        with patch("translation_agent.knowledge.rag_indexing.initialize_rag_manifest", side_effect=OSError("interrupted")):
             with self.assertRaises(OSError):
                 build_retrieval_corpus([path], target)
         # Canonical bytes may already be complete but the RAG manifest is not.

@@ -8,7 +8,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 
-from global_knowledge_base import (
+from translation_agent.knowledge.global_knowledge_base import (
     _report_status,
     search,
     status,

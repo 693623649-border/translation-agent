@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from pipeline_graph import (
+from translation_agent.pipeline.graph import (
     AmbiguousProviderError,
     GraphContext,
     GraphCycleError,

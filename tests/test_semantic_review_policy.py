@@ -8,12 +8,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from semantic_ir import ReviewDecision
-from semantic_review import (
+from translation_agent.semantic.semantic_ir import ReviewDecision
+from translation_agent.semantic.semantic_review import (
     append_semantic_review_decision,
     initialize_review_decision_log,
 )
-from semantic_review_policy import (
+from translation_agent.semantic.semantic_review_policy import (
     SemanticReviewPolicyError,
     collect_reconstruction_review,
     record_semantic_review_decision,
@@ -363,7 +363,7 @@ class SemanticReviewPolicyTests(unittest.TestCase):
                     reconstruction.write_bytes(reconstruction.read_bytes() + b" ")
                 return data
 
-            with mock.patch("semantic_review_policy.os.read", side_effect=racing_read):
+            with mock.patch("translation_agent.semantic.semantic_review_policy.os.read", side_effect=racing_read):
                 with self.assertRaisesRegex(SemanticReviewPolicyError, "changed"):
                     collect_reconstruction_review(output)
 

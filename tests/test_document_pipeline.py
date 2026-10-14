@@ -10,9 +10,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import document_pipeline
-from product_contracts import RunSpec
-from run_execution_service import (
+import translation_agent.cli.document_pipeline as document_pipeline
+from translation_agent.runtime.product_contracts import RunSpec
+from translation_agent.runtime.run_execution_service import (
     SEMANTIC_CACHE_DIRNAME,
     PlanStep,
     RunExecutionError,
@@ -105,11 +105,11 @@ class DocumentPipelineTests(unittest.TestCase):
         graph_request = object()
         with (
             patch(
-                "run_execution_service._graph_request",
+                "translation_agent.runtime.run_execution_service._graph_request",
                 return_value=graph_request,
             ) as make_request,
             patch(
-                "translation_agent_api.prepare_graph",
+                "translation_agent.runtime.translation_agent_api.prepare_graph",
                 return_value=prepared,
             ) as prepare_graph,
         ):
@@ -439,7 +439,7 @@ class DocumentPipelineTests(unittest.TestCase):
         fake_api.run_graph = Mock(return_value=FakeRun())
         fake_api.RunRequest = lambda **kwargs: types.SimpleNamespace(**kwargs)
         fake_api.GraphRunRequest = lambda **kwargs: types.SimpleNamespace(**kwargs)
-        with patch.dict(sys.modules, {"translation_agent_api": fake_api}):
+        with patch.dict(sys.modules, {"translation_agent.runtime.translation_agent_api": fake_api}):
             report = document_pipeline.publish_spec(
                 RunSpec(
                     source_mode="epub",
@@ -453,7 +453,7 @@ class DocumentPipelineTests(unittest.TestCase):
         self.assertEqual(report["publication_status"], "draft")
 
     def test_doctor_flags_are_delegated_without_double_dash(self) -> None:
-        with patch("doctor.main", return_value=0) as doctor_main:
+        with patch("translation_agent.cli.doctor.main", return_value=0) as doctor_main:
             code = document_pipeline.main(["doctor", "--json", "--web"])
 
         self.assertEqual(code, 0)
@@ -508,10 +508,10 @@ class DocumentPipelineTests(unittest.TestCase):
             verify=False,
         )
         with patch(
-            "semantic_translation_runner.load_glossary",
+            "translation_agent.semantic.semantic_translation_runner.load_glossary",
             return_value={"state": "国家"},
         ) as load_glossary, patch(
-            "epub_semantic_import.apply_translations",
+            "translation_agent.sources.epub_semantic_import.apply_translations",
             return_value={"status": "passed"},
         ) as apply_translations:
             report = document_pipeline.apply_spec(
@@ -620,7 +620,7 @@ class DocumentPipelineTests(unittest.TestCase):
             targets=("publication.epub",),
             release_profile="draft",
         )
-        with patch("document_pipeline.execute_runspec", return_value=result) as execute:
+        with patch("translation_agent.cli.document_pipeline.execute_runspec", return_value=result) as execute:
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 code = document_pipeline.main(
@@ -671,9 +671,9 @@ class DocumentPipelineTests(unittest.TestCase):
         fake_api.prepare_graph = lambda request: prepared
         service = RunExecutionService()
         with patch(
-            "run_execution_service._graph_request",
+            "translation_agent.runtime.run_execution_service._graph_request",
             return_value=object(),
-        ), patch.dict(sys.modules, {"translation_agent_api": fake_api}):
+        ), patch.dict(sys.modules, {"translation_agent.runtime.translation_agent_api": fake_api}):
             plan = service.plan(
                 RunSpec(
                     source="book.pdf",
@@ -711,9 +711,9 @@ class DocumentPipelineTests(unittest.TestCase):
         fake_api = types.ModuleType("translation_agent_api")
         fake_api.prepare_graph = Mock(return_value=prepared)
         with patch(
-            "run_execution_service._graph_request",
+            "translation_agent.runtime.run_execution_service._graph_request",
             return_value=object(),
-        ), patch.dict(sys.modules, {"translation_agent_api": fake_api}):
+        ), patch.dict(sys.modules, {"translation_agent.runtime.translation_agent_api": fake_api}):
             result = RunExecutionService().execute(
                 RunSpec(
                     source="book.pdf",
@@ -747,9 +747,9 @@ class DocumentPipelineTests(unittest.TestCase):
         fake_api = types.ModuleType("translation_agent_api")
         fake_api.prepare_graph = Mock(return_value=prepared)
         with patch(
-            "run_execution_service._graph_request",
+            "translation_agent.runtime.run_execution_service._graph_request",
             return_value=object(),
-        ), patch.dict(sys.modules, {"translation_agent_api": fake_api}):
+        ), patch.dict(sys.modules, {"translation_agent.runtime.translation_agent_api": fake_api}):
             with self.assertRaisesRegex(
                 RunExecutionError,
                 "without requested plan targets.*publication.docx",
@@ -787,9 +787,9 @@ class DocumentPipelineTests(unittest.TestCase):
         fake_api = types.ModuleType("translation_agent_api")
         fake_api.prepare_graph = Mock(return_value=prepared)
         with tempfile.TemporaryDirectory() as directory, patch(
-            "run_execution_service._graph_request",
+            "translation_agent.runtime.run_execution_service._graph_request",
             return_value=object(),
-        ), patch.dict(sys.modules, {"translation_agent_api": fake_api}):
+        ), patch.dict(sys.modules, {"translation_agent.runtime.translation_agent_api": fake_api}):
             with self.assertRaisesRegex(
                 RunExecutionError,
                 "did not produce a release-ready 'word' report",
@@ -848,7 +848,7 @@ class DocumentPipelineTests(unittest.TestCase):
             semantic.mkdir()
             (semantic / "translation-units.jsonl").write_text("", encoding="utf-8")
             with patch(
-                "semantic_translation_runner.main",
+                "translation_agent.semantic.semantic_translation_runner.main",
                 return_value=0,
             ) as semantic_main:
                 document_pipeline.translate_spec(
@@ -904,7 +904,7 @@ class DocumentPipelineTests(unittest.TestCase):
 
     def test_standalone_ingest_returns_nonzero_for_blocked_result(self) -> None:
         with patch(
-            "document_pipeline.ingest_spec",
+            "translation_agent.cli.document_pipeline.ingest_spec",
             return_value={"status": "blocked", "release_blocked": True},
         ):
             stdout = io.StringIO()

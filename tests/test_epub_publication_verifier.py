@@ -8,18 +8,18 @@ import tempfile
 import unittest
 import zipfile
 
-from book_pipeline import (
+from translation_agent.pipeline.book_pipeline import (
     build_epub,
     build_knowledge_rows_from_manifest,
     write_knowledge_base,
 )
-from epub_publication_verifier import (
+from translation_agent.publication.epub_publication_verifier import (
     CHECK_IDS,
     EpubPublicationVerificationError,
     normalize_epub_language,
     verify_epub_publication,
 )
-from epub_semantic_import import apply_translations, import_epub
+from translation_agent.sources.epub_semantic_import import apply_translations, import_epub
 
 
 def _write_source_epub(

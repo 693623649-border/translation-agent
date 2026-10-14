@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import doctor
+import translation_agent.cli.doctor as doctor
 
 
 class DoctorTests(unittest.TestCase):
@@ -78,7 +78,7 @@ class DoctorTests(unittest.TestCase):
             return "/test/soffice"
 
         with patch.object(doctor, "CORE_IMPORTS", {}), patch(
-            "docx_render_gate.find_soffice",
+            "translation_agent.publication.docx_render_gate.find_soffice",
             side_effect=noisy_soffice,
         ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = doctor.main(["--json"])

@@ -15,8 +15,8 @@ import re
 import sys
 from pathlib import Path
 
-import book_pipeline as legacy
-import rag_knowledge_base as rag
+import translation_agent.pipeline.book_pipeline as legacy
+import translation_agent.knowledge.rag_knowledge_base as rag
 
 WORK = Path("outputs/视差之见")
 SOURCE = Path(

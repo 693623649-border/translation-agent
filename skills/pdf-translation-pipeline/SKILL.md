@@ -7,7 +7,7 @@ description: 将影印版或文字层 PDF 转换为可审计的逐页文本、�
 
 ## 使用主入口
 
-新任务使用产品入口 `translation-agent`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。`translation-agent` 与 WebUI 共用 RunSpec 编译和执行服务；`book_pipeline.py` 只作为尚未迁出的高级阶段参数兼容入口。
+新任务使用产品入口 `translation-agent`。输入必须是方向正确的 PDF；图片 ZIP 先过滤系统元数据文件、应用 EXIF/人工旋转、按自然页序合成 PDF。`translation-agent` 与 WebUI 共用 RunSpec 编译和执行服务；`translation_agent/pipeline/book_pipeline.py` 只作为尚未迁出的高级阶段参数兼容入口。
 
 ```bash
 translation-agent run SOURCE.pdf -o OUTPUT --source-mode scanned-pdf \
@@ -19,7 +19,7 @@ translation-agent run SOURCE.pdf -o OUTPUT --source-mode scanned-pdf \
 ## 按阶段执行（兼容层）
 
 标准全链、Recipe 和目标选择使用 `translation-agent`。以下细粒度阶段参数尚在迁移，
-需要时可继续调用兼容的 `book_pipeline.py`；不得因此绕过最终发布报告。
+需要时可继续调用兼容的 `translation_agent/pipeline/book_pipeline.py`；不得因此绕过最终发布报告。
 
 1. 运行 `--phase ocr`，将每个 PDF 页保存为独立稳定检查点。默认并行 4 个 Coding Plan GLM-4.6V worker；续跑时复用匹配当前模型指纹的完成页，不要无故使用 `--force`。
 2. 运行 `--phase toc`，从完整候选目录文本生成 `toc.json` 并校准书内页到 PDF 页的映射。目录是一个全局结构请求，不要为了并行而拆坏上下文；证据不足时要求显式 `--toc-pages`、`--printed-pages-per-pdf-page` 或 `--page-offset`。
@@ -56,14 +56,14 @@ OCR 继续使用 GLM/Coding Plan Profile；中文翻译默认使用独立 DeepSe
 3. 先执行一次只更新 Markdown 的本地编译，使审定源稿进入发布章；跳过容器生成和自动全书门：
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase compile --no-verify \
+python translation_agent/pipeline/book_pipeline.py SOURCE.pdf -o OUTPUT --phase compile --no-verify \
   --no-epub --no-docx --no-kb --no-bookmarked-pdf
 ```
 
 4. 再运行增量章节门，只检查改动章：
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
+python translation_agent/pipeline/book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
   --chapter-id CHAPTER_ID \
   --report OUTPUT/audit/chapter-report.json
 ```
@@ -79,7 +79,7 @@ OCR 页脚或尾注进入正文语义层时，必须保存“正文引用落点�
 在宣告任务完成前，必须阅读并遵守 [references/release-gate.md](references/release-gate.md)。独立验收命令不调用模型：
 
 ```bash
-python book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
+python translation_agent/pipeline/book_pipeline.py SOURCE.pdf -o OUTPUT --phase verify \
   --require-translation \
   --report OUTPUT/audit/release-report.json
 ```
@@ -103,4 +103,4 @@ Word publisher 只登记并交付图产物指向的单一 canonical DOCX；不�
 
 ## 兼容入口
 
-`pdf_text_agent.py` 仅保留旧流程兼容。目标包含标题级 Markdown、EPUB 或知识库时，导入旧逐页检查点后仍由 `book_pipeline.py` 完成编译与验收。
+`translation_agent/legacy/pdf_text_agent.py` 仅保留旧流程兼容。目标包含标题级 Markdown、EPUB 或知识库时，导入旧逐页检查点后仍由 `translation_agent/pipeline/book_pipeline.py` 完成编译与验收。

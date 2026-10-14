@@ -3,14 +3,14 @@ from __future__ import annotations
 import hashlib
 import unittest
 
-from born_digital_pdf_import import _translation_units as pdf_translation_units
-from epub_semantic_import import _translation_units as epub_translation_units
-from semantic_ir import (
+from translation_agent.sources.born_digital_pdf_import import _translation_units as pdf_translation_units
+from translation_agent.sources.epub_semantic_import import _translation_units as epub_translation_units
+from translation_agent.semantic.semantic_ir import (
     SemanticContractError,
     TranslationUnit,
     normalize_translation_unit_record,
 )
-from semantic_translation_runner import _batch_key, batch_units
+from translation_agent.semantic.semantic_translation_runner import _batch_key, batch_units
 
 
 CANONICAL_KEYS = {

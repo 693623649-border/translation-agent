@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from semantic_translation_runner import (
+from translation_agent.semantic.semantic_translation_runner import (
     SemanticTranslationError,
     build_openai_chat_request,
     build_prompt,
@@ -338,12 +338,12 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
 
             with patch(
-                "semantic_translation_runner.PROMPT_CONTRACT_SHA256",
+                "translation_agent.semantic.semantic_translation_runner.PROMPT_CONTRACT_SHA256",
                 "0" * 64,
             ):
                 translate_units(units, root / "one.jsonl")
             with patch(
-                "semantic_translation_runner.PROMPT_CONTRACT_SHA256",
+                "translation_agent.semantic.semantic_translation_runner.PROMPT_CONTRACT_SHA256",
                 "1" * 64,
             ):
                 translate_units(units, root / "two.jsonl")

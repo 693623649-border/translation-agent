@@ -18,7 +18,7 @@
 - 清除 `[空白页]`、重复 EPUB cover/titlepage 脚手架、模型前言、调试路径、页 JSON 名、
   临时渲染名和 `python-docx` 默认作者污染。
 
-对于 EPUB，本项目已经在 `epub_semantic_import.py` 区分非链接页码 superscript 与真实
+对于 EPUB，本项目已经在 `translation_agent/sources/epub_semantic_import.py` 区分非链接页码 superscript 与真实
 链接注释；对于 OCR/Markdown，本项目只在显式分页证据下移除连续小数字。改变这些
 规则时必须同时增加“页码被删除”和“合法数字被保留”的对照回归测试。
 
@@ -30,11 +30,11 @@ The Word files must be regenerated through the agent framework, not patched manu
 - 每个路径来自 manifest、report 或明确配置；命令可从仓库脚本和配置重放。
 - canonical 文件若被用户修改/占用，不静默覆盖；保留冲突文件并显式产出安全副本或阻断。
 - 修框架时至少运行针对性测试；交付前运行全量工程测试和静态检查。
-- EPUB 读者版在重建前运行 `epub_semantic_import.py prune-long-footnotes --remove-standalone-page-markers`，并核对 pruning
+- EPUB 读者版在重建前运行 `translation_agent/sources/epub_semantic_import.py prune-long-footnotes --remove-standalone-page-markers`，并核对 pruning
   audit 的删除数、阈值和逐章 ID；原始 `semantic/source_chapters` 不得被改写。内联页码必须在 EPUB
   导入阶段凭来源结构证据移除，不得用通用上标数字规则猜测。
 
-本仓库的 canonical 输出优先通过 `book_pipeline.py ... --phase compile` 自动运行完整门，
+本仓库的 canonical 输出优先通过 `translation_agent/pipeline/book_pipeline.py ... --phase compile` 自动运行完整门，
 或用 Word Recipe 以 `publication.word_report` 为目标。`publication.docx` 只是中间产物。
 
 ## 结构门

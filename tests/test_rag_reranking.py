@@ -7,8 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
 
-from rag_knowledge_base import RagHit, RagProviderError
-from rag_reranking import OpenAICompatibleReranker, load_query_aliases
+from translation_agent.knowledge.rag_knowledge_base import RagHit, RagProviderError
+from translation_agent.knowledge.rag_reranking import OpenAICompatibleReranker, load_query_aliases
 
 
 def _hit(identifier: str, title: str = "段落", content: str = "内容") -> RagHit:

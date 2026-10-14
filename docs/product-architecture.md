@@ -83,7 +83,7 @@ Provider、Source Adapter 和 publisher 可以迭代，但不能绕过这些契�
 分别共用类型化 `compile_service` 和 `publication_service`；Graph 的
 `core.chapters.compile` 与 verify 节点直接提交请求对象，不再拼接 argv 或调用
 legacy 私有 `_main_unlocked`。`runtime.hygiene` 是首个移入
-`publication_checks/` 的模块化确定性检查，抽离没有改变既有报告 ID、schema 或
+`translation_agent/publication/checks/` 的模块化确定性检查，抽离没有改变既有报告 ID、schema 或
 检查顺序。
 
 `compile_service` 保留完整页集合、OCR 模型约束、TOC 页码映射、章节粒度和翻译
@@ -128,7 +128,7 @@ EPUB native verifier 是确定性的包/语义门，不调用模型，也不是�
 
 ## 语义回填不变量
 
-`semantic_apply.py` 是 EPUB 与独立文字 PDF importer 的共享 apply 服务：
+`translation_agent/semantic/semantic_apply.py` 是 EPUB 与独立文字 PDF importer 的共享 apply 服务：
 
 - 上游 reconstruction audit 必须明确 `passed`，且不能有 root/chapter blocker；
 - unit schema、ID、章节顺序、source SHA 和 locator 必须完整一致；

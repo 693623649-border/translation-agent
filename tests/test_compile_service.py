@@ -6,8 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from compile_service import ChapterCompileRequest, run_chapter_compile
-from pipeline_profiles import ModelIdentity
+from translation_agent.pipeline.compile_service import ChapterCompileRequest, run_chapter_compile
+from translation_agent.runtime.pipeline_profiles import ModelIdentity
 
 
 def _identity() -> ModelIdentity:
@@ -65,7 +65,7 @@ class CompileServiceTests(unittest.TestCase):
                 expected_translation_identity=identity,
             )
             with patch(
-                "compile_service._legacy_compiler",
+                "translation_agent.pipeline.compile_service._legacy_compiler",
                 return_value=compiler,
             ):
                 result = run_chapter_compile(request)
@@ -137,7 +137,7 @@ class CompileServiceTests(unittest.TestCase):
             )
             with (
                 patch(
-                    "compile_service._legacy_compiler",
+                    "translation_agent.pipeline.compile_service._legacy_compiler",
                     return_value=compiler,
                 ),
                 self.assertRaisesRegex(
@@ -176,7 +176,7 @@ class CompileServiceTests(unittest.TestCase):
                 required_ocr_model_prefix="ocr/, manual/",
             )
             with patch(
-                "compile_service._legacy_compiler",
+                "translation_agent.pipeline.compile_service._legacy_compiler",
                 return_value=compiler,
             ):
                 result = run_chapter_compile(request)

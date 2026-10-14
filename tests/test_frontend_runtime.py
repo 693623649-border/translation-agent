@@ -1,6 +1,6 @@
 import contextlib
 
-from frontend_runtime import (
+from translation_agent.ui.frontend_runtime import (
     FrontendSettings,
     JobRegistry,
     PathPolicy,
@@ -12,7 +12,7 @@ from frontend_runtime import (
     validate_upload_size,
 )
 
-from pipeline_profiles import ModelProfile
+from translation_agent.runtime.pipeline_profiles import ModelProfile
 
 import hashlib
 import io
@@ -26,10 +26,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import document_pipeline
-import launch_frontend
-from application_service import ApplicationService
-from frontend_runtime import (
+import translation_agent.cli.document_pipeline as document_pipeline
+import translation_agent.cli.launch_frontend as launch_frontend
+from translation_agent.ui.application_service import ApplicationService
+from translation_agent.ui.frontend_runtime import (
     FrontendSettings,
     JobRegistry,
     PathPolicy,
@@ -45,8 +45,8 @@ from frontend_runtime import (
     start_job_process,
     validate_upload_size,
 )
-from product_contracts import RunSpec
-from semantic_review_policy import refresh_semantic_review
+from translation_agent.runtime.product_contracts import RunSpec
+from translation_agent.semantic.semantic_review_policy import refresh_semantic_review
 from tests.test_epub_semantic_import import _write_epub
 
 
@@ -272,7 +272,7 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             fake_process = type("Process", (), {"pid": 43210})()
             with patch(
-                "frontend_runtime.subprocess.Popen", return_value=fake_process
+                "translation_agent.ui.frontend_runtime.subprocess.Popen", return_value=fake_process
             ) as popen:
                 started = start_job_process(
                     registry,
@@ -290,14 +290,14 @@ class FrontendRuntimeTests(unittest.TestCase):
             self.assertIn("--worker-token", command)
 
     def test_launcher_rejects_non_loopback_bind_address(self) -> None:
-        with patch("launch_frontend.subprocess.Popen") as popen:
+        with patch("translation_agent.cli.launch_frontend.subprocess.Popen") as popen:
             with self.assertRaises(SystemExit) as caught:
                 launch_frontend.main(["--host", "0.0.0.0", "--no-browser"])
         self.assertEqual(caught.exception.code, 2)
         popen.assert_not_called()
 
     def test_launcher_overrides_global_streamlit_development_mode(self) -> None:
-        with patch("launch_frontend.subprocess.Popen") as popen:
+        with patch("translation_agent.cli.launch_frontend.subprocess.Popen") as popen:
             popen.return_value.wait.return_value = 0
             self.assertEqual(
                 launch_frontend.main(["--port", "8507", "--no-browser"]),
@@ -595,8 +595,8 @@ class FrontendRuntimeTests(unittest.TestCase):
                 worker_started_at="2026-08-15T00:00:00+00:00",
             )
             with patch(
-                "frontend_runtime._worker_identity_status", return_value="mismatch"
-            ), patch("frontend_runtime.os.killpg") as killpg:
+                "translation_agent.ui.frontend_runtime._worker_identity_status", return_value="mismatch"
+            ), patch("translation_agent.ui.frontend_runtime.os.killpg") as killpg:
                 cancelled = cancel_job(registry, job.id)
             killpg.assert_not_called()
             self.assertEqual(cancelled.status, "cancelled")
@@ -633,8 +633,8 @@ class FrontendRuntimeTests(unittest.TestCase):
                 worker_started_at="2026-08-15T00:00:00+00:00",
             )
             with patch(
-                "frontend_runtime._worker_identity_status", return_value="unknown"
-            ), patch("frontend_runtime.os.killpg") as killpg, self.assertRaisesRegex(
+                "translation_agent.ui.frontend_runtime._worker_identity_status", return_value="unknown"
+            ), patch("translation_agent.ui.frontend_runtime.os.killpg") as killpg, self.assertRaisesRegex(
                 RuntimeError, "refusing to signal"
             ):
                 cancel_job(registry, job.id)
@@ -671,8 +671,8 @@ class FrontendRuntimeTests(unittest.TestCase):
                 worker_started_at="2026-08-15T00:00:00+00:00",
             )
             with patch(
-                "frontend_runtime._worker_identity_status", return_value="match"
-            ), patch("frontend_runtime.os.killpg") as killpg:
+                "translation_agent.ui.frontend_runtime._worker_identity_status", return_value="match"
+            ), patch("translation_agent.ui.frontend_runtime.os.killpg") as killpg:
                 requested = cancel_job(registry, job.id)
             killpg.assert_called_once_with(32125, signal.SIGTERM)
             self.assertEqual(requested.status, "cancel_requested")
@@ -694,7 +694,7 @@ class FrontendRuntimeTests(unittest.TestCase):
                 )
 
             with patch(
-                "frontend_runtime._worker_identity_status", return_value="missing"
+                "translation_agent.ui.frontend_runtime._worker_identity_status", return_value="missing"
             ):
                 registry.reconcile_workers()
             cancelled = registry.get(job.id)
@@ -1331,7 +1331,7 @@ class FrontendRuntimeTests(unittest.TestCase):
                 translate=False,
                 verify=False,
             )
-            with patch("pipeline_graph.book.legacy.load_env_file") as load_env:
+            with patch("translation_agent.pipeline.graph.book.legacy.load_env_file") as load_env:
                 web_nodes = service.preview_plan(spec)
                 compatibility_nodes = frontend_plan_runspec(spec)
             load_env.assert_not_called()
@@ -1384,7 +1384,7 @@ class FrontendRuntimeTests(unittest.TestCase):
                 ),
             )
             with patch(
-                "frontend_runtime.RunExecutionService", return_value=fake_service
+                "translation_agent.ui.frontend_runtime.RunExecutionService", return_value=fake_service
             ):
                 exit_code = execute_job(registry.database, job.id, token)
             failed = registry.get(job.id)
@@ -1434,7 +1434,7 @@ class FrontendRuntimeTests(unittest.TestCase):
                 ),
             )
             with patch(
-                "frontend_runtime.RunExecutionService", return_value=fake_service
+                "translation_agent.ui.frontend_runtime.RunExecutionService", return_value=fake_service
             ):
                 exit_code = execute_job(registry.database, job.id, token)
             failed = registry.get(job.id)

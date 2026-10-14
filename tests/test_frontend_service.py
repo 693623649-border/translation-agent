@@ -3,16 +3,16 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import launch_frontend
+import translation_agent.cli.launch_frontend as launch_frontend
 
-from frontend_service import (
+from translation_agent.ui.frontend_service import (
     PipelineJob,
     artifact_mime_type,
     discover_artifacts,
     run_pipeline_job,
     safe_uploaded_pdf_name,
 )
-from translation_agent_api import RunRequest
+from translation_agent.runtime.translation_agent_api import RunRequest
 
 
 class _FakeProcess:
@@ -25,7 +25,7 @@ class _FakeProcess:
 
 class FrontendServiceTests(unittest.TestCase):
     def test_launcher_rejects_non_loopback_bind_address(self) -> None:
-        with patch("launch_frontend.subprocess.Popen") as popen:
+        with patch("translation_agent.cli.launch_frontend.subprocess.Popen") as popen:
             with self.assertRaises(SystemExit) as caught:
                 launch_frontend.main(["--host", "0.0.0.0", "--no-browser"])
         self.assertEqual(caught.exception.code, 2)
@@ -68,8 +68,8 @@ class FrontendServiceTests(unittest.TestCase):
             credentials={"TEST_API_KEY": "secret-value"},
         )
         with (
-            patch("frontend_service.subprocess.Popen", return_value=_FakeProcess()),
-            patch("frontend_service.status_for_request", return_value={"pages": 1}),
+            patch("translation_agent.ui.frontend_service.subprocess.Popen", return_value=_FakeProcess()),
+            patch("translation_agent.ui.frontend_service.status_for_request", return_value={"pages": 1}),
         ):
             result = run_pipeline_job(job, on_output=lines.append)
         self.assertTrue(result.ok)

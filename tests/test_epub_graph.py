@@ -9,12 +9,12 @@ from unittest import mock
 import warnings
 import zipfile
 
-import pipeline_graph.epub as epub_graph_module
-from pipeline_graph.core import NodeExecutionError
-from semantic_ir import ReviewDecision
-from semantic_review import append_semantic_review_decision
-from semantic_review_policy import refresh_semantic_review
-from pipeline_graph.epub import (
+import translation_agent.pipeline.graph.epub as epub_graph_module
+from translation_agent.pipeline.graph.core import NodeExecutionError
+from translation_agent.semantic.semantic_ir import ReviewDecision
+from translation_agent.semantic.semantic_review import append_semantic_review_decision
+from translation_agent.semantic.semantic_review_policy import refresh_semantic_review
+from translation_agent.pipeline.graph.epub import (
     ART_EPUB,
     ART_EPUB_REPORT,
     ART_READER_CHAPTERS,
@@ -97,8 +97,8 @@ def _translated_units(units_path: Path, target: Path) -> None:
 
 class EpubGraphTests(unittest.TestCase):
     def test_product_translation_profile_still_identifies_epub_cache(self) -> None:
-        from product_contracts import RunSpec
-        from run_execution_service import RunExecutionService
+        from translation_agent.runtime.product_contracts import RunSpec
+        from translation_agent.runtime.run_execution_service import RunExecutionService
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "book.epub"
@@ -114,10 +114,10 @@ class EpubGraphTests(unittest.TestCase):
             self.assertEqual(prepared.options.translation_prompt_profile, "academic")
 
     def test_knowledge_base_uses_reader_dag_and_registers_rag_metadata(self) -> None:
-        from global_knowledge_base import sync_outputs, search
-        from product_contracts import RunSpec
-        from run_execution_service import execute_runspec, plan_runspec
-        from rag_knowledge_base import rag_manifest_is_current
+        from translation_agent.knowledge.global_knowledge_base import sync_outputs, search
+        from translation_agent.runtime.product_contracts import RunSpec
+        from translation_agent.runtime.run_execution_service import execute_runspec, plan_runspec
+        from translation_agent.knowledge.rag_knowledge_base import rag_manifest_is_current
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "book.epub"
@@ -198,7 +198,7 @@ class EpubGraphTests(unittest.TestCase):
                 return result
 
             with mock.patch(
-                "pipeline_graph.epub.import_epub",
+                "translation_agent.pipeline.graph.epub.import_epub",
                 side_effect=mutate_after_import,
             ):
                 with self.assertRaises(NodeExecutionError) as raised:
@@ -243,7 +243,7 @@ class EpubGraphTests(unittest.TestCase):
                 return result
 
             with mock.patch(
-                "pipeline_graph.epub.apply_translations",
+                "translation_agent.pipeline.graph.epub.apply_translations",
                 side_effect=mutate_after_apply,
             ):
                 with self.assertRaises(NodeExecutionError) as raised:
@@ -552,7 +552,7 @@ class EpubGraphTests(unittest.TestCase):
                 ),
             )
             with mock.patch(
-                "pipeline_graph.epub.legacy.build_epub",
+                "translation_agent.pipeline.graph.epub.legacy.build_epub",
                 side_effect=corrupt_epub,
             ):
                 with self.assertRaises(NodeExecutionError) as raised:
@@ -755,7 +755,7 @@ class EpubGraphTests(unittest.TestCase):
             over_budget = root / "budget.epub"
             _write_epub(over_budget, extra_members={"OEBPS/extra.bin": b"12345"})
             with mock.patch(
-                "pipeline_graph.epub.MAX_EPUB_TOTAL_UNCOMPRESSED_BYTES", 10
+                "translation_agent.pipeline.graph.epub.MAX_EPUB_TOTAL_UNCOMPRESSED_BYTES", 10
             ):
                 with self.assertRaisesRegex(EpubGraphConfigurationError, "aggregate"):
                     prepare_epub_graph(over_budget, root / "out-budget")
@@ -773,7 +773,7 @@ class EpubGraphTests(unittest.TestCase):
             source = root / "book.epub"
             _write_epub(source)
             with mock.patch(
-                "semantic_translation_runner.load_env_file",
+                "translation_agent.semantic.semantic_translation_runner.load_env_file",
                 side_effect=AssertionError("dotenv must not be loaded"),
             ):
                 result = prepare_epub_graph(

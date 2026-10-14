@@ -10,7 +10,7 @@ from unittest import mock
 
 import fitz
 
-from book_pipeline import (
+from translation_agent.pipeline.book_pipeline import (
     PageRecord,
     TocEntry,
     _main_unlocked,
@@ -22,7 +22,7 @@ from book_pipeline import (
     save_page_record,
     write_knowledge_base,
 )
-from publication_verifier import (
+from translation_agent.publication.publication_verifier import (
     _canonical_docx_body_text,
     _check_knowledge_base,
     _check_ocr_quality,
@@ -36,7 +36,7 @@ from publication_verifier import (
     _trace_issues,
     verify_publication,
 )
-from semantic_review_policy import (
+from translation_agent.semantic.semantic_review_policy import (
     ACCEPT_AS_TEXT_REASON,
     collect_reconstruction_review,
     record_semantic_review_decision,
@@ -139,7 +139,7 @@ class PublicationVerifierTests(unittest.TestCase):
         issues = _trace_issues(text, path="chapter.md")
         self.assertNotIn("dash_truncation_seam", {issue["code"] for issue in issues})
     def test_docx_expected_text_mirrors_soft_wrap_merge(self) -> None:
-        from book_pipeline import _normalize_wrapped_markdown_for_docx
+        from translation_agent.pipeline.book_pipeline import _normalize_wrapped_markdown_for_docx
 
         source = (
             "# 章节\n\n"
@@ -199,7 +199,7 @@ class PublicationVerifierTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.render_gate = mock.patch(
-            "publication_verifier._check_docx_render",
+            "translation_agent.publication.publication_verifier._check_docx_render",
             return_value={
                 "summary": "fixture render passed",
                 "metrics": {"page_count": 1},
@@ -1475,7 +1475,7 @@ class PublicationVerifierTests(unittest.TestCase):
 
     def test_report_write_failure_keeps_returned_counts_consistent(self) -> None:
         with mock.patch(
-            "publication_verifier._write_report",
+            "translation_agent.publication.publication_verifier._write_report",
             side_effect=OSError("simulated write failure"),
         ):
             report = self._verify(report_name="unwritable.json")

@@ -320,7 +320,7 @@ def main() -> int:
         log("manifest: dropped cover scaffold chapter file")
     kept_hrefs = {str(item.get("source_href")) for item in manifest}
 
-    from publication_semantics import markdown_footnote_contract_sha256, parse_markdown_footnotes
+    from translation_agent.publication.publication_semantics import markdown_footnote_contract_sha256, parse_markdown_footnotes
 
     for item in manifest:
         path = CHAPTERS / item["filename"]

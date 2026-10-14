@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
-from book_pipeline import (  # noqa: E402
+from translation_agent.pipeline.book_pipeline import (  # noqa: E402
     PageRecord,
     build_parser as _book_parser,
     resolve_ocr_backend_name,
@@ -29,7 +29,7 @@ from book_pipeline import (  # noqa: E402
     resolve_expected_ocr_model_prefix,
 )
 from local_paddleocr_import import _parse_args  # noqa: E402
-from pipeline_profiles import ModelProfile  # noqa: E402
+from translation_agent.runtime.pipeline_profiles import ModelProfile  # noqa: E402
 
 
 def _record(page: int, model: str) -> PageRecord:
@@ -117,7 +117,7 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
         exact = resolve_expected_ocr_model_exact(args, profile)
         self.assertTrue(exact.startswith("paddleocr-local/PP-OCRv5-server-det-"))
 
-    @patch("book_pipeline.paddle_native_available", return_value=False)
+    @patch("translation_agent.pipeline.book_pipeline.paddle_native_available", return_value=False)
     def test_auto_backend_prefers_local_then_falls_back(self, _native_probe) -> None:
         args = _book_parser().parse_args([])
         self.assertEqual(args.ocr_backend, "auto")
@@ -132,16 +132,16 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             concurrency=4,
             thinking="omit",
         )
-        with patch("book_pipeline.paddle_local_available", return_value=True):
+        with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=True):
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
             self.assertEqual(backend, "paddleocr-local")
             self.assertIn("local", reason)
-        with patch("book_pipeline.paddle_local_available", return_value=False):
+        with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=False):
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
             self.assertEqual(backend, "coding-plan-mcp")
             self.assertIn("unavailable", reason)
         explicit = _book_parser().parse_args(["--ocr-backend", "coding-plan-mcp"])
-        with patch("book_pipeline.paddle_local_available", return_value=True):
+        with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=True):
             backend, reason = resolve_ocr_backend_name(explicit, remote_profile)
             self.assertEqual(backend, "coding-plan-mcp")
             self.assertEqual(reason, "explicit --ocr-backend")
@@ -157,7 +157,7 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             save_page_record(output, record)
             # A cloud coding-plan rerun without --force must keep the local
             # page untouched (it must not be scheduled as pending).
-            from book_pipeline import ocr_pdf
+            from translation_agent.pipeline.book_pipeline import ocr_pdf
 
             class _StubBackend:
                 def ocr_image(self, path):

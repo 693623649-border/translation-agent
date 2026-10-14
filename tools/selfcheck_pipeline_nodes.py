@@ -25,7 +25,7 @@ import traceback
 import zipfile
 from pathlib import Path
 
-from pipeline_graph.book import (
+from translation_agent.pipeline.graph.book import (
     BookGraphOptions,
     NODE_PROOFREAD,
     NODE_TEXT_EXTRACT,
@@ -33,7 +33,7 @@ from pipeline_graph.book import (
     KNOWN_NODE_NAMES,
     prepare_book_graph,
 )
-from pipeline_graph.epub import (
+from translation_agent.pipeline.graph.epub import (
     EpubGraphOptions,
     NODE_APPLY,
     NODE_TRANSLATE,
@@ -41,7 +41,7 @@ from pipeline_graph.epub import (
     NODE_VERIFY_EPUB,
     prepare_epub_graph,
 )
-from pipeline_graph.recipe import load_recipe
+from translation_agent.pipeline.graph.recipe import load_recipe
 
 RECIPES_DIR = Path("recipes")
 EPUB_ALL_NODES = 11

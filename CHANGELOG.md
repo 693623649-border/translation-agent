@@ -25,7 +25,7 @@
   EPUB/Word/full verifier 与 Web 正式产物目录共同验证同一 provenance 链。
 - 发布验收改由 legacy CLI 与 PDF DAG 共用的类型化 `publication_service` 调用；Graph
   verify 不再拼接 argv 或调用私有 `_main_unlocked`。首个确定性检查
-  `runtime.hygiene` 已拆入 `publication_checks/`，报告 ID、schema 与检查顺序不变。
+  `runtime.hygiene` 已拆入 `translation_agent/publication/checks/`，报告 ID、schema 与检查顺序不变。
 - 章节编译改由阶段式 CLI 与 PDF DAG 共用的类型化 `compile_service` 调用；
   `core.chapters.compile` 不再经 argv 或私有 `_main_unlocked` 回放阶段入口，并完整保留
   页集合、OCR 模型、目录映射、粒度和翻译身份校验。编译仅返回章节清单与知识库行，

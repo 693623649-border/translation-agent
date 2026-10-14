@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from pdf_text_agent import PROVIDER_PROFILES, resolve_agent_connection
+from translation_agent.legacy.pdf_text_agent import PROVIDER_PROFILES, resolve_agent_connection
 
 
 class LegacyDeepSeekEnvironmentTests(unittest.TestCase):

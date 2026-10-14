@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from semantic_ir import ReviewDecision, SemanticContractError, sha256_text
-from semantic_review import (
+from translation_agent.semantic.semantic_ir import ReviewDecision, SemanticContractError, sha256_text
+from translation_agent.semantic.semantic_review import (
     ReviewIssue,
     SemanticReviewError,
     append_semantic_review_decision,

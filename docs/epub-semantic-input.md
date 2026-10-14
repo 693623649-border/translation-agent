@@ -3,7 +3,7 @@
 born-digital EPUB 不运行 OCR，也不伪造 PDF 页、目录或分页检查点。推荐产品入口
 `translation-agent run --source-mode epub` 会把源 ZIP 安全检查、OPF spine 语义
 重建、单元翻译/回填、reader 物化、出版和 native release gate 组织为真实 Graph
-目标闭包。`epub_semantic_import.py` 与 `semantic_translation_runner.py` 仍保留为
+目标闭包。`translation_agent/sources/epub_semantic_import.py` 与 `translation_agent/semantic/semantic_translation_runner.py` 仍保留为
 可检查、可离线回填的细粒度工具。
 
 ## 1. 完整 Graph 运行
@@ -95,7 +95,7 @@ Python API：
 
 ```python
 from pathlib import Path
-from pipeline_graph.epub import EpubGraphOptions, run_epub_graph
+from translation_agent.pipeline.graph.epub import EpubGraphOptions, run_epub_graph
 
 result = run_epub_graph(
     Path("book.epub"),
@@ -114,7 +114,7 @@ fingerprint；Graph 模块本身不加载 `.env`。源 EPUB 和外部 translatio
 
 ## 3. Canonical TranslationUnit
 
-EPUB 与 `born_digital_pdf_import.py` 的当前 writer 都输出八个固定顶层字段：
+EPUB 与 `translation_agent/sources/born_digital_pdf_import.py` 的当前 writer 都输出八个固定顶层字段：
 
 ```json
 {
@@ -159,7 +159,7 @@ strict `TranslationUnit.from_dict()` 只接受 canonical 形状。为恢复既�
 需要人工检查或离线提供译文时，可以拆开运行：
 
 ```bash
-python epub_semantic_import.py import "book.epub" -o "work/book-semantic"
+python translation_agent/sources/epub_semantic_import.py import "book.epub" -o "work/book-semantic"
 ```
 
 主要产物：
@@ -175,7 +175,7 @@ printed-page/index locator 只保留可见文本，不把源 EPUB 文件坐标�
 `prepare` 只生成模型提示，不联网：
 
 ```bash
-python semantic_translation_runner.py prepare \
+python translation_agent/semantic/semantic_translation_runner.py prepare \
   work/book-semantic/semantic/translation-units.jsonl \
   -o work/book-semantic/semantic/prepared.jsonl \
   --glossary glossary.json \
@@ -187,7 +187,7 @@ python semantic_translation_runner.py prepare \
 provider/endpoint/model、prompt contract、目标语言和术语表：
 
 ```bash
-DEEPSEEK_API_KEY=... python semantic_translation_runner.py run \
+DEEPSEEK_API_KEY=... python translation_agent/semantic/semantic_translation_runner.py run \
   work/book-semantic/semantic/translation-units.jsonl \
   -o work/book-semantic/semantic/translations.jsonl \
   --glossary glossary.json \
@@ -202,7 +202,7 @@ DEEPSEEK_API_KEY=... python semantic_translation_runner.py run \
 集合、源 SHA、章节顺序、链接目标与脚注闭环，并以 staging + rollback 提交：
 
 ```bash
-python epub_semantic_import.py apply-translations \
+python translation_agent/sources/epub_semantic_import.py apply-translations \
   -o work/book-semantic \
   work/book-semantic/semantic/translations.jsonl
 ```
@@ -230,7 +230,7 @@ canonical chapters 和具体 EPUB artifact。
 知识库检查只审计 `--target publication.knowledge_base` 产出的 `knowledge_base.jsonl`：
 文件不存在时该检查通过（未选语料不算失败），一旦存在就必须与 canonical 章节逐块
 一致。EPUB 报告文件名是 `audit/epub-release-report.json`；跨书知识库
-（`global_knowledge_base.py status` / `--verified-only`）同时承认规范名
+（`translation_agent/knowledge/global_knowledge_base.py status` / `--verified-only`）同时承认规范名
 `audit/release-report.json` 与该 EPUB-native 报告，规范名优先。
 
 ZIP 路径穿越、重复/加密/symlink 成员、超出单成员或总解压预算、坏 CRC 都会

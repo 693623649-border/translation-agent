@@ -1,0 +1,1 @@
+"""Local PaddleOCR backend."""

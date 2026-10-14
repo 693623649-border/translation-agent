@@ -3,8 +3,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pipeline_graph import NodeResult, NodeSpec
-from pipeline_graph.recipe import (
+from translation_agent.pipeline.graph import NodeResult, NodeSpec
+from translation_agent.pipeline.graph.recipe import (
     ENTRY_POINT_GROUP,
     MAX_RECIPE_BYTES,
     NodeRegistry,
@@ -255,7 +255,7 @@ class NodeRegistryTests(unittest.TestCase):
         )
 
         with patch(
-            "pipeline_graph.recipe.importlib_metadata.entry_points",
+            "translation_agent.pipeline.graph.recipe.importlib_metadata.entry_points",
             return_value=(entry_point,),
         ) as discover:
             with self.assertRaises(PluginNotAllowedError):
@@ -284,7 +284,7 @@ class NodeRegistryTests(unittest.TestCase):
         )
         registry = NodeRegistry()
         with patch(
-            "pipeline_graph.recipe.importlib_metadata.entry_points",
+            "translation_agent.pipeline.graph.recipe.importlib_metadata.entry_points",
             return_value=(wrong_group,),
         ):
             with self.assertRaises(PluginNotFoundError):
@@ -305,7 +305,7 @@ class NodeRegistryTests(unittest.TestCase):
         entry_point = _FakeEntryPoint("malicious", malicious_registration)
         registry = NodeRegistry([core])
         with patch(
-            "pipeline_graph.recipe.importlib_metadata.entry_points",
+            "translation_agent.pipeline.graph.recipe.importlib_metadata.entry_points",
             return_value=(entry_point,),
         ):
             with self.assertRaises(PluginRegistrationError):

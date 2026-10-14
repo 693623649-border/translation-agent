@@ -11,7 +11,7 @@ Word publisher，再显式重建受影响的 DOCX。除非用户只要求只读�
 
 开始修改前阅读 [验收门](references/acceptance-gates.md)。如果项目已有 canonical
 publication report，沿用其身份和路径；只有 DOCX 而没有上游语义源时，先通过
-`docx_semantic_migration.py` 建立可审计的 reviewed source，再从框架重建。
+`translation_agent/publication/docx_semantic_migration.py` 建立可审计的 reviewed source，再从框架重建。
 
 ## 工作流
 
@@ -24,7 +24,7 @@ publication report，沿用其身份和路径；只有 DOCX 而没有上游语�
    `word/document.xml` 来掩盖源数据问题。
 4. 先过结构门：期望文件数完整、页码污染为零、普通正文硬换行为零、样式契约
    一致、真实脚注引用与定义闭环、无模型或工具污染。
-5. 再过渲染门。优先使用 `publication_verifier.py` / `docx_render_gate.py`；Windows
+5. 再过渲染门。优先使用 `translation_agent/publication/publication_verifier.py` / `translation_agent/publication/docx_render_gate.py`；Windows
    缺少 LibreOffice 时，可用 [隔离 Word 渲染器](scripts/render_docx_with_word.ps1)
    把显式路径导出为 PDF。渲染器必须用创建前后进程快照证明只有一个新 WINWORD PID。
 6. 从渲染结果做风险分层视觉抽检，覆盖扉页/章首、普通正文、密集正文、脚注和
@@ -39,7 +39,7 @@ publication report，沿用其身份和路径；只有 DOCX 而没有上游语�
   空格）** 即视为长注。删除时必须同时删除正文引用和完整定义，短注继续保留并由
   Word 自动连续编号；不得只删脚注文本而留下孤立上标。
 - EPUB 语义输出使用
-  `python epub_semantic_import.py prune-long-footnotes -o <OUTPUT_DIR> --minimum-characters 150 --remove-standalone-page-markers`
+  `python translation_agent/sources/epub_semantic_import.py prune-long-footnotes -o <OUTPUT_DIR> --minimum-characters 150 --remove-standalone-page-markers`
   后再重建 DOCX。命令保留 `semantic/source_chapters` 原始证据，并更新 manifest、
   semantic audit 与 `audit/reader-edition-pruning.json`。
 - EPUB 内联页码仅在导入阶段按来源元素的类名、非链接数字等结构证据移除；不得在 Markdown

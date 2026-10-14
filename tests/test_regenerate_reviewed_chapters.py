@@ -6,7 +6,7 @@ from pathlib import Path
 
 import fitz
 
-from regenerate_reviewed_chapters import (
+from translation_agent.maintenance.regenerate_reviewed_chapters import (
     Note,
     SourceBlock,
     assign_markers,

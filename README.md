@@ -75,14 +75,14 @@ Graph 还提供 `--source-mode text-pdf`，用于每页都有完整可复制
 并继续进入相同的 publisher/verifier；它不会注册或调用 OCR 节点。默认仍是
 `scanned-pdf`，系统不会根据 PDF 内容自动猜测入口。
 
-产品入口是 `translation-agent`（`document_pipeline.py`）。CLI 与 WebUI 通过
-`run_execution_service.py` 共用同一套 RunSpec 解析、来源能力、目标选择、计划和
+产品入口是 `translation-agent`（`translation_agent/cli/document_pipeline.py`）。CLI 与 WebUI 通过
+`translation_agent/runtime/run_execution_service.py` 共用同一套 RunSpec 解析、来源能力、目标选择、计划和
 执行语义；三种来源的计划现在都由真实 `NodeSpec` 组成并标记为 `executor=graph`。
-PDF 全链仍由 `graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
-复用 `book_pipeline.py` 的成熟实现和全部旧参数。`book_pipeline.py` 仍是完全
-兼容的阶段式入口。旧的 `pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）
-仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。根目录的
-`patch_translations.py` 和 `extract_textbook_layer.py` 是新格式检查点的人工
+PDF 全链仍由 `translation_agent/cli/graph_pipeline.py` 执行，它把各阶段组织成可替换的依赖图，同时
+复用 `translation_agent/pipeline/book_pipeline.py` 的成熟实现和全部旧参数。`translation_agent/pipeline/book_pipeline.py` 仍是完全
+兼容的阶段式入口。旧的 `translation_agent/legacy/pdf_text_agent.py`（逐页 OCR、翻译、总结、DOCX/PDF）
+仅为兼容已有 `_checkpoints` 保留，不再是影印书编译的推荐入口。
+`translation_agent/maintenance/patch_translations.py` 和 `translation_agent/sources/extract_textbook_layer.py` 是新格式检查点的人工
 辅助工具；一次性书籍脚本和旧监控器已移到 `archive/`，详情见
 `archive/README.md`。
 
@@ -96,7 +96,7 @@ first-class DAG 和无模型的原生发布门；`publication.epub_report` 是�
 
 ## 本版本改动（2026-08）
 
-### 发布清洗层（book_pipeline.py + publication_verifier.py）
+### 发布清洗层（translation_agent/pipeline/book_pipeline.py + translation_agent/publication/publication_verifier.py）
 
 针对输出侧三类常见问题：
 
@@ -158,77 +158,62 @@ git diff --check
 
 ## 仓库结构
 
+源码按职责放在 `translation_agent/` 包内。安装后的命令名不变：
+`translation-agent`、`translation-agent-doctor`、`translation-agent-web`、
+`translation-agent-paddle`、`translation-agent-repo-guard`、
+`translation-agent-kb`、`translation-agent-global-kb`。
+直接运行脚本时使用包内路径，例如
+`python translation_agent/pipeline/book_pipeline.py`。
+
 ```text
 translation-agent/
-├── document_pipeline.py          # 版本化 RunSpec 的统一产品 CLI
-├── run_execution_service.py      # CLI/WebUI 共用的计划、能力与执行服务
-├── graph_pipeline.py             # 可组合 DAG 命令行入口
-├── book_pipeline.py              # 兼容的阶段式执行入口与成熟节点实现
-├── pipeline_graph/
-│   ├── core.py                   # NodeSpec、拓扑规划、缓存、事件与执行器
-│   ├── book.py                   # book_pipeline 的 Graph 适配节点
-│   ├── epub.py                   # EPUB spine 语义 DAG 与原生发布目标
-│   └── recipe.py                 # 严格 Recipe 与 allowlist 插件注册表
-├── recipes/
-│   ├── full-publication.toml     # 完整出版物
-│   ├── chinese-pdf-word.toml     # 中文 PDF → Word
-│   └── outline-word.toml         # PDF 内置目录 → Word
-├── product_contracts.py          # RunSpec / ArtifactRecord / Event 公共契约
-├── semantic_ir.py                # 版本化文档语义 IR 与人工复核决定
-├── semantic_review.py            # append-only 决议日志与可复现 resolution
-├── semantic_review_policy.py     # blocker 全量提取、权限策略与只读复验
-├── semantic_apply.py             # 翻译集合验证与事务回填
-├── translation_agent_api.py      # 传统与 Graph 程序化调用接口
-├── application_service.py        # WebUI 的持久任务与安全工作区 facade
-├── frontend_runtime.py           # SQLite WAL、后台任务、安全环境与产物目录
-├── streamlit_app.py              # Streamlit 多页产品入口
-├── app_pages/                    # 新任务、状态、产物、设置页面
-├── frontend_app.py               # 旧入口兼容 shim
-├── launch_frontend.py            # local-only 一键启动前端
-├── doctor.py                     # 运行环境预检
-├── repository_guard.py           # 密钥、大文件和本地书稿防泄漏门
-├── pipeline_profiles.py          # Provider/Profile 配置与模型指纹
-├── pipeline_runtime.py           # 共享重试和起始限速器
-├── compile_service.py            # CLI/PDF Graph 共用的类型化章节编译服务
-├── publication_service.py        # CLI/PDF Graph 共用的类型化发布验收服务
-├── publication_checks/           # 可独立测试的确定性发布检查
-├── publication_verifier.py       # 无模型调用的统一发布质量门
-├── epub_publication_verifier.py  # EPUB-native 语义、包、导航与链接发布门
-├── epub_semantic_import.py       # EPUB spine → canonical TranslationUnit
-├── born_digital_pdf_import.py    # 文字 PDF → canonical TranslationUnit
-├── pipeline.example.toml         # 不含密钥的模型配置示例
-├── pdf_text_agent.py             # 兼容旧检查点的旧入口
-├── patch_translations.py         # 新格式译文人工修补工具
-├── extract_textbook_layer.py     # 新格式文本层提取工具
-├── tools/note_reflow.py          # 章节注释重组工具（见下文）
-├── skills/                       # Codex 项目级工作流与发布验收指令
-├── archive/
-│   ├── karatani/                 # 硬编码单本书的一次性脚本
-│   └── legacy/monitor.py         # 仅适用旧 Windows 流程
+├── translation_agent/
+│   ├── cli/                 # RunSpec、Graph、doctor、Web 启动、知识库命令
+│   ├── runtime/             # 契约、路径、Profile、执行服务、仓库门禁
+│   ├── pipeline/            # 阶段式书稿流水线与章节编译
+│   │   └── graph/           # DAG 内核、PDF/EPUB 节点、Recipe
+│   ├── sources/             # EPUB、文字层 PDF、教材文本层
+│   ├── ocr/                 # 本机 PaddleOCR
+│   ├── semantic/            # 语义 IR、复核、回填与翻译
+│   ├── publication/         # 发布语义、DOCX/EPUB、验收门
+│   │   └── checks/          # 可单测的确定性发布检查
+│   ├── knowledge/           # 单书 RAG 与全书检索库
+│   ├── ui/                  # Streamlit 工作台与任务服务
+│   │   └── pages/           # 新任务、状态、复核、产物、设置
+│   ├── maintenance/         # 审定稿修补与章节重生成
+│   └── legacy/              # 旧逐页检查点入口
+├── recipes/                 # 严格 Recipe
+├── schemas/                 # RunSpec 与文档语义 schema
+├── skills/                  # 项目级工作流
+├── tools/                   # 流水线辅助工具与单书脚本
 ├── tests/
+├── docs/
+├── deploy/paddleocr/        # 可选的 Docker GPU OCR
+├── archive/                 # 已退役的单书脚本
+├── pipeline.example.toml
 ├── pyproject.toml
-├── requirements.txt
-└── .env.example
+└── requirements.txt
 ```
+
 
 ## Graph 执行引擎
 
-PDF 的 `graph_pipeline.py` 是 `book_pipeline.py` 之上的轻量依赖图，不是另一套
+PDF 的 `translation_agent/cli/graph_pipeline.py` 是 `translation_agent/pipeline/book_pipeline.py` 之上的轻量依赖图，不是另一套
 不兼容的流水线。内置节点继续使用相同的 `pages/page_XXXX.json`、`toc.json`、
 章节目录、模型 Profile、页级 CAS 和断点检查点。Graph 接管节点选择、依赖规划、
 节点缓存、事件记录和输出目录互斥；OCR、目录、校勘和翻译仍委托兼容阶段实现，
 章节编译与发布验收则已抽离为类型化服务。原有命令可以继续使用；要获得可组合
-能力时，把入口改为 `graph_pipeline.py`，其余 `book_pipeline.py` 参数保持不变。
+能力时，把入口改为 `translation_agent/cli/graph_pipeline.py`，其余 `translation_agent/pipeline/book_pipeline.py` 参数保持不变。
 
 章节编译和发布验收是当前 legacy 收敛的两个完成边界。阶段式 CLI 与 PDF Graph
 共同调用类型化 `compile_service` 和 `publication_service`；Graph 的
 `core.chapters.compile` 与 verify 节点不再通过 argv 或私有 `_main_unlocked` 回放
 阶段入口。编译服务保留完整页集合、OCR 模型约束、TOC 页码映射、章节粒度和翻译
 身份校验，并返回章节清单与知识库行；publisher 与 verifier 仍保持独立节点。
-`runtime.hygiene` 也已成为 `publication_checks/` 下首个可独立测试的检查，且不改变
+`runtime.hygiene` 也已成为 `translation_agent/publication/checks/` 下首个可独立测试的检查，且不改变
 既有报告 ID、schema 或顺序。剩余 argv legacy seam 是 OCR、目录、校勘和翻译。
 
-EPUB 走 `pipeline_graph/epub.py` 的独立 first-class Graph：它绑定源 ZIP 字节，
+EPUB 走 `translation_agent/pipeline/graph/epub.py` 的独立 first-class Graph：它绑定源 ZIP 字节，
 按 spine 重建不可变语义章节和 canonical `TranslationUnit`，可选运行或回填翻译，
 物化唯一 reader bundle，再发布 EPUB/Word。它不伪造 PDF 页、OCR 或 TOC 节点，
 但复用同一个 Graph 内核、缓存指纹、事件日志和输出目录锁。
@@ -244,7 +229,7 @@ EPUB 走 `pipeline_graph/epub.py` 的独立 first-class Graph：它绑定源 ZIP
 设置，不调用模型，也不生成出版物：
 
 ```bash
-python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+python translation_agent/cli/graph_pipeline.py "book/input.pdf" -o "outputs/input" \
   --phase all --config pipeline.toml \
   --recipe recipes/full-publication.toml --plan
 ```
@@ -259,17 +244,17 @@ Recipe 只描述“启用哪些节点、禁用哪些节点、需要哪些最终�
 
 ```bash
 # 完整版本：章节 Markdown、知识库、EPUB、Word、参考 PDF 和发布验收
-python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+python translation_agent/cli/graph_pipeline.py "book/input.pdf" -o "outputs/input" \
   --phase all --config pipeline.toml \
   --recipe recipes/full-publication.toml
 
 # 已是中文的 PDF：OCR、目录、章节 Markdown，只发布 Word
-python graph_pipeline.py "book/中文书.pdf" -o "outputs/中文书" \
+python translation_agent/cli/graph_pipeline.py "book/中文书.pdf" -o "outputs/中文书" \
   --phase all --config pipeline.toml \
   --recipe recipes/chinese-pdf-word.toml
 
 # 使用 PDF 内置 outline 代替目录 LLM，只发布 Word
-python graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书" \
+python translation_agent/cli/graph_pipeline.py "book/有书签的书.pdf" -o "outputs/有书签的书" \
   --phase all --config pipeline.toml \
   --recipe recipes/outline-word.toml
 ```
@@ -376,7 +361,7 @@ stage identity 按 PDF 页保存；局部执行只更新所选页，随后全书
 的旧输出，确认 PDF 无误后可仅在首次运行增加 `--adopt-existing-output`；该操作
 要求检查点恰好覆盖源 PDF 的 `1..N` 全部页面。无法确认来源时应使用新目录。
 
-`book_pipeline.py` 的公共 `main()` 与 Graph 共用同一个
+`translation_agent/pipeline/book_pipeline.py` 的公共 `main()` 与 Graph 共用同一个
 `.pipeline_graph/output.lock`，所以两个入口不能同时改写同一输出目录。Graph
 持锁期间只通过内部 unlocked seam 调用旧阶段，以避免嵌套自锁；外部代码仍应
 调用公共 CLI/API，不能直接调用这个内部 seam。`output.lock` 文件在释放后仍会
@@ -393,8 +378,8 @@ Word、EPUB 与参考 PDF 的文件名随有效书名变化。Graph 在
 低代码 API 使用 `GraphRunRequest` 包装原有 `RunRequest`：
 
 ```python
-from pipeline_graph import NodeResult, NodeSpec
-from translation_agent_api import GraphRunRequest, RunRequest, prepare_graph
+from translation_agent.pipeline.graph import NodeResult, NodeSpec
+from translation_agent.runtime.translation_agent_api import GraphRunRequest, RunRequest, prepare_graph
 
 request = GraphRunRequest(
     pipeline=RunRequest(
@@ -487,7 +472,7 @@ enable = ["acme.cleanup_headers"]
 调用者还必须单独授权，Recipe 本身不能给插件执行权限：
 
 ```bash
-python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+python translation_agent/cli/graph_pipeline.py "book/input.pdf" -o "outputs/input" \
   --phase all --config pipeline.toml --recipe recipes/acme.toml \
   --allow-plugin acme_cleanup
 ```
@@ -512,7 +497,7 @@ allowlist 只是显式授权，不是沙箱或代码签名。加载 entry point 
 
 ```bash
 # 单次命令启用
-python graph_pipeline.py "book/input.pdf" -o "outputs/input" \
+python translation_agent/cli/graph_pipeline.py "book/input.pdf" -o "outputs/input" \
   --phase all --config pipeline.toml --include-proofread
 
 # 或在自定义 Recipe 中启用
@@ -579,12 +564,12 @@ translation-agent-web --host 127.0.0.1 --port 8501 --no-browser
 - 每章或每节一个 Markdown 文件；
 - EPUB、RAG/知识库 JSONL、PDF 书签。
 
-`book_pipeline.py` 补齐了这些环节，并让每一步都可单独运行、检查和重跑。
+`translation_agent/pipeline/book_pipeline.py` 补齐了这些环节，并让每一步都可单独运行、检查和重跑。
 
 ## 安装与配置
 
 Graph 与 Profile/Recipe TOML 需要 Python 3.11+；推荐 Python 3.12。macOS
-自带的 Python 3.9 不能直接运行 `graph_pipeline.py`。
+自带的 Python 3.9 不能直接运行 `translation_agent/cli/graph_pipeline.py`。
 
 ```bash
 python3.12 -m pip install -e .          # 核心 CLI
@@ -641,14 +626,14 @@ export GLM_CODING_API_KEY='...'
 export GLM_TOC_API_KEY='...'
 export DEEPSEEK_API_KEY='...'
 
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase all --config pipeline.toml
 ```
 
 切换模型只需选择另一个 Profile：
 
 ```bash
-python book_pipeline.py -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py -o "outputs/my_book" \
   --phase translate --config pipeline.toml \
   --translation-profile deepseek_flash \
   --translate-non-chinese --translation-source-language ja
@@ -679,7 +664,7 @@ DeepSeek 默认模型是 `deepseek-v4-flash`，OpenAI 兼容地址保持为 `htt
 断行时，可在指定页上运行独立校勘阶段：
 
 ```bash
-python book_pipeline.py -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py -o "outputs/my_book" \
   --phase proofread --config pipeline.toml \
   --proofread-profile deepseek_flash \
   --proofread-language ja \
@@ -733,7 +718,7 @@ tesseract --list-langs
 日文竖排页推荐 `jpn_vert+eng`，横排页改用 `jpn+eng`；`--tesseract-psm 3` 让 Tesseract 自动判断版面：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase ocr \
   --ocr-backend tesseract \
   --tesseract-language jpn_vert+eng \
@@ -753,19 +738,19 @@ coding-plan-mcp` 等仍可强制远端；适合整本本地 OCR、续跑失败�
 
 ```bash
 # 默认即本地优先（auto）：可用时走本地 GPU，否则自动回退云端，无需任何参数
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr
 
 # 强制本地（检查点指纹为 paddleocr-local/PP-OCRv5-…，与云端检查点互不混用）
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend paddleocr-local
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend paddleocr-local
 
 # 强制云端（备用）
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend coding-plan-mcp
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --ocr-backend coding-plan-mcp
 
 # 只补失败页（自动按连续页段批量调用 Docker，已匹配指纹的页直接命中缓存）
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --start-page 198 --end-page 198 --ocr-backend paddleocr-local
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --start-page 198 --end-page 198 --ocr-backend paddleocr-local
 
 # 或经 Profile 选用（pipeline.toml 已内置 profiles.paddleocr_local）
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --config pipeline.toml --ocr-profile paddleocr_local
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr   --config pipeline.toml --ocr-profile paddleocr_local
 ```
 
 执行体是 `tools/local_paddleocr_import.py`（渲染 → `docker compose --profile
@@ -777,7 +762,7 @@ models/` 权重已下载（见 `deploy/paddleocr/README.md` 实测配置）。�
 
 ### ZIP 图片输入先转为正向 PDF
 
-`book_pipeline.py` 的输入是 PDF，不直接读取 ZIP。图片 ZIP 必须先解压、按自然页序排序，忽略 `__MACOSX`、`.DS_Store` 等元数据文件，对每张图应用 EXIF 方向并确认正文实际朝上，再按“一张图片对应一页”合成 PDF。不要仅凭文件宽高猜方向；日文竖排书页也应保持整页正向，文字栏通常从右向左排列。建议抽查首、中、末页，确认没有 90°/180° 倒置后再运行 OCR：
+`translation_agent/pipeline/book_pipeline.py` 的输入是 PDF，不直接读取 ZIP。图片 ZIP 必须先解压、按自然页序排序，忽略 `__MACOSX`、`.DS_Store` 等元数据文件，对每张图应用 EXIF 方向并确认正文实际朝上，再按“一张图片对应一页”合成 PDF。不要仅凭文件宽高猜方向；日文竖排书页也应保持整页正向，文字栏通常从右向左排列。建议抽查首、中、末页，确认没有 90°/180° 倒置后再运行 OCR：
 
 ```text
 book-images.zip
@@ -785,7 +770,7 @@ book-images.zip
   → 自然排序（1, 2, …, 10，而不是 1, 10, 2）
   → 应用 EXIF/OSD 或人工校正旋转
   → 合成 book_正向.pdf
-  → 交给 book_pipeline.py
+  → 交给 translation_agent/pipeline/book_pipeline.py
 ```
 
 方向错误会同时降低视觉模型和 Tesseract 的识别质量；先修正源页，比翻译阶段补救可靠。
@@ -793,7 +778,7 @@ book-images.zip
 ## 一条命令完成
 
 ```bash
-python book_pipeline.py "input.pdf" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" \
   -o "outputs/my_book" \
   --phase all \
   --granularity chapter \
@@ -822,7 +807,7 @@ Coding Plan OCR 的请求节流按 API Key 指纹在本机进程间共享：同�
 ### 第一步：逐页 OCR
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase ocr
 ```
 
 OCR 结果位于 `outputs/my_book/pages/page_XXXX.json`，并同步生成便于人工复制的 `page_XXXX.md`。每页记录包含 PDF 页码、Markdown 文本、语言检测、可选译文和 OCR 模型；双页扫描的 JSON 还包含结构化物理页数组。
@@ -830,14 +815,14 @@ OCR 结果位于 `outputs/my_book/pages/page_XXXX.json`，并同步生成便于�
 如果 PDF 的每一页都有完整的可复制文本层，可跳过视觉 OCR，使用通用导入器：
 
 ```bash
-python extract_textbook_layer.py "book/input.pdf" -o "outputs/my_book" \
+python translation_agent/sources/extract_textbook_layer.py "book/input.pdf" -o "outputs/my_book" \
   --strip-leading-page-number-offset 1 --reflow
 ```
 
 也可让 Graph 以第三入口一次执行后续翻译、编译、发布与验收：
 
 ```bash
-python graph_pipeline.py "book/input.pdf" -o "outputs/my_book" --phase all \
+python translation_agent/cli/graph_pipeline.py "book/input.pdf" -o "outputs/my_book" --phase all \
   --source-mode text-pdf --text-pdf-reflow --translate-non-chinese \
   --recipe recipes/text-pdf-full-publication.toml
 ```
@@ -872,14 +857,14 @@ python graph_pipeline.py "book/input.pdf" -o "outputs/my_book" --phase all \
 可选 `replacement` 会在唯一命中后输出审定标题，缺省则保留匹配到的原文。
 目录与正文重复出现同一标题时，可用正整数 `pdf_page` 将唯一匹配限制到正文页。
 缺失或重复匹配只报告清单，不进行模糊猜测。通用导入器不再生成旧版脚本中
-针对单本日文书硬编码的 `toc.json`，导入后应运行 `book_pipeline.py --phase toc`
+针对单本日文书硬编码的 `toc.json`，导入后应运行 `translation_agent/pipeline/book_pipeline.py --phase toc`
 或提供 `--toc-json`。编译前可用
 `--required-ocr-model-prefix text-layer/pymupdf-v1` 验证来源。
 
 也可以导入旧框架结果，无需重新 OCR：
 
 ```bash
-python book_pipeline.py "input.pdf" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" \
   -o "outputs/my_book" \
   --phase ocr --skip-ocr \
   --import-ocr-dir "outputs/old_run"
@@ -892,20 +877,20 @@ python book_pipeline.py "input.pdf" \
 全自动：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase toc
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase toc
 ```
 
 如果肉眼已经确认目录在 PDF 第 6–10 页，建议显式指定，结果更稳定：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase toc --toc-pages 6-10
 ```
 
 如果目录 JSON 已手工整理，可完全跳过目录 LLM：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase toc --toc-json manual_toc.json --page-offset 12
 ```
 
@@ -938,7 +923,7 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 ### 第三、四步：章节 Markdown、EPUB、Word 和知识库
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase compile --granularity chapter \
   --require-complete-ocr --required-ocr-model-prefix coding-plan/
 ```
@@ -946,7 +931,7 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 按节合并：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase compile --granularity section
 ```
 
@@ -965,7 +950,7 @@ EPUB 导航、Word 标题和 PDF 书签均从这些结构化标题生成，而�
 章节 Markdown、EPUB、Word 与知识库 JSONL 都是阅读/检索发布层，不保留来源字段、原 PDF 分页锚点、书内页码或内部物理页边界。可审计坐标仍保留在逐页 JSON、`toc.json` 和 `chapters.json` 中。可单独重新生成 Word：
 
 ```bash
-python book_pipeline.py -o "outputs/my_book" --phase docx --title "书名"
+python translation_agent/pipeline/book_pipeline.py -o "outputs/my_book" --phase docx --title "书名"
 ```
 
 ### RAG 知识库与 embedding 接口
@@ -987,8 +972,8 @@ $env:ZHIPU_API_KEY = "在智谱控制台生成的密钥"
 构建向量索引并检索带 chunk 引用、可直接注入生成提示词的上下文：
 
 ```python
-from rag_knowledge_base import ZhipuEmbeddingProvider
-from translation_agent_api import (
+from translation_agent.knowledge.rag_knowledge_base import ZhipuEmbeddingProvider
+from translation_agent.runtime.translation_agent_api import (
     build_knowledge_base_embedding_index,
     retrieve_knowledge_base_context,
 )
@@ -1115,7 +1100,7 @@ python tools/books/epub_collection_docx.py "book/合集.epub" \
 `audit/release-report.json`。也可独立运行：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase verify --report "outputs/my_book/audit/release-report.json"
 ```
 
@@ -1124,9 +1109,9 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" \
 `--phase verify` 一起使用。不必反复生成或解析 EPUB、Word、知识库和整本 PDF：
 
 ```bash
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase compile \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase compile \
   --no-verify --no-epub --no-docx --no-kb --no-bookmarked-pdf
-python book_pipeline.py "input.pdf" -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" \
   --phase verify --chapter-id chapter-5 --chapter-id chapter-6 \
   --report "outputs/my_book/audit/chapter-report.json"
 ```
@@ -1163,10 +1148,10 @@ python tools/note_reflow.py --dry
 # 3. 写回审定稿：定义归入章末 ## 注释，正文引用标记化为 〔n〕
 python tools/note_reflow.py
 # 4. 轻量编译更新发布章
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase compile \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase compile \
   --no-verify --no-epub --no-docx --no-kb --no-bookmarked-pdf
 # 5. 增量门验收改动章
-python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase verify \
+python translation_agent/pipeline/book_pipeline.py "input.pdf" -o "outputs/my_book" --phase verify \
   --chapter-id intro --chapter-id ch-1 \
   --report "outputs/my_book/audit/chapter-report.json"
 # 6. 全部通过后正常编译一次，自动跑全书门
@@ -1181,7 +1166,7 @@ python book_pipeline.py "input.pdf" -o "outputs/my_book" --phase verify \
 程序总会保留原始 `text`。检测到日文、英文、韩文、俄文等非中文文本时，可显式开启翻译。独立的 `translate` 阶段不依赖 `toc.json`，因此可以在 OCR 仍在写入逐页检查点时分批运行：
 
 ```bash
-python book_pipeline.py -o "outputs/my_book" \
+python translation_agent/pipeline/book_pipeline.py -o "outputs/my_book" \
   --phase translate \
   --config pipeline.toml --translation-profile deepseek_flash \
   --translate-non-chinese \
@@ -1211,13 +1196,13 @@ compare-and-swap；若模型返回前 OCR 已更新，陈旧译文会被丢弃�
 
 ```bash
 # 先对已经转正的 PDF 做本地日语 OCR
-python book_pipeline.py "book_正向.pdf" -o "outputs/book" \
+python translation_agent/pipeline/book_pipeline.py "book_正向.pdf" -o "outputs/book" \
   --phase ocr --ocr-backend coding-plan-mcp \
   --ocr-reading-direction vertical \
   --ocr-cache-model-prefix coding-plan/
 
 # OCR 过程中可反复调用 DeepSeek，只翻译新出现的日文页
-python book_pipeline.py -o "outputs/book" \
+python translation_agent/pipeline/book_pipeline.py -o "outputs/book" \
   --phase translate --translate-non-chinese --target-language 简体中文 \
   --config pipeline.toml --translation-profile deepseek_flash \
   --translation-source-language ja \
@@ -1225,7 +1210,7 @@ python book_pipeline.py -o "outputs/book" \
   --translation-concurrency 16
 
 # 确认/生成 toc.json 后，编译标题级产物
-python book_pipeline.py "book_正向.pdf" -o "outputs/book" \
+python translation_agent/pipeline/book_pipeline.py "book_正向.pdf" -o "outputs/book" \
   --phase compile \
   --granularity chapter --title "中文书名" \
   --require-complete-ocr --required-ocr-model-prefix coding-plan/ \
@@ -1239,7 +1224,7 @@ python book_pipeline.py "book_正向.pdf" -o "outputs/book" \
 查看状态不需要源 PDF：
 
 ```bash
-python book_pipeline.py -o "outputs/book" --phase status \
+python translation_agent/pipeline/book_pipeline.py -o "outputs/book" --phase status \
   --config pipeline.toml
 ```
 
@@ -1249,7 +1234,7 @@ python book_pipeline.py -o "outputs/book" --phase status \
 ## Python 调用接口
 
 ```python
-from translation_agent_api import RunRequest, run_book
+from translation_agent.runtime.translation_agent_api import RunRequest, run_book
 
 result = run_book(
     RunRequest(
@@ -1315,12 +1300,12 @@ flowchart LR
 ```
 
 ```bash
-python global_knowledge_base.py sync
-python global_knowledge_base.py status
-python global_knowledge_base.py verify
-python global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrieval_cases.json
-python global_knowledge_base.py search '自然主义' --limit 5
-python global_knowledge_base.py search '私小説' --scope pages --workspace 私小説論
+python translation_agent/knowledge/global_knowledge_base.py sync
+python translation_agent/knowledge/global_knowledge_base.py status
+python translation_agent/knowledge/global_knowledge_base.py verify
+python translation_agent/knowledge/global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrieval_cases.json
+python translation_agent/knowledge/global_knowledge_base.py search '自然主义' --limit 5
+python translation_agent/knowledge/global_knowledge_base.py search '私小説' --scope pages --workspace 私小説論
 ```
 
 `sync` 只读取各工作区，不修改各书的 `knowledge_base.jsonl` 或发布报告。
@@ -1402,14 +1387,14 @@ Hit@5 ≥ 95%、跨书 Hit@1 ≥ 75%、章节 Hit@1 ≥ 70%，并检查 20 个�
 仅在需要复用旧 `_checkpoints` 时运行旧的翻译、总结和 DOCX/PDF 管线：
 
 ```bash
-python pdf_text_agent.py "input.pdf" -o outputs \
+python translation_agent/legacy/pdf_text_agent.py "input.pdf" -o outputs \
   --llm-core deepseek --ocr-llm-core mimo --keep-page-images
 ```
 
-旧入口与主入口都优先读取 `DEEPSEEK_API_BASE`；为兼容旧 `.env`，`pdf_text_agent.py` 仍接受 `DEEPSEEK_BASE_URL`。若两者同时存在，以 `DEEPSEEK_API_BASE` 为准。旧的 Windows 监控器和三份绑定单本书的脚本位于 `archive/`，不属于可维护的调用接口。
+旧入口与主入口都优先读取 `DEEPSEEK_API_BASE`；为兼容旧 `.env`，`translation_agent/legacy/pdf_text_agent.py` 仍接受 `DEEPSEEK_BASE_URL`。若两者同时存在，以 `DEEPSEEK_API_BASE` 为准。旧的 Windows 监控器和三份绑定单本书的脚本位于 `archive/`，不属于可维护的调用接口。
 
 旧流程详情保留在源码参数帮助中：
 
 ```bash
-python pdf_text_agent.py --help
+python translation_agent/legacy/pdf_text_agent.py --help
 ```

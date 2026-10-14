@@ -20,7 +20,7 @@ import sys
 import unicodedata
 from pathlib import Path
 
-import book_pipeline as legacy
+import translation_agent.pipeline.book_pipeline as legacy
 
 ABSTRACT = re.compile(r"^(?:摘\s*要|内容提要)\s*$")
 NUMBERED = re.compile(r"^[一二三四五六七八九十]+(?:、|\s{2,})\S")

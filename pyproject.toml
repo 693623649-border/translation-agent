@@ -27,65 +27,19 @@ dev = [
 ]
 
 [project.scripts]
-translation-agent = "document_pipeline:cli"
-translation-agent-doctor = "doctor:main"
-translation-agent-web = "launch_frontend:main"
-translation-agent-paddle = "paddle_native:main"
-translation-agent-repo-guard = "repository_guard:main"
-translation-agent-global-kb = "global_knowledge_base:main"
-translation-agent-kb = "knowledge_base_cli:main"
+translation-agent = "translation_agent.cli.document_pipeline:cli"
+translation-agent-doctor = "translation_agent.cli.doctor:main"
+translation-agent-web = "translation_agent.cli.launch_frontend:main"
+translation-agent-paddle = "translation_agent.ocr.paddle_native:main"
+translation-agent-repo-guard = "translation_agent.runtime.repository_guard:main"
+translation-agent-global-kb = "translation_agent.knowledge.global_knowledge_base:main"
+translation-agent-kb = "translation_agent.cli.knowledge_base_cli:main"
 
 [tool.setuptools]
 include-package-data = true
-py-modules = [
-  "book_pipeline",
-  "born_digital_pdf_import",
-  "compile_service",
-  "document_pipeline",
-  "doctor",
-  "docx_footnotes",
-  "docx_render_gate",
-  "docx_translation",
-  "docx_semantic_migration",
-  "epub_publication_verifier",
-  "epub_semantic_import",
-  "extract_textbook_layer",
-  "frontend_app",
-  "frontend_service",
-  "frontend_runtime",
-  "global_knowledge_base",
-  "graph_pipeline",
-  "kb_translation",
-  "knowledge_base_audit",
-  "knowledge_base_cli",
-  "launch_frontend",
-  "patch_translations",
-  "paddle_native",
-  "pdf_text_agent",
-  "pipeline_profiles",
-  "pipeline_runtime",
-  "product_contracts",
-  "product_paths",
-  "run_execution_service",
-  "publication_semantics",
-  "publication_service",
-  "publication_verifier",
-  "rag_knowledge_base",
-  "rag_apparatus",
-  "repository_guard",
-  "regenerate_reviewed_chapters",
-  "semantic_translation_runner",
-  "semantic_apply",
-  "semantic_ir",
-  "semantic_review",
-  "semantic_review_policy",
-  "application_service",
-  "streamlit_app",
-  "translation_agent_api",
-]
 
 [tool.setuptools.packages.find]
-include = ["pipeline_graph*", "app_pages*", "publication_checks*"]
+include = ["translation_agent*"]
 
 [tool.setuptools.data-files]
 "share/translation-agent" = ["pipeline.example.toml"]

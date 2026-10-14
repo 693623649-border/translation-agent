@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from kb_translation import (
+from translation_agent.knowledge.kb_translation import (
     KbTranslationError,
     classify_row,
     ensure_chinese_rows,

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from docx import Document
-from docx_translation import (
+from translation_agent.publication.docx_translation import (
     DocxTranslationError,
     clean_running_heads,
     needs_translation,

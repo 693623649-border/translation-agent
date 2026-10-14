@@ -34,7 +34,7 @@ translation-agent run book/input.pdf -o outputs/local-ocr \
   --start-page 1 --end-page 10
 ```
 
-也可在 `book_pipeline.py` 和 `graph_pipeline.py` 原有命令中传同一组 OCR 参数。
+也可在 `translation_agent/pipeline/book_pipeline.py` 和 `translation_agent/cli/graph_pipeline.py` 原有命令中传同一组 OCR 参数。
 省略 `--end-page` 处理到末页。高精度版使用 `--paddle-native-variant server`。
 `--paddle-native-threads` 默认 4，可设为 1–8；检测长边
 `--paddle-native-det-limit` 默认 960，可设为 320–960。

@@ -3,9 +3,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pipeline_graph import UnknownTargetError
-from pipeline_graph.book import BookGraphConfigurationError
-from translation_agent_api import (
+from translation_agent.pipeline.graph import UnknownTargetError
+from translation_agent.pipeline.graph.book import BookGraphConfigurationError
+from translation_agent.runtime.translation_agent_api import (
     GraphRunRequest,
     RunRequest,
     plan_graph,
@@ -339,7 +339,7 @@ class TranslationAgentApiTests(unittest.TestCase):
     def test_status_request_does_not_require_source_pdf(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            with patch("translation_agent_api.main", return_value=0) as mocked:
+            with patch("translation_agent.runtime.translation_agent_api.main", return_value=0) as mocked:
                 result = run_book(
                     RunRequest(output_dir=output, phase="status")
                 )
@@ -371,16 +371,16 @@ translation_profile = "deepseek_pro"
             config_path = root / "pipeline.toml"
             config_path.write_text(config, encoding="utf-8")
             with (
-                patch("translation_agent_api.main", return_value=0),
+                patch("translation_agent.runtime.translation_agent_api.main", return_value=0),
                 patch(
-                    "translation_agent_api.output_status",
+                    "translation_agent.runtime.translation_agent_api.output_status",
                     return_value={"translations_profile_fresh": 0},
                 ) as mocked_status,
                 # The selected glm_vision profile is the remote fallback; the
                 # test asserts profile-based identity, so hold the local
                 # PaddleOCR probe off (its availability is host-dependent).
-                patch("book_pipeline.paddle_local_available", return_value=False),
-                patch("book_pipeline.paddle_native_available", return_value=False),
+                patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=False),
+                patch("translation_agent.pipeline.book_pipeline.paddle_native_available", return_value=False),
             ):
                 result = run_book(
                     RunRequest(
@@ -407,7 +407,7 @@ if __name__ == "__main__":
 class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
     def test_retrieval_tuning_arguments_forward_to_knowledge_base(self) -> None:
         from unittest.mock import MagicMock
-        import translation_agent_api as api
+        import translation_agent.runtime.translation_agent_api as api
 
         knowledge_base = MagicMock()
         with patch.object(api, "RagKnowledgeBase") as open_cls:
@@ -435,7 +435,7 @@ class RetrieveKnowledgeBaseContextTests(unittest.TestCase):
 
     def test_retrieval_defaults_keep_hybrid_parity_with_cli(self) -> None:
         from unittest.mock import MagicMock
-        import translation_agent_api as api
+        import translation_agent.runtime.translation_agent_api as api
 
         knowledge_base = MagicMock()
         with patch.object(api, "RagKnowledgeBase") as open_cls:

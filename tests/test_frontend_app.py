@@ -30,7 +30,7 @@ class FrontendAppTests(unittest.TestCase):
             os.environ,
             {"TRANSLATION_AGENT_WEBUI_RUNTIME_ROOT": directory},
         ):
-            app = AppTest.from_file(str(root / "streamlit_app.py")).run(timeout=20)
+            app = AppTest.from_file(str(root / "translation_agent" / "ui" / "streamlit_app.py")).run(timeout=20)
         self.assertEqual(len(app.exception), 0)
         self.assertEqual(app.title[0].value, ":material/translate: 翻译出版工作台")
         self.assertEqual(app.header[0].value, "创建翻译任务")
@@ -38,15 +38,15 @@ class FrontendAppTests(unittest.TestCase):
 
     def test_streamlit_sources_use_native_layout_without_deprecated_width(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        sources = [root / "streamlit_app.py", *sorted((root / "app_pages").glob("*.py"))]
+        sources = [root / "translation_agent" / "ui" / "streamlit_app.py", *sorted((root / "translation_agent" / "ui" / "pages").glob("*.py"))]
         combined = "\n".join(path.read_text(encoding="utf-8") for path in sources)
         self.assertNotIn("use_container_width", combined)
         self.assertNotIn("unsafe_allow_html", combined)
         self.assertIn("st.navigation", combined)
-        self.assertIn('"app_pages/review.py"', combined)
+        self.assertIn('"pages/review.py"', combined)
         self.assertIn('"cancel_requested"', combined)
         self.assertIn("正在取消…", combined)
-        review_source = (root / "app_pages" / "review.py").read_text(
+        review_source = (root / "translation_agent" / "ui" / "pages" / "review.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("semantic_review_policy", review_source)
@@ -56,7 +56,7 @@ class FrontendAppTests(unittest.TestCase):
 class NativeOCRFrontendTests(unittest.TestCase):
     def test_native_only_job_submits_without_cloud_credentials(self):
         import fitz
-        from application_service import ApplicationService
+        from translation_agent.ui.application_service import ApplicationService
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as folder:
             source = Path(folder) / 'input.pdf'
@@ -66,10 +66,10 @@ class NativeOCRFrontendTests(unittest.TestCase):
             with patch.dict(os.environ, {
                 'TRANSLATION_AGENT_WEBUI_RUNTIME_ROOT': folder,
                 'TRANSLATION_AGENT_WEBUI_SOURCE_ROOTS': os.pathsep.join([str(root), folder]),
-            }), patch('paddle_native.readiness', return_value=(True, 'ready')):
-                from app_pages._shared import application_service
+            }), patch('translation_agent.ocr.paddle_native.readiness', return_value=(True, 'ready')):
+                from translation_agent.ui.pages._shared import application_service
                 application_service.clear()
-                app = AppTest.from_file(str(root / 'streamlit_app.py')).run()
+                app = AppTest.from_file(str(root / 'translation_agent' / 'ui' / 'streamlit_app.py')).run()
                 app.button_group(key='new_source_mode').set_value('扫描 PDF').run()
                 app.button_group(key='new_task_scope').set_value('仅 OCR').run()
                 app.selectbox(key='new_ocr_mode').select('本机 PaddleOCR（CPU）').run()
@@ -94,8 +94,8 @@ class NativeOCRFrontendTests(unittest.TestCase):
                 application_service.clear()
 
     def test_cancelled_native_ocr_can_resume_without_credentials(self):
-        from frontend_runtime import JobRecord
-        from product_contracts import RunSpec
+        from translation_agent.ui.frontend_runtime import JobRecord
+        from translation_agent.runtime.product_contracts import RunSpec
 
         root = Path(__file__).resolve().parents[1]
         job = JobRecord(
@@ -109,10 +109,10 @@ class NativeOCRFrontendTests(unittest.TestCase):
         service.ocr_pages.return_value = []
         service.log.return_value = "cancelled"
         service.registry.events.return_value = []
-        with patch("app_pages._shared.application_service", return_value=service), patch(
-            "app_pages._shared.load_profiles_for_ui"
+        with patch("translation_agent.ui.pages._shared.application_service", return_value=service), patch(
+            "translation_agent.ui.pages._shared.load_profiles_for_ui"
         ) as profiles:
-            app = AppTest.from_file(str(root / "app_pages/jobs.py")).run()
+            app = AppTest.from_file(str(root / "translation_agent" / "ui" / "pages" / "jobs.py")).run()
             self.assertFalse(app.exception)
             self.assertFalse(app.text_input)
             profiles.assert_not_called()

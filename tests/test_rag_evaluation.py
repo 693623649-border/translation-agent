@@ -6,14 +6,14 @@ import unittest
 from pathlib import Path
 from typing import Sequence
 
-from book_pipeline import write_knowledge_base
-from rag_evaluation import (
+from translation_agent.pipeline.book_pipeline import write_knowledge_base
+from translation_agent.knowledge.rag_evaluation import (
     evaluate_corpus_growth,
     evaluate_retrieval,
     load_evaluation_cases,
     validate_evaluation_cases,
 )
-from rag_knowledge_base import RagKnowledgeBase, initialize_rag_manifest
+from translation_agent.knowledge.rag_knowledge_base import RagKnowledgeBase, initialize_rag_manifest
 
 
 ROWS = [

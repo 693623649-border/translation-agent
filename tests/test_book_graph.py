@@ -14,9 +14,10 @@ from unittest.mock import patch
 
 import fitz
 
-import book_pipeline
-import graph_pipeline
-from publication_service import (
+from translation_agent.runtime.product_paths import dotenv_path
+import translation_agent.pipeline.book_pipeline as book_pipeline
+import translation_agent.cli.graph_pipeline as graph_pipeline
+from translation_agent.publication.publication_service import (
     BOOKMARKED_PDF,
     DOCX,
     EPUB,
@@ -24,8 +25,8 @@ from publication_service import (
     PublicationVerificationRequest,
     PublicationVerificationResult,
 )
-from publication_verifier import verify_publication
-from pipeline_graph import (
+from translation_agent.publication.publication_verifier import verify_publication
+from translation_agent.pipeline.graph import (
     GraphContext,
     GraphExecutor,
     NodeExecutionError,
@@ -37,7 +38,7 @@ from pipeline_graph import (
     Recipe,
     stable_fingerprint,
 )
-from pipeline_graph.book import (
+from translation_agent.pipeline.graph.book import (
     ART_CHAPTERS,
     ART_DOCX,
     ART_EPUB,
@@ -149,7 +150,7 @@ class BookGraphPlanningTests(unittest.TestCase):
             output = Path(directory) / "output"
             output.mkdir()
             with patch(
-                "pipeline_graph.book.legacy.load_env_file"
+                "translation_agent.pipeline.graph.book.legacy.load_env_file"
             ) as load_env_file:
                 prepared = prepare_book_graph(
                     ["--output-dir", str(output), "--phase", "status"],
@@ -165,7 +166,7 @@ class BookGraphPlanningTests(unittest.TestCase):
             self.assertIs(prepared.context.config["load_dotenv"], False)
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 return_value=0,
             ) as legacy_main:
                 _run_phase(prepared.context, "status")
@@ -306,7 +307,7 @@ class BookGraphPlanningTests(unittest.TestCase):
                 ),
             )
 
-            with patch("pipeline_graph.book._ocr_page_handler") as ocr:
+            with patch("translation_agent.pipeline.graph.book._ocr_page_handler") as ocr:
                 result = prepared.execute()
 
             self.assertEqual(result.executed, (NODE_SOURCE, NODE_TEXT_EXTRACT))
@@ -421,31 +422,31 @@ class BookGraphPlanningTests(unittest.TestCase):
 
             with (
                 patch(
-                    "pipeline_graph.book._require_source_argument",
+                    "translation_agent.pipeline.graph.book._require_source_argument",
                     return_value=Path(directory) / "book.pdf",
                 ),
-                patch("pipeline_graph.book._materialize_pages_artifact"),
-                patch("pipeline_graph.book._materialize_toc_artifact"),
+                patch("translation_agent.pipeline.graph.book._materialize_pages_artifact"),
+                patch("translation_agent.pipeline.graph.book._materialize_toc_artifact"),
                 patch(
-                    "pipeline_graph.book.legacy.load_page_records",
+                    "translation_agent.pipeline.graph.book.legacy.load_page_records",
                     side_effect=([record], [record]),
                 ) as load_records,
                 patch(
-                    "pipeline_graph.book.legacy.normalize_cached_page_records"
+                    "translation_agent.pipeline.graph.book.legacy.normalize_cached_page_records"
                 ) as normalize_records,
                 patch(
-                    "pipeline_graph.book.legacy.load_env_file"
+                    "translation_agent.pipeline.graph.book.legacy.load_env_file"
                 ) as load_env_file,
-                patch("pipeline_graph.book.run_chapter_compile") as compile_service,
-                patch("pipeline_graph.book._run_phase") as run_phase,
-                patch("pipeline_graph.book._snapshot_chapter_drafts"),
-                patch("pipeline_graph.book._draft_chapters_artifact", return_value={"sha256": "0" * 64})
+                patch("translation_agent.pipeline.graph.book.run_chapter_compile") as compile_service,
+                patch("translation_agent.pipeline.graph.book._run_phase") as run_phase,
+                patch("translation_agent.pipeline.graph.book._snapshot_chapter_drafts"),
+                patch("translation_agent.pipeline.graph.book._draft_chapters_artifact", return_value={"sha256": "0" * 64})
             ):
                 compile_node.handler(prepared.context)
 
             run_phase.assert_not_called()
             load_env_file.assert_called_once_with(
-                Path(book_pipeline.__file__).with_name(".env")
+                dotenv_path()
             )
             self.assertEqual(load_records.call_count, 2)
             normalize_records.assert_called_once_with(output.resolve(), [record])
@@ -492,24 +493,24 @@ class BookGraphPlanningTests(unittest.TestCase):
             failure = ValueError("compile failed")
             with (
                 patch(
-                    "pipeline_graph.book._require_source_argument",
+                    "translation_agent.pipeline.graph.book._require_source_argument",
                     return_value=source,
                 ),
-                patch("pipeline_graph.book._materialize_pages_artifact"),
-                patch("pipeline_graph.book._materialize_toc_artifact"),
+                patch("translation_agent.pipeline.graph.book._materialize_pages_artifact"),
+                patch("translation_agent.pipeline.graph.book._materialize_toc_artifact"),
                 patch(
-                    "pipeline_graph.book.legacy.load_page_records",
+                    "translation_agent.pipeline.graph.book.legacy.load_page_records",
                     side_effect=([record], [record]),
                 ),
-                patch("pipeline_graph.book.legacy.normalize_cached_page_records"),
+                patch("translation_agent.pipeline.graph.book.legacy.normalize_cached_page_records"),
                 patch(
-                    "pipeline_graph.book.legacy.load_env_file"
+                    "translation_agent.pipeline.graph.book.legacy.load_env_file"
                 ) as load_env_file,
                 patch(
-                    "pipeline_graph.book.run_chapter_compile",
+                    "translation_agent.pipeline.graph.book.run_chapter_compile",
                     side_effect=failure,
                 ),
-                patch("pipeline_graph.book._snapshot_chapter_drafts") as snapshot,
+                patch("translation_agent.pipeline.graph.book._snapshot_chapter_drafts") as snapshot,
             ):
                 with self.assertRaises(LegacyStageError) as raised:
                     compile_node.handler(prepared.context)
@@ -523,21 +524,21 @@ class BookGraphPlanningTests(unittest.TestCase):
             normalization_failure = OSError("checkpoint cleanup failed")
             with (
                 patch(
-                    "pipeline_graph.book._require_source_argument",
+                    "translation_agent.pipeline.graph.book._require_source_argument",
                     return_value=source,
                 ),
-                patch("pipeline_graph.book._materialize_pages_artifact"),
-                patch("pipeline_graph.book._materialize_toc_artifact"),
+                patch("translation_agent.pipeline.graph.book._materialize_pages_artifact"),
+                patch("translation_agent.pipeline.graph.book._materialize_toc_artifact"),
                 patch(
-                    "pipeline_graph.book.legacy.load_page_records",
+                    "translation_agent.pipeline.graph.book.legacy.load_page_records",
                     return_value=[record],
                 ),
                 patch(
-                    "pipeline_graph.book.legacy.normalize_cached_page_records",
+                    "translation_agent.pipeline.graph.book.legacy.normalize_cached_page_records",
                     side_effect=normalization_failure,
                 ),
                 patch(
-                    "pipeline_graph.book.run_chapter_compile"
+                    "translation_agent.pipeline.graph.book.run_chapter_compile"
                 ) as compile_service,
             ):
                 with self.assertRaises(LegacyStageError) as raised:
@@ -583,7 +584,7 @@ class BookGraphPlanningTests(unittest.TestCase):
                 ),
             )
 
-            with patch("pipeline_graph.book._ocr_page_handler") as ocr:
+            with patch("translation_agent.pipeline.graph.book._ocr_page_handler") as ocr:
                 result = prepared.execute()
 
             self.assertEqual(
@@ -837,7 +838,7 @@ translation_profile = "text"
                 output_path.write_bytes(b"stable docx")
 
             with patch(
-                "pipeline_graph.book.legacy.build_docx",
+                "translation_agent.pipeline.graph.book.legacy.build_docx",
                 side_effect=fake_docx,
             ) as build_docx:
                 config.write_text(
@@ -931,7 +932,7 @@ translation_profile = "text"
         with (
             tempfile.TemporaryDirectory() as directory,
             patch(
-                "pipeline_graph.recipe.NodeRegistry._entry_points",
+                "translation_agent.pipeline.graph.recipe.NodeRegistry._entry_points",
                 return_value=(EntryPoint(),),
             ),
         ):
@@ -979,7 +980,7 @@ translation_profile = "text"
 
             report = output / "audit" / "word-release-report.json"
             with patch(
-                "pipeline_graph.book.run_publication_verification",
+                "translation_agent.pipeline.graph.book.run_publication_verification",
                 side_effect=_write_verification_result,
             ) as verification_service:
                 result = by_name[NODE_VERIFY_WORD].handler(prepared.context)
@@ -1049,7 +1050,7 @@ translation_profile = "text"
         with (
             tempfile.TemporaryDirectory() as directory,
             patch(
-                "pipeline_graph.recipe.NodeRegistry._entry_points",
+                "translation_agent.pipeline.graph.recipe.NodeRegistry._entry_points",
                 return_value=(EntryPoint(),),
             ),
         ):
@@ -1177,7 +1178,7 @@ translation_profile = "text"
 
             report = output / "audit" / "release-report.json"
             with patch(
-                "pipeline_graph.book.run_publication_verification",
+                "translation_agent.pipeline.graph.book.run_publication_verification",
                 side_effect=_write_verification_result,
             ) as verification_service:
                 result = by_name[NODE_VERIFY].handler(prepared.context)
@@ -1223,11 +1224,11 @@ translation_profile = "text"
             )
             with (
                 patch(
-                    "pipeline_graph.book.run_publication_verification",
+                    "translation_agent.pipeline.graph.book.run_publication_verification",
                     side_effect=_write_verification_result,
                 ) as verification_service,
                 patch(
-                    "pipeline_graph.book.legacy._main_unlocked"
+                    "translation_agent.pipeline.graph.book.legacy._main_unlocked"
                 ) as legacy_main,
             ):
                 result = verify.handler(prepared.context)
@@ -1283,7 +1284,7 @@ translation_profile = "text"
                 if node.name == NODE_VERIFY_WORD
             )
             with patch(
-                "pipeline_graph.book.run_publication_verification",
+                "translation_agent.pipeline.graph.book.run_publication_verification",
                 side_effect=_write_verification_result,
             ) as verification_service:
                 verify.handler(prepared.context)
@@ -1322,7 +1323,7 @@ translation_profile = "text"
 
             with (
                 patch(
-                    "pipeline_graph.book.run_publication_verification",
+                    "translation_agent.pipeline.graph.book.run_publication_verification",
                     side_effect=failed,
                 ),
                 self.assertRaises(LegacyStageError) as raised,
@@ -1529,7 +1530,7 @@ translation_profile = "text"
             graph = PipelineGraph([*providers, by_name[NODE_VERIFY]])
             executor = GraphExecutor(graph)
             with patch(
-                "pipeline_graph.book.run_publication_verification",
+                "translation_agent.pipeline.graph.book.run_publication_verification",
                 side_effect=verify_canonical_files,
             ) as verification_service:
                 first = executor.execute(
@@ -1586,7 +1587,7 @@ translation_profile = "text"
 
             with (
                 patch(
-                    "pipeline_graph.book.run_publication_verification"
+                    "translation_agent.pipeline.graph.book.run_publication_verification"
                 ) as verification_service,
                 self.assertRaises(BookGraphConfigurationError),
             ):
@@ -1648,7 +1649,7 @@ class BookGraphExecutionTests(unittest.TestCase):
 
             with OutputDirectoryLock(output / ".pipeline_graph" / "output.lock"):
                 with (
-                    patch("book_pipeline.build_docx") as build_docx,
+                    patch("translation_agent.pipeline.book_pipeline.build_docx") as build_docx,
                     self.assertRaises(OutputDirectoryLockedError),
                 ):
                     book_pipeline.main(argv)
@@ -1695,7 +1696,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 )
                 output_path.write_bytes(b"docx")
 
-            with patch("book_pipeline.build_docx", side_effect=fake_docx):
+            with patch("translation_agent.pipeline.book_pipeline.build_docx", side_effect=fake_docx):
                 result = prepared.execute()
 
             self.assertEqual(
@@ -1748,11 +1749,11 @@ class BookGraphExecutionTests(unittest.TestCase):
 
             with (
                 patch(
-                    "pipeline_graph.book.legacy._main_unlocked",
+                    "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                     side_effect=fake_unlocked,
                 ) as unlocked_main,
                 patch(
-                    "pipeline_graph.book.legacy.main",
+                    "translation_agent.pipeline.graph.book.legacy.main",
                     wraps=book_pipeline.main,
                 ) as public_main,
             ):
@@ -1899,7 +1900,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_proofread,
             ):
                 handler(prepared.context)
@@ -1987,7 +1988,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 required_plugins=(PagesEntryPoint.name, TocEntryPoint.name),
             )
             with patch(
-                "pipeline_graph.recipe.NodeRegistry._entry_points",
+                "translation_agent.pipeline.graph.recipe.NodeRegistry._entry_points",
                 return_value=(PagesEntryPoint(), TocEntryPoint()),
             ):
                 prepared = prepare_book_graph(
@@ -2038,10 +2039,10 @@ class BookGraphExecutionTests(unittest.TestCase):
 
             with (
                 patch(
-                    "pipeline_graph.book.run_chapter_compile",
+                    "translation_agent.pipeline.graph.book.run_chapter_compile",
                     side_effect=fake_compile,
                 ),
-                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main,
             ):
                 first = prepared.execute()
                 canonical_page = output / "pages" / "page_0001.json"
@@ -2127,7 +2128,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 required_plugins=("acme_source",),
             )
             with patch(
-                "pipeline_graph.recipe.NodeRegistry._entry_points",
+                "translation_agent.pipeline.graph.recipe.NodeRegistry._entry_points",
                 return_value=(EntryPoint(),),
             ):
                 prepared = prepare_book_graph(
@@ -2143,7 +2144,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 )
 
             with (
-                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main,
                 self.assertRaises(NodeExecutionError) as raised,
             ):
                 prepared.execute()
@@ -2254,7 +2255,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                     target_artifacts=frozenset({target}),
                 )
                 with patch(
-                    "pipeline_graph.recipe.NodeRegistry._entry_points",
+                    "translation_agent.pipeline.graph.recipe.NodeRegistry._entry_points",
                     return_value=(EntryPoint(),),
                 ):
                     prepared = prepare_book_graph(
@@ -2297,12 +2298,12 @@ class BookGraphExecutionTests(unittest.TestCase):
                     execute = prepared.execute
 
                 with (
-                    patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                    patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main,
                     patch(
-                        "pipeline_graph.book.legacy.build_bookmarked_pdf"
+                        "translation_agent.pipeline.graph.book.legacy.build_bookmarked_pdf"
                     ) as build_reference,
                     patch(
-                        "pipeline_graph.book.legacy.build_knowledge_rows_from_manifest"
+                        "translation_agent.pipeline.graph.book.legacy.build_knowledge_rows_from_manifest"
                     ) as build_rows,
                     self.assertRaises(NodeExecutionError) as raised,
                 ):
@@ -2384,7 +2385,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                     return 0
 
                 with patch(
-                    "pipeline_graph.book.legacy._main_unlocked",
+                    "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                     side_effect=fake_ocr,
                 ):
                     prepare_book_graph([*common, *first_options]).execute()
@@ -2419,7 +2420,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_operational_ocr,
             ):
                 prepare_book_graph(common).execute()
@@ -2487,7 +2488,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_ocr,
             ):
                 prepare_book_graph(
@@ -2578,7 +2579,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                     ]
                     calls: list[list[str]] = []
                     with patch(
-                        "pipeline_graph.book.legacy._main_unlocked",
+                        "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                         side_effect=lambda argv: calls.append(list(argv)) or 0,
                     ):
                         prepare_book_graph(
@@ -2649,7 +2650,7 @@ class BookGraphExecutionTests(unittest.TestCase):
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_ocr,
             ):
                 prepare_book_graph([*common, "--dpi", "180"]).execute()
@@ -2657,7 +2658,7 @@ class BookGraphExecutionTests(unittest.TestCase):
             sidecar = output / ".pipeline_graph" / "ocr_identity.json"
             original_sidecar = sidecar.read_bytes()
             with (
-                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main,
                 self.assertRaises(NodeExecutionError) as raised,
             ):
                 prepare_book_graph(
@@ -2685,7 +2686,7 @@ class BookGraphExecutionTests(unittest.TestCase):
             sidecar = output / ".pipeline_graph" / "ocr_identity.json"
 
             with (
-                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main,
                 self.assertRaises(NodeExecutionError) as raised,
             ):
                 prepare_book_graph(
@@ -2729,7 +2730,7 @@ class BookGraphExecutionTests(unittest.TestCase):
             calls: list[list[str]] = []
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=lambda argv: calls.append(list(argv)) or 0,
             ):
                 prepare_book_graph([*common, "--proofread-max-chars", "8000"]).execute()
@@ -2777,7 +2778,7 @@ translation_profile = "translation"
                 prepare_book_graph(common).execute()
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=lambda argv: calls.append(list(argv)) or 0,
             ):
                 run_with_thinking("disabled")
@@ -2819,7 +2820,7 @@ translation_profile = "translation"
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_ocr,
             ):
                 prepared.execute()
@@ -2870,7 +2871,7 @@ translation_profile = "translation"
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_ocr,
             ):
                 result = prepared.execute()
@@ -2918,7 +2919,7 @@ translation_profile = "translation"
                 output_path.write_bytes(b"docx")
 
             with patch(
-                "pipeline_graph.book.legacy.build_docx",
+                "translation_agent.pipeline.graph.book.legacy.build_docx",
                 side_effect=fake_docx,
             ):
                 result = prepared.execute()
@@ -2958,7 +2959,7 @@ translation_profile = "translation"
                 return 0
 
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=fake_ocr,
             ):
                 result = prepare_book_graph(
@@ -3081,7 +3082,7 @@ translation_profile = "translation"
                     return 1
 
                 with patch(
-                    "pipeline_graph.book.legacy.import_existing_ocr",
+                    "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                     side_effect=import_page,
                 ):
                     first = prepare_book_graph(argv, options=options).execute()
@@ -3094,7 +3095,7 @@ translation_profile = "translation"
                     imported_page.write_text("{broken", encoding="utf-8")
 
                 with patch(
-                    "pipeline_graph.book.legacy.import_existing_ocr",
+                    "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                     side_effect=import_page,
                 ) as importer:
                     second = prepare_book_graph(argv, options=options).execute()
@@ -3146,7 +3147,7 @@ translation_profile = "translation"
                 return imported
 
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr",
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                 side_effect=import_current_pages,
             ):
                 first = prepare_book_graph(argv, options=options).execute()
@@ -3158,7 +3159,7 @@ translation_profile = "translation"
 
             (source_pages / "page_0002.json").unlink()
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr",
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                 side_effect=import_current_pages,
             ) as importer:
                 second = prepare_book_graph(argv, options=options).execute()
@@ -3177,7 +3178,7 @@ translation_profile = "translation"
             )
 
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr"
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr"
             ) as cached_importer:
                 third = prepare_book_graph(argv, options=options).execute()
             self.assertEqual(third.skipped, (NODE_PAGES_IMPORT,))
@@ -3244,7 +3245,7 @@ translation_profile = "translation"
                 return 1
 
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr",
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                 side_effect=import_partial,
             ):
                 result = prepare_book_graph(argv, options=options).execute()
@@ -3309,7 +3310,7 @@ translation_profile = "translation"
                 return count
 
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr",
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                 side_effect=import_current_pages,
             ):
                 prepare_book_graph(argv, options=options).execute()
@@ -3336,7 +3337,7 @@ translation_profile = "translation"
             (source_pages / "page_0002.json").unlink()
 
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr",
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr",
                 side_effect=import_current_pages,
             ) as importer:
                 second = prepare_book_graph(argv, options=options).execute()
@@ -3363,7 +3364,7 @@ translation_profile = "translation"
             self.assertEqual(set(management["managed_pages"]), {"1"})
 
             with patch(
-                "pipeline_graph.book.legacy.import_existing_ocr"
+                "translation_agent.pipeline.graph.book.legacy.import_existing_ocr"
             ) as cached_importer:
                 third = prepare_book_graph(argv, options=options).execute()
             self.assertEqual(third.skipped, (NODE_PAGES_IMPORT,))
@@ -3565,7 +3566,7 @@ translation_profile = "translation"
                 options=BookGraphOptions(toc_source="outline"),
             )
             with (
-                patch("pipeline_graph.book.legacy.import_existing_ocr") as importer,
+                patch("translation_agent.pipeline.graph.book.legacy.import_existing_ocr") as importer,
                 self.assertRaises(NodeExecutionError),
             ):
                 second.execute()
@@ -3767,7 +3768,7 @@ translation_profile = "translation"
                 output_path.write_bytes(b"docx")
 
             with patch(
-                "pipeline_graph.book.legacy.build_docx",
+                "translation_agent.pipeline.graph.book.legacy.build_docx",
                 side_effect=build_fake_docx,
             ) as build_docx:
                 result = prepared.execute()
@@ -3853,7 +3854,7 @@ translation_profile = "translation"
             executions: list[tuple[str, ...]] = []
             skips: list[tuple[str, ...]] = []
             with patch(
-                "pipeline_graph.book.legacy.build_docx",
+                "translation_agent.pipeline.graph.book.legacy.build_docx",
                 side_effect=build_fake_docx,
             ):
                 for _ in range(4):
@@ -4000,7 +4001,7 @@ translation_profile = "translation"
             )
 
             with (
-                patch("pipeline_graph.book.legacy.build_docx") as build_docx,
+                patch("translation_agent.pipeline.graph.book.legacy.build_docx") as build_docx,
                 self.assertRaises(NodeExecutionError) as caught,
             ):
                 prepared.execute()
@@ -4073,7 +4074,7 @@ translation_profile = "translation"
             )
 
             with (
-                patch("pipeline_graph.book.legacy.build_docx") as build_docx,
+                patch("translation_agent.pipeline.graph.book.legacy.build_docx") as build_docx,
                 self.assertRaises(NodeExecutionError) as caught,
             ):
                 prepared.execute()
@@ -4309,21 +4310,21 @@ translation_profile = "translation"
                     + "\n",
                     encoding="utf-8",
                 )
-                from rag_knowledge_base import initialize_rag_manifest
+                from translation_agent.knowledge.rag_knowledge_base import initialize_rag_manifest
 
                 initialize_rag_manifest(output_path)
 
             with (
                 patch(
-                    "pipeline_graph.book.legacy.build_epub",
+                    "translation_agent.pipeline.graph.book.legacy.build_epub",
                     side_effect=fake_epub,
                 ) as build_epub,
                 patch(
-                    "pipeline_graph.book.legacy.build_knowledge_rows_from_manifest",
+                    "translation_agent.pipeline.graph.book.legacy.build_knowledge_rows_from_manifest",
                     side_effect=fake_knowledge_rows,
                 ) as build_rows,
                 patch(
-                    "pipeline_graph.book.legacy.write_knowledge_base",
+                    "translation_agent.pipeline.graph.book.legacy.write_knowledge_base",
                     side_effect=fake_write_knowledge_base,
                 ) as write_kb,
             ):
@@ -4371,7 +4372,7 @@ translation_profile = "translation"
                 options=BookGraphOptions(toc_source="outline"),
             )
 
-            with patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main:
+            with patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main:
                 result = prepared.execute()
 
             legacy_main.assert_not_called()
@@ -4411,7 +4412,7 @@ translation_profile = "translation"
                     "ocr",
                 ]
             )
-            with patch("pipeline_graph.book.legacy._main_unlocked", return_value=7):
+            with patch("translation_agent.pipeline.graph.book.legacy._main_unlocked", return_value=7):
                 with self.assertRaises(NodeExecutionError) as raised:
                     prepared.execute()
 
@@ -4438,7 +4439,7 @@ translation_profile = "translation"
                 ]
             )
             with patch(
-                "pipeline_graph.book.legacy._main_unlocked",
+                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
                 side_effect=SystemExit(2),
             ):
                 with self.assertRaises(NodeExecutionError) as raised:
@@ -4451,8 +4452,8 @@ translation_profile = "translation"
 
     def test_standalone_publishers_retire_unchanged_previous_title(self) -> None:
         cases = (
-            ("docx", ".docx", "pipeline_graph.book.legacy.build_docx"),
-            ("epub", ".epub", "pipeline_graph.book.legacy.build_epub"),
+            ("docx", ".docx", "translation_agent.pipeline.graph.book.legacy.build_docx"),
+            ("epub", ".epub", "translation_agent.pipeline.graph.book.legacy.build_epub"),
         )
         for phase, suffix, builder_name in cases:
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
@@ -4636,15 +4637,15 @@ translation_profile = "translation"
 
             with (
                 patch(
-                    "pipeline_graph.book.legacy.build_docx",
+                    "translation_agent.pipeline.graph.book.legacy.build_docx",
                     side_effect=build_docx_fake,
                 ),
                 patch(
-                    "pipeline_graph.book.legacy.build_epub",
+                    "translation_agent.pipeline.graph.book.legacy.build_epub",
                     side_effect=build_epub_fake,
                 ),
                 patch(
-                    "pipeline_graph.book.legacy.build_bookmarked_pdf",
+                    "translation_agent.pipeline.graph.book.legacy.build_bookmarked_pdf",
                     side_effect=build_reference_fake,
                 ),
             ):
@@ -4690,7 +4691,7 @@ translation_profile = "translation"
             stdout = io.StringIO()
             with (
                 patch.object(PreparedBookGraph, "execute") as execute,
-                patch("pipeline_graph.book.legacy._main_unlocked") as legacy_main,
+                patch("translation_agent.pipeline.graph.book.legacy._main_unlocked") as legacy_main,
                 contextlib.redirect_stdout(stdout),
             ):
                 exit_code = graph_pipeline.main(

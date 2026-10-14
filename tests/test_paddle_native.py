@@ -13,11 +13,11 @@ from unittest.mock import Mock, patch
 from PIL import Image
 import fitz
 
-import book_pipeline as book
-from paddle_native import (BACKEND, MODEL_FILES, NativeOptions, PaddleNativeOCR,
+import translation_agent.pipeline.book_pipeline as book
+from translation_agent.ocr.paddle_native import (BACKEND, MODEL_FILES, NativeOptions, PaddleNativeOCR,
                            identity_from_args, model_identity, options_from_args,
                            ordered_text, readiness)
-from pipeline_graph.core import OutputDirectoryLock
+from translation_agent.pipeline.graph.core import OutputDirectoryLock
 
 
 class NativeOCRTests(unittest.TestCase):
@@ -38,13 +38,13 @@ class NativeOCRTests(unittest.TestCase):
         Image.new('RGB', (2200, 3000), 'white').save(self.image)
 
     def backend(self):
-        with patch('paddle_native.readiness', return_value=(True, 'ready')):
+        with patch('translation_agent.ocr.paddle_native.readiness', return_value=(True, 'ready')):
             return PaddleNativeOCR(self.options, model_id=model_identity(self.options))
 
     def test_readiness_checks_dependencies_and_complete_models_without_importing(self):
-        with patch('paddle_native.importlib.util.find_spec', return_value=None):
+        with patch('translation_agent.ocr.paddle_native.importlib.util.find_spec', return_value=None):
             self.assertFalse(readiness(self.options)[0])
-        with patch('paddle_native.importlib.util.find_spec', return_value=object()):
+        with patch('translation_agent.ocr.paddle_native.importlib.util.find_spec', return_value=object()):
             self.assertTrue(readiness(self.options)[0])
             (self.options.models_dir / self.options.model_names[0] / 'inference.pdiparams').unlink()
             self.assertFalse(readiness(self.options)[0])
@@ -66,14 +66,14 @@ class NativeOCRTests(unittest.TestCase):
 
     def test_auto_prefers_gpu_then_cpu_then_profile_and_explicit_cloud_wins(self):
         args = book.build_parser().parse_args([])
-        with patch('book_pipeline.paddle_local_available', return_value=True):
+        with patch('translation_agent.pipeline.book_pipeline.paddle_local_available', return_value=True):
             self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'paddleocr-local')
-        with patch('book_pipeline.paddle_local_available', return_value=False), patch('book_pipeline.paddle_native_available', return_value=True):
+        with patch('translation_agent.pipeline.book_pipeline.paddle_local_available', return_value=False), patch('translation_agent.pipeline.book_pipeline.paddle_native_available', return_value=True):
             self.assertEqual(book.resolve_ocr_backend_name(args)[0], BACKEND)
             args.ocr_backend = 'glm-ocr'
             self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'glm-ocr')
         args.ocr_backend = 'auto'
-        with patch('book_pipeline.paddle_local_available', return_value=False), patch('book_pipeline.paddle_native_available', return_value=False):
+        with patch('translation_agent.pipeline.book_pipeline.paddle_local_available', return_value=False), patch('translation_agent.pipeline.book_pipeline.paddle_native_available', return_value=False):
             self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'coding-plan-mcp')
 
     def test_horizontal_and_vertical_ordering_and_malformed_results(self):
@@ -107,7 +107,7 @@ class NativeOCRTests(unittest.TestCase):
         backend = self.backend()
         backend._engine = Mock()
         backend._engine.predict.return_value = [{'rec_texts': [], 'rec_boxes': []}]
-        with patch('book_pipeline.is_visually_blank_page', return_value=(False, .5)):
+        with patch('translation_agent.pipeline.book_pipeline.is_visually_blank_page', return_value=(False, .5)):
             with self.assertRaisesRegex(RuntimeError, 'nonblank'):
                 backend.ocr_image(self.image)
         backend.close()
@@ -146,7 +146,7 @@ class NativeOCRTests(unittest.TestCase):
         engine = Mock()
         engine.predict.return_value = [{'rec_texts': [], 'rec_boxes': []}]
         factory = Mock(return_value=engine)
-        with patch('paddle_native.readiness', return_value=(True, 'ready')), patch.dict('sys.modules', {'paddleocr': types.SimpleNamespace(PaddleOCR=factory)}):
+        with patch('translation_agent.ocr.paddle_native.readiness', return_value=(True, 'ready')), patch.dict('sys.modules', {'paddleocr': types.SimpleNamespace(PaddleOCR=factory)}):
             self.assertEqual(book.main(args), 0)
             records = book.load_page_records(output)
             self.assertEqual(len(records), 2)
@@ -161,8 +161,8 @@ class NativeOCRTests(unittest.TestCase):
             self.assertEqual(engine.predict.call_count, 4)
 
     def test_product_cli_and_runspec_preserve_native_options(self):
-        from document_pipeline import build_parser, _spec_from_args
-        from run_execution_service import _graph_request
+        from translation_agent.cli.document_pipeline import build_parser, _spec_from_args
+        from translation_agent.runtime.run_execution_service import _graph_request
         args = build_parser().parse_args(['run', 'input.pdf', '--phase', 'ocr', '--no-translate', '--no-verify',
             '--ocr-backend', BACKEND, '--paddle-native-variant', 'server', '--paddle-native-det-limit', '640'])
         spec = _spec_from_args(args)
@@ -175,7 +175,7 @@ class NativeOCRTests(unittest.TestCase):
         self.assertEqual(options_from_args(parsed).det_limit, 640)
 
     def test_graph_and_execution_share_native_profile_identity(self):
-        from pipeline_graph.book import _ocr_stage_semantics, _selected_model_profiles
+        from translation_agent.pipeline.graph.book import _ocr_stage_semantics, _selected_model_profiles
         config = self.root / 'profiles.toml'
         config.write_text('''schema_version = 1
 [profiles.local]

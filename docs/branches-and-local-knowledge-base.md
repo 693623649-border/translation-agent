@@ -66,7 +66,7 @@ cd /Users/dddkazusa/translation-agent
 
 目录、校勘和翻译阶段仍使用所选 Profile 的文本模型；本机 OCR 不等于整条流程离线。
 原文无需翻译时加 `--no-translate`。有文字层的 PDF 使用 `--source-mode text-pdf`。
-如已有人工目录，可用 `book_pipeline.py --phase toc --toc-json ... --page-offset ...`
+如已有人工目录，可用 `translation_agent/pipeline/book_pipeline.py --phase toc --toc-json ... --page-offset ...`
 导入，避免模型识别目录。完整报告保留 OCR 人工抽样、语义评审、Word 渲染等门槛；
 按报告修复后重跑，不能把 `--no-verify` 作为正式发布的替代。
 
@@ -102,13 +102,13 @@ Git 提交只保存代码、测试和文档。`outputs/`、SQLite、原书和本
 
 ```bash
 cd /Users/dddkazusa/translation-agent
-.venv/bin/python global_knowledge_base.py \
+.venv/bin/python translation_agent/knowledge/global_knowledge_base.py \
   --db /Users/dddkazusa/translation-agent/global_knowledge_base.sqlite3 \
   sync --outputs /Users/dddkazusa/translation-agent/outputs
-.venv/bin/python global_knowledge_base.py status
-.venv/bin/python global_knowledge_base.py verify
-.venv/bin/python global_knowledge_base.py search '自然主义' --limit 5
-.venv/bin/python global_knowledge_base.py search '私小説' \
+.venv/bin/python translation_agent/knowledge/global_knowledge_base.py status
+.venv/bin/python translation_agent/knowledge/global_knowledge_base.py verify
+.venv/bin/python translation_agent/knowledge/global_knowledge_base.py search '自然主义' --limit 5
+.venv/bin/python translation_agent/knowledge/global_knowledge_base.py search '私小説' \
   --workspace 私小説論 --scope pages
 ```
 
@@ -128,7 +128,7 @@ cd /Users/dddkazusa/translation-agent
 在加载本仓库模块的 Python 环境里调用：
 
 ```python
-from global_knowledge_base import search, sync_outputs
+from translation_agent.knowledge.global_knowledge_base import search, sync_outputs
 
 db = "/Users/dddkazusa/translation-agent/global_knowledge_base.sqlite3"
 sync_outputs("/Users/dddkazusa/translation-agent/outputs", db)
@@ -149,7 +149,7 @@ hits = search("自然主义", db_path=db, limit=5)
 带目录 PDF 产物被改动都会判定为 `stale`。
 
 ```bash
-.venv/bin/python global_knowledge_base.py evaluate \
+.venv/bin/python translation_agent/knowledge/global_knowledge_base.py evaluate \
   --cases tests/fixtures/global_kb_retrieval_cases.json
 ```
 

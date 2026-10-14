@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from publication_service import (
+from translation_agent.publication.publication_service import (
     BOOKMARKED_PDF,
     DOCX,
     EPUB,
@@ -59,7 +59,7 @@ class PublicationServiceTests(unittest.TestCase):
                 chapter_ids=("chapter-1", "chapter-2"),
             )
             with patch(
-                "publication_service.verify_publication",
+                "translation_agent.publication.publication_service.verify_publication",
                 return_value={"ok": True, "release_ready": True},
             ) as verifier:
                 result = run_publication_verification(request)
@@ -97,7 +97,7 @@ class PublicationServiceTests(unittest.TestCase):
                 required_artifacts=frozenset({EPUB, BOOKMARKED_PDF}),
             )
             with patch(
-                "publication_service.verify_publication",
+                "translation_agent.publication.publication_service.verify_publication",
                 return_value={"ok": False},
             ) as verifier:
                 result = run_publication_verification(request)

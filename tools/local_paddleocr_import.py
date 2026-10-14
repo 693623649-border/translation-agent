@@ -133,7 +133,7 @@ def _render_pages(
     reuse: bool,
     pages: Iterable[int],
 ) -> None:
-    from book_pipeline import render_pdf_page
+    from translation_agent.pipeline.book_pipeline import render_pdf_page
 
     params = _render_params(args)
     pending = [
@@ -183,7 +183,7 @@ def _docker_path(host_path: Path) -> str:
 
 
 def _model_id(args: argparse.Namespace) -> str:
-    from book_pipeline import paddle_local_model_id
+    from translation_agent.pipeline.book_pipeline import paddle_local_model_id
 
     return paddle_local_model_id(
         det_variant=args.det_variant,
@@ -306,7 +306,7 @@ def _validate_pages(work_dir: Path, pages: Iterable[int], model_id: str) -> None
 def _import_records(
     work_dir: Path, output_dir: Path, pages: Iterable[int]
 ) -> None:
-    from book_pipeline import import_existing_ocr
+    from translation_agent.pipeline.book_pipeline import import_existing_ocr
 
     expected = len(list(pages))
     imported = import_existing_ocr(work_dir, output_dir)

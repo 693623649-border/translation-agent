@@ -6,9 +6,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-import semantic_apply
-from semantic_apply import SemanticApplyError, validate_translation_set
-from semantic_ir import ReviewDecision, SemanticContractError, SourceLocator
+import translation_agent.semantic.semantic_apply as semantic_apply
+from translation_agent.semantic.semantic_apply import SemanticApplyError, validate_translation_set
+from translation_agent.semantic.semantic_ir import ReviewDecision, SemanticContractError, SourceLocator
 
 
 def _source_unit(markdown: str) -> dict[str, object]:

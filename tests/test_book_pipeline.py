@@ -16,10 +16,10 @@ from unittest.mock import patch
 
 import fitz
 from PIL import Image
-from publication_service import DOCX, PublicationVerificationResult
+from translation_agent.publication.publication_service import DOCX, PublicationVerificationResult
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from book_pipeline import (
+from translation_agent.pipeline.book_pipeline import (
     ChatTranslator,
     CodingPlanVisionOCR,
     DeepSeekClient,
@@ -76,7 +76,7 @@ class UtilityTests(unittest.TestCase):
 
             with (
                 patch(
-                    "book_pipeline.run_publication_verification",
+                    "translation_agent.pipeline.book_pipeline.run_publication_verification",
                     side_effect=verify,
                 ),
                 patch("builtins.print"),
@@ -122,16 +122,16 @@ class UtilityTests(unittest.TestCase):
             argv = ["--output-dir", str(output), "--phase", "status"]
 
             with (
-                patch("book_pipeline.load_env_file") as loader,
-                patch("book_pipeline._main_unlocked", return_value=0) as unlocked,
+                patch("translation_agent.pipeline.book_pipeline.load_env_file") as loader,
+                patch("translation_agent.pipeline.book_pipeline._main_unlocked", return_value=0) as unlocked,
             ):
                 self.assertEqual(main(argv), 0)
             loader.assert_called_once()
             unlocked.assert_called_once_with(argv, load_dotenv=True)
 
             with (
-                patch("book_pipeline.load_env_file") as loader,
-                patch("book_pipeline._main_unlocked", return_value=0) as unlocked,
+                patch("translation_agent.pipeline.book_pipeline.load_env_file") as loader,
+                patch("translation_agent.pipeline.book_pipeline._main_unlocked", return_value=0) as unlocked,
             ):
                 self.assertEqual(main(argv, load_dotenv=False), 0)
             loader.assert_not_called()
@@ -851,8 +851,8 @@ class UtilityTests(unittest.TestCase):
 
             with (
                 patch.dict("os.environ", {"GLM_OCR_API_KEY": "standard-key"}, clear=True),
-                patch("book_pipeline.GlmClient", RecordingGlmOCR),
-                patch("book_pipeline.load_env_file", lambda path: None),
+                patch("translation_agent.pipeline.book_pipeline.GlmClient", RecordingGlmOCR),
+                patch("translation_agent.pipeline.book_pipeline.load_env_file", lambda path: None),
                 patch("sys.stderr", stderr),
             ):
                 result = main(
@@ -1286,7 +1286,7 @@ M.E.Sharpe, Inc., 1983.
         )
 
     def test_markdown_to_html_restores_named_entities(self) -> None:
-        from book_pipeline import markdown_to_html
+        from translation_agent.pipeline.book_pipeline import markdown_to_html
 
         output = markdown_to_html("“伦敦”①测试")
         self.assertIn("“伦敦”", output)

@@ -185,4 +185,4 @@ python verify_ocr.py --models-dir ./models   # 复用同一套脚本与权重
 
 ## 与翻译流水线的衔接（展望）
 
-`book_pipeline.py` / `extract_textbook_layer.py` 当前面向原生数字 PDF；扫描件可由本服务产出文本层后再进现有语义 DAG。衔接方式：容器以 `paddleocr ocr` CLI 批量输出 JSON，宿主机侧按页合并为 text layer。
+`translation_agent/pipeline/book_pipeline.py` / `translation_agent/sources/extract_textbook_layer.py` 当前面向原生数字 PDF；扫描件可由本服务产出文本层后再进现有语义 DAG。衔接方式：容器以 `paddleocr ocr` CLI 批量输出 JSON，宿主机侧按页合并为 text layer。
