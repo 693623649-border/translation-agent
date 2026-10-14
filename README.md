@@ -1282,59 +1282,106 @@ outputs/my_book/
 └── 书名_带目录.pdf            # 原版外观 + 可复制层（若原有）+ 书签
 ```
 
-### 本机跨书知识库
+### 知识库的两条管线
 
-master 已集成 Mac 原生 OCR、向量/混合 RAG 和 SQLite/FTS5
-跨书检索，两种检索入口共用五字段 JSONL 语料。当前可将 `outputs/` 下的全部
-成品工作区同步到仓库根目录的 `global_knowledge_base.sqlite3`（已被 Git 忽略）：
+入库和调用是分开的。入库把已经出版的读者文本写成可检索语料；调用只返回
+命中片段和来源，不生成回答。两条管线都认同一份五字段 JSONL：`id`、`title`、
+`chapter_id`、`chapter_order`、`content`。SQLite 文件
+`global_knowledge_base.sqlite3` 在仓库根目录，已被 Git 忽略。
+
+#### 入库
+
+单书语料在发布图的 `core.publish.knowledge_base` 写出。节点读取清洗后的读者版
+章节 Markdown，按约 4000 字切块，不直接收逐页 OCR。`write_knowledge_base`
+同时建立 `knowledge_base.rag.json`。`--rag-embed` 再向智谱请求向量，写入
+`knowledge_base.vectors.jsonl`；向量失败只把这本书留在词法检索，不让这次发布
+失败。已有 JSONL 可以事后补向量：
+
+```bash
+translation-agent-kb register outputs/my_book
+translation-agent-kb translate-kb outputs/my_book --dry-run
+```
+
+`translate-kb` 只把非中文正文译成中文，术语对照、书目和索引保持原样，并另写
+`knowledge_base.translation.json`。目录、前言类装置可以用
+`translation-agent-kb annotate-apparatus` 标注重权，不必重建向量。
+
+跨书索引用 `sync`。它只读 `outputs/` 里带 `knowledge_base.jsonl` 或
+`chapters.json` 的工作区，在临时库建完并通过完整性检查后，再原子替换
+SQLite。它不改各书的 JSONL 或发布报告。
 
 ```mermaid
 flowchart LR
-  A[outputs/*/knowledge_base.jsonl] --> D[本地同步器]
-  B[缺失 KB 的章节 Markdown] --> D
-  C[原页 OCR / 逐页译文 / 章节存档] --> D
-  D --> E[(仓库级 SQLite + FTS5)]
-  F[DOCX / EPUB / PDF / 图片] --> G[文件清单与 SHA-256]
-  G --> E
-  E --> H[跨书检索 / 来源定位 / 验收状态过滤]
+  A[读者版章节 Markdown] --> B[knowledge_base.jsonl]
+  B --> C{可选向量 / 中文归一}
+  C --> D[sync]
+  E[缺失 JSONL 的章节 Markdown] --> D
+  F[页级 OCR、校对、译文、审定稿] --> D
+  G[DOCX / EPUB / PDF / 图片] --> D
+  D --> H[(SQLite + FTS5)]
 ```
+
+四层内容：
+
+- `reader`：JSONL；没有 JSONL 的章从 `chapters.json` 所列 Markdown 补入
+- `archive`：已被 JSONL 覆盖的章节 Markdown，以及 `reviewed_chapters/`
+- `pages`：原页 OCR、校对文本和逐页译文
+- 资产表：DOCX、EPUB、PDF 和图片的相对路径与 SHA-256
+
+正文、apparatus 或发布报告变化后重跑 `sync`。旧 schema v1 也靠同一次 `sync`
+升到 v2。`--no-verify` 的 OCR 草稿可以进索引，但 `report_status` 不会是
+`passed`；入库不表示已经校对通过。
 
 ```bash
-python translation_agent/knowledge/global_knowledge_base.py sync
+python translation_agent/knowledge/global_knowledge_base.py sync \
+  --outputs outputs
 python translation_agent/knowledge/global_knowledge_base.py status
 python translation_agent/knowledge/global_knowledge_base.py verify
-python translation_agent/knowledge/global_knowledge_base.py evaluate --cases tests/fixtures/global_kb_retrieval_cases.json
-python translation_agent/knowledge/global_knowledge_base.py search '自然主义' --limit 5
-python translation_agent/knowledge/global_knowledge_base.py search '私小説' --scope pages --workspace 私小説論
+python translation_agent/knowledge/global_knowledge_base.py evaluate \
+  --cases tests/fixtures/global_kb_retrieval_cases.json
 ```
 
-`sync` 只读取各工作区，不修改各书的 `knowledge_base.jsonl` 或发布报告。
-五字段和旧版带页码字段的 JSONL 都可导入；没有 JSONL 的工作区从
-`chapters.json` 所列的 Markdown 章节补入。已由 JSONL 覆盖的章节 Markdown 独立版本
-也存入 `archive` 层，原页 OCR、校对文本和逐页译文存入 `pages` 层；
-DOCX、EPUB、PDF 和图片以可追溯的文件路径及哈希登记。默认 `search` 只检索书目
-JSONL 和缺失章节的补入文本，`--scope pages|archive|all` 可切换范围。
-结果会显示工作区、来源文件、章节、验收报告状态和内容哈希；跨书正文检索
-默认每本最多返回一条，以免同一本书占满结果页，可用 `--per-book-cap`
-调整，或用 `--workspace` 检索指定书的更多段落。
-检索索引用项目已声明的 OpenCC 依赖统一繁简字形；请在安装了项目依赖的
-Python 环境中运行上述命令。`evaluate` 使用固定的 17 道跨书问题和 18 道
-书内章节问题，报告写入 `work/global_kb_evaluation.json`；质量门要求两组
-Hit@5 ≥ 95%、跨书 Hit@1 ≥ 75%、章节 Hit@1 ≥ 70%，并检查 20 个工作区
-及来源哈希都仍然有效。题集见 `tests/fixtures/global_kb_retrieval_cases.json`。
-命中率衡量的是检索定位，不代表原书 OCR、翻译或校对已经通过质量门。
-`--verified-only` 只返回目前具有未过期、通过的发布报告的工作区；PDF/full profile 的
-`audit/release-report.json` 与 EPUB-native 的 `audit/epub-release-report.json` 都被承认
-（规范名优先）。
-原页及旧版语料可能未经当前质量门验收，入库不等于已校对通过。
-`verify` 可检查来源有无新增、删除或改动。工作区内容发生变化后重新运行
-`sync`；数据库在完整构建并通过 SQLite
-完整性检查后才会替换旧索引。
+`verify` 对照来源文件和资产哈希，发现新增、删除或改动。`evaluate` 用固定的
+17 道跨书题和 18 道书内题，报告写到 `work/global_kb_evaluation.json`。质量门
+要求两组 Hit@5 ≥ 95%、跨书 Hit@1 ≥ 75%、章节 Hit@1 ≥ 70%，并核对 20 个工作区
+的来源哈希。题集是 `tests/fixtures/global_kb_retrieval_cases.json`。命中率只
+衡量检索定位。
 
-本分支已引入 deploy 分支的连接关闭、固定路径、DOCX 独立章节 ID
-兼容和目录/索引降权修复。旧版 SQLite 索引须重新 `sync` 生成 schema v2。
-安装为 wheel 或从其他目录调用时，建议显式传入 `--db` 与 `sync --outputs`
-的绝对路径，避免将数据写到安装目录；完整示例见上述维护说明。
+从其他目录或已安装的 wheel 调用时，给 `--db` 和 `sync --outputs` 绝对路径。
+本机固定路径见
+[分支分工与 macOS 知识库维护](docs/branches-and-local-knowledge-base.md)。
+
+#### 调用
+
+单书或一份 JSONL 用 `translation-agent-kb retrieve`。默认 `hybrid`：词法召回
+再和向量一起排序。没有向量，或向量调用失败时，退回词法。返回 JSON，里面有
+命中列表和拼好的 `context`。调用方自己把 `context` 交给模型。
+
+```bash
+translation-agent-kb retrieve outputs/my_book "自然主义" --top-k 5
+```
+
+跨书索引用 `translation-agent-global-kb search`，或直接调用 `search()`。
+默认只查 `reader`。FTS5 使用三字索引，并用 OpenCC 把繁简归一。跨书正文默认
+每本书最多一条，避免同一本书占满结果；`--per-book-cap` 调整上限，
+`--workspace` 只查一本书。`--scope pages|archive|all` 换层。
+`--verified-only` 只返回发布报告仍为 `passed` 的工作区。PDF/full 认
+`audit/release-report.json`，EPUB 认 `audit/epub-release-report.json`，规范名
+优先；报告之后读者语料或成品被改过，状态记为 `stale`。
+
+```bash
+translation-agent-global-kb search '自然主义' --limit 5
+translation-agent-global-kb search '私小説' --scope pages --workspace 私小説論
+```
+
+```python
+from translation_agent.knowledge.global_knowledge_base import search
+
+hits = search("自然主义", db_path="global_knowledge_base.sqlite3", limit=5)
+```
+
+每条命中带工作区、来源文件、章节、报告状态、内容哈希和摘录。这一步到摘录
+为止，不调用模型写答案。
 
 ## 常用参数
 
