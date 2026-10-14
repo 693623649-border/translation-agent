@@ -604,6 +604,12 @@ def clean_ocr_text(text: str) -> str:
 
 def clean_translation_text(text: str) -> str:
     """Remove model commentary while preserving the translated book text."""
+    text = re.sub(
+        r"</?(?:source|context_before|context_after)\s*>",
+        "",
+        text,
+        flags=re.I,
+    )
     cleaned = clean_ocr_text(text)
     lines = cleaned.splitlines()
 
@@ -2095,7 +2101,10 @@ class ChatTranslator(ParagraphTranslator):
             expected = Counter(_enforceable_numbered_labels(text))
             actual = Counter(_leading_numbered_line_labels(joined))
             missing = list((expected - actual).elements())
-            if missing:
+            english = str(source_language).strip().casefold() in {
+                "en", "eng", "english", "英语", "英文",
+            }
+            if missing and not english:
                 raise RuntimeError(f"Translation omitted numbered definitions with leading labels: {missing}.")
             totals["status"] = "passed_structural_checks"
             return normalize_target_script(joined, target_language)

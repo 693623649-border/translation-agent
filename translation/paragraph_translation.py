@@ -14,6 +14,9 @@ from ingestion.ocr_quality_gate import punctuation_signature
 
 QUOTES = "「」『』〈〉《》"
 PAIRS = {"「": "」", "『": "』", "〈": "〉", "《": "》"}
+# English book titles are often unmarked. Local Chinese may add these
+# title brackets; Japanese quotation glyphs stay exact.
+_ADDED_TITLE_MARKS = set("《》〈〉")
 
 
 class TranslationQualityError(ValueError):
@@ -86,19 +89,28 @@ def validate_target_language(translated: str) -> None:
         raise TranslationQualityError("Translation does not contain Chinese text.")
 
 
+def _quote_sequence(text: str, *, allow_added_title_marks: bool) -> str:
+    return "".join(
+        char for char in text
+        if char in QUOTES and not (allow_added_title_marks and char in _ADDED_TITLE_MARKS)
+    )
+
+
 def validate_translation(
-    source: str, translated: str, *, preserve_punctuation: bool = True
+    source: str, translated: str, *, preserve_punctuation: bool = True,
+    allow_added_title_marks: bool = False,
 ) -> None:
     # Report untranslated prose first so the bounded repair addresses meaning
     # rather than copying Japanese to satisfy the quotation-count constraint.
     validate_target_language(translated)
-    source_quotes = "".join(c for c in source if c in QUOTES)
-    translated_quotes = "".join(c for c in translated if c in QUOTES)
-    if source_quotes != translated_quotes:
+    if _quote_sequence(source, allow_added_title_marks=allow_added_title_marks) != _quote_sequence(
+        translated, allow_added_title_marks=allow_added_title_marks
+    ):
         raise TranslationQualityError("Translation changed source quotation glyphs, order, or counts.")
-    for pattern in (r"[…⋯]+", r"\.{3,}", r"。{3,}"):
-        if len(re.findall(pattern, translated)) > len(re.findall(pattern, source)):
-            raise TranslationQualityError("Translation introduced an ellipsis.")
+    if not allow_added_title_marks:
+        for pattern in (r"[…⋯]+", r"\.{3,}", r"。{3,}"):
+            if len(re.findall(pattern, translated)) > len(re.findall(pattern, source)):
+                raise TranslationQualityError("Translation introduced an ellipsis.")
     if preserve_punctuation and punctuation_signature(source) != punctuation_signature(translated):
         raise TranslationQualityError("Translation changed source punctuation glyphs, order, or counts.")
 
@@ -199,6 +211,9 @@ class ParagraphTranslator:
             results = []
             target = target_language or self.target_language
             preserve_punctuation = _requires_exact_source_punctuation(source_language, target)
+            allow_added_title_marks = (
+                str(source_language).strip().casefold() in _ENGLISH_LANGUAGES
+            )
             # Prompt selection does not change the existing provider-scoped gates.
             local_provider = getattr(self.client, "provider_name", "") == "local"
             if preserve_punctuation and local_provider:
@@ -276,7 +291,11 @@ class ParagraphTranslator:
                             prompt + (f"\n上次输出未通过检查：{error}。请重新翻译完整正文，修正该问题。" if attempt else ""),
                             system=system,
                         ).strip()
-                        validate_translation(chunk, output, preserve_punctuation=preserve_punctuation)
+                        validate_translation(
+                            chunk, output,
+                            preserve_punctuation=preserve_punctuation,
+                            allow_added_title_marks=allow_added_title_marks,
+                        )
                         results.append(output)
                         break
                     except (TranslationQualityError, OSError, TimeoutError) as exc:

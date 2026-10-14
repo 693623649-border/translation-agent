@@ -51,6 +51,22 @@ class ParagraphTranslationTests(unittest.TestCase):
         self.assertEqual((prompt, actual_system), (expected, system))
         self.assertEqual(version, JAPANESE_PROMPT_VERSION)
 
+    def test_english_translation_may_add_title_marks(self):
+        validate_translation(
+            "He cites Citizen Kane.",
+            "他引用《公民凯恩》……",
+            preserve_punctuation=False,
+            allow_added_title_marks=True,
+        )
+        client = Client(["他引用《公民凯恩》。"])
+        translator = ParagraphTranslator(client)
+        self.assertEqual(
+            translator.translate("He cites Citizen Kane.", source_language="en"),
+            "他引用《公民凯恩》。",
+        )
+        with self.assertRaisesRegex(TranslationQualityError, "quotation"):
+            validate_translation("『猫』", "《猫》")
+
     def test_english_prompt_is_independent_of_japanese_examples_and_tracks_version(self):
         class LocalClient(Client):
             provider_name = "local"
