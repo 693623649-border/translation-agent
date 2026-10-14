@@ -17,12 +17,14 @@ from book_pipeline import (
     build_bookmarked_pdf,
     build_docx,
     build_epub,
+    build_knowledge_rows_from_manifest,
     compile_chapters,
     save_page_record,
     write_knowledge_base,
 )
 from publication_verifier import (
     _canonical_docx_body_text,
+    _check_knowledge_base,
     _check_ocr_quality,
     _canonical_visible_text,
     _citation_inventory,
@@ -1271,6 +1273,60 @@ class PublicationVerifierTests(unittest.TestCase):
             {issue["code"] for issue in check["issues"]},
         )
         self.assertTrue(check["metrics"]["endnotes_present"])
+
+    def test_empty_reader_chapter_needs_no_knowledge_base_row(self) -> None:
+        output = self.root / "kb-empty-chapter"
+        chapters = output / "chapters"
+        chapters.mkdir(parents=True)
+        (chapters / "001.md").write_text("# 扉页\n", encoding="utf-8")
+        (chapters / "002.md").write_text(
+            "# 第一章\n\n正文段落。\n", encoding="utf-8"
+        )
+        manifest = [
+            {
+                "id": "cover",
+                "sequence": 1,
+                "display_title": "扉页",
+                "filename": "001.md",
+                "reviewed_override": False,
+            },
+            {
+                "id": "ch-1",
+                "sequence": 2,
+                "display_title": "第一章",
+                "filename": "002.md",
+                "reviewed_override": False,
+            },
+        ]
+        (output / "chapters.json").write_text(
+            json.dumps(manifest, ensure_ascii=False), encoding="utf-8"
+        )
+        rows = [
+            row
+            for row in build_knowledge_rows_from_manifest(
+                self.source_pdf, chapters, manifest
+            )
+            if str(row["content"]).strip()
+        ]
+        self.assertEqual([row["chapter_id"] for row in rows], ["ch-1"])
+        write_knowledge_base(output / "knowledge_base.jsonl", rows)
+        context = SimpleNamespace(
+            output_dir=output,
+            source_pdf=self.source_pdf,
+            manifest=manifest,
+            chapter_texts={
+                "cover": "# 扉页\n",
+                "ch-1": "# 第一章\n\n正文段落。\n",
+            },
+        )
+
+        check = _check_knowledge_base(context)
+
+        self.assertEqual(check["issues"], [])
+        self.assertEqual(check["metrics"]["empty_chapter_count"], 1)
+        self.assertEqual(check["metrics"]["covered_chapter_count"], 1)
+        # 空正文章节没有可比的块，视作内容一致。
+        self.assertEqual(check["metrics"]["content_match_chapter_count"], 2)
 
     def test_knowledge_base_content_tampering_is_blocked(self) -> None:
         path = self.output / "knowledge_base.jsonl"

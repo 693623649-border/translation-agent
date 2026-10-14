@@ -134,9 +134,25 @@ def _manifest(workspace: Path) -> list[dict[str, Any]]:
     return [item for item in payload if isinstance(item, dict)]
 
 
+def _release_report_path(workspace: Path) -> Path | None:
+    """Return the release report that covers one workspace, if any.
+
+    PDF/Word runs write ``audit/release-report.json``; EPUB-native runs only
+    write ``audit/epub-release-report.json`` (see ``pipeline_graph.epub``).
+    Both are accepted here so an EPUB workspace can be recognised as verified;
+    the canonical name wins when a workspace carries both reports.
+    """
+
+    for name in ("release-report.json", "epub-release-report.json"):
+        candidate = workspace / "audit" / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _report_status(workspace: Path, reader_paths: Iterable[Path]) -> str:
-    path = workspace / "audit" / "release-report.json"
-    if not path.is_file():
+    path = _release_report_path(workspace)
+    if path is None:
         return "missing"
     try:
         report = _read_json(path)

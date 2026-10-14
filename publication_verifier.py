@@ -4152,7 +4152,22 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
                 actual=encountered_orders,
             )
         )
-    missing_chapters = [chapter_id for chapter_id in manifest_by_id if not rows_by_chapter[chapter_id]]
+    # A chapter whose reader body is empty (a title page, for example) keeps no
+    # chunk: the publisher filters empty rows, so demanding coverage would fail
+    # a knowledge base that is already exactly what the publisher produced.
+    empty_chapters = {
+        str(item.get("id") or "")
+        for item in context.manifest
+        if context.chapter_texts.get(str(item.get("id") or "")) is not None
+        and not _chapter_body(
+            context.chapter_texts[str(item.get("id") or "")]
+        ).strip()
+    }
+    missing_chapters = [
+        chapter_id
+        for chapter_id in manifest_by_id
+        if chapter_id not in empty_chapters and not rows_by_chapter[chapter_id]
+    ]
     if missing_chapters:
         issues.append(
             _issue(
@@ -4237,6 +4252,7 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
             "covered_chapter_count": sum(bool(rows_by_chapter[key]) for key in manifest_by_id),
             "content_match_chapter_count": content_match_count,
             "chapter_count": len(manifest_by_id),
+            "empty_chapter_count": len(empty_chapters),
             "rag_manifest_path": str(rag_manifest_path),
             "rag_lexical_status": (
                 "ready" if rag_embedding_status is not None else "invalid"

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "description": "Human-curated local corpus queries: cross-book topical discovery and within-book chapter finding. Backup is tested only as a scoped chapter case.",
-  "expected_workspaces": 18,
+  "expected_workspaces": 20,
   "top_k": 5,
   "thresholds": {
     "cross_book": {

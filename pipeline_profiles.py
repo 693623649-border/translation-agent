@@ -35,6 +35,12 @@ PIPELINE_FIELDS = frozenset(
         "proofread_profile",
     }
 )
+# ``thinking`` speaks two provider dialects.  ``enabled``/``disabled``/``omit``
+# keep the original ``thinking.type`` payload, while ``low``/``high``/``max``
+# select an OpenAI-style ``reasoning_effort`` level.  DeepSeek ``deepseek-flash``
+# and ``deepseek-v4-pro`` expose exactly these three reasoning levels.
+REASONING_EFFORT_VALUES = ("low", "high", "max")
+THINKING_VALUES = ("enabled", "disabled", "omit") + REASONING_EFFORT_VALUES
 
 
 @dataclass(frozen=True)
@@ -221,9 +227,10 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
                 f"Profile {name!r} timeout and concurrency must be positive."
             )
         thinking = str(raw.get("thinking", "disabled")).strip().lower()
-        if thinking not in {"enabled", "disabled", "omit"}:
+        if thinking not in THINKING_VALUES:
             raise ValueError(
-                f"Profile {name!r} thinking must be enabled, disabled, or omit."
+                f"Profile {name!r} thinking must be one of "
+                f"{', '.join(THINKING_VALUES)}."
             )
         profiles[name] = ModelProfile(
             name=name,

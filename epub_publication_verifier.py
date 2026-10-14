@@ -28,9 +28,11 @@ from publication_semantics import (
 from semantic_review import SemanticReviewError
 from semantic_review_policy import validate_semantic_review
 
+import knowledge_base_audit
+
 
 SCHEMA_VERSION = 1
-VERIFIER_VERSION = "epub-publication-verifier-v3"
+VERIFIER_VERSION = "epub-publication-verifier-v4"
 PUBLICATION_PROFILE = "epub"
 VERIFIER_NODE = "core.publication.verify.epub"
 DEFAULT_REPORT_NAME = "epub-release-report.json"
@@ -40,6 +42,7 @@ CHECK_IDS = (
     "semantic.reconstruction",
     "semantic.translation",
     "chapters.canonical",
+    "knowledge_base.structure",
     "epub.package",
     "epub.navigation",
     "epub.content",
@@ -64,9 +67,19 @@ class EpubPublicationVerificationError(ValueError):
 
 
 class _CheckFailure(ValueError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        issues: Iterable[Mapping[str, Any]] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        reported = [dict(issue) for issue in issues or ()]
+        self.issues: list[dict[str, Any]] = reported or [
+            {"code": code, "message": message}
+        ]
 
 
 def _sha256_file(path: Path) -> str:
@@ -410,7 +423,7 @@ class _Verifier:
                     "status": "failed",
                     "summary": str(exc),
                     "metrics": {},
-                    "issues": [{"code": exc.code, "message": str(exc)}],
+                    "issues": [dict(issue) for issue in exc.issues],
                     "warnings": [],
                 }
             )
@@ -795,6 +808,41 @@ class _Verifier:
         self.context["chapters"] = chapters
         return {"chapter_count": len(chapters), "footnote_count": total_footnotes}
 
+    def knowledge_base_structure(self) -> Mapping[str, Any]:
+        """Run the same knowledge-base gate the PDF/Word profile runs.
+
+        The EPUB publisher drops rows whose content is empty, so a chapter with
+        no reader body (a title page, for example) is allowed to contribute no
+        chunks; every other chapter must be covered by stable-id chunks that
+        rebuild its Markdown losslessly.
+        """
+
+        manifest = self.context.get("manifest")
+        chapters = self.context.get("chapters")
+        if not isinstance(manifest, list) or not isinstance(chapters, list):
+            raise _CheckFailure(
+                "prerequisite_failed",
+                "canonical chapter checks did not expose a chapter manifest",
+            )
+        expectations = knowledge_base_audit.chapter_expectations(manifest, chapters)
+        report = knowledge_base_audit.audit_knowledge_base(
+            self.output_dir / "knowledge_base.jsonl",
+            source_name=self.source_epub.name,
+            chapters=expectations,
+        )
+        issues = report["issues"]
+        if issues:
+            codes = sorted({str(issue.get("code") or "") for issue in issues})
+            raise _CheckFailure(
+                str(issues[0].get("code") or "knowledge_base_invalid"),
+                "knowledge base is not release-ready: " + ", ".join(codes),
+                issues=issues,
+            )
+        metrics = dict(report["metrics"])
+        metrics["present"] = bool(report["present"])
+        metrics.setdefault("chunk_count", 0)
+        return metrics
+
     def package(self) -> Mapping[str, Any]:
         artifact_stat = _require_regular_file(self.artifact_path, label="published EPUB")
         before_sha = _sha256_file(self.artifact_path)
@@ -1115,6 +1163,7 @@ class _Verifier:
             ("semantic.reconstruction", self.reconstruction),
             ("semantic.translation", self.translation),
             ("chapters.canonical", self.canonical_chapters),
+            ("knowledge_base.structure", self.knowledge_base_structure),
             ("epub.package", self.package),
             ("epub.navigation", self.navigation),
             ("epub.content", self.content),

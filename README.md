@@ -554,6 +554,12 @@ EPUB 默认开启原生发布质量门，目标规范化为 `publication.epub_re
 Word-native release profile，因此 Word 不能借 EPUB 报告转正。PDF 的 Word/full
 profile 保持原有语义。
 
+EPUB 原生门共九项检查，除源身份、重建审计、译文绑定、canonical 章节、EPUB
+包/nav/正文与成品哈希外，还包括 `knowledge_base.structure`：只要输出目录里存在
+`knowledge_base.jsonl`，它就必须通过与 PDF/Word profile 相同的五字段、稳定
+SHA-1 ID、章节覆盖、块顺序和无损重组审计；正文为空的章节（扉页、版权页、纯图片页）
+不要求行。文件不存在时该检查通过，表示未产出语料而非放行。
+
 启动器拒绝 `0.0.0.0` 和其他非 loopback 地址。远程服务器请保持本机绑定：
 
 ```bash
@@ -1329,10 +1335,12 @@ JSONL 和缺失章节的补入文本，`--scope pages|archive|all` 可切换范�
 检索索引用项目已声明的 OpenCC 依赖统一繁简字形；请在安装了项目依赖的
 Python 环境中运行上述命令。`evaluate` 使用固定的 17 道跨书问题和 18 道
 书内章节问题，报告写入 `work/global_kb_evaluation.json`；质量门要求两组
-Hit@5 ≥ 95%、跨书 Hit@1 ≥ 75%、章节 Hit@1 ≥ 70%，并检查 18 个工作区
+Hit@5 ≥ 95%、跨书 Hit@1 ≥ 75%、章节 Hit@1 ≥ 70%，并检查 20 个工作区
 及来源哈希都仍然有效。题集见 `tests/fixtures/global_kb_retrieval_cases.json`。
 命中率衡量的是检索定位，不代表原书 OCR、翻译或校对已经通过质量门。
-`--verified-only` 只返回目前具有未过期、通过的完整发布报告的工作区。
+`--verified-only` 只返回目前具有未过期、通过的发布报告的工作区；PDF/full profile 的
+`audit/release-report.json` 与 EPUB-native 的 `audit/epub-release-report.json` 都被承认
+（规范名优先）。
 原页及旧版语料可能未经当前质量门验收，入库不等于已校对通过。
 `verify` 可检查来源有无新增、删除或改动。工作区内容发生变化后重新运行
 `sync`；数据库在完整构建并通过 SQLite

@@ -25,7 +25,7 @@
 - Word 真实脚注包：正文脚注必须生成 `word/footnotes.xml` 中的真实 `w:footnote`，不得扁平化成正文、伪造普通段落或改用 endnotes。质量门检查 OPC content type、document relationship、引用和非保留定义 ID 的唯一性与双向闭环，并要求 `-1` separator、`0` continuation separator 两个保留节点存在且分别声明正确 `w:type`；正文不得引用保留 ID，任何孤儿引用、孤儿定义、重复 ID、非法关系、缺失 part 或意外 endnotes 都失败。报告使用稳定的 `docx_footnotes_*`、`docx_footnote_*` 和 `docx_unexpected_endnotes` issue code，并动态记录引用、定义、孤儿及保留节点计数。
 - Word 引注语义：OCR 页脚/尾注的引用落点必须可追溯到注释定义和来源页。唯一且达到阈值的落点才可自动发布；低置信度、多候选或仅靠“最近句子”启发式得到的落点必须在 `audit/` 中列出章节、来源页、标记和候选位置，并作为 blocking check，不能降级为 warning。
 - Word 渲染：包结构门通过后，在隔离、固定字体配置的 LibreOffice 或 Word 渲染环境打开 canonical DOCX 并生成 PDF/页图。检查渲染成功且页数非零、无异常空白或超密页、正文/脚注不越过页边界、表格不溢出、无非预期分页；对 20 页以上的长文还限制少于 300 字的正文内页比例，并在报告记录短页清单、renderer、字体配置和页数。渲染器或所需字体不可用时该检查必须 `skipped`/失败，使报告成为 `partial` 且非 release-ready；不能以 OOXML 结构检查代替视觉渲染门。
-- 知识库：每行合法 JSON；字段及其类型严格符合 `id`、`title`、`chapter_id`、`chapter_order`、`content` schema；提供源 PDF 时重算 SHA-1 稳定 ID；块顺序和章节顺序正确；按章拼接的完整内容与 Markdown 正文一致且无孤儿章。
+- 知识库：每行合法 JSON；字段及其类型严格符合 `id`、`title`、`chapter_id`、`chapter_order`、`content` schema；提供源 PDF 时重算 SHA-1 稳定 ID；块顺序和章节顺序正确；按章拼接的完整内容与 Markdown 正文一致且无孤儿章。正文为空的章节（扉页、版权页、纯图片页）不要求行，也不计入覆盖率分母；该检查由 `knowledge_base_audit` 统一实现，PDF/full、Word 与 EPUB-native 三个 profile 用同一套规则，EPUB 门中对应稳定 ID 为 `knowledge_base.structure`。
 - 参考 PDF：必须提供源 PDF，页数与源 PDF 相等；书签逐项等于 `toc.json` 经封面/封底过滤和层级归一后的标题、层级与目标页；逐页页面尺寸/旋转、可复制文字层和低分辨率 RGB 渲染哈希均与源 PDF 相同。书签数不要求等于编译章节数。
 - 发布卫生：Markdown、EPUB、Word、知识库无来源分页、模型说明、乱码或内部占位符；OCR、校勘、翻译的 stage lock 均未被占用；无编译临时文件或 `_page_images_<pid>_<uuid>` 崩溃遗留目录。
 
@@ -35,7 +35,7 @@ Word Recipe 使用独立的 `publication.word_report`，而不是把仅含 DOCX 
 
 ## 报告与失败处理
 
-完整多格式报告位于 `OUTPUT/audit/release-report.json`；Word 专用报告位于 `OUTPUT/audit/word-release-report.json`。检查项使用稳定 ID，数量位于 `metrics`/`summary`，每个失败项给出对应 artifact 与原因。完整发布必须同时满足 `publication_profile=full`、`mode=full`、`ok=true`、`release_ready=true`、`status=passed` 和 `summary.skipped=0`；主动跳过任一容器的 full 检查返回 `partial` 且非 release-ready。Word 发布必须满足 `publication_profile=word`、`mode=full`、`ok=true`、`release_ready=true`、`status=passed`，且 skipped 集合只能包含 EPUB、知识库和参考 PDF 三项。
+完整多格式报告位于 `OUTPUT/audit/release-report.json`；Word 专用报告位于 `OUTPUT/audit/word-release-report.json`；EPUB-native 报告位于 `OUTPUT/audit/epub-release-report.json`（`publication_profile=epub`、`mode=full`、九项检查，含 `knowledge_base.structure`）。跨书索引识别规范名 `release-report.json` 与 EPUB-native 报告（规范名优先；`word-release-report.json` 不算 release 证据），因此 EPUB 工作区同样能进入 `--verified-only`。检查项使用稳定 ID，数量位于 `metrics`/`summary`，每个失败项给出对应 artifact 与原因。完整发布必须同时满足 `publication_profile=full`、`mode=full`、`ok=true`、`release_ready=true`、`status=passed` 和 `summary.skipped=0`；主动跳过任一容器的 full 检查返回 `partial` 且非 release-ready。Word 发布必须满足 `publication_profile=word`、`mode=full`、`ok=true`、`release_ready=true`、`status=passed`，且 skipped 集合只能包含 EPUB、知识库和参考 PDF 三项。
 
 1. 先查看失败 check，不凭日志猜测。
 2. 修正最上游的 reviewed Markdown、TOC 或逐页检查点。

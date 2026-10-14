@@ -45,6 +45,7 @@ from PIL import Image
 from compile_service import ChapterCompileRequest, run_chapter_compile
 import rag_knowledge_base
 from pipeline_profiles import (
+    THINKING_VALUES,
     ModelIdentity,
     ModelProfile,
     PipelineProfiles,
@@ -734,8 +735,10 @@ class GlmClient:
         self.retries = retries
         self.provider_name = provider_name
         self.adapter_name = adapter_name
-        if thinking not in {"enabled", "disabled", "omit"}:
-            raise ValueError("thinking must be enabled, disabled, or omit")
+        if thinking not in THINKING_VALUES:
+            raise ValueError(
+                f"thinking must be one of {', '.join(THINKING_VALUES)}"
+            )
         self.thinking = thinking
         self.reading_direction = reading_direction if reading_direction in {"horizontal", "vertical"} else "horizontal"
 

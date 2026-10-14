@@ -143,13 +143,17 @@ hits = search("自然主义", db_path=db, limit=5)
 
 `verify` 检查已登记语料、资产及新文件是否与索引一致，不代表 OCR/译文已校对。
 `--verified-only` 按索引保存的发布状态过滤；发布报告变化后也应重跑 `sync`。
+工作区状态同时承认 `audit/release-report.json`（PDF/full profile 规范名）与
+`audit/epub-release-report.json`（EPUB-native 门），规范名优先；两种报告都要求
+`status=passed`，且报告之后任何 reader 语料、`toc.json`、复核决策、EPUB/DOCX/
+带目录 PDF 产物被改动都会判定为 `stale`。
 
 ```bash
 .venv/bin/python global_knowledge_base.py evaluate \
   --cases tests/fixtures/global_kb_retrieval_cases.json
 ```
 
-该题集绑定原有 18 个工作区及 35 道检索题，是语料快照验收，不是任意用户
+该题集绑定 20 个工作区及 35 道检索题，是语料快照验收，不是任意用户
 目录都应通过的通用测试。增删书籍后需人工复核并更新题集，不能为过门而
 降低阈值。日常先运行单元测试，再做自己语料的检索验收。
 

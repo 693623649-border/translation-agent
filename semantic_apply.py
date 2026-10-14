@@ -50,6 +50,7 @@ _LINK = re.compile(
     r"!?\[(?P<label>[^\]\n]*)\]\((?P<target>[^)\s]+)(?:\s+[\"'][^)]*[\"'])?\)"
 )
 _FOOTNOTE_MARKER = re.compile(r"\[\^(?P<id>[^\]\s]+)\]")
+_HTML_TAG = re.compile(r"<[^>]*>")
 _LIST_ITEM = re.compile(r"^(?P<indent>[ \t]*)(?P<marker>[-+*]|\d+[.)])\s+", re.M)
 _HEADING = re.compile(r"^(?P<marks>#{1,6})[ \t]+", re.M)
 
@@ -399,6 +400,17 @@ def _plain_text(markdown: str) -> str:
     return " ".join(value.split())
 
 
+def _prose_text(markdown: str) -> str:
+    """Return the natural-language text of a unit without inline HTML tags.
+
+    Anchor and span markup carries latin letters (``span``, ``id``,
+    ``key-chu1_4-6``) that are not prose.  A footnote reference whose only
+    prose is a short term must be judged on that term, not on its markup.
+    """
+
+    return _plain_text(_HTML_TAG.sub(" ", markdown))
+
+
 def _validate_target_language(
     source: str,
     translated: str,
@@ -406,23 +418,26 @@ def _validate_target_language(
     unit_id: str,
     target_language: str,
 ) -> None:
-    source_plain = _plain_text(source)
-    translated_plain = _plain_text(translated)
-    source_latin = len(_LATIN.findall(source_plain))
-    normalized_source = " ".join(source_plain.casefold().split())
-    normalized_translation = " ".join(translated_plain.casefold().split())
+    # Every heuristic below judges prose: inline markup (``<span id="...">``,
+    # anchor targets) carries latin letters that are not translation content.
+    normalized_source = " ".join(_prose_text(source).casefold().split())
+    normalized_translation = " ".join(_prose_text(translated).casefold().split())
+    source_latin = len(_LATIN.findall(normalized_source))
     if source_latin >= 4 and normalized_source == normalized_translation:
         raise SemanticApplyError(f"translated unit is unchanged source text: {unit_id}")
     if source_latin < 8 or target_language not in {"简体中文", "中文", "zh-CN", "zh-Hans"}:
         return
 
-    cjk_count = len(_CJK.findall(translated_plain))
-    translated_latin = len(_LATIN.findall(translated_plain))
+    cjk_count = len(_CJK.findall(normalized_translation))
+    translated_latin = len(_LATIN.findall(normalized_translation))
     if cjk_count == 0:
         raise SemanticApplyError(f"translated unit has no target-language coverage: {unit_id}")
 
     similarity = SequenceMatcher(
-        None, normalized_source, normalized_translation, autojunk=False
+        None,
+        normalized_source,
+        normalized_translation,
+        autojunk=False,
     ).ratio()
     # A token Chinese prefix attached to an otherwise copied English unit must
     # not satisfy the language gate.  Citation-heavy units remain possible

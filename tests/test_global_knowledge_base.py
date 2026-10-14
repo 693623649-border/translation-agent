@@ -1,13 +1,20 @@
 import hashlib
 import importlib.util
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
 
-from global_knowledge_base import search, status, sync_outputs, verify_sources
+from global_knowledge_base import (
+    _report_status,
+    search,
+    status,
+    sync_outputs,
+    verify_sources,
+)
 
 
 class GlobalKnowledgeBaseTests(unittest.TestCase):
@@ -199,6 +206,48 @@ class LocalFixtureTests(unittest.TestCase):
             if case["group"] == "chapter":
                 self.assertTrue(case.get("expected_chapter_id"))
                 self.assertTrue(case.get("workspace_filter"))
+
+
+class ReleaseReportDiscoveryTests(unittest.TestCase):
+    """EPUB workspaces publish audit/epub-release-report.json instead of the
+    unified audit/release-report.json; both must satisfy the cross-book status."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.workspace = Path(self.temp.name) / "book"
+        (self.workspace / "audit").mkdir(parents=True)
+
+    def _write(self, name, *, status_value="passed"):
+        path = self.workspace / "audit" / name
+        path.write_text(json.dumps({"status": status_value}), encoding="utf-8")
+        return path
+
+    def test_a_workspace_without_any_report_is_missing(self):
+        self.assertEqual(_report_status(self.workspace, []), "missing")
+
+    def test_epub_native_report_marks_the_workspace_passed(self):
+        self._write("epub-release-report.json")
+        self.assertEqual(_report_status(self.workspace, []), "passed")
+
+    def test_canonical_report_takes_precedence_over_the_epub_report(self):
+        self._write("epub-release-report.json")
+        self._write("release-report.json", status_value="failed")
+        self.assertEqual(_report_status(self.workspace, []), "failed")
+
+    def test_reader_output_newer_than_the_epub_report_is_stale(self):
+        report = self._write("epub-release-report.json")
+        reader = self.workspace / "knowledge_base.jsonl"
+        reader.write_text("{}\n", encoding="utf-8")
+        stamp = report.stat().st_mtime_ns + 10**9
+        os.utime(reader, ns=(stamp, stamp))
+        self.assertEqual(_report_status(self.workspace, [reader]), "stale")
+
+    def test_unreadable_epub_report_is_invalid(self):
+        (self.workspace / "audit" / "epub-release-report.json").write_text(
+            "not json", encoding="utf-8"
+        )
+        self.assertEqual(_report_status(self.workspace, []), "invalid")
 
 
 if __name__ == "__main__":

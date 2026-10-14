@@ -8,7 +8,11 @@ import tempfile
 import unittest
 import zipfile
 
-from book_pipeline import build_epub
+from book_pipeline import (
+    build_epub,
+    build_knowledge_rows_from_manifest,
+    write_knowledge_base,
+)
 from epub_publication_verifier import (
     CHECK_IDS,
     EpubPublicationVerificationError,
@@ -182,6 +186,48 @@ class EpubPublicationVerifierTests(unittest.TestCase):
             report["semantic"]["canonical_chapters_sha256"]
         )
         self.assertEqual(persisted, report)
+
+    def test_knowledge_base_is_gated_against_the_canonical_chapters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            source, output, artifact = self._fixture(Path(temporary))
+            manifest = json.loads(
+                (output / "chapters.json").read_text(encoding="utf-8")
+            )
+            rows = [
+                row
+                for row in build_knowledge_rows_from_manifest(
+                    source, output / "chapters", manifest
+                )
+                if str(row["content"]).strip()
+            ]
+            self.assertTrue(rows)
+            knowledge_base = output / "knowledge_base.jsonl"
+            write_knowledge_base(knowledge_base, rows)
+
+            report = verify_epub_publication(
+                output, source_epub=source, artifact_path=artifact
+            )
+            self.assertTrue(report["release_ready"], report["errors"])
+            check = next(
+                item
+                for item in report["checks"]
+                if item["id"] == "knowledge_base.structure"
+            )
+            self.assertEqual(check["status"], "passed")
+            self.assertEqual(check["metrics"]["chunk_count"], len(rows))
+            self.assertGreater(check["metrics"]["content_match_chapter_count"], 0)
+
+            tampered = [dict(row) for row in rows]
+            tampered[0]["content"] = "被篡改的正文"
+            write_knowledge_base(knowledge_base, tampered)
+            report = verify_epub_publication(
+                output, source_epub=source, artifact_path=artifact
+            )
+
+        self.assertFalse(report["release_ready"])
+        self.assertIn(
+            "knowledge_base_chapter_content_mismatch", self._issue_codes(report)
+        )
 
     def test_epub_language_labels_are_normalized_and_invalid_tags_rejected(self) -> None:
         self.assertEqual(normalize_epub_language("简体中文"), "zh-CN")

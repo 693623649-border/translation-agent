@@ -16,7 +16,12 @@ from typing import Any, Callable, Iterable
 import urllib.error
 import urllib.request
 
-from pipeline_profiles import ModelProfile, load_pipeline_profiles
+from pipeline_profiles import (
+    REASONING_EFFORT_VALUES,
+    THINKING_VALUES,
+    ModelProfile,
+    load_pipeline_profiles,
+)
 from semantic_apply import SemanticApplyError, validate_translation_pair
 from semantic_ir import SemanticContractError, normalize_translation_unit_record
 
@@ -296,8 +301,10 @@ def translate_units(
 ) -> dict[str, Any]:
     if not provider.strip() or not prompt_profile.strip():
         raise SemanticTranslationError("provider and prompt_profile must not be empty")
-    if thinking not in {"enabled", "disabled", "omit"}:
-        raise SemanticTranslationError("thinking must be enabled, disabled, or omit")
+    if thinking not in THINKING_VALUES:
+        raise SemanticTranslationError(
+            f"thinking must be one of {', '.join(THINKING_VALUES)}"
+        )
     if not 0.0 <= temperature <= 2.0:
         raise SemanticTranslationError("temperature must be between 0 and 2")
     glossary = glossary or {}; units = _read_jsonl(units_path); batches = batch_units(units, max_chars=max_chars)
@@ -443,7 +450,13 @@ def build_openai_chat_request(*, api_key: str, base_url: str, model: str, timeou
                 {"role": "user", "content": prompt},
             ],
         }
-        if thinking != "omit":
+        if thinking in REASONING_EFFORT_VALUES:
+            # OpenAI-style reasoning dial.  DeepSeek exposes ``low``/``high``/
+            # ``max`` through ``reasoning_effort``; its default level is already
+            # ``high`` but sending the level keeps the choice explicit and part
+            # of the recorded request identity.
+            payload["reasoning_effort"] = thinking
+        elif thinking != "omit":
             payload["thinking"] = {"type": thinking}
         endpoint = f"{base_url.rstrip('/')}/chat/completions"
         http_request = urllib.request.Request(
@@ -486,7 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None); parser.add_argument("--cache-dir", default=".translation-cache")
     parser.add_argument("--api-key-env", default=None); parser.add_argument("--api-base", default=None)
     parser.add_argument("--provider", default=None); parser.add_argument("--prompt-profile", default=None)
-    parser.add_argument("--thinking", choices=("enabled", "disabled", "omit"), default=None)
+    parser.add_argument("--thinking", choices=THINKING_VALUES, default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--env-file", default=str(Path(__file__).with_name(".env")))
     parser.add_argument("--max-chars", type=int, default=9000); parser.add_argument("--concurrency", type=int, default=None); parser.add_argument("--retries", type=int, default=3)

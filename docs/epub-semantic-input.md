@@ -85,10 +85,10 @@ EPUB Graph 支持以下 target artifacts：
 | `chapters.reader` | 通过结构/语言/术语复验的唯一 reader bundle |
 | `publication.epub` | 未单独验收的 EPUB 文件 |
 | `publication.docx` | 未单独验收的 Word 文件 |
+| `publication.knowledge_base` | 无分页的五字段检索语料 `knowledge_base.jsonl` 及其 RAG 清单 |
 | `publication.epub_report` | EPUB-native 正式发布报告；自动依赖 `publication.epub` |
 
-EPUB 暂不支持知识库、参考 PDF、`publication.report` 或
-`publication.word_report`。EPUB Graph 也尚未消费 Recipe TOML；传入 `--recipe`
+EPUB 暂不支持参考 PDF、`publication.report` 或 `publication.word_report`。EPUB Graph 也尚未消费 Recipe TOML；传入 `--recipe`
 会在计划阶段失败，不会静默忽略。需要收窄运行时直接使用一个或多个 `--target`。
 
 Python API：
@@ -213,16 +213,25 @@ canonical chapters 和具体 EPUB artifact。
 
 ## 5. EPUB-native 发布门与已知边界
 
-`core.publication.verify.epub` 不调用模型，依次执行八个检查：
+`core.publication.verify.epub` 不调用模型，依次执行九个检查：
 
 1. 源路径/SHA-256 与 reconstruction audit 身份；
 2. reconstruction audit、不可变源章节和脚注摘要；
 3. translation audit 与上游审计/当前 reader 的哈希绑定；
 4. canonical manifest、章节顺序、可见文本与脚注闭环；
-5. EPUB3 mimetype/container/OPF/manifest/spine/语言/资源清单；
-6. nav 顺序、标题和 fragment；
-7. XHTML 正文、脚注数及所有 `href`/`src` 内部目标；
-8. 验收期间未变化的成品 SHA-256 与大小。
+5. `knowledge_base.jsonl` 的五字段 schema、稳定 SHA-1 ID、章节覆盖、块顺序与
+   按章无损重组（与 PDF/Word profile 的 `knowledge_base.structure` 同一套
+   `knowledge_base_audit` 规则；正文为空的扉页/版权页/纯图片章节不要求行）；
+6. EPUB3 mimetype/container/OPF/manifest/spine/语言/资源清单；
+7. nav 顺序、标题和 fragment；
+8. XHTML 正文、脚注数及所有 `href`/`src` 内部目标；
+9. 验收期间未变化的成品 SHA-256 与大小。
+
+知识库检查只审计 `--target publication.knowledge_base` 产出的 `knowledge_base.jsonl`：
+文件不存在时该检查通过（未选语料不算失败），一旦存在就必须与 canonical 章节逐块
+一致。EPUB 报告文件名是 `audit/epub-release-report.json`；跨书知识库
+（`global_knowledge_base.py status` / `--verified-only`）同时承认规范名
+`audit/release-report.json` 与该 EPUB-native 报告，规范名优先。
 
 ZIP 路径穿越、重复/加密/symlink 成员、超出单成员或总解压预算、坏 CRC 都会
 fail closed。外部 `http`、`https`、`mailto` 超链接可以保留；外部图片/媒体资源

@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from semantic_translation_runner import (
     SemanticTranslationError,
+    build_openai_chat_request,
     build_prompt,
     protect_tokens,
     restore_tokens,
@@ -201,6 +202,103 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             self.assertFalse((root / "translated.jsonl").exists())
             self.assertFalse((root / "cache").exists())
 
+    def test_markup_heavy_reference_unit_allows_a_translated_term(self) -> None:
+        source = (
+            '<span id="key-chu1_4-6"></span>'
+            "[＊６](007_intro.xhtml#ref-chu1_4-6)\u3000段階論"
+        )
+        translated = (
+            '<span id="key-chu1_4-6"></span>'
+            "[＊６](007_intro.xhtml#ref-chu1_4-6)\u3000阶段论"
+        )
+        protected, _tokens = protect_tokens(source)
+        model_output = protected.replace("段階論", "阶段论")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unit = _unit("c-1", "c", 1, source)
+            units = root / "units.jsonl"
+            units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
+
+            report = translate_units(
+                units,
+                root / "translated.jsonl",
+                cache_dir=root / "cache",
+                request=lambda _: (
+                    "⟦UNIT:c-1:START⟧\n"
+                    f"{model_output}\n"
+                    "⟦UNIT:c-1:END⟧"
+                ),
+                retries=1,
+            )
+            rows = [
+                json.loads(line)
+                for line in (root / "translated.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+            self.assertEqual(report["unit_count"], 1)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["translated_markdown"], translated)
+
+    def test_markup_does_not_hide_unchanged_latin_prose(self) -> None:
+        source = (
+            '<span id="key-chu1_4-6"></span>'
+            "A complete English sentence that needs translation."
+        )
+        echoed, _tokens = protect_tokens(source)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unit = _unit("c-1", "c", 1, source)
+            units = root / "units.jsonl"
+            units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SemanticTranslationError, "unchanged source"):
+                translate_units(
+                    units,
+                    root / "translated.jsonl",
+                    cache_dir=root / "cache",
+                    request=lambda _: (
+                        "⟦UNIT:c-1:START⟧\n"
+                        f"{echoed}\n"
+                        "⟦UNIT:c-1:END⟧"
+                    ),
+                    retries=1,
+                )
+
+    def test_identical_cjk_term_inside_markup_is_accepted(self) -> None:
+        source = (
+            '<span id="key-chu1_4-10"></span>'
+            "[＊10](007_intro.xhtml#ref-chu1_4-10)\u3000京都学派"
+        )
+        echoed, _tokens = protect_tokens(source)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unit = _unit("c-1", "c", 1, source)
+            units = root / "units.jsonl"
+            units.write_text(json.dumps(unit) + "\n", encoding="utf-8")
+
+            report = translate_units(
+                units,
+                root / "translated.jsonl",
+                cache_dir=root / "cache",
+                request=lambda _: (
+                    "⟦UNIT:c-1:START⟧\n"
+                    f"{echoed}\n"
+                    "⟦UNIT:c-1:END⟧"
+                ),
+                retries=1,
+            )
+            rows = [
+                json.loads(line)
+                for line in (root / "translated.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+            self.assertEqual(report["unit_count"], 1)
+            self.assertEqual(rows[0]["translated_markdown"], source)
+
     def test_cache_identity_includes_provider_endpoint_and_prompt_settings(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -253,6 +351,54 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             one = json.loads((root / "one.jsonl").read_text(encoding="utf-8"))
             two = json.loads((root / "two.jsonl").read_text(encoding="utf-8"))
             self.assertNotEqual(one["cache_key"], two["cache_key"])
+
+
+class OpenAICompatibleTransportTests(unittest.TestCase):
+    def _capture(self, thinking: str) -> dict:
+        captured: dict = {}
+
+        class _Response:
+            def __enter__(self) -> "_Response":
+                return self
+
+            def __exit__(self, *exc: object) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return json.dumps(
+                    {"choices": [{"message": {"content": "译文"}}]}
+                ).encode("utf-8")
+
+        def _urlopen(request: object, timeout: int | None = None) -> "_Response":
+            captured.update(json.loads(request.data.decode("utf-8")))  # type: ignore[attr-defined]
+            return _Response()
+
+        with patch("urllib.request.urlopen", _urlopen):
+            request = build_openai_chat_request(
+                api_key="test-key",
+                base_url="https://api.deepseek.com",
+                model="deepseek-flash",
+                timeout=30,
+                thinking=thinking,
+            )
+            self.assertEqual(request("hi"), "译文")
+        return captured
+
+    def test_reasoning_levels_are_sent_as_reasoning_effort(self) -> None:
+        for level in ("low", "high", "max"):
+            payload = self._capture(level)
+            self.assertEqual(payload["reasoning_effort"], level)
+            self.assertNotIn("thinking", payload)
+
+    def test_legacy_thinking_dialect_is_unchanged(self) -> None:
+        disabled = self._capture("disabled")
+        self.assertEqual(disabled["thinking"], {"type": "disabled"})
+        self.assertNotIn("reasoning_effort", disabled)
+        enabled = self._capture("enabled")
+        self.assertEqual(enabled["thinking"], {"type": "enabled"})
+        omitted = self._capture("omit")
+        self.assertNotIn("thinking", omitted)
+        self.assertNotIn("reasoning_effort", omitted)
 
 
 if __name__ == "__main__":

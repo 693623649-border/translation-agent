@@ -249,6 +249,51 @@ translation_profile = "deepseek_pro"
         ):
             self.assertNotEqual(changed.fingerprint, fingerprint)
 
+    def test_reasoning_level_profile_is_accepted(self) -> None:
+        config = """
+[profiles.deepseek_flash_high]
+adapter = "openai-chat"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+credential_env = "DEEPSEEK_TEST_API_KEY"
+timeout = 900
+concurrency = 8
+thinking = "high"
+
+[pipeline]
+translation_profile = "deepseek_flash_high"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pipeline.toml"
+            path.write_text(config, encoding="utf-8")
+            loaded = load_pipeline_profiles(path)
+
+        profile = loaded.for_stage("translation")
+        assert profile is not None
+        self.assertEqual(profile.model, "deepseek-flash")
+        self.assertEqual(profile.thinking, "high")
+        self.assertEqual(loaded.for_stage("proofread").name, "deepseek_flash_high")
+
+    def test_unknown_thinking_value_is_rejected(self) -> None:
+        config = """
+[profiles.deepseek_flash_medium]
+adapter = "openai-chat"
+provider = "deepseek"
+model = "deepseek-flash"
+thinking = "medium"
+
+[pipeline]
+translation_profile = "deepseek_flash_medium"
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pipeline.toml"
+            path.write_text(config, encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                load_pipeline_profiles(path)
+
+        self.assertIn("thinking must be one of", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

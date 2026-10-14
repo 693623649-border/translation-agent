@@ -37,6 +37,7 @@ from epub_publication_verifier import (
     verify_epub_publication,
 )
 from epub_semantic_import import IMPORTER_VERSION, apply_translations, import_epub
+from pipeline_profiles import THINKING_VALUES
 from semantic_ir import SemanticContractError, TranslationUnit
 from semantic_review import REVIEW_POLICY_VERSION, SemanticReviewError
 from semantic_review_policy import validate_semantic_review
@@ -340,9 +341,9 @@ class EpubGraphOptions:
                 raise EpubGraphConfigurationError(
                     f"{label} must be a path string, Path, or None"
                 )
-        if self.translation_thinking not in {"enabled", "disabled", "omit"}:
+        if self.translation_thinking not in THINKING_VALUES:
             raise EpubGraphConfigurationError(
-                "translation_thinking must be enabled, disabled, or omit"
+                f"translation_thinking must be one of {', '.join(THINKING_VALUES)}"
             )
         if type(self.translation_temperature) not in {int, float} or not (
             0.0 <= float(self.translation_temperature) <= 2.0
