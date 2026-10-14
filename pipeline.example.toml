@@ -30,7 +30,7 @@ base_url = "http://127.0.0.1:8010/v1"
 model = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
 credential_env = "LOCAL_LLM_API_KEY"
 timeout = 600
-concurrency = 16
+concurrency = 48
 thinking = "omit"
 
 [pipeline]

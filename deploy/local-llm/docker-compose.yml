@@ -8,7 +8,7 @@
 # 用法：
 #   首次下载权重（约 15GB；本机容器可直连 huggingface.co）：
 #     docker compose --profile gpu run --rm download
-#   常驻服务（显存预算 0.70；实际占用以运行记录为准）：
+#   常驻服务（显存预算 0.70，同时序列 48；实际占用以运行记录为准）：
 #     docker compose --profile gpu up -d vllm
 #   验证：
 #     curl http://127.0.0.1:8010/v1/models
@@ -62,7 +62,7 @@ services:
         --host 0.0.0.0 --port 8010
         --max-model-len 32768
         --gpu-memory-utilization 0.70
-        --max-num-seqs 16
+        --max-num-seqs 48
         --enforce-eager
     restart: unless-stopped
 

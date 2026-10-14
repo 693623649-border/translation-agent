@@ -50,7 +50,7 @@ python -m pip show opencc-python-reimplemented
 | 模型 | `Intel/Hy-MT2-30B-A3B-int4-AutoRound` | Hy-MT2 的 Intel INT4 检查点，不能当成 BF16 的质量结论 |
 | 服务地址 | `127.0.0.1:8010` | 只暴露本机回环端口 |
 | 最大上下文 | `32768` | 单请求上限，输入与输出共享预算 |
-| 调度序列上限 | `16` | 不代表能同时运行 16 个满上下文请求 |
+| 调度序列上限 | `48` | 页级译文较短；16 路时 KV cache 大约只用三分之一 |
 | 显存利用率预算 | `0.70` | 本次从 `0.82` 调低，减少 KV cache 预分配；实际可用量以日志为准 |
 | 执行方式 | `--enforce-eager` | 保留已有配置，不在本次采集改用 CUDA graph |
 
@@ -95,7 +95,7 @@ base_url = "http://127.0.0.1:8010/v1"
 model = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
 credential_env = "LOCAL_LLM_API_KEY"
 timeout = 600
-concurrency = 16
+concurrency = 48
 thinking = "omit"
 
 [pipeline]
@@ -199,8 +199,8 @@ EPUB-native 仍按草稿边界交付。翻译审校不能代替发布检查，�
 ## 08 · 排障与停止服务
 
 - 模型端点无法连接：先查 `docker info`，再查服务日志；容器存在不表示推理服务就绪。
-- KV cache OOM：本次日志在 `0.82` 下尝试分配 10.12 GiB 失败，因此下调预算到 `0.70`。
-  预算与实际显存占用不同；降低客户端并发不一定减少已经预分配的 KV cache。
+- KV cache OOM：本次日志在 `0.82` 下尝试分配 10.12 GiB 失败，因此预算保持 `0.70`。
+  页级翻译在 16 路时 KV cache 大约只用三分之一，所以把同时序列和客户端并发提到 48，不提高显存预算。
 - `device not ready`：历史 Windows 挂载测试中出现过；改用命名卷后曾启动成功。
   这支持保留命名卷，不足以确认或宣称 TDR 根因已被根治。
 - 旧版 `v0.27.1`：历史记录在 AutoRound 混合量化解析阶段报错，已有 `v0.31.0` 成功启动证据。

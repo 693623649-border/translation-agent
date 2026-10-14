@@ -31,7 +31,7 @@ model = "Intel/Hy-MT2-30B-A3B-int4-AutoRound"
 # vLLM 未以 --api-key 启动时无需真实凭据；缺失时自动使用占位符。
 credential_env = "LOCAL_LLM_API_KEY"
 timeout = 600
-concurrency = 16
+concurrency = 48
 thinking = "omit"
 
 [pipeline]
