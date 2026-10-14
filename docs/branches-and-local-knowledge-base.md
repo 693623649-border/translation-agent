@@ -2,27 +2,38 @@
 
 ## 维护选择
 
-现在日常开发和运行统一使用 `master`：Mac 原生 CPU OCR、新书生产、DOCX 处理、
-单书/合辑 RAG 和跨书 SQLite/FTS5 索引均已合入。无需再为导入 PDF 切换分支。
+本机日常开发和运行使用独立的 `macos` 分支，工作目录是
+`/Users/dddkazusa/translation-agent`。原生 CPU OCR、新书生产、DOCX 处理、
+单书/合辑 RAG 和跨书 SQLite/FTS5 索引都在这条本地主线上维护。
+
+`macos` 从当前本机版本 `4ff0d287ffef56b58aed36dc25b4f92b94e9e520` 分出，
+保留已有的 macOS 代码与共同历史。该基线过去已经合入 macOS OCR/RAG；
+本次分支拆分不重写历史，从此独立发展。
+
+`macos` 未设置 upstream。`git fetch origin` 只刷新远端引用，可以用于比较；
+不从 `origin/master` 或 `origin/deploy/*` 执行 pull、merge、rebase，也不把
+macOS 改动自动合回 Windows/服务器分支。通用修复需要跨平台共享时，先由用户
+明确指定修复及目标分支，再单独移植、检查。发布本分支也需要用户明确要求；
+未来若设置跟踪关系，应对应专用的远端 macOS 分支。
 
 ## 各分支用途
 
-| 分支 | 合并后的用途 | 维护建议 |
+| 分支 | 用途 | 维护建议 |
 | --- | --- | --- |
-| `master` | 原生 CPU OCR、PDF/EPUB/DOCX 生产、统一 DAG、发布门、RAG、跨书索引 | 日常唯一维护主线 |
-| `codex/native-paddleocr-macos` | 本次合入的 macOS 产线历史，已提交内容包含在 master 中 | 保留作历史参照；原 worktree 尚有未提交前端工作，不删除 |
-| `codex/global-knowledge-base` | 早期知识库原型 | 已被 master 中修复版替代 |
+| `macos` | 本机 CPU OCR、PDF/EPUB/DOCX 生产、统一 DAG、发布门、RAG、跨书索引 | 本机独立开发主线 |
+| `master` / `origin/master` | 拆分时的共同历史与远端默认分支 | 保留供比较；macOS 日常开发不在此进行 |
+| `origin/deploy/paddleocr-rtx5090` / `origin/deploy/vllm-translation-rtx5090` | 远端 Windows/服务器部署线 | 独立维护，不整体合入 macOS |
+| `codex/macos-kb-integration` | 原有合并基线 worktree | 保留作历史参照 |
+| `codex/native-paddleocr-macos` | 早期 macOS 产线及前端 worktree | 保留历史和未提交前端工作，不自动合入 |
+| `codex/global-knowledge-base` | 早期知识库原型 | 保留作历史参照 |
 | `codex/debug-latest` | 过时调试快照 | 不继续开发 |
-| `origin/deploy/paddleocr-rtx5090` | GPU 部署线，仍含独立的服务器工具与修复 | 部署专用，不整体合并；通用修复按需回流 |
 
-本次合并保留 master 的统一执行服务、哈希绑定评审和原生 EPUB 发布门，
-将原 macOS 分支已提交的 31 个提交纳入历史。原生 OCR 参数通过同一执行服务
-传给 CLI/Web 后台；旧 EPUB 适配器的入库能力已迁入 DAG。OCR/编译/发布缓存
-版本已更新，防止合并后误用旧产物。
+独立分支保存已提交的代码历史；未提交改动属于对应 worktree，不能仅靠
+保留分支名备份。书籍、索引、模型和本地配置仍按下文单独维护。
 
 ## 从 PDF 添加新书
 
-首次为主干环境安装依赖；本机已有模型无需重新下载：
+首次为 macOS 分支环境安装依赖；本机已有模型无需重新下载：
 
 ```bash
 cd /Users/dddkazusa/translation-agent
@@ -73,13 +84,13 @@ cd /Users/dddkazusa/translation-agent
 
 本机核对到的路径：
 
-- 主干代码：`/Users/dddkazusa/translation-agent`。
-- macOS 产线代码：`/Users/dddkazusa/translation-agent-debug`（独立 worktree）。
+- 当前 macOS 代码（`macos` 分支）：`/Users/dddkazusa/translation-agent`。
+- 历史 macOS 前端工作（`codex/native-paddleocr-macos`）：`/Users/dddkazusa/translation-agent-debug`（独立 worktree）。
 - 现有书籍数据：`/Users/dddkazusa/translation-agent/outputs`。
 - 跨书派生索引：`/Users/dddkazusa/translation-agent/global_knowledge_base.sqlite3`。
 
-合并后在主干工作目录运行生产与检索即可。原 macOS worktree 有尚未提交的
-前端开发，已原样保留；本次仅合入其已提交内容。同一本书避免多个任务同时写入。
+在 `macos` 工作目录运行生产与检索即可。历史 macOS 前端 worktree 有尚未提交的
+开发内容，继续原样保留；本次分支拆分没有移植这些改动。同一本书避免多个任务同时写入。
 各 worktree 保留独立虚拟环境，避免 editable install 的命令指向另一条分支。
 
 Git 提交只保存代码、测试和文档。`outputs/`、SQLite、原书和本地配置已被忽略，
@@ -87,7 +98,7 @@ Git 提交只保存代码、测试和文档。`outputs/`、SQLite、原书和本
 
 ## 更新与调用跨书知识库
 
-在主干根目录、已安装项目依赖的环境中执行：
+在 `macos` 分支根目录、已安装项目依赖的环境中执行：
 
 ```bash
 cd /Users/dddkazusa/translation-agent
@@ -125,10 +136,10 @@ hits = search("自然主义", db_path=db, limit=5)
 ```
 
 此入口返回命中文段与来源，属于本地词法检索，不会自动调用大模型生成答案。
-向量 embedding、混合检索和重排现在也使用主干环境的 `translation-agent-kb`。
+向量 embedding、混合检索和重排也使用 macOS 分支环境的 `translation-agent-kb`。
 可将命中的 `content` 和来源元数据交给需要调用知识库的应用。
 
-## 验收与回流
+## 验收与独立维护
 
 `verify` 检查已登记语料、资产及新文件是否与索引一致，不代表 OCR/译文已校对。
 `--verified-only` 按索引保存的发布状态过滤；发布报告变化后也应重跑 `sync`。
@@ -142,5 +153,6 @@ hits = search("自然主义", db_path=db, limit=5)
 目录都应通过的通用测试。增删书籍后需人工复核并更新题集，不能为过门而
 降低阈值。日常先运行单元测试，再做自己语料的检索验收。
 
-后续通用 OCR、RAG 与知识库改动均从 master 开发并回流 master。GPU/macOS
-通过后端与配置区分；历史分支不自动删除，以保留未完成工作。
+后续本机 OCR、RAG 与知识库改动从 `macos` 开发并提交到 `macos`。Windows/服务器
+版本继续在其远端分支独立发展；双方不自动合并或回流。历史分支及 worktree
+不自动删除，以保留未完成工作。

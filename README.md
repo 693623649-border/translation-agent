@@ -5,6 +5,10 @@ EPUB 通过显式 Source Adapter 进入同一语义、清洗与发布契约；DA
 断点缓存和产物身份；已接入对应 verification profile 的文件必须通过发布门后才
 可以正式交付。
 
+本地 macOS 版本在 `macos` 分支独立开发。Windows/服务器远端分支独立维护，
+不自动向本分支合并、rebase 或回流；分支规则见
+[分支分工与 macOS 知识库维护](docs/branches-and-local-knowledge-base.md)。
+
 ## 本机 PaddleOCR（Mac CPU）
 
 新增原生 `paddleocr-native` 后端，支持本机识别、模型复用、页级缓存和 Web“仅 OCR”任务。
