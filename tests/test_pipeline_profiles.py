@@ -27,6 +27,14 @@ class PipelineProfileTests(unittest.TestCase):
         self.assertEqual(translation.name, "local_llm")
         self.assertEqual(translation.provider, "local")
         self.assertEqual(translation.thinking, "omit")
+        self.assertEqual(loaded.ocr_profile, "paddleocr_local")
+        self.assertEqual(loaded.toc_profile, "")
+        self.assertNotIn("glm_vision", loaded.profiles)
+        self.assertNotIn("glm_toc", loaded.profiles)
+        ocr = loaded.for_stage("ocr")
+        assert ocr is not None
+        self.assertEqual(ocr.adapter, "paddleocr-local")
+        self.assertEqual(ocr.model, "PP-OCRv6-medium")
         flash = loaded.get("deepseek_flash")
         self.assertEqual(flash.provider, "deepseek")
         self.assertEqual(flash.thinking, "enabled")
@@ -37,6 +45,10 @@ class PipelineProfileTests(unittest.TestCase):
 
         self.assertEqual(loaded.translation_profile, "deepseek_flash")
         self.assertEqual(loaded.proofread_profile, "deepseek_flash")
+        self.assertEqual(loaded.ocr_profile, "paddleocr_local")
+        self.assertEqual(loaded.toc_profile, "")
+        self.assertNotIn("glm_vision", loaded.profiles)
+        self.assertNotIn("glm_toc", loaded.profiles)
         self.assertEqual(
             loaded.for_stage("proofread").name,
             "deepseek_flash",

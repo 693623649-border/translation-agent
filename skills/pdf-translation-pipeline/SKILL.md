@@ -21,7 +21,7 @@ python -m ingestion.book_pipeline SOURCE.pdf -o OUTPUT --phase all \
 
 ## 按阶段执行
 
-1. 运行 `--phase ocr`，将每个 PDF 页保存为独立稳定检查点。默认并行 4 个 Coding Plan GLM-4.6V worker；续跑时复用匹配当前模型指纹的完成页，不要无故使用 `--force`。
+1. 运行 `--phase ocr`，将每个 PDF 页保存为独立稳定检查点。扫描页使用本地 PP-OCRv6（`--ocr-backend paddleocr-local` 或 `auto`）；续跑时复用匹配当前模型指纹的完成页，不要无故使用 `--force`。
 2. 运行 `--phase toc`，从完整候选目录文本生成 `toc.json` 并校准书内页到 PDF 页的映射。目录是一个全局结构请求，不要为了并行而拆坏上下文；证据不足时要求显式 `--toc-pages`、`--printed-pages-per-pdf-page` 或 `--page-offset`。
 3. 仅在明确要求时运行 `--phase proofread` 校勘 OCR；非中文内容运行 `--phase translate --translate-non-chinese`。OCR、校勘和翻译可按页并行，分别保留检查点与模型指纹。
 4. 运行 `--phase compile --require-complete-ocr`，按结构化标题生成章节 Markdown、EPUB、Word、知识库和带书签 PDF；翻译任务同时加 `--require-translation`。未显式指定 `--granularity` 时保持已有清单粒度，避免续跑时意外改变章节数量；编译结束会自动执行发布质量门。

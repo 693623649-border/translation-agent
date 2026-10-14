@@ -126,10 +126,10 @@ flowchart LR
   sm_120），权重与 IO 目录经挂载卷交换文件；宿主对每段连续页发起一次
   `docker run`（`tools/local_paddleocr_import.py`）。页面 checkpoint 身份包含本地
   指纹（`paddleocr-local/<model fingerprint>`）。
-- **本地/云边界要说清**：不出机器的是**页图与视觉推理**；文本阶段仍调用云端——
-  目录抽取 `glm-5.2`、校对与页面翻译 `deepseek-v4-flash`。因此 API 密钥与配额
-  只影响文本阶段，OCR 不消耗配额；embedding 缺失时会降级为纯词法 KB 而不是
-  阻断发布。
+- **本地/云边界要说清**：页图与视觉推理不出机器，活动 OCR profile 是本地
+  `paddleocr_local`。智谱接口只用于 `embedding-3`。正文翻译默认是本机 Hy-MT2；
+  DeepSeek 只在显式选择 profile 时用于文本阶段。embedding 缺失时报告 hybrid
+  不可用，不以词法结果冒充 hybrid。
 - `pages` 层（原页 OCR / 校对文本）与 `archive` 层（章节快照）按设计保留原文，
   不在语言门内；`page_translation` 层本身就是对应译文。门只约束检索面（reader 层）
   与交付物（Word）。

@@ -13,7 +13,7 @@ from orchestration.product_contracts import RunSpec
 from orchestration.product_paths import default_profile_path
 
 
-OCR_ADAPTERS = frozenset({"coding-plan-mcp", "glm-ocr", "tesseract"})
+OCR_ADAPTERS = frozenset({"paddleocr-local", "tesseract"})
 TEXT_ADAPTERS = frozenset({"openai-chat", "glm-chat"})
 
 

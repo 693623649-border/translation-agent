@@ -12,7 +12,7 @@
 | 人工核图 | 人查看原页与 OCR 对照，判断漏字、错序、标题和脚注 | 固定抽样与异常必审页的并集 |
 | 翻译 | 已整理的源文送 Hy-MT2，DeepSeek 可显式切换 | 与 OCR、校勘分别配置 |
 
-[`resolve_ocr_backend_name`](../ingestion/book_pipeline.py) 的 `auto` 只选择本地 PP-OCRv6；本地部署缺失就失败，正式入口已移除云 OCR。配置里的 `glm_vision` 和源码中的旧 GLM/MCP 类属于遗留接口，不能据此判断当前扫描流程正在调用 GLM 视觉服务。
+[`resolve_ocr_backend_name`](../ingestion/book_pipeline.py) 的 `auto` 只选择本地 PP-OCRv6；本地部署缺失就失败，正式入口已移除云 OCR。活动配置的 OCR profile 是 `paddleocr_local`。源码中残留的旧 GLM/MCP 类不能据此判断当前扫描流程正在调用 GLM 视觉服务。
 
 [`ChatOCRProofreader`](../ingestion/book_pipeline.py) 调用 `chat_text`，只接收文字。它可以提出有限的错字和空格修正，不能凭文字上下文确认源图里有没有某个字，也不能承担列序、标题或整页漏识的视觉验收。校勘结果作为覆盖层保存，原始 OCR 检查点保留。
 
