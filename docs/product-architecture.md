@@ -207,5 +207,6 @@ python -m compileall -q .
 python -m build
 ```
 
-CI 在 Python 3.11 和 3.12 上执行相同快速门；需要 LibreOffice 与固定字体的真实
-渲染 smoke 可放在 nightly/release job，避免拖慢日常小改动。
+CI 在 Python 3.11 和 3.12 上执行相同快速门；需要真实渲染器（LibreOffice 或
+Microsoft Word COM 回退）与固定字体的渲染 smoke 可放在 nightly/release job，
+避免拖慢日常小改动。

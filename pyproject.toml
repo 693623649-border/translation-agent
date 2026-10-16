@@ -18,17 +18,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-web = ["streamlit>=1.48,<2"]
 legacy = ["openai>=1,<3", "reportlab>=4,<5"]
 dev = [
   "build>=1.2,<2",
-  "streamlit>=1.48,<2",
+  "numpy>=1.26,<3",
 ]
 
 [project.scripts]
 translation-agent = "orchestration.document_pipeline:cli"
 translation-agent-doctor = "orchestration.doctor:main"
-translation-agent-web = "frontend.launch_frontend:main"
 translation-agent-repo-guard = "orchestration.repository_guard:main"
 translation-agent-kb = "knowledge.knowledge_base_cli:main"
 translation-agent-global-kb = "knowledge.global_knowledge_base:main"
@@ -37,15 +35,46 @@ translation-agent-global-kb = "knowledge.global_knowledge_base:main"
 include-package-data = true
 
 [tool.setuptools.packages.find]
+where = ["."]
+# Namespace discovery descends into every directory, so it walked `.venv/`,
+# `deploy/`, `outputs/` and the trash folders — tens of thousands of files with
+# no package marker — and the editable build never returned.  Every shipped
+# package has an `__init__.py`, so plain package discovery plus the explicit
+# exclude list keeps the scan bounded.
+namespaces = false
 include = [
   "pipeline_graph*",
-  "app_pages*",
   "orchestration*",
   "ingestion*",
   "translation*",
   "publication*",
   "knowledge*",
   "frontend*",
+]
+exclude = [
+  ".venv*",
+  ".tmp*",
+  ".git*",
+  ".github*",
+  ".codex-trash*",
+  ".cursor*",
+  ".dsh*",
+  ".learnings*",
+  ".omx*",
+  ".pytest_cache*",
+  "archive*",
+  "book*",
+  "deploy*",
+  "docs*",
+  "node_modules*",
+  "outputs*",
+  "recipes*",
+  "schemas*",
+  "skills*",
+  "tests*",
+  "tmp*",
+  "tools*",
+  "work*",
 ]
 
 [tool.setuptools.data-files]

@@ -161,10 +161,10 @@ class DocumentPipelineTests(unittest.TestCase):
 
     def test_doctor_flags_are_delegated_without_double_dash(self) -> None:
         with patch("orchestration.doctor.main", return_value=0) as doctor_main:
-            code = document_pipeline.main(["doctor", "--json", "--web"])
+            code = document_pipeline.main(["doctor", "--json", "--render"])
 
         self.assertEqual(code, 0)
-        doctor_main.assert_called_once_with(["--json", "--web"])
+        doctor_main.assert_called_once_with(["--json", "--render"])
 
     def test_epub_run_requires_explicit_draft_authorization(self) -> None:
         with patch("orchestration.document_pipeline.ingest_spec") as ingest:

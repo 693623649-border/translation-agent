@@ -7,7 +7,6 @@
 
 # 保留 .env.example 作为模板
 !.env.example
-.streamlit/secrets.toml
 
 # 输出目录（翻译结果和中间产物）
 outputs/

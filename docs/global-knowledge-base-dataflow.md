@@ -184,9 +184,10 @@ content_sha256, source_path, source_row_id, source_metadata, apparatus_weight`�
 #### P1 · 两条链路没有任何连接（最严重）
 
 `knowledge/global_knowledge_base.py` 在运行时代码中**零引用**：全仓库只有
-`pyproject.toml:34` 的 console script、`tests/test_global_knowledge_base.py:10`
+`pyproject.toml` 的 console script、`tests/test_global_knowledge_base.py:10`
 和 README。而 `frontend/translation_agent_api.py:367 retrieve_knowledge_base_context`
-也没有生产调用方，`app_pages/` 四个页面与 `frontend/frontend_app.py` 均不涉及检索。
+也没有生产调用方；原有的工作台页面（`app_pages/`、`frontend/frontend_app.py`）已随
+WebUI 一并移除，不再存在可能的调用方。
 
 后果：项目实际拥有**两个独立实现的 BM25**——SQLite FTS5 trigram（全局）与
 手写纯 Python BM25（分书）。两者分词、IDF 公式、分数尺度都不同

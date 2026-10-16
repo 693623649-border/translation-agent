@@ -38,20 +38,6 @@ class DoctorTests(unittest.TestCase):
         )
         self.assertEqual(credential["detail"], "present")
 
-    def test_missing_required_web_dependency_fails(self) -> None:
-        real_find_spec = doctor.importlib.util.find_spec
-
-        def fake_find_spec(name: str):
-            if name == "streamlit":
-                return None
-            return real_find_spec(name)
-
-        with patch.object(doctor.importlib.util, "find_spec", side_effect=fake_find_spec):
-            report = doctor.run_doctor(require_web=True)
-
-        self.assertEqual(report["status"], "failed")
-        self.assertIn("python:streamlit", report["failed_required"])
-
     def test_json_mode_contains_no_optional_backend_output(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()

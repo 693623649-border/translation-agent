@@ -74,6 +74,19 @@ _WORD_RENDER_SCRIPT = (
 )
 
 
+def find_word_renderer() -> str | None:
+    """Return the Word COM fallback script when this host can use it.
+
+    The render gate accepts either renderer: LibreOffice when present, or the
+    isolated Microsoft Word COM script on Windows.  Callers that only diagnose
+    the environment need the cheap availability answer, not a full render.
+    """
+
+    if os.name != "nt":
+        return None
+    return str(_WORD_RENDER_SCRIPT) if _WORD_RENDER_SCRIPT.is_file() else None
+
+
 def _render_docx_with_word(path: Path, *, timeout_seconds: int) -> dict[str, Any] | None:
     """Render via the isolated Word COM fallback when LibreOffice is absent.
 
@@ -663,7 +676,8 @@ def verify_docx_render(
             "issues": [
                 _issue(
                     "docx_renderer_missing",
-                    "完整 Word 发布要求 LibreOffice/soffice 渲染器，但当前环境未找到。",
+                    "完整 Word 发布要求渲染器，但当前环境既没有 LibreOffice/soffice，"
+                    "也没有可用的 Microsoft Word COM 回退。",
                 )
             ],
             "warnings": [],

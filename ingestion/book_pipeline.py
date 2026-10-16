@@ -6472,7 +6472,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-docx-render",
         action="store_true",
         help=(
-            "Skip LibreOffice rendering of Word only for an unvalidated "
+            "Skip rendering the Word deliverable only for an unvalidated "
             "intermediate build; a full report will not be release-ready."
         ),
     )
@@ -6482,9 +6482,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="full",
         help=(
             "Verification contract: full requires every selected publication "
-            "container; word requires DOCX structure and LibreOffice rendering "
-            "while allowing EPUB, knowledge base, and reference PDF to remain "
-            "outside the release scope."
+            "container; word requires DOCX structure and a rendered-layout "
+            "check while allowing EPUB, knowledge base, and reference PDF to "
+            "remain outside the release scope."
         ),
     )
     parser.add_argument(

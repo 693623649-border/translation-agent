@@ -43,23 +43,14 @@ flowchart TB
 
 ```powershell
 py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e '.[web]'
-.\.venv\Scripts\translation-agent-doctor.exe --web
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\translation-agent-doctor.exe
 if (-not (Test-Path pipeline.toml)) { Copy-Item pipeline.example.toml pipeline.toml }
 .\.venv\Scripts\Activate.ps1
 ```
 
 已有 `pipeline.toml` 时保留原配置。若执行策略不允许激活，直接使用 `.venv\Scripts\` 下的可执行文件。
 Python 包安装不会提供 GPU 驱动、OCR 服务或翻译权重；对应服务在下一步分别准备。
-
-需要图形工作台时启动：
-
-```powershell
-translation-agent-web
-```
-
-默认地址为 [http://127.0.0.1:8501](http://127.0.0.1:8501)。WebUI 仅允许 loopback 监听，
-远程访问需使用带认证的本地隧道。
 
 <a id="models"></a>
 ## 02 · 配置模型与启动翻译服务
@@ -429,7 +420,6 @@ python tools/kb_qa_plugin/kb_qa.py --db global_knowledge_base.sqlite3 `
 | 入口 | 职责 |
 | --- | --- |
 | `translation-agent` | `plan`、`run`、`ingest`、`translate`、`apply`、`publish`、`review`、`status`、`doctor` |
-| `translation-agent-web` | 本地工作台 |
 | `translation-agent-doctor` | 环境预检 |
 | `translation-agent-kb` | 单书注册、retrieve、状态、装置注释与派生产物 |
 | `translation-agent-global-kb` | 全局 SQLite sync、search、verify 与评测 |
@@ -455,19 +445,6 @@ DAG 按目标选择依赖闭包，在 `.pipeline_graph/state.json` 和事件记�
 
 </details>
 
-<details>
-<summary>架构与审查工作台</summary>
-
-打开工作台“架构与审查”，或访问[架构页面](http://127.0.0.1:8501/architecture)。
-它读取项目定义、任务、工作区状态与事件，不启动任务或更改模型配置；无事件的节点显示未记录。
-
-![字符版架构与审查面板](docs/images/architecture-ascii.jpg)
-
-节点可查看源码位置、状态与证据，支持 Tab/Enter；快照可导出 JSON/TXT。
-图中的分组不等于所有 recipe 的执行依赖，详见[架构与审查面板](docs/architecture-review.md)与 [DESIGN.md](DESIGN.md)。
-
-</details>
-
 ## 版本记录与开发验证
 
 历史记录按日期从旧到新整理至[版本与 workflow 演进](docs/workflow-history.md)，
@@ -490,7 +467,7 @@ git diff --check
 | `translation/semantic_ir.py` / `translation/semantic_apply.py` | 语义结构与翻译回填 |
 | `knowledge/rag_knowledge_base.py` / `knowledge/rag_apparatus.py` | 单书 hybrid、向量、装置与上下文 |
 | `knowledge/global_knowledge_base.py` / `tools/kb_qa_plugin/` | 全局发现、精读编排与引文核验 |
-| `frontend/frontend_runtime.py` / `orchestration/application_service.py` | 任务与应用服务 |
+| `frontend/translation_agent_api.py` | CLI 的运行请求与状态契约 |
 | `skills/` / `tools/*_plugin/` | 入库与阅读工具 |
 | `tests/` / `docs/` | 验证与专题说明 |
 

@@ -61,7 +61,16 @@ def _command_check(command: str, *, required: bool) -> DoctorCheck:
     )
 
 
-def _soffice_check(*, required: bool) -> DoctorCheck:
+def _render_backend_check(*, required: bool) -> DoctorCheck:
+    """Report the renderer the Word layout gate will actually use.
+
+    The gate accepts LibreOffice/soffice or, on Windows, the isolated Microsoft
+    Word COM fallback, so requiring a specific one of them would demand an
+    installation the gate does not need.
+    """
+
+    resolved: str | None = None
+    word: str | None = None
     try:
         # Optional document backends may print import-time compatibility
         # warnings (PyMuPDF 1.28 does this for the legacy ``fitz`` name).
@@ -70,16 +79,29 @@ def _soffice_check(*, required: bool) -> DoctorCheck:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
             io.StringIO()
         ):
-            from publication.docx_render_gate import find_soffice
+            from publication.docx_render_gate import find_soffice, find_word_renderer
 
             resolved = find_soffice()
+            word = None if resolved else find_word_renderer()
     except Exception:
+        # A failing import still leaves the PATH probe and the Word fallback.
         resolved = shutil.which("soffice")
+        try:
+            from publication.docx_render_gate import find_word_renderer
+
+            word = None if resolved else find_word_renderer()
+        except Exception:
+            word = None
+    detail = (
+        resolved
+        or (f"Microsoft Word COM fallback: {word}" if word else "")
+        or "no LibreOffice/soffice and no Word COM renderer"
+    )
     return DoctorCheck(
-        name="command:soffice",
-        ok=resolved is not None,
+        name="command:renderer",
+        ok=bool(resolved or word),
         required=required,
-        detail=resolved or "LibreOffice/soffice not found",
+        detail=detail,
     )
 
 
@@ -100,7 +122,6 @@ def run_doctor(
     config: Path | None = None,
     output_dir: Path | None = None,
     source: Path | None = None,
-    require_web: bool = False,
     require_render: bool = False,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
@@ -119,8 +140,7 @@ def run_doctor(
         _module_check(module, distribution, required=True)
         for module, distribution in CORE_IMPORTS.items()
     )
-    checks.append(_module_check("streamlit", "streamlit", required=require_web))
-    checks.append(_soffice_check(required=require_render))
+    checks.append(_render_backend_check(required=require_render))
     checks.append(_command_check("tesseract", required=False))
 
     required_commands: set[str] = set()
@@ -180,9 +200,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--source", type=Path)
-    parser.add_argument("--web", action="store_true", help="require Streamlit")
     parser.add_argument(
-        "--render", action="store_true", help="require LibreOffice/soffice"
+        "--render", action="store_true", help="require a Word/PDF renderer"
     )
     parser.add_argument("--json", action="store_true", help="emit JSON only")
     return parser
@@ -202,7 +221,6 @@ def main(argv: list[str] | None = None) -> int:
         config=args.config,
         output_dir=args.output_dir,
         source=args.source,
-        require_web=args.web,
         require_render=args.render,
     )
     if args.json:
