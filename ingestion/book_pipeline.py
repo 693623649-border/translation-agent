@@ -5978,7 +5978,14 @@ def build_docx(
     *,
     book_title: str,
     author: str | None = None,
+    strip_running_titles: bool = True,
 ) -> None:
+    """Compile chapter Markdown files into the reader-facing Word document.
+
+    ``strip_running_titles=False`` keeps the running-title heuristic off (EPUB
+    spine sources carry no page furniture and legitimately repeat the book
+    title in front matter); page markers are still removed either way.
+    """
     try:
         from docx import Document  # type: ignore[import-not-found]
         from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore[import-not-found]
@@ -6024,8 +6031,10 @@ def build_docx(
             if item.get("reviewed_override")
             else strip_publication_metadata(
                 source,
-                publication_title=book_title,
-                chapter_title=str(item.get("display_title") or ""),
+                publication_title=book_title if strip_running_titles else None,
+                chapter_title=(
+                    str(item.get("display_title") or "") if strip_running_titles else None
+                ),
             )
         )
         rendered_markdown, chapter_notes = markdown_footnotes_to_docx_markers(

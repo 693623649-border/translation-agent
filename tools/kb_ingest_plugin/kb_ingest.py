@@ -355,9 +355,11 @@ def parse_markdown_chapters(text: str) -> list[Chapter]:
         if position == 0 and preamble:
             body = f"{preamble}\n\n{body}".strip()
         chapters.append(Chapter(title=title, body=body, level=level))
-    return [chapter for chapter in chapters if chapter["body"]] or [
-        Chapter(title="全文", body=text.strip(), level=0)
-    ]
+    # Title-only chapters are legitimate: an EPUB chapter document can consist
+    # of nothing but its heading, and the publisher renders it as a bare H1.
+    # Dropping them here would misname the surviving text as one 「全文」 blob
+    # and break the fidelity gate's heading comparison.
+    return chapters or [Chapter(title="全文", body=text.strip(), level=0)]
 
 
 def parse_plaintext_chapters(text: str) -> list[Chapter]:
@@ -630,22 +632,33 @@ def parse_epub_chapters(path: Path) -> list[Chapter]:
                 # would duplicate the title — and the publisher's running-title
                 # stripper would then delete a prose line that merely resembles
                 # it, losing real text.
-                body_paragraphs = _drop_heading_paragraphs(
-                    paragraphs, extractor.heading_texts()
-                )
-                if not body_paragraphs:
-                    continue
+                headings = extractor.heading_texts()
+                body_paragraphs = _drop_heading_paragraphs(paragraphs, headings)
                 title_match = re.search(
                     r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", payload, flags=re.I | re.S
                 )
                 if title_match:
                     title = re.sub(r"<[^>]+>", "", title_match.group(1))
                     title = " ".join(title.split())
-                else:
+                elif body_paragraphs:
+                    # Calibre EPUBs frequently render headings as styled
+                    # paragraphs instead of real <h1>-<h3> elements.  When the
+                    # document has no real heading, its leading paragraph IS
+                    # the chapter heading: name the chapter after it and
+                    # consume it, so the publisher's H1 does not duplicate it
+                    # in the body — the running-title stripper would otherwise
+                    # delete the duplicate and the fidelity gate would report
+                    # the loss as missing source characters.
                     title = body_paragraphs[0][:60]
+                    if body_paragraphs[0] == title:
+                        body_paragraphs = body_paragraphs[1:]
+                else:
+                    title = ""
+                if not title:
+                    continue
                 chapters.append(
                     Chapter(
-                        title=title or f"第{len(chapters) + 1}节",
+                        title=title,
                         body="\n\n".join(body_paragraphs),
                         level=1,
                     )
@@ -822,6 +835,7 @@ def build_corpus(
     book_id = f"01_{slugify(book_title)}"
     rows: list[dict[str, Any]] = []
     sidecar: list[dict[str, Any]] = []
+    used_chapter_ids: dict[str, int] = {}
     order = 0
     for chapter in chapters:
         title = str(chapter.get("title") or "").strip() or f"第{order + 1}节"
@@ -829,7 +843,16 @@ def build_corpus(
         if not body:
             continue
         chapter_slug = slugify(title)
+        # Spine documents can share a heading (e.g. a half-title page and the
+        # colophon both headed 「岩波新書（新赤版）5」).  Row ids hash
+        # ``chapter_id`` together with the chunk index, so identical slugs
+        # would collide; disambiguate repeats deterministically so re-ingesting
+        # an unchanged source still reproduces byte-identical ids.
         chapter_id = f"{book_id}:{chapter_slug}"
+        occurrence = used_chapter_ids.get(chapter_id, 0)
+        used_chapter_ids[chapter_id] = occurrence + 1
+        if occurrence:
+            chapter_id = f"{chapter_id}-{occurrence + 1}"
         for chunk_index, chunk in enumerate(split_text(body, chunk_chars), start=1):
             order += 1
             row_id = hashlib.sha1(
@@ -965,7 +988,7 @@ def build_chapter_markdown(chapters: Sequence[Mapping[str, Any]]) -> str:
     for chapter in chapters:
         title = str(chapter.get("title") or "").strip()
         body = str(chapter.get("body") or "").strip()
-        if not title or not body:
+        if not title:
             continue
         blocks.append(f"# {title}\n\n{body}")
     return "\n\n".join(blocks).rstrip() + "\n"
@@ -977,6 +1000,7 @@ def publish_docx(
     *,
     book_title: str,
     author: str = "",
+    strip_running_titles: bool = True,
 ) -> Path:
     """Publish the reader-facing Chinese Word document.
 
@@ -991,11 +1015,18 @@ def publish_docx(
     output_dir : pathlib.Path
         Workspace directory.
     chapters : sequence of mapping
-        ``{"title", "body"}`` entries.
+        ``{"title", "body"}`` entries.  Each published chapter dict gains a
+        ``published_markdown`` key holding the exact markdown the publisher
+        rendered, so the fidelity gate can compare the true round trip.
     book_title : str
         Title printed on the cover page and in the document properties.
     author : str, optional
         Author line, when known.
+    strip_running_titles : bool, optional
+        Apply the running-title heuristic designed for OCR pipelines.  EPUB
+        spine documents carry no page furniture, and their front-matter pages
+        legitimately repeat the book title, so callers should pass ``False``
+        for them; page markers are still removed.
 
     Returns
     -------
@@ -1006,12 +1037,17 @@ def publish_docx(
     book_pipeline, _verifier = _load_pipeline()
     chapter_dir = output_dir / "chapters"
     chapter_dir.mkdir(parents=True, exist_ok=True)
+    # Re-ingesting into an existing workspace must not leave stale chapter
+    # files behind: the verify-word entry point re-reads this directory, so a
+    # leftover file from an earlier run would be compared as if it were source.
+    for stale in chapter_dir.glob("*.md"):
+        stale.unlink()
 
     manifest: list[dict[str, Any]] = []
     for sequence, chapter in enumerate(chapters, start=1):
         title = str(chapter.get("title") or "").strip()
         body = str(chapter.get("body") or "").strip()
-        if not title or not body:
+        if not title:
             continue
         filename = f"{sequence:03d}_{slugify(title, limit=40)}.md"
         # ``build_docx`` reads the chapter file back from disk and applies
@@ -1024,9 +1060,11 @@ def publish_docx(
         source_markdown = f"# {title}\n\n{body}\n"
         published = book_pipeline.strip_publication_metadata(
             source_markdown,
-            publication_title=book_title,
-            chapter_title=title,
+            publication_title=book_title if strip_running_titles else None,
+            chapter_title=title if strip_running_titles else None,
         )
+        if isinstance(chapter, dict):
+            chapter["published_markdown"] = published
         manifest.append(
             {
                 "id": f"src-{sequence:04d}",
@@ -1050,6 +1088,7 @@ def publish_docx(
             manifest,
             book_title=book_title,
             author=author or None,
+            strip_running_titles=strip_running_titles,
         )
     (output_dir / "chapters.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
@@ -1600,13 +1639,13 @@ def build_published_markdown(chapters: Sequence[Mapping[str, Any]]) -> str:
 
     blocks: list[str] = []
     for chapter in chapters:
-        if not str(chapter.get("body") or "").strip():
-            continue
         published = chapter.get("published_markdown")
         if isinstance(published, str) and published.strip():
             blocks.append(published.rstrip())
             continue
         title = str(chapter.get("title") or "").strip()
+        if not title:
+            continue
         blocks.append(f"# {title}\n\n{str(chapter.get('body') or '').strip()}")
     return "\n\n".join(blocks).rstrip() + "\n"
 
@@ -1868,7 +1907,7 @@ def verify_word_document(
     expected_headings = [
         str(chapter.get("title") or "").strip()
         for chapter in chapters
-        if str(chapter.get("body") or "").strip()
+        if str(chapter.get("title") or "").strip()
     ]
     actual_headings = _heading_texts(paragraphs)
     if expected_headings != actual_headings:
@@ -2117,7 +2156,14 @@ def ingest_source(
     docx_path: Path | None = None
     if word:
         docx_path = publish_docx(
-            workspace, chapters, book_title=book_title, author=author
+            workspace,
+            chapters,
+            book_title=book_title,
+            author=author,
+            # EPUB spine documents carry no page furniture; their front matter
+            # legitimately repeats the book title, so the OCR running-title
+            # heuristic must not delete it. Other adapters keep the strip step.
+            strip_running_titles=adapter != "epub-spine",
         )
         fidelity = verify_word_document(
             docx_path,

@@ -204,6 +204,83 @@ class SourceAdapterTests(unittest.TestCase):
         self.assertEqual(fidelity["extra_characters"], 0)
         self.assertEqual(fidelity["similarity"], 1.0)
 
+    def test_epub_fallback_title_is_consumed_and_round_trips(self) -> None:
+        """A calibre-style EPUB without real headings must round-trip intact.
+
+        The half-title page and the colophon both open with the same styled
+        paragraph, and the half-title body legitimately contains the book
+        title.  The fallback title must be consumed from the body, duplicate
+        chapter slugs must not collide on row ids, and the running-title
+        stripper must stay off so no source text is deleted.
+        """
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            path = workspace / "book.epub"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr(
+                    "META-INF/container.xml",
+                    '<?xml version="1.0"?><container><rootfiles>'
+                    '<rootfile full-path="OEBPS/content.opf"/></rootfiles></container>',
+                )
+                archive.writestr(
+                    "OEBPS/content.opf",
+                    '<?xml version="1.0"?><package><manifest>'
+                    '<item id="d1" href="d1.xhtml"/>'
+                    '<item id="d2" href="d2.xhtml"/>'
+                    '<item id="d3" href="d3.xhtml"/></manifest>'
+                    '<spine><itemref idref="d1"/><itemref idref="d2"/>'
+                    '<itemref idref="d3"/></spine></package>',
+                )
+                archive.writestr(
+                    "OEBPS/d1.xhtml",
+                    "<html><body>"
+                    "<p>岩波新书（新赤版）5</p><p>广松涉</p>"
+                    f"<p>新哲学入门</p><p>岩波书店</p></body></html>",
+                )
+                archive.writestr(
+                    "OEBPS/d2.xhtml",
+                    "<html><body><p>第一章 认识是怎么一回事</p></body></html>",
+                )
+                archive.writestr(
+                    "OEBPS/d3.xhtml",
+                    "<html><body>"
+                    "<p>岩波新书（新赤版）5</p><p>新哲学入门〔电子书版〕</p>"
+                    f"<p>二〇一九年九月发行。</p><p>{CHINESE_BODY}</p>"
+                    "</body></html>",
+                )
+            chapters = kb_ingest.parse_epub_chapters(path)
+            self.assertEqual(
+                [c["title"] for c in chapters],
+                ["岩波新书（新赤版）5", "第一章 认识是怎么一回事", "岩波新书（新赤版）5"],
+            )
+            # The fallback title paragraph is consumed from each body.
+            self.assertFalse(chapters[0]["body"].startswith("岩波新书"))
+            self.assertFalse(chapters[2]["body"].startswith("岩波新书"))
+            self.assertEqual(chapters[1]["body"], "")
+
+            rows, _ = kb_ingest.build_corpus(path, chapters, book_title="新哲学入门")
+            self.assertEqual(len({row["id"] for row in rows}), len(rows))
+
+            report = kb_ingest.ingest_source(
+                path,
+                output_dir=workspace / "out",
+                title="新哲学入门",
+                author="广松涉",
+            )
+            # The standalone re-verification must also pass: it re-reads
+            # chapters.json, including the title-only chapter, so a regression
+            # to the 「全文」 blob or a stale heading list shows up here.
+            recheck = kb_ingest.verify_word(workspace / "out")
+            self.assertTrue(recheck["ok"], recheck.get("issues"))
+        self.assertEqual(report["status"], "passed", report)
+        self.assertNotIn("error", report)
+        fidelity = report["docx_fidelity"]
+        self.assertEqual(fidelity["missing_characters"], 0)
+        self.assertEqual(fidelity["extra_characters"], 0)
+        self.assertEqual(fidelity["similarity"], 1.0)
+
     def test_heading_dropping_only_consumes_a_leading_run(self) -> None:
         # Each heading is consumed once and only from the front, so a heading
         # that legitimately recurs deeper in the prose survives.
