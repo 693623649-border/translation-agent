@@ -4,7 +4,7 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 from PIL import Image
 
 from translation_agent.pipeline.book_pipeline import PageStore, TRANSLATION_PROMPT_VERSION

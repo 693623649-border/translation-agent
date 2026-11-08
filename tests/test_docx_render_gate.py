@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-import fitz
+import pymupdf as fitz
 
 from translation_agent.publication.docx_render_gate import (
     _interleaved_index_blocks,

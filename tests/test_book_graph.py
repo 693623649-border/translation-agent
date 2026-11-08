@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import fitz
+import pymupdf as fitz
 
 from translation_agent.runtime.product_paths import dotenv_path
 import translation_agent.pipeline.book_pipeline as book_pipeline

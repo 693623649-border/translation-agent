@@ -71,7 +71,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _page_count(pdf_path: Path) -> int:
-    import fitz
+    import pymupdf as fitz
 
     with fitz.open(pdf_path) as document:
         return int(document.page_count)

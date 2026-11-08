@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-import fitz
+import pymupdf as fitz
 from PIL import Image
 from translation_agent.publication.publication_service import DOCX, PublicationVerificationResult
 from docx.enum.text import WD_ALIGN_PARAGRAPH

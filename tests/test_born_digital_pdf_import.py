@@ -6,7 +6,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-import fitz
+import pymupdf as fitz
 
 from translation_agent.sources.born_digital_pdf_import import apply_translations, import_born_digital_pdf
 from translation_agent.semantic.semantic_review_policy import (

@@ -4,7 +4,7 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 
 from translation_agent.maintenance.regenerate_reviewed_chapters import (
     Note,

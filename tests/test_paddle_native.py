@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from PIL import Image
-import fitz
+import pymupdf as fitz
 
 import translation_agent.pipeline.book_pipeline as book
 from translation_agent.ocr.paddle_native import (BACKEND, MODEL_FILES, NativeOptions, PaddleNativeOCR,

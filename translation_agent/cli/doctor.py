@@ -45,7 +45,7 @@ class DoctorCheck:
 
 
 CORE_IMPORTS = {
-    "fitz": "PyMuPDF",
+    "pymupdf": "PyMuPDF",
     "PIL": "Pillow",
     "markdown": "Markdown",
     "lxml": "lxml",
@@ -128,7 +128,7 @@ def _command_check(command: str, *, required: bool) -> DoctorCheck:
 def _soffice_check(*, required: bool) -> DoctorCheck:
     try:
         # Optional document backends may print import-time compatibility
-        # warnings (PyMuPDF 1.28 does this for the legacy ``fitz`` name).
+        # warnings, as PyMuPDF 1.28 does for the legacy ``fitz`` name.
         # Diagnostics own their final stdout/stderr contract, especially when
         # ``--json`` is requested, so contain those third-party side effects.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(

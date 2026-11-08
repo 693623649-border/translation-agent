@@ -1011,7 +1011,7 @@ def _check_checkpoints(context: _VerificationContext) -> dict[str, Any]:
     expected_page_count = 0
     if context.source_pdf is not None and context.source_pdf.is_file():
         try:
-            import fitz  # type: ignore[import-not-found]
+            import pymupdf as fitz
 
             with fitz.open(context.source_pdf) as document:
                 expected_page_count = document.page_count
@@ -1627,7 +1627,7 @@ def _check_manifest(context: _VerificationContext) -> dict[str, Any]:
             )
             if context.source_pdf is not None and context.source_pdf.is_file():
                 try:
-                    import fitz  # type: ignore[import-not-found]
+                    import pymupdf as fitz
 
                     with fitz.open(context.source_pdf) as source_document:
                         last_pdf_page = source_document.page_count
@@ -4339,7 +4339,7 @@ def _check_pdf(context: _VerificationContext) -> dict[str, Any]:
             )
         )
     try:
-        import fitz  # type: ignore[import-not-found]
+        import pymupdf as fitz
 
         with fitz.open(path) as document:
             output_page_count = document.page_count

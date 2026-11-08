@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import fitz
+import pymupdf as fitz
 
 from translation_agent.pipeline.book_pipeline import (
     PageRecord,

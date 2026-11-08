@@ -4,7 +4,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 
 from translation_agent.pipeline.book_pipeline import (
     PROOFREAD_PROMPT_VERSION,

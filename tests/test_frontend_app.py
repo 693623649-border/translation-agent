@@ -55,7 +55,7 @@ class FrontendAppTests(unittest.TestCase):
 
 class NativeOCRFrontendTests(unittest.TestCase):
     def test_native_only_job_submits_without_cloud_credentials(self):
-        import fitz
+        import pymupdf as fitz
         from translation_agent.ui.application_service import ApplicationService
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as folder:
