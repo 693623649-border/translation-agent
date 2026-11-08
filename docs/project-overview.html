@@ -1,0 +1,803 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>translation-agent 工程模块总览（macOS 分支）</title>
+<style>
+/* ── 设计令牌：图表配色经 dataviz 校验器验证（light/dark 均通过 CVD 与正常视觉分离检查） ── */
+.viz-root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface-1: #fcfcfb; --surface-2: #f3f2ee;
+  --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #6f6d68;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+  --series-4: #eda100; --series-5: #e87ba4; --series-6: #008300;
+  --good: #0ca30c; --critical: #d03b3b; --warning: #fab219;
+  --good-text: #006300;
+  --shadow: 0 1px 2px rgba(11,11,11,.06), 0 4px 16px rgba(11,11,11,.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --surface-2: #232321;
+    --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9a988f;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    --series-4: #c98500; --series-5: #d55181; --series-6: #008300;
+    --good-text: #0ca30c;
+    --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface-1: #1a1a19; --surface-2: #232321;
+  --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #9a988f;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+  --series-4: #c98500; --series-5: #d55181; --series-6: #008300;
+  --good-text: #0ca30c;
+  --shadow: 0 1px 2px rgba(0,0,0,.4);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body.viz-root {
+  background: var(--page); color: var(--text-primary);
+  font: 15px/1.6 system-ui, -apple-system, "PingFang SC", "Segoe UI", sans-serif;
+}
+a { color: var(--series-1); }
+code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .86em; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 24px 80px; }
+
+/* ── 顶栏与章节导航 ── */
+header.top {
+  position: sticky; top: 0; z-index: 20; backdrop-filter: blur(10px);
+  background: color-mix(in srgb, var(--page) 86%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+header.top .wrap { display: flex; align-items: center; gap: 20px; padding: 12px 24px; }
+header.top .brand { font-weight: 650; white-space: nowrap; }
+header.top nav { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
+header.top nav a {
+  color: var(--text-secondary); text-decoration: none; padding: 4px 10px; border-radius: 6px; font-size: 13px;
+}
+header.top nav a:hover { background: var(--surface-2); color: var(--text-primary); }
+.theme-btn {
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+  border-radius: 8px; padding: 5px 10px; cursor: pointer; font: inherit; font-size: 13px;
+}
+
+section { margin-top: 56px; scroll-margin-top: 72px; }
+h1 { font-size: 30px; line-height: 1.25; margin: 40px 0 8px; }
+h2 { font-size: 22px; margin: 0 0 6px; }
+h3 { font-size: 16px; margin: 0 0 6px; }
+.lede { color: var(--text-secondary); max-width: 820px; margin: 0; }
+.sub { color: var(--text-secondary); margin: 0 0 20px; max-width: 860px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); padding: 20px;
+}
+.grid { display: grid; gap: 16px; }
+
+/* ── 指标卡 ── */
+.stats { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); margin-top: 28px; }
+.stat .label { color: var(--text-secondary); font-size: 13px; }
+.stat .value { font-size: 30px; font-weight: 650; line-height: 1.2; margin-top: 4px; }
+.stat .note { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+.delta-down { color: var(--good-text); font-weight: 600; }
+
+/* ── 分层架构图 ── */
+.layers { display: grid; gap: 10px; }
+.layer { display: grid; grid-template-columns: 150px 1fr; gap: 14px; align-items: stretch; }
+.layer-name {
+  border-radius: 10px; padding: 12px 14px; background: var(--surface-2);
+  display: flex; flex-direction: column; justify-content: center;
+}
+.layer-name b { font-size: 14px; }
+.layer-name span { font-size: 12px; color: var(--text-secondary); }
+.layer-pkgs { display: flex; gap: 10px; flex-wrap: wrap; }
+.pkg-chip {
+  flex: 1 1 200px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+  background: var(--surface-1); cursor: pointer; text-align: left; font: inherit; color: inherit;
+  border-left: 5px solid var(--c); transition: transform .12s ease, box-shadow .12s ease;
+}
+.pkg-chip:hover, .pkg-chip:focus-visible { transform: translateY(-1px); box-shadow: var(--shadow); outline: none; }
+.pkg-chip.active { box-shadow: 0 0 0 2px var(--c); }
+.pkg-chip .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.pkg-chip .nm { font-weight: 650; font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+.pkg-chip .ln { color: var(--text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.pkg-chip .ds { color: var(--text-secondary); font-size: 13px; margin-top: 4px; }
+.pkg-chip .bar { height: 4px; border-radius: 2px; background: var(--grid); margin-top: 10px; overflow: hidden; }
+.pkg-chip .bar i { display: block; height: 100%; background: var(--c); border-radius: 2px; }
+
+/* ── 模块详情面板 ── */
+.detail { margin-top: 16px; display: none; }
+.detail.open { display: block; }
+.detail-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.detail table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 13px; }
+.detail th, .detail td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+.detail th { color: var(--text-secondary); font-weight: 600; }
+.detail td.num { font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+.mini-bar { display: inline-block; height: 8px; border-radius: 0 4px 4px 0; background: var(--c); vertical-align: middle; margin-right: 6px; }
+.dep-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--text-secondary); }
+.pill b { color: var(--text-primary); font-weight: 600; }
+
+/* ── 树图（代码体量） ── */
+.treemap { position: relative; width: 100%; height: 440px; }
+.tm-cell {
+  position: absolute; border: 2px solid var(--surface-1); border-radius: 6px; overflow: hidden;
+  background: var(--c); color: #fff; padding: 6px 8px; font-size: 12px; line-height: 1.3; cursor: default;
+}
+.tm-cell.dark-ink { color: #0b0b0b; }
+.tm-cell .t { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tm-cell .n { opacity: .9; font-variant-numeric: tabular-nums; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text-secondary); }
+.legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--c); margin-right: 6px; vertical-align: -1px; }
+
+/* ── 提示框 ── */
+.tooltip {
+  position: fixed; pointer-events: none; z-index: 50; max-width: 340px;
+  background: var(--surface-1); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); padding: 8px 10px; font-size: 12.5px;
+  opacity: 0; transition: opacity .08s;
+}
+.tooltip.show { opacity: 1; }
+.tooltip .tt-title { font-weight: 650; margin-bottom: 2px; font-family: ui-monospace, Menlo, monospace; }
+.tooltip .tt-muted { color: var(--text-secondary); }
+
+/* ── 数据流 DAG ── */
+.tabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.tab {
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit; font-size: 13px;
+}
+.tab[aria-selected="true"] { background: var(--text-primary); color: var(--surface-1); border-color: var(--text-primary); }
+.dag-wrap { overflow-x: auto; text-align: center; }
+.dag-wrap svg { display: block; margin: 0 auto; max-width: none; }
+.dag-note { text-align: left; }
+svg text { fill: var(--text-primary); }
+.dag-node rect { fill: var(--surface-1); stroke: var(--c); stroke-width: 2; }
+.dag-node .stage { fill: var(--c); }
+.dag-node text.nm { font: 600 12px ui-monospace, Menlo, monospace; }
+.dag-node text.art { font: 11px system-ui, sans-serif; fill: var(--text-secondary); }
+.dag-node.nocache rect { stroke-dasharray: 5 3; }
+.dag-node.dim { opacity: .22; }
+.dag-edge { fill: none; stroke: var(--axis); stroke-width: 1.5; }
+.dag-edge.hot { stroke: var(--text-primary); stroke-width: 2; }
+.dag-edge.dim { opacity: .15; }
+.dag-note { display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--text-secondary); margin-top: 10px; }
+.dag-note .dash { display: inline-block; width: 22px; height: 0; border-top: 2px dashed var(--text-secondary); vertical-align: middle; margin-right: 6px; }
+
+/* ── 依赖矩阵 ── */
+.matrix { border-collapse: separate; border-spacing: 2px; font-size: 12px; }
+.matrix th { font-weight: 600; color: var(--text-secondary); padding: 4px 6px; font-family: ui-monospace, Menlo, monospace; }
+.matrix th.col { writing-mode: vertical-rl; transform: rotate(180deg); height: 124px; text-align: left; vertical-align: bottom; white-space: nowrap; }
+.matrix th.rowh { text-align: right; }
+.matrix td {
+  width: 38px; height: 30px; text-align: center; border-radius: 4px; font-variant-numeric: tabular-nums;
+  background: var(--surface-2); color: var(--text-muted);
+}
+.matrix td.has { color: #fff; font-weight: 600; cursor: default; }
+.matrix td.self { background: transparent; }
+.matrix td.cycle { box-shadow: inset 0 0 0 2px var(--critical); }
+.scale { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; white-space: nowrap; font-size: 12px; color: var(--text-secondary); margin-top: 12px; }
+.scale i { width: 26px; height: 12px; border-radius: 3px; display: inline-block; }
+
+/* ── 契约 / 门禁卡 ── */
+.contracts { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+.contract h3 { font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+.contract p { margin: 0; color: var(--text-secondary); font-size: 13px; }
+.contract .ver { float: right; font-size: 11px; color: var(--text-muted); }
+.gates { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.gate { border-radius: 10px; padding: 14px; border: 1px solid var(--border); background: var(--surface-1); }
+.gate .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; margin-bottom: 6px; background: var(--surface-2); color: var(--text-secondary); }
+.gate .tag.ready::before { content: "✓ "; color: var(--good-text); }
+.gate .tag.draft::before { content: "○ "; }
+.gate h3 { font-family: ui-monospace, Menlo, monospace; font-size: 14px; }
+.gate p { margin: 0; font-size: 13px; color: var(--text-secondary); }
+
+/* ── 入口 ── */
+.entries { grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); }
+.entry h3 code { font-size: 14px; }
+.entry .mono { overflow-wrap: anywhere; }
+.entry p { margin: 4px 0 8px; color: var(--text-secondary); font-size: 13px; }
+.entry .cmds { display: flex; gap: 5px; flex-wrap: wrap; }
+
+/* ── 清理时间线 ── */
+.timeline { display: grid; gap: 10px; }
+.tl-row { display: grid; grid-template-columns: 90px 1fr 260px; gap: 14px; align-items: center; }
+.tl-hash { font-family: ui-monospace, Menlo, monospace; color: var(--text-secondary); font-size: 13px; }
+.tl-kind { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px; margin-right: 6px; font-weight: 600; }
+.tl-kind.fix { background: color-mix(in srgb, var(--critical) 14%, transparent); color: var(--critical); }
+.tl-kind.ref { background: color-mix(in srgb, var(--series-1) 14%, transparent); color: var(--series-1); }
+.tl-desc { font-size: 14px; }
+.tl-desc small { display: block; color: var(--text-secondary); font-size: 12.5px; }
+.diverge { position: relative; height: 22px; }
+.diverge .mid { position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--axis); }
+.diverge .del, .diverge .add { position: absolute; top: 4px; height: 14px; }
+.diverge .del { right: 50%; background: var(--series-2); border-radius: 4px 0 0 4px; margin-right: 1px; }
+.diverge .add { left: 50%; background: var(--series-1); border-radius: 0 4px 4px 0; margin-left: 1px; }
+.diverge .lbl { position: absolute; top: 2px; font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+.bugs { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+.bug h3 { font-size: 14px; }
+.bug .where { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.bug p { margin: 6px 0 0; font-size: 13px; color: var(--text-secondary); }
+.bug .ba { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; font-size: 12px; }
+.bug .ba div { border-radius: 8px; padding: 6px 8px; background: var(--surface-2); }
+.bug .ba b { display: block; font-size: 11px; color: var(--text-muted); font-weight: 600; }
+
+.todo { list-style: none; padding: 0; margin: 0; display: grid; gap: 8px; }
+.todo li { display: grid; grid-template-columns: 76px 1fr; gap: 12px; align-items: start; }
+.prio { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 6px; text-align: center; background: var(--surface-2); }
+.prio.p1 { color: var(--critical); } .prio.p2 { color: var(--series-2); } .prio.p3 { color: var(--text-secondary); }
+footer { margin-top: 64px; color: var(--text-muted); font-size: 12.5px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+@media (max-width: 760px) {
+  .layer { grid-template-columns: 1fr; }
+  .tl-row { grid-template-columns: 1fr; }
+  .treemap { height: 640px; }
+}
+</style>
+</head>
+<body class="viz-root" data-palette="#2a78d6,#eb6834,#1baf7a,#eda100,#e87ba4,#008300">
+<header class="top">
+  <div class="wrap">
+    <div class="brand">translation-agent</div>
+    <nav aria-label="章节">
+      <a href="#overview">概览</a><a href="#layers">分层架构</a><a href="#size">代码体量</a>
+      <a href="#dataflow">数据流</a><a href="#deps">包依赖</a><a href="#contracts">契约与门禁</a>
+      <a href="#entries">入口</a><a href="#cleanup">本次清理</a><a href="#next">后续</a>
+    </nav>
+    <button class="theme-btn" id="themeBtn" type="button">切换深色</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="overview" style="margin-top:0">
+    <h1>影印书 / EPUB 翻译出版流水线：模块总览</h1>
+    <p class="lede">本地优先的书籍翻译与出版系统：输入扫描 PDF、文字层 PDF 或 EPUB，经 OCR / 语义重建 / 翻译 / 回填 / 清洗，
+      输出 EPUB、Word、知识库与带书签的参考 PDF，并由确定性发布门禁签发 <code>release_ready</code>。
+      本页数据取自 <code>macos-cleanup-legacy-code</code> 分支 HEAD <code>59b3d97</code>，由源码静态分析与真实构建的节点图生成。</p>
+    <div class="grid stats" id="stats"></div>
+  </section>
+
+  <section id="layers">
+    <h2>分层架构</h2>
+    <p class="sub">11 个包按产品职责分成 5 层。点击任意包，查看它包含的模块、每个模块的职责、行数，以及它依赖和被依赖的包。</p>
+    <div class="layers" id="layerView"></div>
+    <div class="card detail" id="pkgDetail" aria-live="polite"></div>
+  </section>
+
+  <section id="size">
+    <h2>代码体量</h2>
+    <p class="sub">面积 = 模块行数（共 47,751 行），颜色 = 所属层。三个文件超过 3900 行，合计占 <b id="bigShare"></b>，是后续拆分的首要对象。悬停可看模块说明。</p>
+    <div class="card">
+      <div class="treemap" id="treemap" role="img" aria-label="各模块代码行数树图"></div>
+      <div class="legend" id="tmLegend"></div>
+    </div>
+  </section>
+
+  <section id="dataflow">
+    <h2>数据流：Graph 节点与产物</h2>
+    <p class="sub">每个方框是一个 <code>NodeSpec</code>，下方小字是它产出的 artifact；连线表示 <code>requires → provides</code> 依赖。
+      节点只能读取声明过的输入，缓存身份包含节点版本与上游产物指纹。悬停节点会高亮它的上下游。</p>
+    <div class="tabs" role="tablist" id="dagTabs"></div>
+    <div class="card dag-wrap"><svg id="dag" role="img" aria-label="流水线节点依赖图"></svg>
+      <div class="dag-note">
+        <span><span class="dash"></span>虚线框：不缓存，每次重新执行（OCR、发布验收）</span>
+        <span id="dagCaption"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="deps">
+    <h2>包间依赖矩阵</h2>
+    <p class="sub">行导入列：格内数字是 <code>import</code> 语句数。红框表示两个包互相导入（循环依赖），这类耦合会让模块难以单独测试和替换。</p>
+    <div class="card" style="overflow-x:auto">
+      <table class="matrix" id="matrix"></table>
+      <div class="scale" id="matrixScale"></div>
+    </div>
+  </section>
+
+  <section id="contracts">
+    <h2>公共契约与发布门禁</h2>
+    <p class="sub">CLI、Web UI 与 Graph 共用同一套版本化契约，任何一方都不能私自解释配置。发布档位（release profile）由请求的 target 决定。</p>
+    <div class="grid contracts" id="contractCards"></div>
+    <h3 style="margin-top:26px">发布档位</h3>
+    <div class="gates" id="gateCards" style="margin-top:10px"></div>
+  </section>
+
+  <section id="entries">
+    <h2>入口</h2>
+    <p class="sub"><code>pyproject.toml</code> 注册的 7 个命令。产品主入口是 <code>translation-agent</code>，其余是诊断、Web、OCR 与知识库工具。</p>
+    <div class="grid entries" id="entryCards"></div>
+  </section>
+
+  <section id="cleanup">
+    <h2>本次清理（7 个提交）</h2>
+    <p class="sub">基线 <code>bf24493</code> → HEAD <code>59b3d97</code>：68 个文件，新增 418 行、删除 591 行，净减少 173 行。
+      测试从 818 项增至 824 项；唯一失败项在基线就存在（本机缺 LibreOffice，Word 渲染门禁无法运行）。
+      左侧橙色为删除行，右侧蓝色为新增行。</p>
+    <div class="card timeline" id="timeline"></div>
+    <h3 style="margin-top:28px">清理中发现并修复的缺陷</h3>
+    <div class="grid bugs" id="bugCards" style="margin-top:10px"></div>
+  </section>
+
+  <section id="next">
+    <h2>后续维护建议（按优先级）</h2>
+    <div class="card"><ul class="todo" id="todo"></ul></div>
+  </section>
+
+  <footer>
+    生成方式：<code>ast</code> 静态分析 <code>translation_agent/</code> 统计行数与 import；节点图由
+    <code>prepare_book_graph</code> / <code>prepare_epub_graph</code> 实际构建后导出；提交数据来自 <code>git show --numstat</code>。
+    图表配色经 dataviz 校验器检查（浅色/深色两套均通过色觉缺陷与正常视觉分离检查；三种浅色低对比色均配有文字标签）。
+  </footer>
+</main>
+
+<div class="tooltip" id="tip" role="tooltip"></div>
+
+<script>
+// ── 数据：由仓库源码生成 ──
+const MODULES = [{"pkg":"cli","path":"cli/doctor.py","lines":291,"doc":"Preflight diagnostics for repeatable translation-agent runs."},{"pkg":"cli","path":"cli/document_pipeline.py","lines":551,"doc":"Unified product CLI over the Graph and semantic document adapters."},{"pkg":"cli","path":"cli/graph_pipeline.py","lines":288,"doc":"CLI for the dependency-graph execution engine."},{"pkg":"cli","path":"cli/knowledge_base_cli.py","lines":642,"doc":""},{"pkg":"cli","path":"cli/launch_frontend.py","lines":81,"doc":""},{"pkg":"knowledge","path":"knowledge/global_knowledge_base.py","lines":825,"doc":"Repository-wide, local-only search index for published output workspaces."},{"pkg":"knowledge","path":"knowledge/kb_translation.py","lines":665,"doc":"Chinese normalisation for knowledge-base corpora: detect → translate → record."},{"pkg":"knowledge","path":"knowledge/knowledge_base_audit.py","lines":419,"doc":"Shared structural audit for reader-facing knowledge bases."},{"pkg":"knowledge","path":"knowledge/rag_apparatus.py","lines":95,"doc":"Versioned document-role annotations; published corpus and vectors stay intact."},{"pkg":"knowledge","path":"knowledge/rag_evaluation.py","lines":173,"doc":"Reproducible retrieval evaluation without translation/runtime dependencies."},{"pkg":"knowledge","path":"knowledge/rag_indexing.py","lines":172,"doc":"Build disposable retrieval corpora without changing published source books."},{"pkg":"knowledge","path":"knowledge/rag_knowledge_base.py","lines":1627,"doc":"Retrieval runtime and embedding sidecars for published knowledge bases."},{"pkg":"knowledge","path":"knowledge/rag_reranking.py","lines":128,"doc":"Optional model reranking through an explicitly configured OpenAI client."},{"pkg":"legacy","path":"legacy/pdf_text_agent.py","lines":1511,"doc":""},{"pkg":"maintenance","path":"maintenance/patch_translations.py","lines":142,"doc":"Patch the 4 pages blocked by GLM's content filter with faithful academic Chinese"},{"pkg":"maintenance","path":"maintenance/regenerate_reviewed_chapters.py","lines":1044,"doc":"Regenerate reader-facing chapters from continuous PDF text-layer prose."},{"pkg":"ocr","path":"ocr/paddle_native.py","lines":327,"doc":"Offline PP-OCRv5 CPU backend; optional Paddle imports stay out of planning/UI."},{"pkg":"pipeline","path":"pipeline/book_pipeline.py","lines":7974,"doc":""},{"pkg":"pipeline","path":"pipeline/compile_service.py","lines":179,"doc":"Typed, argv-free chapter compilation boundary."},{"pkg":"pipeline","path":"pipeline/graph/book.py","lines":3939,"doc":"Book-pipeline adapters for the lightweight DAG runtime."},{"pkg":"pipeline","path":"pipeline/graph/core.py","lines":1248,"doc":"Small, dependency-free DAG runtime for the translation pipeline."},{"pkg":"pipeline","path":"pipeline/graph/epub.py","lines":1935,"doc":"First-class EPUB DAG built on the shared graph runtime."},{"pkg":"pipeline","path":"pipeline/graph/recipe.py","lines":618,"doc":"Strict, low-code recipes and allowlisted graph-node plugins."},{"pkg":"publication","path":"publication/checks/runtime_hygiene.py","lines":164,"doc":"Detect temporary output, live stage locks, and sibling pipeline workers."},{"pkg":"publication","path":"publication/docx_footnotes.py","lines":724,"doc":"Deterministically materialize true Word footnotes from stable markers."},{"pkg":"publication","path":"publication/docx_render_gate.py","lines":840,"doc":"Headless DOCX render gate used by the publication verifier."},{"pkg":"publication","path":"publication/docx_semantic_migration.py","lines":848,"doc":"Migrate an accepted Word publication into semantic Markdown chapters."},{"pkg":"publication","path":"publication/docx_translation.py","lines":405,"doc":"Translate a delivered DOCX in place, preserving its layout and styles."},{"pkg":"publication","path":"publication/epub_publication_verifier.py","lines":1352,"doc":"Deterministic release gate for EPUB-native publication runs."},{"pkg":"publication","path":"publication/publication_semantics.py","lines":593,"doc":"Deterministic semantic reconstruction for reader-facing publications."},{"pkg":"publication","path":"publication/publication_service.py","lines":176,"doc":"Typed application service for deterministic publication verification."},{"pkg":"publication","path":"publication/publication_verifier.py","lines":4792,"doc":"Deterministic release verification for compiled book publications."},{"pkg":"runtime","path":"runtime/digests.py","lines":20,"doc":"SHA-256 digests shared by artifact fingerprints, manifests, and audits."},{"pkg":"runtime","path":"runtime/pipeline_profiles.py","lines":267,"doc":""},{"pkg":"runtime","path":"runtime/pipeline_runtime.py","lines":355,"doc":"Shared runtime primitives for pipeline clients and concurrent workers."},{"pkg":"runtime","path":"runtime/product_contracts.py","lines":389,"doc":"Stable, JSON-safe contracts shared by CLI, API, Graph and Web UI."},{"pkg":"runtime","path":"runtime/product_paths.py","lines":118,"doc":"Portable locations for bundled assets and writable product state."},{"pkg":"runtime","path":"runtime/repository_guard.py","lines":149,"doc":"Fail-fast guard against committing books, caches, large files or secrets."},{"pkg":"runtime","path":"runtime/run_execution_service.py","lines":879,"doc":"Single product-level compiler and executor for :class:`RunSpec`."},{"pkg":"runtime","path":"runtime/translation_agent_api.py","lines":425,"doc":""},{"pkg":"semantic","path":"semantic/semantic_apply.py","lines":1008,"doc":"Shared, fail-closed application of semantic translation units."},{"pkg":"semantic","path":"semantic/semantic_ir.py","lines":675,"doc":"Versioned canonical intermediate representation for document semantics."},{"pkg":"semantic","path":"semantic/semantic_review.py","lines":1161,"doc":"Fail-closed human-review decisions for canonical document semantics."},{"pkg":"semantic","path":"semantic/semantic_review_policy.py","lines":680,"doc":"Central, fail-closed policy for semantic reconstruction review."},{"pkg":"semantic","path":"semantic/semantic_translation_runner.py","lines":567,"doc":"Concurrent, hash-bound DeepSeek runner for semantic EPUB units."},{"pkg":"sources","path":"sources/born_digital_pdf_import.py","lines":775,"doc":"Deterministically import a born-digital PDF into semantic chapters."},{"pkg":"sources","path":"sources/epub_semantic_import.py","lines":1418,"doc":"Import born-digital EPUB books into the publication semantic layer."},{"pkg":"sources","path":"sources/extract_textbook_layer.py","lines":510,"doc":"Import a born-digital PDF text layer into ``book_pipeline`` checkpoints."},{"pkg":"ui","path":"ui/application_service.py","lines":444,"doc":"Application facade shared by the Web UI and other local product clients."},{"pkg":"ui","path":"ui/frontend_runtime.py","lines":1823,"doc":"Local-first job runtime for the Streamlit product shell."},{"pkg":"ui","path":"ui/frontend_service.py","lines":161,"doc":""},{"pkg":"ui","path":"ui/pages/_shared.py","lines":152,"doc":"Shared Streamlit-only helpers; business logic remains in application_service."},{"pkg":"ui","path":"ui/pages/artifacts.py","lines":81,"doc":""},{"pkg":"ui","path":"ui/pages/jobs.py","lines":147,"doc":""},{"pkg":"ui","path":"ui/pages/new_job.py","lines":423,"doc":""},{"pkg":"ui","path":"ui/pages/review.py","lines":204,"doc":""},{"pkg":"ui","path":"ui/pages/settings.py","lines":80,"doc":""},{"pkg":"ui","path":"ui/streamlit_app.py","lines":72,"doc":"Canonical Streamlit entry point for the local translation workbench."}];
+const EDGES = [{"from":"cli","to":"knowledge","n":6},{"from":"cli","to":"ocr","n":2},{"from":"cli","to":"pipeline","n":5},{"from":"cli","to":"publication","n":1},{"from":"cli","to":"runtime","n":7},{"from":"cli","to":"semantic","n":4},{"from":"cli","to":"sources","n":4},{"from":"knowledge","to":"pipeline","n":3},{"from":"knowledge","to":"runtime","n":3},{"from":"knowledge","to":"semantic","n":2},{"from":"legacy","to":"runtime","n":1},{"from":"maintenance","to":"pipeline","n":1},{"from":"maintenance","to":"runtime","n":1},{"from":"ocr","to":"pipeline","n":3},{"from":"pipeline","to":"knowledge","n":3},{"from":"pipeline","to":"ocr","n":5},{"from":"pipeline","to":"publication","n":5},{"from":"pipeline","to":"runtime","n":9},{"from":"pipeline","to":"semantic","n":4},{"from":"pipeline","to":"sources","n":2},{"from":"publication","to":"knowledge","n":3},{"from":"publication","to":"pipeline","n":3},{"from":"publication","to":"runtime","n":4},{"from":"publication","to":"semantic","n":4},{"from":"runtime","to":"knowledge","n":1},{"from":"runtime","to":"pipeline","n":4},{"from":"runtime","to":"semantic","n":1},{"from":"semantic","to":"publication","n":1},{"from":"semantic","to":"runtime","n":5},{"from":"sources","to":"pipeline","n":1},{"from":"sources","to":"publication","n":2},{"from":"sources","to":"runtime","n":2},{"from":"sources","to":"semantic","n":8},{"from":"ui","to":"cli","n":3},{"from":"ui","to":"ocr","n":2},{"from":"ui","to":"pipeline","n":1},{"from":"ui","to":"runtime","n":14},{"from":"ui","to":"semantic","n":2}];
+const COMMITS = [{"hash":"7aa9597","subject":"refactor: remove dead code and lint debt found by pyflakes","add":100,"del":209,"files":46},{"hash":"bb2a264","subject":"refactor: share one SHA-256 helper module across packages","add":158,"del":202,"files":16},{"hash":"cfef17e","subject":"refactor: import PyMuPDF by its supported module name","add":16,"del":16,"files":13},{"hash":"a53daca","subject":"fix: stop treating katakana-block punctuation as Japanese in DOCX triage","add":13,"del":45,"files":4},{"hash":"856641f","subject":"refactor: drop unreachable guards and unused state in UI, KB and EPUB import","add":18,"del":54,"files":9},{"hash":"71c44dc","subject":"fix: rerun graph nodes whose cached output fingerprints are damaged","add":87,"del":59,"files":6},{"hash":"59b3d97","subject":"fix: plan RunSpecs whose numeric or list options are explicitly null","add":27,"del":7,"files":2}];
+
+// ── 层与包的定义：颜色按层分配（固定顺序的分类色） ──
+const LAYERS = [
+  { id: "entry",   name: "入口层",   desc: "CLI 与 Web UI", color: "--series-1", pkgs: ["cli", "ui"] },
+  { id: "runtime", name: "运行时层", desc: "契约、编译与调度", color: "--series-2", pkgs: ["runtime"] },
+  { id: "engine",  name: "流水线层", desc: "Graph 引擎与阶段实现", color: "--series-3", pkgs: ["pipeline", "ocr", "sources"] },
+  { id: "domain",  name: "领域层",   desc: "语义、出版、知识库", color: "--series-4", pkgs: ["semantic", "publication", "knowledge"] },
+  { id: "support", name: "维护层",   desc: "旧入口与一次性修复", color: "--series-5", pkgs: ["legacy", "maintenance"] },
+];
+const PKG_DESC = {
+  cli: "产品 CLI：plan / run / ingest / translate / apply / publish / review / doctor，以及知识库子命令",
+  ui: "Streamlit 工作台：新任务、任务状态、人工复核、产物、设置；SQLite WAL 任务注册表",
+  runtime: "RunSpec 契约与唯一编译器 RunExecutionService；模型 profile、路径、仓库守卫、SHA-256",
+  pipeline: "轻量 DAG 引擎（core）、PDF/EPUB 图适配器、Recipe 插件；book_pipeline 是阶段式实现",
+  ocr: "离线 PP-OCRv5 CPU 后端（Mac 本机）",
+  sources: "来源导入：EPUB 语义导入、文字层 PDF 导入",
+  semantic: "语义中间表示 TranslationUnit、人工复核策略、并发翻译 runner、事务式回填",
+  publication: "发布验收：语义重建、EPUB/Word 验证器、Word 渲染门禁、真脚注",
+  knowledge: "RAG 知识库：索引、混合检索、重排、评测、全局库、中文规范化",
+  legacy: "旧版逐页 OCR+翻译入口（兼容保留）",
+  maintenance: "已审定章节重生成、单书补丁",
+};
+const pkgLayer = {};
+LAYERS.forEach(l => l.pkgs.forEach(p => pkgLayer[p] = l));
+const isDark = () => document.documentElement.dataset.theme === "dark"
+  || (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches);
+// 支持 ?theme=light|dark，便于分享与截图时固定主题
+const themeParam = new URLSearchParams(location.search).get("theme");
+if (themeParam === "light" || themeParam === "dark") document.documentElement.dataset.theme = themeParam;
+const fmt = n => n.toLocaleString("zh-CN");
+
+const byPkg = {};
+MODULES.forEach(m => (byPkg[m.pkg] ||= []).push(m));
+Object.values(byPkg).forEach(list => list.sort((a, b) => b.lines - a.lines));
+const pkgLines = Object.fromEntries(Object.entries(byPkg).map(([p, l]) => [p, l.reduce((s, m) => s + m.lines, 0)]));
+const TOTAL = MODULES.reduce((s, m) => s + m.lines, 0);
+const maxPkg = Math.max(...Object.values(pkgLines));
+
+// ── 提示框 ──
+const tip = document.getElementById("tip");
+function showTip(html, ev) {
+  tip.innerHTML = html; tip.classList.add("show"); moveTip(ev);
+}
+function moveTip(ev) {
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = ev.clientX + pad, y = ev.clientY + pad;
+  if (x + w > innerWidth - 8) x = ev.clientX - w - pad;
+  if (y + h > innerHeight - 8) y = ev.clientY - h - pad;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+const hideTip = () => tip.classList.remove("show");
+
+// ── 指标卡 ──
+function renderStats() {
+  const items = [
+    { label: "源码模块", value: MODULES.length, note: "11 个包，不含 __init__" },
+    { label: "源码行数", value: fmt(TOTAL), note: "translation_agent/" },
+    { label: "Graph 节点类型", value: 29, note: "PDF 与 EPUB 两张图共用一个引擎" },
+    { label: "单元测试", value: 824, note: "61 个测试文件" },
+    { label: "本次净删减", value: "−173 行", note: "新增 418 / 删除 591", cls: "delta-down" },
+    { label: "修复缺陷", value: 6, note: "每个都有回归测试" },
+  ];
+  document.getElementById("stats").innerHTML = items.map(i =>
+    `<div class="card stat"><div class="label">${i.label}</div><div class="value ${i.cls || ""}">${i.value}</div><div class="note">${i.note}</div></div>`).join("");
+}
+
+// ── 分层架构 + 包详情 ──
+function renderLayers() {
+  const view = document.getElementById("layerView");
+  view.innerHTML = LAYERS.map(l => `
+    <div class="layer">
+      <div class="layer-name"><b>${l.name}</b><span>${l.desc}</span></div>
+      <div class="layer-pkgs">${l.pkgs.map(p => `
+        <button class="pkg-chip" type="button" data-pkg="${p}" style="--c:var(${l.color})" aria-expanded="false">
+          <div class="row"><span class="nm">${p}/</span><span class="ln">${byPkg[p].length} 个模块 · ${fmt(pkgLines[p])} 行</span></div>
+          <div class="ds">${PKG_DESC[p]}</div>
+          <div class="bar"><i style="width:${(pkgLines[p] / maxPkg * 100).toFixed(1)}%"></i></div>
+        </button>`).join("")}
+      </div>
+    </div>`).join("");
+  view.addEventListener("click", ev => {
+    const btn = ev.target.closest(".pkg-chip");
+    if (btn) openPkg(btn.dataset.pkg);
+  });
+}
+function openPkg(pkg) {
+  const panel = document.getElementById("pkgDetail");
+  document.querySelectorAll(".pkg-chip").forEach(b => {
+    const on = b.dataset.pkg === pkg && !(panel.classList.contains("open") && panel.dataset.pkg === pkg);
+    b.classList.toggle("active", on); b.setAttribute("aria-expanded", on);
+  });
+  if (panel.classList.contains("open") && panel.dataset.pkg === pkg) { panel.classList.remove("open"); return; }
+  const layer = pkgLayer[pkg];
+  const mods = byPkg[pkg];
+  const maxL = mods[0].lines;
+  const outs = EDGES.filter(e => e.from === pkg).sort((a, b) => b.n - a.n);
+  const ins = EDGES.filter(e => e.to === pkg).sort((a, b) => b.n - a.n);
+  panel.dataset.pkg = pkg;
+  panel.style.setProperty("--c", `var(${layer.color})`);
+  panel.innerHTML = `
+    <div class="detail-head"><h3><code>translation_agent/${pkg}/</code> · ${layer.name}</h3>
+      <span class="pill">${mods.length} 个模块 · <b>${fmt(pkgLines[pkg])}</b> 行</span></div>
+    <div class="dep-pills"><span class="pill">依赖 →</span>${outs.map(e => `<span class="pill"><b>${e.to}</b> ×${e.n}</span>`).join("") || '<span class="pill">无</span>'}</div>
+    <div class="dep-pills"><span class="pill">被依赖 ←</span>${ins.map(e => `<span class="pill"><b>${e.from}</b> ×${e.n}</span>`).join("") || '<span class="pill">无</span>'}</div>
+    <table><thead><tr><th>模块</th><th>职责（模块 docstring 首行）</th><th style="text-align:right">行数</th></tr></thead><tbody>
+      ${mods.map(m => `<tr><td><code>${m.path.split("/").slice(1).join("/")}</code></td>
+        <td>${m.doc || '<span style="color:var(--text-muted)">（无模块说明）</span>'}</td>
+        <td class="num"><span class="mini-bar" style="width:${Math.max(2, m.lines / maxL * 90)}px"></span>${fmt(m.lines)}</td></tr>`).join("")}
+    </tbody></table>`;
+  panel.classList.add("open");
+}
+
+// ── 树图：squarified 布局，按层分组 ──
+function squarify(items, x, y, w, h, out) {
+  if (!items.length) return;
+  const total = items.reduce((s, i) => s + i.v, 0);
+  if (items.length === 1) { out.push({ ...items[0], x, y, w, h }); return; }
+  const horizontal = w >= h;
+  const side = horizontal ? h : w;
+  const scale = (w * h) / total;
+  let row = [], rowSum = 0, best = Infinity, i = 0;
+  const worst = (r, s) => {
+    const area = s * scale, len = area / side;
+    return Math.max(...r.map(it => { const a = it.v * scale, d = a / len; return Math.max(len / d, d / len); }));
+  };
+  for (; i < items.length; i++) {
+    const next = [...row, items[i]], ns = rowSum + items[i].v, wv = worst(next, ns);
+    if (row.length && wv > best) break;
+    row = next; rowSum = ns; best = wv;
+  }
+  const len = rowSum * scale / side;
+  let off = 0;
+  row.forEach(it => {
+    const d = it.v * scale / len;
+    out.push(horizontal ? { ...it, x, y: y + off, w: len, h: d } : { ...it, x: x + off, y, w: d, h: len });
+    off += d;
+  });
+  const rest = items.slice(i);
+  if (horizontal) squarify(rest, x + len, y, w - len, h, out);
+  else squarify(rest, x, y + len, w, h - len, out);
+}
+function renderTreemap() {
+  const box = document.getElementById("treemap");
+  const W = box.clientWidth, H = box.clientHeight;
+  const groups = LAYERS.map(l => ({ layer: l, v: l.pkgs.reduce((s, p) => s + pkgLines[p], 0) }))
+    .sort((a, b) => b.v - a.v);
+  const groupRects = []; squarify(groups, 0, 0, W, H, groupRects);
+  const cells = [];
+  groupRects.forEach(g => {
+    const mods = g.layer.pkgs.flatMap(p => byPkg[p]).map(m => ({ m, v: m.lines })).sort((a, b) => b.v - a.v);
+    squarify(mods, g.x, g.y, g.w, g.h, cells);
+    cells.forEach(c => c.layer ||= g.layer);
+  });
+  box.innerHTML = cells.map((c, i) => {
+    const small = c.w < 58 || c.h < 34;
+    const darkInk = c.layer.color === "--series-4" && !isDark();
+    const name = c.m.path.split("/").pop().replace(".py", "");
+    return `<div class="tm-cell ${darkInk ? "dark-ink" : ""}" data-i="${i}" style="left:${c.x}px;top:${c.y}px;width:${c.w}px;height:${c.h}px;--c:var(${c.layer.color})">
+      ${small ? "" : `<div class="t">${name}</div><div class="n">${fmt(c.m.lines)}</div>`}</div>`;
+  }).join("");
+  box.onmousemove = ev => {
+    const el = ev.target.closest(".tm-cell"); if (!el) return hideTip();
+    const c = cells[+el.dataset.i];
+    showTip(`<div class="tt-title">${c.m.path}</div><div>${fmt(c.m.lines)} 行 · 占 ${(c.m.lines / TOTAL * 100).toFixed(1)}% · ${c.layer.name}</div><div class="tt-muted">${c.m.doc || "（无模块说明）"}</div>`, ev);
+  };
+  box.onmouseleave = hideTip;
+  document.getElementById("tmLegend").innerHTML = LAYERS.map(l => `<span style="--c:var(${l.color})">${l.name}（${l.pkgs.join(" / ")}）</span>`).join("");
+  const big = MODULES.filter(m => m.lines > 3900).reduce((s, m) => s + m.lines, 0);
+  document.getElementById("bigShare").textContent = `${fmt(big)} 行（${(big / TOTAL * 100).toFixed(0)}%）`;
+}
+
+// ── DAG：节点按拓扑层级排布 ──
+const STAGE = { source: "--series-1", pages: "--series-2", chapters: "--series-3", semantic: "--series-5", publish: "--series-4", verify: "--series-6" };
+const DAGS = {
+  pdf: {
+    label: "扫描 PDF（OCR）",
+    caption: "扫描 PDF 默认 phase=all；页级 OCR 不缓存，按页检查点续跑。",
+    nodes: [
+      ["core.source.inspect", [], ["source.pdf"], "source"],
+      ["core.pages.ocr", ["source.pdf"], ["pages.raw"], "pages", false],
+      ["core.toc.resolve", ["pages.raw", "source.pdf"], ["toc.mapped"], "chapters"],
+      ["core.chapters.compile", ["pages.raw", "source.pdf", "toc.mapped"], ["chapters.markdown"], "chapters"],
+      ["core.reconstruct.semantic", ["chapters.markdown"], ["chapters.semantic"], "semantic"],
+      ["core.publication.sanitize", ["chapters.semantic"], ["chapters.reader"], "semantic"],
+      ["core.publish.knowledge_base", ["chapters.reader", "source.pdf"], ["publication.knowledge_base"], "publish"],
+      ["core.publish.epub", ["chapters.reader"], ["publication.epub"], "publish"],
+      ["core.publish.docx", ["chapters.reader"], ["publication.docx"], "publish"],
+      ["core.publish.reference_pdf", ["source.pdf", "toc.mapped"], ["publication.reference_pdf"], "publish"],
+      ["core.publication.verify", ["chapters.reader", "chapters.semantic", "pages.raw", "publication.docx", "publication.epub", "publication.knowledge_base", "publication.reference_pdf", "source.pdf", "toc.mapped"], ["publication.report"], "verify", false],
+    ],
+  },
+  pdfTranslate: {
+    label: "扫描 PDF + 校勘 + 翻译",
+    caption: "启用校勘（include_proofread）与 --translate-non-chinese 时，在 OCR 与目录之间插入两个页级节点。",
+    nodes: [
+      ["core.source.inspect", [], ["source.pdf"], "source"],
+      ["core.pages.ocr", ["source.pdf"], ["pages.raw"], "pages", false],
+      ["core.pages.proofread", ["pages.raw"], ["pages.proofread"], "pages"],
+      ["core.pages.translate", ["pages.proofread"], ["pages.translated"], "pages"],
+      ["core.toc.resolve", ["pages.translated", "source.pdf"], ["toc.mapped"], "chapters"],
+      ["core.chapters.compile", ["pages.translated", "source.pdf", "toc.mapped"], ["chapters.markdown"], "chapters"],
+      ["core.reconstruct.semantic", ["chapters.markdown"], ["chapters.semantic"], "semantic"],
+      ["core.publication.sanitize", ["chapters.semantic"], ["chapters.reader"], "semantic"],
+      ["core.publish.knowledge_base", ["chapters.reader", "source.pdf"], ["publication.knowledge_base"], "publish"],
+      ["core.publish.epub", ["chapters.reader"], ["publication.epub"], "publish"],
+      ["core.publish.docx", ["chapters.reader"], ["publication.docx"], "publish"],
+      ["core.publish.reference_pdf", ["source.pdf", "toc.mapped"], ["publication.reference_pdf"], "publish"],
+      ["core.publication.verify", ["chapters.reader", "chapters.semantic", "pages.translated", "publication.docx", "publication.epub", "publication.knowledge_base", "publication.reference_pdf", "source.pdf", "toc.mapped"], ["publication.report"], "verify", false],
+    ],
+  },
+  textPdf: {
+    label: "文字层 PDF",
+    caption: "text-pdf 不做 OCR，用 core.pages.text_extract 直接读文字层，其余节点与扫描 PDF 相同。",
+    nodes: [
+      ["core.source.inspect", [], ["source.pdf"], "source"],
+      ["core.pages.text_extract", ["source.pdf"], ["pages.raw"], "pages"],
+      ["core.toc.resolve", ["pages.raw", "source.pdf"], ["toc.mapped"], "chapters"],
+      ["core.chapters.compile", ["pages.raw", "source.pdf", "toc.mapped"], ["chapters.markdown"], "chapters"],
+      ["core.reconstruct.semantic", ["chapters.markdown"], ["chapters.semantic"], "semantic"],
+      ["core.publication.sanitize", ["chapters.semantic"], ["chapters.reader"], "semantic"],
+      ["core.publish.knowledge_base", ["chapters.reader", "source.pdf"], ["publication.knowledge_base"], "publish"],
+      ["core.publish.epub", ["chapters.reader"], ["publication.epub"], "publish"],
+      ["core.publish.docx", ["chapters.reader"], ["publication.docx"], "publish"],
+      ["core.publish.reference_pdf", ["source.pdf", "toc.mapped"], ["publication.reference_pdf"], "publish"],
+      ["core.publication.verify", ["chapters.reader", "chapters.semantic", "pages.raw", "publication.docx", "publication.epub", "publication.knowledge_base", "publication.reference_pdf", "source.pdf", "toc.mapped"], ["publication.report"], "verify", false],
+    ],
+  },
+  epub: {
+    label: "EPUB（翻译）",
+    caption: "EPUB 走独立 Graph：语义重建同时产出翻译单元；translate → apply 生成 reader，再由 EPUB 原生门禁验收。不翻译时 apply 换成 materialize_reader。",
+    nodes: [
+      ["core.source.epub.inspect", [], ["source.epub"], "source"],
+      ["core.reconstruct.epub_semantic", ["source.epub"], ["chapters.semantic", "semantic.translation_units"], "semantic"],
+      ["core.semantic.review", ["chapters.semantic"], ["semantic.review"], "semantic"],
+      ["core.semantic.translate", ["semantic.translation_units"], ["semantic.translations"], "semantic"],
+      ["core.semantic.apply", ["chapters.semantic", "semantic.translations", "semantic.review"], ["chapters.reader"], "semantic"],
+      ["core.publish.epub", ["chapters.reader"], ["publication.epub"], "publish"],
+      ["core.publish.docx", ["chapters.reader"], ["publication.docx"], "publish"],
+      ["core.publish.knowledge_base", ["chapters.reader", "source.epub"], ["publication.knowledge_base"], "publish"],
+      ["core.publication.verify.epub", ["source.epub", "semantic.review", "chapters.reader", "publication.epub"], ["publication.epub_report"], "verify", false],
+    ],
+  },
+};
+let currentDag = "pdf";
+function renderTabs() {
+  const tabs = document.getElementById("dagTabs");
+  tabs.innerHTML = Object.entries(DAGS).map(([k, d]) => `<button class="tab" role="tab" type="button" data-k="${k}" aria-selected="${k === currentDag}">${d.label}</button>`).join("");
+  tabs.onclick = ev => { const b = ev.target.closest(".tab"); if (b) { currentDag = b.dataset.k; renderTabs(); renderDag(); } };
+}
+function renderDag() {
+  const dag = DAGS[currentDag];
+  const nodes = dag.nodes.map(([name, req, prov, stage, cache = true]) => ({ name, req, prov, stage, cache }));
+  const producer = {};
+  nodes.forEach(n => n.prov.forEach(a => producer[a] = n));
+  nodes.forEach(n => n.parents = [...new Set(n.req.map(a => producer[a]).filter(Boolean))]);
+  nodes.forEach(n => n.depth = 0);
+  for (let k = 0; k < nodes.length; k++) nodes.forEach(n => n.parents.forEach(p => n.depth = Math.max(n.depth, p.depth + 1)));
+  const rows = {};
+  nodes.forEach(n => (rows[n.depth] ||= []).push(n));
+  const NW = 232, NH = 50, GX = 22, GY = 46, PAD = 12;
+  const depths = Object.keys(rows).map(Number).sort((a, b) => a - b);
+  const maxCols = Math.max(...depths.map(d => rows[d].length));
+  const W = maxCols * NW + (maxCols - 1) * GX + PAD * 2;
+  const H = depths.length * NH + (depths.length - 1) * GY + PAD * 2;
+  depths.forEach(d => {
+    const row = rows[d];
+    // 同层按上游节点平均横坐标排序，减少连线交叉
+    if (d > 0) row.sort((a, b) => avgX(a) - avgX(b));
+    const rowW = row.length * NW + (row.length - 1) * GX;
+    row.forEach((n, i) => { n.x = (W - rowW) / 2 + i * (NW + GX); n.y = PAD + d * (NH + GY); });
+  });
+  function avgX(n) { return n.parents.length ? n.parents.reduce((s, p) => s + p.x, 0) / n.parents.length : 0; }
+  const edges = [];
+  nodes.forEach(n => n.parents.forEach(p => edges.push({ from: p, to: n })));
+  // 出入口沿节点上下边分散，避免多条线挤在同一点
+  nodes.forEach(n => {
+    const outs = edges.filter(e => e.from === n).sort((a, b) => a.to.x - b.to.x);
+    outs.forEach((e, i) => e.x1 = n.x + NW * (outs.length === 1 ? 0.5 : 0.2 + 0.6 * i / (outs.length - 1)));
+    const ins = edges.filter(e => e.to === n).sort((a, b) => a.from.x - b.from.x);
+    ins.forEach((e, i) => e.x2 = n.x + NW * (ins.length === 1 ? 0.5 : 0.15 + 0.7 * i / (ins.length - 1)));
+  });
+  const svg = document.getElementById("dag");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`); svg.setAttribute("width", W); svg.setAttribute("height", H);
+  const short = s => s.replace(/^core\./, "");
+  svg.innerHTML = `
+    <defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--axis)"/></marker></defs>
+    <g>${edges.map((e, i) => {
+      const y1 = e.from.y + NH, y2 = e.to.y - 2, my = (y1 + y2) / 2;
+      return `<path class="dag-edge" data-i="${i}" marker-end="url(#arr)" d="M${e.x1},${y1} C${e.x1},${my} ${e.x2},${my} ${e.x2},${y2}"/>`;
+    }).join("")}</g>
+    <g>${nodes.map((n, i) => `
+      <g class="dag-node ${n.cache ? "" : "nocache"}" data-i="${i}" style="--c:var(${STAGE[n.stage]})" tabindex="0">
+        <rect x="${n.x}" y="${n.y}" width="${NW}" height="${NH}" rx="8"/>
+        <rect class="stage" x="${n.x + 1}" y="${n.y + 1}" width="5" height="${NH - 2}" rx="2"/>
+        <text class="nm" x="${n.x + 14}" y="${n.y + 21}">${short(n.name)}</text>
+        <text class="art" x="${n.x + 14}" y="${n.y + 38}">→ ${n.prov.join(", ")}</text>
+      </g>`).join("")}</g>`;
+  const nodeEls = [...svg.querySelectorAll(".dag-node")], edgeEls = [...svg.querySelectorAll(".dag-edge")];
+  const related = n => {
+    const up = new Set(), down = new Set();
+    const walkUp = x => x.parents.forEach(p => { if (!up.has(p)) { up.add(p); walkUp(p); } });
+    const walkDown = x => nodes.filter(c => c.parents.includes(x)).forEach(c => { if (!down.has(c)) { down.add(c); walkDown(c); } });
+    walkUp(n); walkDown(n); return { up, down };
+  };
+  const focus = (n, ev) => {
+    const { up, down } = related(n);
+    nodeEls.forEach((el, i) => el.classList.toggle("dim", !(nodes[i] === n || up.has(nodes[i]) || down.has(nodes[i]))));
+    edgeEls.forEach((el, i) => {
+      const e = edges[i];
+      const onPath = ((up.has(e.from) || e.from === n) && (up.has(e.to) || e.to === n))
+        || ((down.has(e.to) || e.to === n) && (down.has(e.from) || e.from === n));
+      el.classList.toggle("hot", onPath); el.classList.toggle("dim", !onPath);
+    });
+    if (ev) showTip(`<div class="tt-title">${n.name}</div>
+      <div><span class="tt-muted">requires：</span>${n.req.length ? n.req.join(", ") : "（无，直接读源文件）"}</div>
+      <div><span class="tt-muted">provides：</span>${n.prov.join(", ")}</div>
+      <div class="tt-muted">${n.cache ? "可缓存：指纹不变时跳过" : "不缓存：每次重新执行"} · 上游 ${up.size} 个 / 下游 ${down.size} 个节点</div>`, ev);
+  };
+  const clear = () => { nodeEls.forEach(el => el.classList.remove("dim")); edgeEls.forEach(el => el.classList.remove("hot", "dim")); hideTip(); };
+  nodeEls.forEach((el, i) => {
+    el.addEventListener("mouseenter", ev => focus(nodes[i], ev));
+    el.addEventListener("mousemove", moveTip);
+    el.addEventListener("mouseleave", clear);
+    el.addEventListener("focus", () => focus(nodes[i]));
+    el.addEventListener("blur", clear);
+  });
+  document.getElementById("dagCaption").textContent = dag.caption;
+}
+
+// ── 依赖矩阵：单色顺序色阶 ──
+function renderMatrix() {
+  const order = LAYERS.flatMap(l => l.pkgs);
+  const map = {}; EDGES.forEach(e => map[e.from + ">" + e.to] = e.n);
+  const max = Math.max(...EDGES.map(e => e.n));
+  const ramp = ["#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95"];
+  const rampDark = ["#184f95", "#1c5cab", "#256abf", "#3987e5", "#6da7ec"];
+  const step = n => Math.min(4, Math.floor((n - 1) / max * 5));
+  const r = isDark() ? rampDark : ramp;
+  const t = document.getElementById("matrix");
+  t.innerHTML = `<caption class="sr-only">包间导入次数矩阵</caption><thead><tr><th></th>${order.map(p => `<th class="col" scope="col">${p}</th>`).join("")}</tr></thead>
+    <tbody>${order.map(a => `<tr><th class="rowh" scope="row">${a}</th>${order.map(b => {
+      if (a === b) return `<td class="self"></td>`;
+      const n = map[a + ">" + b];
+      if (!n) return `<td>·</td>`;
+      const cyc = map[b + ">" + a] ? " cycle" : "";
+      const s = step(n);
+      const ink = (isDark() ? s >= 3 : s <= 1) ? "#0b0b0b" : "#ffffff";
+      return `<td class="has${cyc}" data-a="${a}" data-b="${b}" data-n="${n}" style="background:${r[s]};color:${ink}">${n}</td>`;
+    }).join("")}</tr>`).join("")}</tbody>`;
+  t.onmousemove = ev => {
+    const td = ev.target.closest("td.has"); if (!td) return hideTip();
+    const { a, b, n } = td.dataset, back = map[b + ">" + a];
+    showTip(`<div class="tt-title">${a} → ${b}</div><div>${n} 条 import 语句</div>${back ? `<div class="tt-muted">循环：${b} 也导入 ${a}（${back} 条）</div>` : ""}`, ev);
+  };
+  t.onmouseleave = hideTip;
+  const cycles = EDGES.filter(e => map[e.to + ">" + e.from] && e.from < e.to).map(e => `${e.from} ⇄ ${e.to}`);
+  document.getElementById("matrixScale").innerHTML = `<span>少</span>${r.map(c => `<i style="background:${c}"></i>`).join("")}<span>多（最大 ${max}）</span>
+    <span style="margin-left:16px"><i style="box-shadow:inset 0 0 0 2px var(--critical);background:transparent"></i> 循环依赖 ${cycles.length} 对：${cycles.join("，")}</span>`;
+}
+
+// ── 契约、门禁、入口 ──
+function renderCards() {
+  const contracts = [
+    ["RunSpec", "v1", "CLI、服务与 Web UI 的统一输入：严格类型、来源与目标能力校验，不保存密钥"],
+    ["DocumentSemantic", "v1", "文档、章节、语义块、来源定位与资产清单"],
+    ["TranslationUnit", "v1", "8 个固定字段、稳定顺序、源文本 SHA-256 与来源定位（SourceLocator）"],
+    ["ReviewDecision", "v1", "只追加的人工复核决定，绑定 reconstruction、对象与源哈希"],
+    ["ArtifactRecord", "v1", "产物身份、SHA-256 与草稿 / 阻断 / 正式状态"],
+    ["Graph state / event", "v1", "节点缓存、产物指纹和恢复记录（state.json / events.jsonl）"],
+  ];
+  document.getElementById("contractCards").innerHTML = contracts.map(([n, v, d]) =>
+    `<div class="card contract"><h3>${n}<span class="ver">${v}</span></h3><p>${d}</p></div>`).join("");
+  const gates = [
+    ["full", "ready", "publication.report", "PDF 全量验收：章节、知识库、EPUB、Word、参考 PDF 一起检查"],
+    ["word", "ready", "publication.word_report", "Word 包结构 + 固定环境渲染门禁（需要 LibreOffice）"],
+    ["epub", "ready", "publication.epub_report", "EPUB3 包、语义哈希绑定、脚注闭环、内部链接确定性检查"],
+    ["draft", "draft", "publication.epub / docx …", "直接出版目标，不跑验收，结果始终是草稿"],
+  ];
+  document.getElementById("gateCards").innerHTML = gates.map(([p, k, t, d]) =>
+    `<div class="gate"><span class="tag ${k}">${k === "ready" ? "可签发 release_ready" : "仅草稿"}</span><h3>${p}</h3><p><code>${t}</code></p><p style="margin-top:4px">${d}</p></div>`).join("");
+  const entries = [
+    ["translation-agent", "cli/document_pipeline.py", "产品主入口，所有子命令都经 RunExecutionService 解释同一份 RunSpec", ["plan", "run", "ingest", "translate", "apply", "publish", "status", "review", "doctor"]],
+    ["translation-agent-web", "cli/launch_frontend.py", "启动本机 Streamlit 工作台，只允许回环地址", ["新任务", "任务状态", "人工复核", "产物", "设置"]],
+    ["translation-agent-kb", "cli/knowledge_base_cli.py", "知识库注册、装置标注、中文化、检索与评测", ["register", "annotate-apparatus", "translate-kb", "retrieve", "status", "evaluate", "derive-docx"]],
+    ["translation-agent-doctor", "cli/doctor.py", "运行前环境诊断：Python 版本、核心依赖、soffice 等", ["--json"]],
+    ["translation-agent-paddle", "ocr/paddle_native.py", "离线 PP-OCRv5 CPU 识别（Mac 本机）", ["--variant", "--threads"]],
+    ["translation-agent-global-kb", "knowledge/global_knowledge_base.py", "跨输出目录的本地全局检索索引", ["build", "query"]],
+    ["translation-agent-repo-guard", "runtime/repository_guard.py", "提交前拦截书籍、缓存、大文件和密钥（CI 第一步）", ["CI"]],
+  ];
+  document.getElementById("entryCards").innerHTML = entries.map(([c, f, d, cmds]) =>
+    `<div class="card entry"><h3><code>${c}</code></h3><div class="mono" style="color:var(--text-muted)">${f}</div><p>${d}</p><div class="cmds">${cmds.map(x => `<span class="pill">${x}</span>`).join("")}</div></div>`).join("");
+}
+
+// ── 清理时间线（发散条：左删除、右新增） ──
+const COMMIT_NOTES = {
+  "7aa9597": "补上缺失的 Sequence 导入；删除 7 个零引用函数与未用导入/变量；py311 写法升级",
+  "bb2a264": "14 个模块各自复制的 SHA-256 helper 合并到 runtime/digests.py",
+  "cfef17e": "全部改用 pymupdf 模块名，测试输出不再出现弃用警告",
+  "a53daca": "假名正则重复赋值导致中文段落被误送翻译；同时删除未用的 Web 兼容入口",
+  "856641f": "空列表翻译在并发时报错；删除不可达分支、未用常量与字段",
+  "71c44dc": "缓存指纹损坏时重跑节点；删除 graph/semantic/CLI 中重复的上游校验",
+  "59b3d97": "RunSpec 选项显式为 null 时生成计划会崩溃",
+};
+function renderTimeline() {
+  const max = Math.max(...COMMITS.flatMap(c => [c.add, c.del]));
+  document.getElementById("timeline").innerHTML = COMMITS.map(c => {
+    const kind = c.subject.startsWith("fix") ? "fix" : "ref";
+    const title = c.subject.replace(/^(fix|refactor): /, "");
+    const dw = c.del / max * 46, aw = c.add / max * 46;
+    return `<div class="tl-row">
+      <div class="tl-hash">${c.hash}</div>
+      <div class="tl-desc"><span class="tl-kind ${kind}">${kind === "fix" ? "修复" : "重构"}</span>${COMMIT_NOTES[c.hash]}<small><span class="mono">${title}</span> · ${c.files} 个文件</small></div>
+      <div class="diverge" aria-label="删除 ${c.del} 行，新增 ${c.add} 行">
+        <div class="mid"></div>
+        <div class="del" style="width:${dw}%"></div><div class="add" style="width:${aw}%"></div>
+        <span class="lbl" style="right:${52 + dw}%">−${c.del}</span><span class="lbl" style="left:${52 + aw}%">+${c.add}</span>
+      </div></div>`;
+  }).join("");
+  const bugs = [
+    ["NameError：Sequence 未导入", "pipeline/book_pipeline.py", "类型注解引用了未导入的 Sequence。", "注解里的名字未定义", "补上导入"],
+    ["--verbose 运行崩溃", "tools/books/endnote_transform_parallax_view.py", "打印日志时引用了未定义变量 marker。", "NameError", "打印本页生成的脚注标记"],
+    ["中文段落被误送翻译", "publication/docx_translation.py", "_KANA_RE 被第二次赋值覆盖，片假名区的标点「・」「゠」被当成日文。", "needs_translation('中文・正文') = True", "False；ゟ ヿ 仍判为日文"],
+    ["空列表翻译报错", "knowledge/kb_translation.py", "concurrency>1 时创建 0 个线程的线程池。", "translate_texts([]) → ValueError", "返回 []"],
+    ["缓存指纹损坏后无法恢复", "pipeline/graph/core.py", "state.json 里指纹是 []、12、null 等时仍命中缓存，随后被 GraphContext 拒绝。", "整次运行失败，重跑也失败", "视为缓存失效，重跑并写回"],
+    ["null 选项导致计划崩溃", "runtime/run_execution_service.py", "校验放行 null，但规划时调用 int(None) / tuple(None)。", "5 个选项各自 TypeError", "按省略处理，取默认值"],
+  ];
+  document.getElementById("bugCards").innerHTML = bugs.map(([t, w, d, before, after]) => `
+    <div class="card bug"><h3>${t}</h3><div class="where">${w}</div><p>${d}</p>
+      <div class="ba"><div><b>修复前</b>${before}</div><div><b>修复后</b>${after}</div></div></div>`).join("");
+  const todo = [
+    ["p1", "P1", "拆分 <code>pipeline/book_pipeline.py</code>（约 8000 行）：OCR、目录、校勘、翻译仍是 argv 兼容层，按 Graph 节点边界逐个抽成类型化服务（compile_service 已是先例）。"],
+    ["p1", "P1", "拆分 <code>publication/publication_verifier.py</code>（约 4800 行）：把各项检查像 <code>checks/runtime_hygiene.py</code> 一样移到 <code>publication/checks/</code>，保持报告 ID 与顺序不变。"],
+    ["p2", "P2", "消除循环依赖（见依赖矩阵红框），优先处理 pipeline ⇄ publication 与 pipeline ⇄ knowledge：把共用类型下沉到 runtime 或 semantic。"],
+    ["p2", "P2", "在本机安装 LibreOffice 或标记该用例需要 soffice，让全量测试在 Mac 上能完全通过。"],
+    ["p3", "P3", "清理剩余风格类 lint（printf 格式化 61 处、测试闭包引用循环变量等），并把 ruff 加入 CI。"],
+    ["p3", "P3", "为没有模块说明的文件（如 book_pipeline、translation_agent_api、各 Streamlit 页面）补一行 docstring。"],
+  ];
+  document.getElementById("todo").innerHTML = todo.map(([c, p, t]) => `<li><span class="prio ${c}">${p}</span><span>${t}</span></li>`).join("");
+}
+
+// ── 主题切换：深色是单独选定的色阶，不是自动反色 ──
+const themeBtn = document.getElementById("themeBtn");
+function syncThemeLabel() {
+  themeBtn.textContent = isDark() ? "切换浅色" : "切换深色";
+}
+themeBtn.onclick = () => {
+  document.documentElement.dataset.theme = isDark() ? "light" : "dark";
+  syncThemeLabel(); renderTreemap(); renderMatrix();
+};
+
+renderStats(); renderLayers(); renderTreemap(); renderTabs(); renderDag(); renderMatrix(); renderCards(); renderTimeline(); syncThemeLabel();
+addEventListener("resize", () => renderTreemap());
+</script>
+</body>
+</html>
