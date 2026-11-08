@@ -706,21 +706,47 @@ def main(argv: list[str] | None = None) -> int:
         verify_artifacts(profile.local)
         print(f"ok: {profile.local.model_file.name} and {profile.local.server_binary} match pinned SHA-256")
         return 0
-    server = ManagedLlamaServer(profile.local, label="serve")
-    stop = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    try:
-        server.ensure_started()
+    return _serve_foreground(ManagedLlamaServer(profile.local, label="serve"))
+
+
+def _serve_foreground(server: ManagedLlamaServer) -> int:
+    """Run ``serve`` until SIGTERM/SIGINT/SIGHUP, cancelling any queued or loading start.
+
+    The handler only records the signal: it runs in the main thread between
+    bytecodes and must not take locks the interrupted code may hold.  Start
+    (lease wait, load, health check) runs in a worker thread so the main
+    thread can always react and call ``close()``, which cancels the lease
+    wait or health wait, reaps our processes and releases the lease.
+    """
+
+    received: list[int] = []
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(signum, lambda number, _frame: received.append(number))
+    failure: list[BaseException] = []
+
+    def start() -> None:
+        try:
+            server.ensure_started()
+        except BaseException as exc:  # noqa: BLE001 - reported by the main thread
+            failure.append(exc)
+            return
         # Per-session bearer token; the server listens on 127.0.0.1 only.
         print(json.dumps({"base_url": f"{server.base_url}/v1", "model": server._alias,
                           "authorization": f"Bearer {server._api_key}"}), flush=True)
-        while not stop.wait(0.5):
-            pass
-    except KeyboardInterrupt:
-        pass
+
+    worker = threading.Thread(target=start, name="local-llm-serve-start", daemon=True)
+    worker.start()
+    try:
+        while not received and not failure:
+            time.sleep(0.1)
     finally:
         server.close()
-    return 0
+        worker.join()
+    if received:
+        lease_log(COMPONENT, f"serve stopped by signal {received[0]}")
+        return 128 + received[0]
+    print(f"serve failed: {failure[0]}", file=sys.stderr, flush=True)
+    return 1
 
 
 if __name__ == "__main__":

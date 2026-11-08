@@ -390,6 +390,87 @@ class ParentExitTests(LocalServerTestCase):
         self.assertIsNone(unrelated.poll())
 
 
+def _read_until(stream, marker: str, timeout: float) -> str:
+    """Read a pipe until ``marker`` appears; fail instead of hanging."""
+
+    import select
+
+    seen = ""
+    deadline = time.monotonic() + timeout
+    while marker not in seen:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"{marker!r} not seen within {timeout}s; got {seen!r}")
+        readable, _, _ = select.select([stream], [], [], remaining)
+        if readable:
+            chunk = os.read(stream.fileno(), 4096).decode("utf-8", errors="replace")
+            if not chunk:
+                raise AssertionError(f"stream closed before {marker!r}; got {seen!r}")
+            seen += chunk
+    return seen
+
+
+class ServeCliSignalTests(LocalServerTestCase):
+    """Real ``python -m ... serve`` subprocess receiving SIGTERM (stub backend)."""
+
+    def serve(self) -> subprocess.Popen:
+        config = LocalProfileTests.write_config(self)
+        process = subprocess.Popen(
+            [sys.executable, "-m", "translation_agent.runtime.local_llm_server",
+             "serve", "--config", str(config), "--profile", "local"],
+            cwd=REPOSITORY, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        self.addCleanup(process.stdout.close)
+        self.addCleanup(process.stderr.close)
+        return process
+
+    def assert_terminated(self, process: subprocess.Popen, *, within: float) -> None:
+        process.send_signal(signal.SIGTERM)
+        self.assertEqual(process.wait(within), 128 + signal.SIGTERM)
+
+    def test_sigterm_while_queued_exits_without_loading(self) -> None:
+        holder = OutputDirectoryLock(heavy_model_lock_path(), purpose="paddleocr-native")
+        holder.acquire()
+        process = self.serve()
+        try:
+            _read_until(process.stderr, "queued:", timeout=20)
+            # Bounded exit while the OCR lease is still held.
+            self.assert_terminated(process, within=3)
+        finally:
+            holder.release()
+        time.sleep(0.5)
+        self.assertFalse(self.timeline.exists(), "a cancelled queued serve must never load")
+        self.assertTrue(_lock_is_free())
+
+    def test_sigterm_while_loading_reaps_backend_and_releases_lease(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_LOAD_SECONDS": "30"}):
+            process = self.serve()
+            _read_until(process.stderr, "loading ", timeout=20)
+        state = server_module.state_path()
+        deadline = time.monotonic() + 10
+        while not state.is_file() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        recorded = json.loads(state.read_text(encoding="utf-8"))
+        self.assert_terminated(process, within=15)
+        for pid in (recorded["supervisor_pid"], recorded["server_pid"]):
+            self.assertFalse(_alive(pid), f"pid {pid} survived serve cancellation")
+        self.assertFalse(state.exists())
+        self.assertTrue(_lock_is_free())
+        self.assertFalse(self.timeline.exists(), "the stub was stopped before it finished loading")
+
+    def test_sigterm_while_serving_unloads(self) -> None:
+        process = self.serve()
+        _read_until(process.stdout, "base_url", timeout=20)
+        recorded = json.loads(server_module.state_path().read_text(encoding="utf-8"))
+        self.assert_terminated(process, within=15)
+        for pid in (recorded["supervisor_pid"], recorded["server_pid"]):
+            self.assertFalse(_alive(pid))
+        self.assertTrue(_lock_is_free())
+        events = [json.loads(line)["event"] for line in self.timeline.read_text().splitlines()]
+        self.assertEqual(events, ["load", "unload"])
+
+
 class SemanticAndPageSeamTests(LocalServerTestCase):
     REPLY = (
         "⟦UNIT:c-u1:START⟧\n"
