@@ -23,9 +23,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Mapping, Sequence, Tuple, Union
-
-from os import PathLike
+from typing import Iterable, Mapping, Sequence, Union
 
 from lxml import etree
 
@@ -81,7 +79,7 @@ _CT = "{%s}" % CT_NS
 _MARKER_RE = re.compile(r"\[\[FN:([^\]\r\n]+)\]\]")
 
 PathLike = Union[str, os.PathLike]
-OrderedNotes = Union[Mapping[str, str], Iterable[Tuple[str, str]]]
+OrderedNotes = Union[Mapping[str, str], Iterable[tuple[str, str]]]
 
 
 class FootnotePatchError(ValueError):
@@ -93,12 +91,12 @@ class FootnoteInventory:
     """Structural inventory for true footnotes in a DOCX package."""
 
     has_part: bool
-    reference_ids: Tuple[int, ...]
-    definition_ids: Tuple[int, ...]
-    separators: Tuple[Tuple[int, Union[str, None]], ...]
-    relationship_ids: Tuple[str, ...]
-    content_type_parts: Tuple[str, ...]
-    problems: Tuple[str, ...]
+    reference_ids: tuple[int, ...]
+    definition_ids: tuple[int, ...]
+    separators: tuple[tuple[int, Union[str, None]], ...]
+    relationship_ids: tuple[str, ...]
+    content_type_parts: tuple[str, ...]
+    problems: tuple[str, ...]
 
     @property
     def valid(self) -> bool:
@@ -269,7 +267,7 @@ def inspect_docx_footnotes(docx_path: PathLike) -> FootnoteInventory:
     )
 
 
-def _normalize_notes(notes: OrderedNotes) -> Sequence[Tuple[str, str]]:
+def _normalize_notes(notes: OrderedNotes) -> Sequence[tuple[str, str]]:
     raw_items = notes.items() if isinstance(notes, Mapping) else notes
     normalized = []
     seen = set()

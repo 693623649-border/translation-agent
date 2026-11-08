@@ -7,7 +7,6 @@ from pathlib import Path
 
 from docx import Document
 from translation_agent.publication.docx_translation import (
-    DocxTranslationError,
     clean_running_heads,
     needs_translation,
     strip_running_heads,

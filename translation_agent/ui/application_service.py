@@ -46,7 +46,7 @@ class ApplicationService:
     def from_environment(
         cls,
         environment: Mapping[str, str] | None = None,
-    ) -> "ApplicationService":
+    ) -> ApplicationService:
         return cls(FrontendSettings.from_environment(environment))
 
     def _job_paths(self, job_id: str) -> tuple[Path, Path, Path]:

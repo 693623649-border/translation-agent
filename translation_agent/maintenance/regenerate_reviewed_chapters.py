@@ -305,12 +305,6 @@ def page_layout_hints(
     return starts, quote_starts
 
 
-def page_layout_paragraph_starts(document: fitz.Document, pdf_page: int) -> set[str]:
-    """Compatibility helper returning only paragraph-start hints."""
-
-    return page_layout_hints(document, pdf_page)[0]
-
-
 def parse_body_blocks(
     text: str,
     pdf_page: int,
@@ -411,7 +405,7 @@ def join_text(left: str, right: str) -> str:
 
 def append_note_stream(
     note_text: str,
-    notes: "OrderedDict[int, Note]",
+    notes: OrderedDict[int, Note],
     active_number: int | None,
 ) -> int | None:
     """Append one page's note stream, including a carried-over long note."""
@@ -483,9 +477,9 @@ def reconstruct_chapter(
     end: int,
     paragraph_starts_by_page: dict[int, set[str]] | None = None,
     quote_starts_by_page: dict[int, set[str]] | None = None,
-) -> tuple[list[SourceBlock], "OrderedDict[int, Note]"]:
+) -> tuple[list[SourceBlock], OrderedDict[int, Note]]:
     blocks: list[SourceBlock] = []
-    notes: "OrderedDict[int, Note]" = OrderedDict()
+    notes: OrderedDict[int, Note] = OrderedDict()
     active_note: int | None = None
     for pdf_page in range(start, end + 1):
         body, note_stream = split_page_streams(load_page_text(output_dir, pdf_page))
@@ -535,7 +529,7 @@ def reconstruct_chapter(
     return blocks, notes
 
 
-def protect_references(blocks: list[SourceBlock], notes: "OrderedDict[int, Note]") -> None:
+def protect_references(blocks: list[SourceBlock], notes: OrderedDict[int, Note]) -> None:
     for number in notes:
         pattern = re.compile(rf"(?<!\d){number}(?!\d)")
         matches = sum(len(pattern.findall(item.text)) for item in blocks if item.kind == "body")
@@ -548,7 +542,7 @@ def protect_references(blocks: list[SourceBlock], notes: "OrderedDict[int, Note]
                 item.text = pattern.sub(f"⟦R{number}⟧", item.text)
 
 
-def assign_markers(blocks: list[SourceBlock], notes: "OrderedDict[int, Note]") -> None:
+def assign_markers(blocks: list[SourceBlock], notes: OrderedDict[int, Note]) -> None:
     body_index = 0
     for item in blocks:
         if item.kind == "body":
@@ -563,7 +557,7 @@ def assign_markers(blocks: list[SourceBlock], notes: "OrderedDict[int, Note]") -
 
 def make_units(
     blocks: list[SourceBlock],
-    notes: "OrderedDict[int, Note]",
+    notes: OrderedDict[int, Note],
     max_chars: int,
 ) -> list[TranslationUnit]:
     units: list[TranslationUnit] = []
@@ -769,7 +763,7 @@ def figure_placeholder(source: str) -> str:
 def render_reviewed_chapter(
     title: str,
     blocks: list[SourceBlock],
-    notes: "OrderedDict[int, Note]",
+    notes: OrderedDict[int, Note],
     translations: dict[str, str],
 ) -> str:
     output = [f"# {title}", ""]
@@ -798,7 +792,7 @@ def write_reconstruction_audit(
     start: int,
     end: int,
     blocks: list[SourceBlock],
-    notes: "OrderedDict[int, Note]",
+    notes: OrderedDict[int, Note],
     units: list[TranslationUnit],
     reviewed: str,
     profile: ModelProfile,

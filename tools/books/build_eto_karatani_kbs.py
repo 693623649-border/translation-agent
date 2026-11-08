@@ -73,9 +73,7 @@ def main() -> int:
                 legacy.split_text(body, 4000), start=1
             ):
                 row_id = hashlib.sha1(
-                    f"{source.name}:{item['id']}:compiled:{chunk_index}".encode(
-                        "utf-8"
-                    )
+                    f"{source.name}:{item['id']}:compiled:{chunk_index}".encode()
                 ).hexdigest()
                 rows.append(
                     {

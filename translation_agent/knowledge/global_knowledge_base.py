@@ -40,7 +40,7 @@ import tempfile
 import unicodedata
 from collections import Counter
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -128,7 +128,7 @@ def _load_kb(path: Path) -> tuple[list[dict[str, Any]], str]:
         if not line.strip():
             continue
         row = json.loads(line)
-        if not isinstance(row, dict) or not REQUIRED_KB_FIELDS <= set(row):
+        if not isinstance(row, dict) or not set(row) >= REQUIRED_KB_FIELDS:
             raise ValueError(f"Invalid knowledge-base fields at {path}:{number}")
         if (not isinstance(row["id"], str)
                 or not re.fullmatch(r"[0-9a-f]{40}", row["id"])
@@ -480,7 +480,7 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
             _create_schema(db)
             db.execute("INSERT INTO meta VALUES (?, ?)", ("outputs_root", str(root)))
             db.execute("INSERT INTO meta VALUES (?, ?)",
-                       ("built_at", datetime.now(timezone.utc).isoformat()))
+                       ("built_at", datetime.now(UTC).isoformat()))
             db.execute("INSERT INTO meta VALUES (?, ?)",
                        ("search_normalization", _NORMALIZATION))
             for workspace in workspaces:

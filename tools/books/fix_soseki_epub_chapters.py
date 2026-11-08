@@ -93,7 +93,6 @@ def main() -> int:
     audit_path = WORK / "audit" / "semantic-reconstruction.json"
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
     audit_by_id = {entry["chapter_id"]: entry for entry in audit["chapters"]}
-    manifest_by_id = {item["id"]: item for item in manifest}
 
     new_manifest: list[dict] = []
     new_audit: list[dict] = []

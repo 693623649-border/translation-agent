@@ -7,7 +7,6 @@ page selection, segment batching, and argument plumbing — without Docker.
 
 from __future__ import annotations
 
-import argparse
 import sys
 import tempfile
 import unittest

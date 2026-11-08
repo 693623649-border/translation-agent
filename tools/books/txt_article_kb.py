@@ -96,7 +96,7 @@ def main(argv: list[str] | None = None) -> int:
             order += 1
             chapter_id = f"{book_id}:{_slug(section_title)}"
             row_id = hashlib.sha1(
-                f"{chapter_id}\n{chunk_index}\n{chunk[:200]}".encode("utf-8")
+                f"{chapter_id}\n{chunk_index}\n{chunk[:200]}".encode()
             ).hexdigest()
             rows.append(
                 {

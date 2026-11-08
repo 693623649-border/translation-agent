@@ -406,7 +406,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
 
 def _normalize_chapter_id(title: str, sequence: int) -> str:
     normalized = re.sub(r"\W+", "-", title.casefold()).strip("-")
-    digest = hashlib.sha1(f"{sequence}:{title}".encode("utf-8")).hexdigest()[:10]
+    digest = hashlib.sha1(f"{sequence}:{title}".encode()).hexdigest()[:10]
     return f"docx-{sequence:04d}-{normalized[:32] or digest}"
 
 
@@ -442,7 +442,7 @@ def _docx_rows(source: Path) -> list[dict[str, Any]]:
         chapter_id = _normalize_chapter_id(str(chapter["title"]), sequence)
         for chunk_index, chunk in enumerate(split_text(content, 4000), start=1):
             row_id = hashlib.sha1(
-                f"{source.name}:{chapter_id}:{chunk_index}:{chunk}".encode("utf-8")
+                f"{source.name}:{chapter_id}:{chunk_index}:{chunk}".encode()
             ).hexdigest()
             rows.append(
                 {

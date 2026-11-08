@@ -48,7 +48,7 @@ def main() -> int:
         body = re.sub(r"\n{3,}", "\n\n", body).strip()
         for chunk_index, chunk in enumerate(legacy.split_text(body, 4000), start=1):
             row_id = hashlib.sha1(
-                f"{SOURCE.name}:{item['id']}:compiled:{chunk_index}".encode("utf-8")
+                f"{SOURCE.name}:{item['id']}:compiled:{chunk_index}".encode()
             ).hexdigest()
             rows.append(
                 {

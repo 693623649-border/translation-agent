@@ -22,7 +22,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -418,7 +418,7 @@ class GraphContext:
     def __getitem__(self, name: str) -> Any:
         return self.require(name)
 
-    def _for_node(self, node: NodeSpec) -> "GraphContext":
+    def _for_node(self, node: NodeSpec) -> GraphContext:
         """Build the isolated contract view passed to one node callback."""
 
         required_values = {
@@ -484,13 +484,13 @@ class PipelineGraph:
     def nodes(self) -> tuple[NodeSpec, ...]:
         return tuple(self._nodes.values())
 
-    def add(self, node: NodeSpec) -> "PipelineGraph":
+    def add(self, node: NodeSpec) -> PipelineGraph:
         if node.name in self._nodes:
             raise DuplicateNodeError(f"duplicate node name: {node.name!r}")
         self._nodes[node.name] = node
         return self
 
-    def replace(self, name: str, node: NodeSpec) -> "PipelineGraph":
+    def replace(self, name: str, node: NodeSpec) -> PipelineGraph:
         """Replace a node in place, preserving deterministic registry order."""
 
         if name not in self._nodes:
@@ -510,7 +510,7 @@ class PipelineGraph:
         except KeyError:
             raise KeyError(name) from None
 
-    def copy(self) -> "PipelineGraph":
+    def copy(self) -> PipelineGraph:
         return PipelineGraph(self.nodes)
 
     def _providers(self) -> dict[str, NodeSpec]:
@@ -620,7 +620,7 @@ class PipelineGraph:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -797,7 +797,7 @@ class OutputDirectoryLock:
             self._handle = None
             self._owned = False
 
-    def __enter__(self) -> "OutputDirectoryLock":
+    def __enter__(self) -> OutputDirectoryLock:
         self.acquire()
         return self
 
@@ -1138,6 +1138,7 @@ class GraphExecutor:
                                     f"node {node.name!r} produced invalid artifact {name!r}"
                                 )
                     except Exception as exc:
+                        failure: Exception = exc
                         try:
                             self._assert_required_inputs_unchanged(
                                 node,
@@ -1145,27 +1146,27 @@ class GraphExecutor:
                                 required_snapshot,
                             )
                         except NodeContractError as mutation_error:
-                            exc = mutation_error
-                        safe_error = self._safe_error_text(context, exc)
+                            failure = mutation_error
+                        safe_error = self._safe_error_text(context, failure)
                         self._append_event(
                             events_path,
                             {
                                 "event": "node_failed",
                                 "run_id": run_id,
                                 "node": node.name,
-                                "error_type": type(exc).__name__,
+                                "error_type": type(failure).__name__,
                                 "error": safe_error,
                                 "duration_seconds": round(time.monotonic() - started, 6),
                                 "timestamp": _utc_now(),
                             },
                         )
-                        if isinstance(exc, NodeContractError):
-                            raise exc
+                        if isinstance(failure, NodeContractError):
+                            raise failure
                         raise NodeExecutionError(
                             node.name,
-                            exc,
+                            failure,
                             safe_message=safe_error,
-                        ) from exc
+                        ) from failure
 
                     outputs = _isolated_copy(dict(result.outputs))
                     output_fingerprints = {

@@ -10,7 +10,7 @@ code review authority.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 import hashlib
 import json
 import os
@@ -647,7 +647,7 @@ def record_semantic_review_decision(
         )
     _ensure_decision_log(context.decision_log_path)
     _assert_reconstruction_current(context)
-    review_timestamp = timestamp or datetime.now(timezone.utc).isoformat(
+    review_timestamp = timestamp or datetime.now(UTC).isoformat(
         timespec="seconds"
     ).replace("+00:00", "Z")
     row = ReviewDecision(

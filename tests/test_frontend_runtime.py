@@ -1,19 +1,3 @@
-import contextlib
-
-from translation_agent.ui.frontend_runtime import (
-    FrontendSettings,
-    JobRegistry,
-    PathPolicy,
-    artifact_catalog,
-    child_environment,
-    plan_runspec,
-    safe_upload_name,
-    start_job_process,
-    validate_upload_size,
-)
-
-from translation_agent.runtime.pipeline_profiles import ModelProfile
-
 import hashlib
 import io
 import json
@@ -35,12 +19,12 @@ from translation_agent.ui.frontend_runtime import (
     PathPolicy,
     WorkerLeaseLostError,
     _RedactingWriter,
+    _redaction_values,
     artifact_catalog,
     cancel_job,
     child_environment,
     execute_job,
-    plan_runspec as frontend_plan_runspec,
-    _redaction_values,
+    plan_runspec,
     safe_upload_name,
     start_job_process,
     validate_upload_size,
@@ -1333,7 +1317,7 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             with patch("translation_agent.pipeline.graph.book.legacy.load_env_file") as load_env:
                 web_nodes = service.preview_plan(spec)
-                compatibility_nodes = frontend_plan_runspec(spec)
+                compatibility_nodes = plan_runspec(spec)
             load_env.assert_not_called()
             cli_plan = document_pipeline.plan_spec(spec)
         self.assertEqual(

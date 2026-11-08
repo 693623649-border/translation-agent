@@ -61,7 +61,7 @@ USER_PROMPT_TEMPLATE = (
     "术语表：\n{terms}\n\n{sections}"
 )
 PROMPT_CONTRACT_SHA256 = hashlib.sha256(
-    f"{SYSTEM_PROMPT}\0{USER_PROMPT_TEMPLATE}".encode("utf-8")
+    f"{SYSTEM_PROMPT}\0{USER_PROMPT_TEMPLATE}".encode()
 ).hexdigest()
 TOKEN_PATTERN = re.compile(
     r"\[\^[^\]\s]+\]"

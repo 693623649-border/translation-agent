@@ -99,7 +99,7 @@ class VramSampler:
                 self.available = False
             self._stop.wait(self.interval_sec)
 
-    def __enter__(self) -> "VramSampler":
+    def __enter__(self) -> VramSampler:
         self._thread.start()
         return self
 

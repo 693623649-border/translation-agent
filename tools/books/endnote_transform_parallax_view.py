@@ -125,7 +125,7 @@ def convert_chapter(
         text = text.replace(block_text, "".join(markers), 1)
         converted += len(notes)
         if verbose:
-            print(f"    page {page}: {len(notes)} note(s) -> {marker}")
+            print(f"    page {page}: {len(notes)} note(s) -> {''.join(markers)}")
     if definitions:
         # Pull page-boundary markers back onto the preceding text so the Word
         # renderer keeps them inline and the sentence split by the page break

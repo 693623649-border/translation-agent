@@ -1073,7 +1073,6 @@ def _toc_fingerprint(context: GraphContext) -> dict[str, Any]:
 
 
 def _sanitize_fingerprint(context: GraphContext) -> dict[str, Any]:
-    args = _parsed_args(context)
     return {
         "adapter": GRAPH_ADAPTER_VERSION,
         "sanitizer": "publication-metadata-v3",
@@ -3239,19 +3238,6 @@ def _selected_publishers(args: Any, disabled: frozenset[str]) -> frozenset[str]:
     return frozenset(selected - set(disabled))
 
 
-def _requested_publication_artifacts(args: Any) -> frozenset[str]:
-    artifacts: set[str] = set()
-    if not args.no_kb:
-        artifacts.add(ART_KB)
-    if not args.no_epub:
-        artifacts.add(ART_EPUB)
-    if not args.no_docx:
-        artifacts.add(ART_DOCX)
-    if not args.no_bookmarked_pdf:
-        artifacts.add(ART_REFERENCE_PDF)
-    return frozenset(artifacts)
-
-
 def _secret_redaction_values(args: Any) -> tuple[str, ...]:
     values: set[str] = set()
     for field_name in ("api_key", "ocr_api_key", "translation_api_key"):
@@ -3964,18 +3950,3 @@ def prepare_book_graph(
     return prepared
 
 
-def run_book_graph(
-    pipeline_argv: Iterable[str],
-    *,
-    options: BookGraphOptions | None = None,
-    recipe: Recipe | None = None,
-    plugin_allowlist: Iterable[str] = (),
-) -> GraphRunResult:
-    """Prepare and execute a graph-backed legacy pipeline request."""
-
-    return prepare_book_graph(
-        pipeline_argv,
-        options=options,
-        recipe=recipe,
-        plugin_allowlist=plugin_allowlist,
-    ).execute()

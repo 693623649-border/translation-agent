@@ -20,8 +20,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from translation_agent.semantic.semantic_ir import (
-    REVIEW_DECISIONS,
-    SEMANTIC_SCHEMA_VERSION,
     ReviewDecision,
     SemanticContractError,
 )
@@ -235,7 +233,7 @@ class ReviewIssue:
         evidence_sha256: str | None = None,
         reviewable: bool = False,
         allowed_decisions: Sequence[str] | None = None,
-    ) -> "ReviewIssue":
+    ) -> ReviewIssue:
         if allowed_decisions is None:
             if reviewable:
                 raise SemanticReviewError(
@@ -282,7 +280,7 @@ class ReviewIssue:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ReviewIssue":
+    def from_dict(cls, value: Mapping[str, Any]) -> ReviewIssue:
         """Read an issue; absent review policy deliberately means no waiver."""
 
         if not isinstance(value, Mapping):

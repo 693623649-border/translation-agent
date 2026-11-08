@@ -411,11 +411,3 @@ def verify_translated_docx(path: Path | str) -> dict[str, Any]:
     }
 
 
-def languages_in(paragraph_texts: Sequence[str]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for text in paragraph_texts:
-        if not text.strip():
-            continue
-        language = detect_language(text)
-        counts[language] = counts.get(language, 0) + 1
-    return counts

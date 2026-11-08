@@ -124,7 +124,7 @@ class _FileSnapshot:
     uncompressed_size: int | None = None
 
     @classmethod
-    def capture(cls, value: Path | str, *, suffix: str | None = None) -> "_FileSnapshot":
+    def capture(cls, value: Path | str, *, suffix: str | None = None) -> _FileSnapshot:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
@@ -890,7 +890,7 @@ def _bundle_artifact(
     content_sha256 = _bundle_digest(manifest_path, chapter_dir, audits)
     bundle_sha256 = (
         hashlib.sha256(
-            f"{content_sha256}\0{translation_input_sha256}".encode("utf-8")
+            f"{content_sha256}\0{translation_input_sha256}".encode()
         ).hexdigest()
         if translation_input_sha256 is not None
         else content_sha256
@@ -937,7 +937,7 @@ def _bundle_is_current(
         translation_input_sha256 = value.get("translation_input_sha256")
         expected_sha256 = (
             hashlib.sha256(
-                f"{content_sha256}\0{translation_input_sha256}".encode("utf-8")
+                f"{content_sha256}\0{translation_input_sha256}".encode()
             ).hexdigest()
             if translation_input_sha256 is not None
             else content_sha256

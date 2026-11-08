@@ -160,7 +160,7 @@ class _ClosingConnection(sqlite3.Connection):
 
 
 def _utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
+    return dt.datetime.now(dt.UTC).isoformat()
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
@@ -237,7 +237,7 @@ class FrontendSettings:
     def from_environment(
         cls,
         environment: Mapping[str, str] | None = None,
-    ) -> "FrontendSettings":
+    ) -> FrontendSettings:
         values = os.environ if environment is None else environment
         runtime_root = Path(
             values.get("TRANSLATION_AGENT_WEBUI_RUNTIME_ROOT", DEFAULT_RUNTIME_ROOT)

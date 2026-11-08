@@ -43,7 +43,6 @@ def main() -> int:
     audit = json.loads(
         (WORK / "audit" / "semantic-reconstruction.json").read_text(encoding="utf-8")
     )
-    audit_by_id = {entry["chapter_id"]: entry for entry in audit["chapters"]}
     zipped = zipfile.ZipFile(EPUB)
     image_by_hash = {
         hashlib.sha256(zipped.read(name)).hexdigest()[:12]: zipped.read(name)

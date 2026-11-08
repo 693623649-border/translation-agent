@@ -100,7 +100,7 @@ def main() -> int:
     from paddleocr import PaddleOCR  # noqa: F401 - 提前暴露安装问题
 
     test_img = here / "_verify_test.png"
-    expected = make_test_image(test_img)
+    make_test_image(test_img)
     print(f"测试图已生成: {test_img}")
 
     print(f"使用 {args.variant} 变体权重推理（首次推理含显存预热，耗时偏长）...")

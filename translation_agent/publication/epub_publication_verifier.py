@@ -363,7 +363,7 @@ def _expected_markdown_body_text(
         extensions=["extra", "sane_lists", "footnotes"],
         output_format="xhtml",
     )
-    root = _xml(f"<body xmlns='{_XHTML_NS}'>{rendered}</body>".encode("utf-8"), label="rendered canonical Markdown")
+    root = _xml(f"<body xmlns='{_XHTML_NS}'>{rendered}</body>".encode(), label="rendered canonical Markdown")
     return _normalized_text(root)
 
 

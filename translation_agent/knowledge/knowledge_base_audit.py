@@ -276,9 +276,7 @@ def audit_rows(
         row_source = str(chapter.get("row_source") or DEFAULT_ROW_SOURCE)
         expected_ids = [
             hashlib.sha1(
-                f"{source_name}:{chapter_id}:{row_source}:{chunk_index}".encode(
-                    "utf-8"
-                )
+                f"{source_name}:{chapter_id}:{row_source}:{chunk_index}".encode()
             ).hexdigest()
             for chunk_index in range(1, len(chunks) + 1)
         ]

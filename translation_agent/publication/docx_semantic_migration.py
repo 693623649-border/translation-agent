@@ -683,7 +683,7 @@ def backup_semantic_migration_sources(
     try:
         manifest = {
             "schema_version": 1,
-            "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "created_at": dt.datetime.now(dt.UTC).isoformat(),
             "source_output": str(root),
             "reviewed_chapters_existed": (root / "reviewed_chapters").is_dir(),
             "files": inventory,

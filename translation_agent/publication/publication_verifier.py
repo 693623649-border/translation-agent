@@ -4196,7 +4196,7 @@ def _check_knowledge_base(context: _VerificationContext) -> dict[str, Any]:
                     (
                         f"{context.source_pdf.name}:{chapter_id}:"
                         f"{row_source}:{chunk_index}"
-                    ).encode("utf-8")
+                    ).encode()
                 ).hexdigest()
                 for chunk_index in range(1, len(chunks) + 1)
             ]
@@ -4739,7 +4739,7 @@ def verify_publication(
         "ok": (not errors) if context.incremental else release_ready,
         "release_ready": release_ready,
         "mode": "chapters" if context.incremental else "full",
-        "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "generated_at": dt.datetime.now(dt.UTC).isoformat(),
         "output_dir": str(output_path),
         "source_pdf": str(source_path) if source_path is not None else None,
         "book_title": (

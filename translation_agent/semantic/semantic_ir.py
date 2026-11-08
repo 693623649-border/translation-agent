@@ -116,7 +116,7 @@ class SourceLocator:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "SourceLocator":
+    def from_dict(cls, value: Mapping[str, Any]) -> SourceLocator:
         if not isinstance(value, Mapping):
             raise SemanticContractError("locator must be an object")
         allowed = {"adapter", "source", "page", "href", "anchor", "block_index"}
@@ -171,7 +171,7 @@ class SemanticBlock:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "SemanticBlock":
+    def from_dict(cls, value: Mapping[str, Any]) -> SemanticBlock:
         allowed = {"id", "kind", "markdown", "locators", "metadata"}
         unknown = sorted(set(value) - allowed)
         if unknown:
@@ -214,7 +214,7 @@ class SemanticChapter:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "SemanticChapter":
+    def from_dict(cls, value: Mapping[str, Any]) -> SemanticChapter:
         unknown = sorted(set(value) - {"id", "sequence", "title", "blocks"})
         if unknown:
             raise SemanticContractError(f"chapter has unknown fields: {unknown}")
@@ -268,7 +268,7 @@ class DocumentSemantic:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "DocumentSemantic":
+    def from_dict(cls, value: Mapping[str, Any]) -> DocumentSemantic:
         allowed = {
             "schema_version",
             "id",
@@ -344,7 +344,7 @@ class TranslationUnit:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "TranslationUnit":
+    def from_dict(cls, value: Mapping[str, Any]) -> TranslationUnit:
         """Read only the canonical record shape; use the normalizer for v1 legacy rows."""
 
         if not isinstance(value, Mapping):
@@ -565,7 +565,7 @@ class ReviewDecision:
         value: Mapping[str, Any],
         *,
         require_reconstruction: bool = False,
-    ) -> "ReviewDecision":
+    ) -> ReviewDecision:
         """Parse a decision without coercing fields or accepting extensions.
 
         ``require_reconstruction`` is used by the executable review contract.

@@ -110,7 +110,7 @@ def audit_paragraphs(paras, title_keys=()):
 
         for key in title_keys:
             idx = stripped.find(key)
-            if 0 < idx and CJK_RE.match(stripped[idx - 1]):
+            if idx > 0 and CJK_RE.match(stripped[idx - 1]):
                 counts["running_head"] += 1
                 _keep(
                     samples["running_head"],

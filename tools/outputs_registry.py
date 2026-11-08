@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -115,7 +115,7 @@ def _book_entry(book: Path) -> dict:
     return {
         "name": book.name,
         "updated": datetime.fromtimestamp(
-            book.stat().st_mtime, tz=timezone.utc
+            book.stat().st_mtime, tz=UTC
         ).isoformat(timespec="minutes"),
         "chapter_count": chapter_count,
         "ocr_page_checkpoints": ocr_pages,
@@ -130,7 +130,7 @@ def _markdown(entries: list[dict]) -> str:
     lines = [
         "# outputs/ 产出版本注册表",
         "",
-        f"生成时间：{datetime.now(timezone.utc).isoformat(timespec='seconds')}（UTC）",
+        f"生成时间：{datetime.now(UTC).isoformat(timespec='seconds')}（UTC）",
         "重新生成：`python tools/outputs_registry.py`。",
         "",
         "| 书 | 章 | OCR页 | 交付物 | 知识库 | 发布门 | 来源 |",
@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
     ]
     json_path = outputs / "MANIFEST.json"
     json_path.write_text(
-        json.dumps({"generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        json.dumps({"generated": datetime.now(UTC).isoformat(timespec="seconds"),
                     "books": entries},
                    ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",

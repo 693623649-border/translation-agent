@@ -57,7 +57,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Protocol
+from typing import Any, Iterable, Iterator, Protocol, Sequence
 
 import pymupdf as fitz
 from PIL import Image
@@ -150,7 +150,7 @@ class PhysicalPageOCRText(str):
 
     physical_page_texts: tuple[str, ...]
 
-    def __new__(cls, pages: Iterable[str]) -> "PhysicalPageOCRText":
+    def __new__(cls, pages: Iterable[str]) -> PhysicalPageOCRText:
         normalized = tuple(str(page).strip() for page in pages)
         instance = super().__new__(cls, join_physical_page_texts(normalized))
         instance.physical_page_texts = normalized
@@ -285,15 +285,6 @@ class PageRecord:
             and self.translation_prompt_version == prompt_version
             and self.translation_fingerprint == profile_fingerprint
         )
-
-    def compile_text_for(self, identity: ModelIdentity | None) -> str:
-        if identity is None:
-            return self.compile_text
-        return (
-            self.translated_text
-            if self.translation_is_fresh_for(identity)
-            else self.effective_text
-        ).strip()
 
     def compile_physical_pages_for(
         self,
@@ -2228,7 +2219,7 @@ def _exclusive_stage_lock(output_dir: Path, stage: str) -> Iterator[None]:
                 ) from exc
             handle.seek(0)
             handle.truncate()
-            handle.write(f"pid={os.getpid()} started={dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+            handle.write(f"pid={os.getpid()} started={dt.datetime.now(dt.UTC).isoformat()}\n")
             handle.flush()
             try:
                 yield
@@ -2263,8 +2254,8 @@ def _exclusive_stage_lock(output_dir: Path, stage: str) -> Iterator[None]:
                     descriptor,
                     (
                         f"pid={os.getpid()} "
-                        f"started={dt.datetime.now(dt.timezone.utc).isoformat()}\n"
-                    ).encode("utf-8"),
+                        f"started={dt.datetime.now(dt.UTC).isoformat()}\n"
+                    ).encode(),
                 )
                 yield
             finally:
@@ -3861,7 +3852,7 @@ def build_knowledge_rows_from_manifest(
                 (
                     f"{pdf_path.name}:{item['id']}:{row_source}:"
                     f"{chunk_index}"
-                ).encode("utf-8")
+                ).encode()
             ).hexdigest()
             rows.append(
                 {
@@ -6015,7 +6006,7 @@ def build_epub(
     language: str,
 ) -> None:
     book_id = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, book_title)}"
-    modified = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    modified = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     nav_items: list[str] = []
     spine_items: list[str] = []
     manifest_items: list[str] = []

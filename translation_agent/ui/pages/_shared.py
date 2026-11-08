@@ -28,6 +28,7 @@ from typing import Iterable
 import streamlit as st
 
 from translation_agent.ui.application_service import ApplicationService
+from translation_agent.ui.frontend_runtime import JobRecord
 from translation_agent.runtime.pipeline_profiles import ModelProfile, PipelineProfiles, load_pipeline_profiles
 from translation_agent.runtime.product_contracts import RunSpec
 from translation_agent.runtime.product_paths import default_profile_path
@@ -113,17 +114,12 @@ def credential_inputs(
     return credentials
 
 
-def job_option_rows(jobs: Iterable[object]) -> list[str]:
-    return [str(getattr(job, "id")) for job in jobs]
-
-
-def job_label(job_id: str, jobs: Iterable[object]) -> str:
-    by_id = {str(getattr(job, "id")): job for job in jobs}
-    job = by_id.get(job_id)
+def job_label(job_id: str, jobs: Iterable[JobRecord]) -> str:
+    job = next((item for item in jobs if item.id == job_id), None)
     if job is None:
         return job_id
-    title = getattr(job, "spec").title or getattr(job, "source_path").stem
-    return f"{title} · {job_id[:8]} · {getattr(job, 'status')}"
+    title = job.spec.title or job.source_path.stem
+    return f"{title} · {job_id[:8]} · {job.status}"
 
 
 def build_spec(

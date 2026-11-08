@@ -243,7 +243,6 @@ def extract_work_texts(
     """Fill Piece.text, splitting multi-anchor files and attaching stray files."""
 
     with zipfile.ZipFile(epub_path) as zf:
-        prefix = _common_prefix(works)
         cache: dict[str, tuple[str, dict[str, int]]] = {}
 
         def load(file: str) -> tuple[str, dict[str, int]]:
@@ -342,20 +341,6 @@ def extract_work_texts(
                 )
 
 
-def _common_prefix(works: list[Work]) -> str:
-    files = [piece.file for work in works for piece in work.pieces]
-    if not files:
-        return ""
-    head = files[0].split("/")
-    prefix: list[str] = []
-    for i, part in enumerate(head[:-1]):
-        if all(len(f.split("/")) > i + 1 and f.split("/")[i] == part for f in files):
-            prefix.append(part)
-        else:
-            break
-    return "/".join(prefix) + "/" if prefix else ""
-
-
 def _slug(text: str) -> str:
     text = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", text.strip())
     return re.sub(r"-{2,}", "-", text).strip("-")[:48] or "p"
@@ -407,7 +392,7 @@ def build_rows(
                 order += 1
                 chapter_id = f"{book_id}:{_slug(piece_title)}"
                 row_id = hashlib.sha1(
-                    f"{chapter_id}\n{chunk_index}\n{content[:200]}".encode("utf-8")
+                    f"{chapter_id}\n{chunk_index}\n{content[:200]}".encode()
                 ).hexdigest()
                 suffix = f"·{chunk_index}" if len(chunks) > 1 else ""
                 rows.append(

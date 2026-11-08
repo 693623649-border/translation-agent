@@ -42,9 +42,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import tempfile
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 from urllib.parse import unquote, urljoin, urlsplit
 import zipfile
 
@@ -600,7 +599,7 @@ class _XhtmlRenderer:
         key = (target_href, fragment)
         occurrence = self.reference_counts.get(key, 0) + 1
         self.reference_counts[key] = occurrence
-        digest = hashlib.sha256(f"{target_href}#{fragment}".encode("utf-8")).hexdigest()[:12]
+        digest = hashlib.sha256(f"{target_href}#{fragment}".encode()).hexdigest()[:12]
         note_id = f"epub-{digest}-r{occurrence}"
         note_text = self._note_text(target, target_href)
         continuation_texts = [
@@ -913,7 +912,7 @@ def _translation_units(chapter_id: str, markdown: str, source_href: str) -> list
     for index, block in enumerate(blocks, start=1):
         source_sha256 = _sha256_bytes(block.encode("utf-8"))
         unit_digest = hashlib.sha256(
-            f"{source_href}\0{index}\0{source_sha256}".encode("utf-8")
+            f"{source_href}\0{index}\0{source_sha256}".encode()
         ).hexdigest()[:16]
         kind = (
             "heading" if re.match(r"^#{1,6}\s", block)

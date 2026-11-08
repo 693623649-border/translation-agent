@@ -31,13 +31,12 @@ _ensure_checkout_importable()
 import argparse
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
 import tempfile
 import unicodedata
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import pymupdf as fitz
 

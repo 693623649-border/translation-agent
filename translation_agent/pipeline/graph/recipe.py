@@ -184,7 +184,7 @@ class Recipe:
             )
 
     @classmethod
-    def from_mapping(cls, payload: Mapping[str, Any]) -> "Recipe":
+    def from_mapping(cls, payload: Mapping[str, Any]) -> Recipe:
         if not isinstance(payload, Mapping):
             raise RecipeSchemaError("recipe root must be a TOML table")
         if any(not isinstance(key, str) for key in payload):

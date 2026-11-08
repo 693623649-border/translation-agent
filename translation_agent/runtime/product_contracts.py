@@ -261,7 +261,7 @@ class RunSpec:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "RunSpec":
+    def from_dict(cls, payload: Mapping[str, Any]) -> RunSpec:
         _strict_fields(payload, allowed=cls.FIELDS, contract="RunSpec")
         targets = payload.get("targets", ())
         if not isinstance(targets, (list, tuple)):
@@ -332,7 +332,7 @@ class ArtifactRecord:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "ArtifactRecord":
+    def from_dict(cls, payload: Mapping[str, Any]) -> ArtifactRecord:
         _strict_fields(payload, allowed=cls.FIELDS, contract="ArtifactRecord")
         return cls(
             schema_version=int(payload["schema_version"]),

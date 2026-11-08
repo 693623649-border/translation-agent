@@ -588,7 +588,6 @@ def validate_translation_set(
 
         kind = canonical.kind
         source_markdown = canonical.source_markdown
-        source_sha256 = canonical.source_sha256
         actual_sha256 = _sha256_bytes(source_markdown.encode("utf-8"))
         if translated.get("source_sha256") != actual_sha256:
             raise SemanticApplyError(f"translated unit is bound to different source bytes: {unit_id}")

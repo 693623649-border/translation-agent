@@ -433,10 +433,10 @@ def load_knowledge_rows(path: Path | str) -> list[dict[str, Any]]:
             raise RagFormatError(f"Invalid row id at {source}:{line_number}")
         if row_id in seen_ids:
             raise RagFormatError(f"Duplicate row id at {source}:{line_number}: {row_id}")
-        for field in ("title", "chapter_id", "content"):
-            if not isinstance(raw[field], str) or not raw[field].strip():
+        for key in ("title", "chapter_id", "content"):
+            if not isinstance(raw[key], str) or not raw[key].strip():
                 raise RagFormatError(
-                    f"Field {field!r} must be a non-empty string at "
+                    f"Field {key!r} must be a non-empty string at "
                     f"{source}:{line_number}"
                 )
         if not isinstance(chapter_order, int) or isinstance(chapter_order, bool):
@@ -1063,7 +1063,7 @@ class RagKnowledgeBase:
         self._lexical_terms = {str(row["id"]): Counter(_tokens(f"{row['title']} {row['title']} {row['content']}")) for row in self._rows}
 
     @classmethod
-    def open(cls, knowledge_base_path: Path | str) -> "RagKnowledgeBase":
+    def open(cls, knowledge_base_path: Path | str) -> RagKnowledgeBase:
         source = Path(knowledge_base_path)
         rows = load_knowledge_rows(source)
         manifest = read_rag_manifest(source)
@@ -1169,8 +1169,8 @@ class RagKnowledgeBase:
         """
 
         meta = self._sidecar.get(str(row["id"]), {})
-        for field in ("book_title", "book_id"):
-            value = str(meta.get(field) or "").strip()
+        for key in ("book_title", "book_id"):
+            value = str(meta.get(key) or "").strip()
             if value:
                 return value
         chapter_id = str(row.get("chapter_id") or "")

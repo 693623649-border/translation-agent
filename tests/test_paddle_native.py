@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import io
-import json
 from pathlib import Path
 import tempfile
 import threading

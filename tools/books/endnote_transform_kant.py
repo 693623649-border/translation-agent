@@ -39,7 +39,6 @@ def transform(text: str) -> tuple[str, dict]:
     lines = text.splitlines()
     defs: dict[str, str] = {}
     keep_lines: list[str] = []
-    drop_block = False
     for line in lines:
         match = DEF_LINE.match(line)
         if match:
@@ -48,11 +47,9 @@ def transform(text: str) -> tuple[str, dict]:
                 defs[key] += " " + match.group(4).strip()
             else:
                 defs[key] = match.group(4).strip()
-            drop_block = True
             continue
         if line.strip() == "---":
             continue
-        drop_block = False
         keep_lines.append(line)
     text = "\n".join(keep_lines)
 

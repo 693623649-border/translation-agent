@@ -75,7 +75,6 @@ def load_defs(epub: Path, files: set[str]) -> dict[str, dict[str, str]]:
 
 
 def transform(text: str, defs: dict[str, str]) -> tuple[str, dict]:
-    lines = text.splitlines()
     heading_marker_drops: list[str] = []
     pieces: list[str] = []
     cursor = 0
