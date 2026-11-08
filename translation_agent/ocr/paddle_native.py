@@ -196,23 +196,20 @@ class PaddleNativeOCR:
     def _ensure_engine(self):
         if self._engine is not None:
             return self._engine
-        from translation_agent.pipeline.graph.core import OutputDirectoryLock, OutputDirectoryLockedError
+        from translation_agent.runtime.model_lease import (
+            HeavyModelLeaseCancelled,
+            acquire_heavy_model_lease,
+            lease_log,
+        )
 
-        # Different Web tasks run in different processes. Hold a single CPU
-        # reservation for the entire stage to avoid loading several models.
-        lock = OutputDirectoryLock(Path.home() / ".translation-agent" / "paddleocr" / "cpu.lock")
-        announced = False
-        while True:
-            if self._closed.is_set():
-                raise RuntimeError("Native OCR cancelled")
-            try:
-                lock.acquire()
-                break
-            except OutputDirectoryLockedError:
-                if not announced:
-                    print("[paddleocr-native] waiting for another local CPU OCR task", flush=True)
-                    announced = True
-                self._closed.wait(.2)
+        # Different Web tasks run in different processes, and the managed
+        # local LLM uses the same lease. Hold it for the whole OCR stage so
+        # two heavy models are never loaded at the same time.
+        try:
+            lock = acquire_heavy_model_lease(BACKEND, cancelled=self._closed)
+        except HeavyModelLeaseCancelled as exc:
+            raise RuntimeError("Native OCR cancelled") from exc
+        lease_log(BACKEND, f"loading PP-OCRv5 {self.options.variant}")
         self._process_lock = lock
         try:
             # Only local weights are allowed; setup is the explicit network step.
@@ -266,10 +263,15 @@ class PaddleNativeOCR:
                     self._cleanup()
 
     def _cleanup(self) -> None:
+        loaded = self._engine is not None
         self._engine = None
         gc.collect()
         if self._process_lock is not None:
-            self._process_lock.release()
+            from translation_agent.runtime.model_lease import lease_log, release_heavy_model_lease
+
+            if loaded:
+                lease_log(BACKEND, "unloaded")
+            release_heavy_model_lease(BACKEND, self._process_lock)
             self._process_lock = None
 
     def close(self) -> None:

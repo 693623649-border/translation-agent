@@ -599,13 +599,37 @@ def main(argv: list[str] | None = None) -> int:
     thinking = args.thinking or (profile.thinking if profile else "disabled")
     credential_env = args.api_key_env or (profile.credential_env if profile else "DEEPSEEK_API_KEY")
     concurrency = args.concurrency or (profile.concurrency if profile else 16)
+    max_chars = args.max_chars
     request = None
-    if args.command == "run":
+    local_request = None
+    if profile is not None and profile.local is not None:
+        from translation_agent.runtime.local_llm_server import LocalSemanticRequest
+
+        identity = profile.identity(target_language=args.target_language, prompt_version=RUNNER_VERSION)
+        base_url, model, concurrency = identity.base_url, identity.model, 1
+        max_chars = min(max_chars, profile.local.max_input_chars)
+        args.temperature = profile.local.temperature  # sampling is fixed by the profile
+        if args.command == "run":
+            # The server starts on the first uncached batch and is unloaded below.
+            request = local_request = LocalSemanticRequest(profile, system_prompt=SYSTEM_PROMPT)
+    elif args.command == "run":
         api_key = os.getenv(credential_env, "")
         if not api_key:
             raise SystemExit(f"missing credential environment variable: {credential_env}")
         request = build_openai_chat_request(api_key=api_key, base_url=base_url, model=model, timeout=profile.timeout if profile else 120, thinking=thinking, temperature=args.temperature)
-    result = translate_units(
+    try:
+        result = _run_units(args, request, model=model, provider=provider, base_url=base_url,
+                            prompt_profile=prompt_profile, thinking=thinking,
+                            max_chars=max_chars, concurrency=concurrency)
+    finally:
+        if local_request is not None:
+            local_request.close()
+    print(json.dumps(result, ensure_ascii=False, indent=2)); return 0
+
+
+def _run_units(args: argparse.Namespace, request: Callable[[str], str] | None, *, model: str, provider: str,
+               base_url: str, prompt_profile: str, thinking: str, max_chars: int, concurrency: int) -> dict[str, Any]:
+    return translate_units(
         Path(args.units).expanduser(),
         Path(args.output).expanduser(),
         target_language=args.target_language,
@@ -618,12 +642,11 @@ def main(argv: list[str] | None = None) -> int:
         temperature=args.temperature,
         cache_dir=Path(args.cache_dir).expanduser(),
         request=request,
-        max_chars=args.max_chars,
+        max_chars=max_chars,
         concurrency=concurrency,
         retries=args.retries,
         progress=(lambda done, total, cached: print(f"[semantic-translate] {done}/{total} batches ({'cache' if cached else 'model'})", file=sys.stderr, flush=True)) if args.command == "run" else None,
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2)); return 0
 
 
 if __name__ == "__main__":

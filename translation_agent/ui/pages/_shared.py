@@ -36,6 +36,8 @@ from translation_agent.runtime.product_paths import default_profile_path
 
 OCR_ADAPTERS = frozenset({"coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"})
 TEXT_ADAPTERS = frozenset({"openai-chat", "glm-chat"})
+# The managed local model is validated for translation only (not TOC/proofread).
+TRANSLATION_ADAPTERS = TEXT_ADAPTERS | {"llama-cpp-local"}
 
 
 @st.cache_resource
@@ -69,7 +71,7 @@ def profiles_for_stage(
     profiles: PipelineProfiles,
     stage: str,
 ) -> list[ModelProfile]:
-    adapters = OCR_ADAPTERS if stage == "ocr" else TEXT_ADAPTERS
+    adapters = {"ocr": OCR_ADAPTERS, "translation": TRANSLATION_ADAPTERS}.get(stage, TEXT_ADAPTERS)
     return sorted(
         (profile for profile in profiles.profiles.values() if profile.adapter in adapters),
         key=lambda profile: profile.name,

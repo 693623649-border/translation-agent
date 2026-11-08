@@ -432,7 +432,14 @@ def _add_spec_arguments(parser: argparse.ArgumentParser, *, source: bool = True)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--recipe", type=Path)
     parser.add_argument("--target", action="append", default=[])
-    parser.add_argument("--translation-profile")
+    parser.add_argument(
+        "--translation-profile",
+        help=(
+            "translation Profile from --config; e.g. hy_mt2_local runs a "
+            "workflow-managed local llama.cpp model (no API key, one slot, "
+            "shares the native-OCR model lease)"
+        ),
+    )
     parser.add_argument("--start-page", type=int)
     parser.add_argument("--end-page", type=int)
     parser.add_argument("--ocr-profile")

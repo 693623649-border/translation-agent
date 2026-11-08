@@ -51,7 +51,8 @@ if profile_error:
 assert profiles is not None
 
 ocr_profiles = profiles_for_stage(profiles, "ocr")
-text_profiles = profiles_for_stage(profiles, "translation")
+text_profiles = profiles_for_stage(profiles, "text")
+translation_profiles = profiles_for_stage(profiles, "translation")
 
 recipes = list(recipe_paths())
 recipe_options: list[Path | None] = [None, *recipes]
@@ -206,9 +207,9 @@ with st.form("new_translation_job"):
         if not ocr_only:
             translation_profile = st.selectbox(
                 "翻译 Profile",
-                text_profiles,
+                translation_profiles,
                 index=profile_default_index(
-                    text_profiles, profiles.translation_profile
+                    translation_profiles, profiles.translation_profile
                 ),
                 format_func=profile_label,
             )
