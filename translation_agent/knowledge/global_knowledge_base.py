@@ -60,6 +60,8 @@ ARCHIVE_KINDS = ("chapter_snapshot", "reviewed_chapter")
 ASSET_SUFFIXES = {".docx", ".epub", ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"}
 REQUIRED_KB_FIELDS = {"id", "title", "chapter_id", "chapter_order", "content"}
 SCHEMA_VERSION = 2
+# Bump when ingestion or normalization rules change, even without a SQL change.
+SYNC_VERSION = 1
 _T2S = OpenCC("t2s") if OpenCC is not None else None
 _NORMALIZATION = "nfkc+t2s" if _T2S is not None else "nfkc"
 
@@ -444,6 +446,51 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
     return dict(counts)
 
 
+def _workspace_fingerprint(workspace: Path) -> str:
+    """Hash every input that can change ingestion or the saved release status."""
+    paths = {
+        workspace / name for name in (
+            "chapters.json", "knowledge_base.jsonl", "knowledge_base.apparatus.json",
+            "toc.json", "audit/release-report.json", "audit/epub-release-report.json",
+            "audit/semantic-review.json", "audit/review-decisions.jsonl",
+        ) if (workspace / name).is_file()
+    }
+    reader_paths = {workspace / "chapters.json", workspace / "knowledge_base.jsonl"}
+    for pattern in ("chapters/*.md", "reviewed_chapters/*.md", "pages/page_*.json"):
+        found = {path for path in workspace.glob(pattern) if path.is_file()}
+        paths.update(found)
+        reader_paths.update(found)
+    paths.update(path for path in workspace.rglob("*")
+                 if path.is_file() and not path.is_symlink()
+                 and path.suffix.lower() in ASSET_SUFFIXES)
+    payload = {
+        "files": [(path.relative_to(workspace).as_posix(), sha256_file(path))
+                  for path in sorted(paths)],
+        # Status also depends on relative mtimes, including a report touched
+        # after publication. Content hashes alone cannot capture that change.
+        "report_status": _report_status(workspace, reader_paths),
+    }
+    return _sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+
+
+def _sync_counts(db: sqlite3.Connection) -> dict[str, int]:
+    counts = dict(zip(
+        ("reader_chunks", "page_chunks", "archive_chunks"),
+        db.execute("SELECT coalesce(sum(reader_chunks), 0), coalesce(sum(page_chunks), 0), "
+                   "coalesce(sum(archive_chunks), 0) FROM workspaces").fetchone(),
+    ))
+    for table, key in (("source_files", "source_files"), ("assets", "assets")):
+        counts[key] = db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    return counts
+
+
+def _delete_workspace(db: sqlite3.Connection, name: str) -> None:
+    db.execute("DELETE FROM chunks_fts WHERE id IN (SELECT id FROM chunks WHERE workspace=?)", (name,))
+    for table in ("chunks", "source_files", "assets"):
+        db.execute(f"DELETE FROM {table} WHERE workspace=?", (name,))
+    db.execute("DELETE FROM workspaces WHERE name=?", (name,))
+
+
 def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
                  db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
     root = Path(outputs_root).expanduser().resolve()
@@ -461,35 +508,76 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
         raise ValueError(f"No output workspaces found in {root}")
     if target.is_relative_to(root) and any(target.is_relative_to(path) for path in workspaces):
         raise ValueError("The global database must not overwrite an output workspace")
+    fingerprints = {workspace.name: _workspace_fingerprint(workspace) for workspace in workspaces}
+    previous: dict[str, str] = {}
+    incremental = False
+    if target.is_file():
+        with closing(sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True)) as old:
+            if old.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION:
+                meta = dict(old.execute("SELECT key, value FROM meta"))
+                if (meta.get("outputs_root") == str(root)
+                        and meta.get("sync_version") == str(SYNC_VERSION)
+                        and meta.get("search_normalization") == _NORMALIZATION):
+                    try:
+                        previous = json.loads(meta.get("workspace_fingerprints", "null"))
+                    except json.JSONDecodeError:
+                        previous = None
+                    names = {row[0] for row in old.execute("SELECT name FROM workspaces")}
+                    incremental = (isinstance(previous, dict) and set(previous) == names
+                                   and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                                           for value in previous.values()))
+                if incremental and previous == fingerprints:
+                    return {"database": str(target), "outputs_root": str(root),
+                            "workspaces": len(workspaces), "counts": _sync_counts(old),
+                            "updated_workspaces": [], "removed_workspaces": [], "rebuilt": False}
+    if not incremental:
+        previous = {}
+    changed = [workspace for workspace in workspaces
+               if previous.get(workspace.name) != fingerprints[workspace.name]]
+    removed = sorted(set(previous) - set(fingerprints))
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=".global-kb-", suffix=".sqlite3", dir=target.parent)
     os.close(fd)
     temporary = Path(temp_name)
-    totals: Counter[str] = Counter()
     try:
         # A Connection context manager commits but does not close the handle.
         # Windows cannot replace the finished database until it is closed.
-        with closing(sqlite3.connect(temporary)) as db, db:
-            _create_schema(db)
-            db.execute("INSERT INTO meta VALUES (?, ?)", ("outputs_root", str(root)))
-            db.execute("INSERT INTO meta VALUES (?, ?)",
-                       ("built_at", datetime.now(UTC).isoformat()))
-            db.execute("INSERT INTO meta VALUES (?, ?)",
-                       ("search_normalization", _NORMALIZATION))
-            for workspace in workspaces:
-                totals.update(_ingest_workspace(db, root, workspace))
-            db.commit()
+        with closing(sqlite3.connect(temporary)) as db:
+            if incremental:
+                with closing(sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True)) as old:
+                    old.backup(db)
+                db.execute("PRAGMA foreign_keys = ON")
+            else:
+                _create_schema(db)
+            with db:
+                for name in [*removed, *(workspace.name for workspace in changed)]:
+                    if name in previous:
+                        _delete_workspace(db, name)
+                for workspace in changed:
+                    _ingest_workspace(db, root, workspace)
+                    if _workspace_fingerprint(workspace) != fingerprints[workspace.name]:
+                        raise ValueError(f"Workspace changed during sync: {workspace}")
+                db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", [
+                    ("outputs_root", str(root)),
+                    ("built_at", datetime.now(UTC).isoformat()),
+                    ("search_normalization", _NORMALIZATION),
+                    ("sync_version", str(SYNC_VERSION)),
+                    ("workspace_fingerprints", json.dumps(fingerprints, sort_keys=True)),
+                ])
             if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
                 raise RuntimeError("SQLite integrity check failed")
             total_chunks = db.execute("SELECT count(*) FROM chunks").fetchone()[0]
             fts_chunks = db.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
             if total_chunks != fts_chunks:
                 raise RuntimeError("Search index row count does not match content table")
+            totals = _sync_counts(db)
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
     return {"database": str(target), "outputs_root": str(root),
-            "workspaces": len(workspaces), "counts": dict(totals)}
+            "workspaces": len(workspaces), "counts": totals,
+            "updated_workspaces": [workspace.name for workspace in changed],
+            "removed_workspaces": removed, "rebuilt": not incremental}
 
 
 def status(db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:

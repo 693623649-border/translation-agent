@@ -2,11 +2,15 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
+
+from translation_agent.knowledge import global_knowledge_base as kb_index
 
 from translation_agent.knowledge.global_knowledge_base import (
     _report_status,
@@ -102,6 +106,228 @@ class GlobalKnowledgeBaseTests(unittest.TestCase):
         sync_outputs(self.outputs, self.db)
         hits = search("台湾儿少NGO 人口贩卖", db_path=self.db)
         self.assertEqual(hits[0]["workspace"], "traditional")
+
+
+class IncrementalSyncTests(unittest.TestCase):
+    setUp = GlobalKnowledgeBaseTests.setUp
+    _workspace = GlobalKnowledgeBaseTests._workspace
+
+    def _sync(self, expected):
+        with patch.object(kb_index, "_ingest_workspace", wraps=kb_index._ingest_workspace) as ingest:
+            result = sync_outputs(self.outputs, self.db)
+        self.assertEqual([call.args[2].name for call in ingest.call_args_list], expected)
+        self.assertEqual(result["updated_workspaces"], expected)
+        self.assertEqual(status(self.db)["integrity"], "ok")
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM chunks").fetchone(),
+                             db.execute("SELECT count(*) FROM chunks_fts").fetchone())
+            self.assertEqual(db.execute("SELECT id FROM chunks EXCEPT SELECT id FROM chunks_fts").fetchall(), [])
+            self.assertEqual(db.execute("SELECT id FROM chunks_fts EXCEPT SELECT id FROM chunks").fetchall(), [])
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        return result
+
+    def test_five_books_cold_unchanged_and_single_book_change(self):
+        for index in range(5):
+            folder = self.outputs / f"book{index}"
+            folder.mkdir()
+            (folder / "knowledge_base.jsonl").write_text("".join(
+                json.dumps({"id": hashlib.sha1(f"{index}:{row}".encode()).hexdigest(),
+                            "title": "title", "chapter_id": "chapter-1", "chapter_order": 1,
+                            "content": f"original content book{index} paragraph {row}"}) + "\n"
+                for row in range(100)
+            ), encoding="utf-8")
+        with patch.object(kb_index, "_insert_chunk", wraps=kb_index._insert_chunk) as insert:
+            cold = self._sync([f"book{i}" for i in range(5)])
+        self.assertEqual(insert.call_count, 500)
+        self.assertTrue(cold["rebuilt"])
+        before, stamp = self.db.read_bytes(), self.db.stat().st_mtime_ns
+        with patch.object(kb_index, "_create_schema") as schema, patch.object(kb_index, "_insert_chunk") as insert:
+            hot = self._sync([])
+        schema.assert_not_called()
+        insert.assert_not_called()
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(self.db.stat().st_mtime_ns, stamp)
+        self.assertEqual(cold["counts"], hot["counts"])
+        path = self.outputs / "book0" / "knowledge_base.jsonl"
+        content = path.read_text(encoding="utf-8").replace("original", "revised!", 1)
+        old_stat = path.stat()
+        path.write_text(content, encoding="utf-8")
+        os.utime(path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+        with patch.object(kb_index, "_create_schema") as schema, patch.object(kb_index, "_insert_chunk", wraps=kb_index._insert_chunk) as insert:
+            self._sync(["book0"])
+        schema.assert_not_called()
+        self.assertEqual(insert.call_count, 100)
+        self.assertEqual(search("revised", db_path=self.db)[0]["workspace"], "book0")
+        self.assertEqual(status(self.db)["workspace_count"], 5)
+        self.assertTrue(verify_sources(self.db)["current"])
+
+    def test_added_and_removed_books_refresh_fts_and_leave_other_books(self):
+        self._workspace("book0")
+        self._workspace("book1")
+        self._sync(["book0", "book1"])
+        self._workspace("book2")
+        self._sync(["book2"])
+        shutil.rmtree(self.outputs / "book0")
+        result = self._sync([])
+        self.assertEqual(result["removed_workspaces"], ["book0"])
+        self.assertEqual({hit["workspace"] for hit in search("正式正文", db_path=self.db)}, {"book1", "book2"})
+        self.assertTrue(verify_sources(self.db)["current"])
+
+    def test_chapter_page_and_asset_add_change_delete_refresh_only_their_book(self):
+        folder = self._workspace("book", kb=False, page=True)
+        self._workspace("untouched")
+        self._sync(["book", "untouched"])
+        chapter = folder / "chapters" / "001.md"
+        chapter.write_text("# 第一章\n\n修订章节内容。", encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(search("修订章节", db_path=self.db)[0]["workspace"], "book")
+        manifest = folder / "chapters.json"
+        rows = json.loads(manifest.read_text(encoding="utf-8"))
+        rows.append({"id": "chapter-2", "sequence": 2, "title": "第二章", "filename": "002.md"})
+        manifest.write_text(json.dumps(rows), encoding="utf-8")
+        second = folder / "chapters" / "002.md"
+        second.write_text("# 第二章\n\n新增章节内容。", encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(len(search("新增章节", db_path=self.db)), 1)
+        second.unlink()
+        manifest.write_text(json.dumps(rows[:1]), encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(search("新增章节", db_path=self.db), [])
+        reviewed = folder / "reviewed_chapters" / "chapter-1.md"
+        reviewed.parent.mkdir()
+        reviewed.write_text("# 第一章\n\n审定存档正文。", encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(len(search("审定存档", db_path=self.db, scope="archive")), 1)
+        reviewed.unlink()
+        self._sync(["book"])
+        self.assertEqual(search("审定存档", db_path=self.db, scope="archive"), [])
+        page = folder / "pages" / "page_0001.json"
+        page.write_text(json.dumps({"pdf_page": 1, "text": "更新页正文"}), encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(len(search("更新页正文", db_path=self.db, scope="pages")), 1)
+        added = folder / "pages" / "page_0002.json"
+        added.write_text(json.dumps({"pdf_page": 2, "text": "新增页正文"}), encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(len(search("新增页", db_path=self.db, scope="pages")), 1)
+        page.unlink()
+        added.unlink()
+        self._sync(["book"])
+        self.assertEqual(search("更新页正文", db_path=self.db, scope="pages"), [])
+        asset = folder / "nested" / "new.png"
+        asset.parent.mkdir()
+        asset.write_bytes(b"asset-a")
+        self._sync(["book"])
+        asset.write_bytes(b"asset-b")
+        self._sync(["book"])
+        with closing(sqlite3.connect(self.db)) as db:
+            self.assertEqual(db.execute("SELECT sha256 FROM assets WHERE path='book/nested/new.png'").fetchone()[0], hashlib.sha256(b"asset-b").hexdigest())
+        asset.unlink()
+        self._sync(["book"])
+        self.assertTrue(verify_sources(self.db)["current"])
+
+    def test_apparatus_sidecar_added_changed_and_removed_updates_weights(self):
+        folder = self._workspace("book")
+        self._workspace("untouched")
+        self._sync(["book", "untouched"])
+        row_id = json.loads((folder / "knowledge_base.jsonl").read_text(encoding="utf-8"))["id"]
+        sidecar = folder / "knowledge_base.apparatus.json"
+        for weight in (0.25, 0.75, None):
+            if weight is None:
+                sidecar.unlink()
+            else:
+                sidecar.write_text(json.dumps({"annotations": {row_id: {"is_apparatus": True, "default_weight": weight}}}), encoding="utf-8")
+            self._sync(["book"])
+            with closing(sqlite3.connect(self.db)) as db:
+                actual = db.execute("SELECT apparatus_weight FROM chunks WHERE source_row_id=?", (row_id,)).fetchone()[0]
+            self.assertEqual(actual, 1.0 if weight is None else weight)
+
+    def test_release_status_refreshes_on_report_content_and_timestamp_dependencies(self):
+        folder = self._workspace("book")
+        self._workspace("untouched")
+        self._sync(["book", "untouched"])
+        audit = folder / "audit"
+        audit.mkdir()
+        report = audit / "epub-release-report.json"
+        report.write_text('{"status":"passed"}', encoding="utf-8")
+        self._sync(["book"])
+
+        def saved_status():
+            with closing(sqlite3.connect(self.db)) as db:
+                return db.execute("SELECT report_status FROM workspaces WHERE name='book'").fetchone()[0]
+
+        self.assertEqual(saved_status(), "passed")
+        watched = [folder / "toc.json", audit / "semantic-review.json", audit / "review-decisions.jsonl",
+                   folder / "new.epub", folder / "book.docx", folder / "book_带目录.pdf"]
+        for item in watched:
+            item.write_text("{}", encoding="utf-8")
+            stamp = report.stat().st_mtime_ns + 10**9
+            os.utime(item, ns=(stamp, stamp))
+            self._sync(["book"])
+            self.assertEqual(saved_status(), "stale")
+            os.utime(report, ns=(stamp + 10**9, stamp + 10**9))
+            self._sync(["book"])
+            self.assertEqual(saved_status(), "passed")
+        canonical = audit / "release-report.json"
+        canonical.write_text('{"status":"failed"}', encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(saved_status(), "failed")
+        canonical.unlink()
+        self._sync(["book"])
+        self.assertEqual(saved_status(), "passed")
+        report.unlink()
+        self._sync(["book"])
+        self.assertEqual(saved_status(), "missing")
+
+    def test_incremental_failure_after_deletion_and_ingestion_preserves_old_database(self):
+        folder = self._workspace("book")
+        self._workspace("untouched")
+        self._sync(["book", "untouched"])
+        original = self.db.read_bytes()
+        (folder / "knowledge_base.jsonl").write_text("broken", encoding="utf-8")
+        with self.assertRaises(json.JSONDecodeError):
+            sync_outputs(self.outputs, self.db)
+        self.assertEqual(self.db.read_bytes(), original)
+        self.assertEqual(len(search("正式正文", db_path=self.db)), 2)
+        self.assertEqual(list(self.root.glob(".global-kb-*")), [])
+
+    def test_write_during_ingestion_does_not_publish_mixed_snapshot(self):
+        folder = self._workspace("book")
+        self._sync(["book"])
+        original = self.db.read_bytes()
+        path = folder / "knowledge_base.jsonl"
+        path.write_text(path.read_text(encoding="utf-8").replace("正式正文", "新定正文"), encoding="utf-8")
+        ingest = kb_index._ingest_workspace
+
+        def changing(db, root, workspace):
+            counts = ingest(db, root, workspace)
+            path.write_text(path.read_text(encoding="utf-8").replace("新定正文", "再次变更"), encoding="utf-8")
+            return counts
+
+        with patch.object(kb_index, "_ingest_workspace", side_effect=changing):
+            with self.assertRaisesRegex(ValueError, "changed during sync"):
+                sync_outputs(self.outputs, self.db)
+        self.assertEqual(self.db.read_bytes(), original)
+
+    def test_schema_normalization_and_sync_version_changes_force_full_rebuild(self):
+        self._workspace("book0")
+        self._workspace("book1")
+        self._sync(["book0", "book1"])
+        for kind in ("schema", "normalization", "sync_version", "missing_fingerprints"):
+            with self.subTest(kind=kind), closing(sqlite3.connect(self.db)) as db:
+                if kind == "schema":
+                    db.execute("PRAGMA user_version=1")
+                elif kind == "normalization":
+                    db.execute("UPDATE meta SET value='nfkc-old' WHERE key='search_normalization'")
+                elif kind == "sync_version":
+                    db.execute("UPDATE meta SET value='0' WHERE key='sync_version'")
+                else:
+                    db.execute("DELETE FROM meta WHERE key='workspace_fingerprints'")
+                db.commit()
+            with patch.object(kb_index, "_create_schema", wraps=kb_index._create_schema) as schema:
+                result = self._sync(["book0", "book1"])
+            self.assertTrue(result["rebuilt"])
+            schema.assert_called_once()
+        self._sync([])
 
 
 class ApparatusDemotionTests(unittest.TestCase):
