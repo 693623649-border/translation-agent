@@ -239,6 +239,47 @@ class NativeOCRTests(unittest.TestCase):
         self.assertEqual(events, ['engine-freed', 'lease-released'])
         self.assertIsNone(backend._process_lock)
 
+    def unreadable_images(self):
+        corrupt = self.root / 'corrupt.png'
+        corrupt.write_bytes(b'\x89PNG\r\n\x1a\n not an image')
+        return (
+            (self.root / 'missing.png', FileNotFoundError, 'missing.png'),
+            (corrupt, Image.UnidentifiedImageError, 'corrupt.png'),
+        )
+
+    def test_unreadable_image_on_cold_backend_never_loads_or_takes_the_lease(self):
+        for path, error, detail in self.unreadable_images():
+            with self.subTest(image=path.name):
+                backend, engines, events = self.lifecycle_backend(lambda _engine, _array: self.page_result())
+                with self.assertRaisesRegex(error, detail):
+                    backend.ocr_image(path)
+                self.assertEqual(engines, [], 'no model load for an unreadable page')
+                self.assertIsNone(backend._process_lock)
+                lock = OutputDirectoryLock(self.root / '.translation-agent/paddleocr/cpu.lock')
+                lock.acquire()  # the lease was never taken
+                lock.release()
+                backend.close()
+                self.assertEqual(events, [])
+
+    def test_unreadable_image_on_warm_backend_kept_error_does_not_retain_engine(self):
+        for path, error, detail in self.unreadable_images():
+            with self.subTest(image=path.name):
+                backend, engines, events = self.lifecycle_backend(lambda _engine, _array: self.page_result())
+                self.assertEqual(backend.ocr_image(self.image)[0], 'text')
+                kept = []
+                try:
+                    backend.ocr_image(path)
+                except error as exc:
+                    kept.append(exc)  # the caller keeps the error and its traceback
+                self.assertIn(detail, str(kept[0]), 'the real error is preserved')
+                # A bad page does not unload: the stage may continue.
+                self.assertIs(backend._engine, engines[0]())
+                self.assertEqual(backend.ocr_image(self.image)[0], 'text')
+                self.assertEqual(len(engines), 1, 'the warm engine is reused after a bad page')
+                backend.close()
+                self.assertIsNone(engines[0](), 'kept image error must not pin the engine')
+                self.assertEqual(events, ['engine-freed', 'lease-released'])
+
     def test_success_path_reuses_one_engine_until_close(self):
         backend, engines, events = self.lifecycle_backend(lambda _engine, _array: self.page_result())
         self.assertEqual(backend.ocr_image(self.image)[0], 'text')

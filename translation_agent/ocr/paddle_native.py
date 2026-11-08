@@ -264,23 +264,24 @@ class PaddleNativeOCR:
             if self._closed.is_set():
                 raise RuntimeError("Native OCR cancelled")
             try:
-                engine = self._ensure_engine()
                 import numpy as np
                 from PIL import Image
 
+                # Decode the page before touching the model: a missing or
+                # corrupt image never loads weights or takes the lease.
                 with Image.open(image_path) as source:
                     image = source.convert("RGB")
                     image.thumbnail((2000, 2000))
-                    try:
-                        # Paddle image arrays use OpenCV's BGR ordering.
-                        results = list(engine.predict(np.asarray(image)[:, :, ::-1].copy()))
-                    except BaseException as exc:
-                        _drop_model_frame_locals(exc)
-                        raise
-                    finally:
-                        # self._engine is the only owner; a traceback of a
-                        # later error must not keep this frame's reference.
-                        del engine
+                    # Paddle image arrays use OpenCV's BGR ordering.
+                    array = np.asarray(image)[:, :, ::-1].copy()
+                try:
+                    # No local name ever binds the engine, so self._engine
+                    # stays its only owner and a kept traceback of any error
+                    # in this method cannot pin the model after _cleanup.
+                    results = list(self._ensure_engine().predict(array))
+                except BaseException as exc:
+                    _drop_model_frame_locals(exc)
+                    raise
                 if len(results) != 1:
                     raise RuntimeError("PaddleOCR returned an unexpected number of pages")
                 text = ordered_text(results[0], self.options.reading_direction)
