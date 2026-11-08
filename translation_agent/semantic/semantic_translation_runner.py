@@ -23,7 +23,7 @@ _ensure_checkout_importable()
 
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
@@ -31,6 +31,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Callable, Iterable
 import urllib.error
@@ -75,6 +76,17 @@ UNIT_END = "⟦UNIT:{unit_id}:END⟧"
 
 class SemanticTranslationError(ValueError):
     pass
+
+
+class SemanticRequestError(SemanticTranslationError):
+    def __init__(self, message: str, *, retryable: bool, status_code: int | None = None):
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+class SemanticOutputError(SemanticTranslationError):
+    """Model content violates the translation contract; smaller batches may help."""
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -151,7 +163,7 @@ def restore_tokens(value: str, tokens: Iterable[str]) -> str:
     found = re.findall(r"⟦SEMANTIC_TOKEN_(\d{4})⟧", result)
     expected = [f"{index:04d}" for index in range(len(token_list))]
     if found != expected:
-        raise SemanticTranslationError(f"model changed protected token order/count: expected={expected}, actual={found}")
+        raise SemanticOutputError(f"model changed protected token order/count: expected={expected}, actual={found}")
     for index, token in enumerate(token_list):
         result = result.replace(f"⟦SEMANTIC_TOKEN_{index:04d}⟧", token)
     return result.strip()
@@ -277,14 +289,14 @@ def _parse_batch(
         start = UNIT_START.format(unit_id=unit_id); end = UNIT_END.format(unit_id=unit_id)
         start_at = raw.find(start, cursor)
         if start_at < 0 or raw.find(start, start_at + len(start)) >= 0:
-            raise SemanticTranslationError(f"missing or duplicate UNIT start marker: {unit_id}")
+            raise SemanticOutputError(f"missing or duplicate UNIT start marker: {unit_id}")
         end_at = raw.find(end, start_at + len(start))
         if end_at < 0:
-            raise SemanticTranslationError(f"missing UNIT end marker: {unit_id}")
+            raise SemanticOutputError(f"missing UNIT end marker: {unit_id}")
         value = restore_tokens(raw[start_at + len(start):end_at], tokens)
         source = str(unit["source_markdown"])
         if not value or len(value) < max(1, int(len(source) * 0.12)) or len(value) > max(300, int(len(source) * 4.5)):
-            raise SemanticTranslationError(f"implausible translated length: {unit_id}")
+            raise SemanticOutputError(f"implausible translated length: {unit_id}")
         try:
             validate_translation_pair(
                 source,
@@ -294,10 +306,10 @@ def _parse_batch(
                 glossary=glossary or {},
             )
         except SemanticApplyError as exc:
-            raise SemanticTranslationError(str(exc)) from exc
+            raise SemanticOutputError(str(exc)) from exc
         values.append(value); cursor = end_at + len(end)
     if re.search(r"⟦UNIT:[^:]+:(?:START|END)⟧", raw[cursor:]):
-        raise SemanticTranslationError("unexpected trailing UNIT marker")
+        raise SemanticOutputError("unexpected trailing UNIT marker")
     return values
 
 
@@ -364,6 +376,10 @@ def translate_units(
         _atomic_text(output_path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
         return {"status": "passed", "mode": "prepare", "unit_count": len(units), "batch_count": len(batches), "cache_hits": 0, "output": str(output_path.resolve())}
 
+    if retries < 1:
+        raise SemanticTranslationError("retries must be positive")
+    stopped = threading.Event()
+
     def execute(item: tuple[int, list[dict[str, Any]], str, list[tuple[str, tuple[str, ...]]], str]) -> tuple[int, list[dict[str, Any]], bool]:
         index, batch, prompt, protected, key = item
 
@@ -377,6 +393,8 @@ def translate_units(
             cached = bool(cache_path and cache_path.is_file())
             last_error: Exception | None = None
             for attempt in range(1, retries + 1):
+                if stopped.is_set():
+                    raise CancelledError("translation stopped after another batch failed")
                 try:
                     if cached:
                         raw = str(json.loads(cache_path.read_text(encoding="utf-8"))["model_output"])
@@ -414,10 +432,14 @@ def translate_units(
                     last_error = exc
                     if cached:
                         raise SemanticTranslationError(f"invalid batch cache {current_key}: {exc}") from exc
+                    if not isinstance(exc, (SemanticRequestError, SemanticOutputError)):
+                        raise
+                    if isinstance(exc, SemanticRequestError) and not exc.retryable:
+                        raise
                     if attempt < retries:
                         time.sleep(min(0.25 * (2 ** (attempt - 1)), 1.0))
 
-            if len(current_batch) > 1 and isinstance(last_error, SemanticTranslationError):
+            if len(current_batch) > 1 and isinstance(last_error, SemanticOutputError):
                 midpoint = len(current_batch) // 2
                 split_rows: list[dict[str, Any]] = []
                 split_cached = True
@@ -438,18 +460,53 @@ def translate_units(
                     split_rows.extend(child_rows)
                     split_cached = split_cached and child_cached
                 return split_rows, split_cached
-            raise SemanticTranslationError(f"batch failed after {retries} attempts: {last_error}")
+            if isinstance(last_error, SemanticRequestError):
+                raise SemanticRequestError(
+                    f"batch failed after {retries} attempts: {last_error}",
+                    retryable=last_error.retryable,
+                    status_code=last_error.status_code,
+                ) from last_error
+            raise SemanticOutputError(f"batch failed after {retries} attempts: {last_error}") from last_error
 
-        rows, cached = run_batch(batch, prompt, protected, key)
+        try:
+            rows, cached = run_batch(batch, prompt, protected, key)
+        except Exception:
+            stopped.set()
+            raise
         return index, rows, cached
 
     completed: dict[int, list[dict[str, Any]]] = {}; cache_hits = 0
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
-        futures = [executor.submit(execute, item) for item in prepared]
-        for future in as_completed(futures):
-            index, rows, cached = future.result(); completed[index] = rows; cache_hits += int(cached)
-            if progress is not None:
-                progress(len(completed), len(batches), cached)
+    executor = ThreadPoolExecutor(max_workers=max(1, concurrency))
+    pending = iter(prepared)
+    futures = set()
+    try:
+        for _ in range(max(1, concurrency)):
+            item = next(pending, None)
+            if item is None or stopped.is_set():
+                break
+            futures.add(executor.submit(execute, item))
+        while futures:
+            done, futures = wait(futures, return_when=FIRST_COMPLETED)
+            # Observe every completed failure before submitting more work.
+            for future in done:
+                if future.exception() is not None and not isinstance(future.exception(), CancelledError):
+                    future.result()
+            for future in done:
+                if isinstance(future.exception(), CancelledError):
+                    continue
+                index, rows, cached = future.result(); completed[index] = rows; cache_hits += int(cached)
+                if progress is not None:
+                    progress(len(completed), len(batches), cached)
+            for _ in done:
+                item = next(pending, None)
+                if item is None or stopped.is_set():
+                    break
+                futures.add(executor.submit(execute, item))
+    finally:
+        stopped.set()
+        # urllib calls already in flight finish under their transport timeout;
+        # join them so successful cache writes finish before returning the error.
+        executor.shutdown(wait=True, cancel_futures=True)
     results = [row for index in range(len(batches)) for row in completed[index]]
     _atomic_text(output_path, "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in results))
     return {"status": "passed", "mode": "run", "unit_count": len(results), "batch_count": len(batches), "cache_hits": cache_hits, "output": str(output_path.resolve())}
@@ -494,15 +551,21 @@ def build_openai_chat_request(*, api_key: str, base_url: str, model: str, timeou
                 response_payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")[:1200]
-            raise SemanticTranslationError(f"OpenAI-compatible HTTP {exc.code}: {detail}") from exc
+            raise SemanticRequestError(
+                f"OpenAI-compatible HTTP {exc.code}: {detail}",
+                retryable=exc.code in (408, 409, 425, 429) or 500 <= exc.code < 600,
+                status_code=exc.code,
+            ) from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise SemanticTranslationError(f"OpenAI-compatible request failed: {exc}") from exc
+            raise SemanticRequestError(f"OpenAI-compatible request failed: {exc}", retryable=True) from exc
         try:
             value = response_payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise SemanticTranslationError("OpenAI-compatible response has no message content") from exc
-        if not isinstance(value, str) or not value.strip():
-            raise SemanticTranslationError("OpenAI-compatible endpoint returned empty content")
+            raise SemanticRequestError("OpenAI-compatible response has no message content", retryable=False) from exc
+        if not isinstance(value, str):
+            raise SemanticRequestError("OpenAI-compatible message content is not text", retryable=False)
+        if not value.strip():
+            raise SemanticOutputError("OpenAI-compatible endpoint returned empty content")
         return value
     return request
 

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import re
 from pathlib import Path
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
 from translation_agent.semantic.semantic_translation_runner import (
+    SemanticOutputError,
+    SemanticRequestError,
     SemanticTranslationError,
     build_openai_chat_request,
     build_prompt,
@@ -174,7 +179,7 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
     def test_changed_marker_order_is_rejected(self) -> None:
         protected, tokens = protect_tokens("A[^a] B[^b]")
         self.assertIn("SEMANTIC_TOKEN", protected)
-        with self.assertRaises(SemanticTranslationError):
+        with self.assertRaises(SemanticOutputError):
             restore_tokens("⟦SEMANTIC_TOKEN_0001⟧ ⟦SEMANTIC_TOKEN_0000⟧", tokens)
 
     def test_source_as_translation_is_rejected_before_cache_write(self) -> None:
@@ -350,6 +355,183 @@ class SemanticTranslationRunnerTests(unittest.TestCase):
             one = json.loads((root / "one.jsonl").read_text(encoding="utf-8"))
             two = json.loads((root / "two.jsonl").read_text(encoding="utf-8"))
             self.assertNotEqual(one["cache_key"], two["cache_key"])
+
+
+class SemanticRequestRecoveryTests(unittest.TestCase):
+    def _units(self, root: Path, chapters: str = "ab") -> Path:
+        path = root / "units.jsonl"
+        path.write_text("".join(
+            json.dumps(_unit(f"{chapter}-{i}", chapter, i, f"English sentence number {i}.")) + "\n"
+            for chapter in chapters for i in range(1, 9)
+        ), encoding="utf-8")
+        return path
+
+    def _request(self):
+        return build_openai_chat_request(
+            api_key="offline-test", base_url="https://offline.invalid/v1",
+            model="offline", timeout=1,
+        )
+
+    def _ids(self, request) -> list[str]:
+        payload = json.loads(request.data)
+        return re.findall(r"⟦UNIT:([^:]+):START⟧", payload["messages"][-1]["content"])
+
+    def _response(self, ids: list[str]) -> io.BytesIO:
+        content = "\n".join(f"⟦UNIT:{uid}:START⟧\n完整中文译文。\n⟦UNIT:{uid}:END⟧" for uid in ids)
+        return io.BytesIO(json.dumps({"choices": [{"message": {"content": content}}]}).encode())
+
+    def test_permanent_http_errors_stop_without_retry_split_or_next_batch(self) -> None:
+        for status in (400, 401, 403, 404):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                units = self._units(root)
+                calls = []
+
+                def urlopen(request, **kwargs):
+                    calls.append(len(self._ids(request)))
+                    raise HTTPError(request.full_url, status, "offline probe", {}, io.BytesIO(b"offline probe"))
+
+                with patch("urllib.request.urlopen", urlopen), patch("time.sleep") as sleep:
+                    with self.assertRaises(SemanticRequestError) as caught:
+                        translate_units(units, root / "out.jsonl", request=self._request(), concurrency=1)
+                self.assertEqual(caught.exception.status_code, status)
+                self.assertFalse(caught.exception.retryable)
+                self.assertEqual(calls, [8])
+                sleep.assert_not_called()
+                self.assertFalse((root / "out.jsonl").exists())
+
+    def test_transient_http_and_network_errors_have_bounded_attempts_without_split(self) -> None:
+        for status in (408, 429, 500, 503, None):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                units = self._units(root)
+                calls = []
+
+                def urlopen(request, **kwargs):
+                    calls.append(len(self._ids(request)))
+                    if status is None:
+                        raise URLError("offline network failure")
+                    raise HTTPError(request.full_url, status, "offline", {}, io.BytesIO(b"offline"))
+
+                with patch("urllib.request.urlopen", urlopen), patch("time.sleep") as sleep:
+                    with self.assertRaises(SemanticRequestError) as caught:
+                        translate_units(units, root / "out.jsonl", request=self._request(), concurrency=1)
+                self.assertTrue(caught.exception.retryable)
+                self.assertEqual(calls, [8, 8, 8])
+                self.assertEqual(sleep.call_count, 2)
+
+    def test_transient_http_error_recovers_in_same_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            units = self._units(root, "a")
+            calls = []
+
+            def urlopen(request, **kwargs):
+                ids = self._ids(request)
+                calls.append(len(ids))
+                if len(calls) < 3:
+                    raise HTTPError(request.full_url, 429, "offline", {}, io.BytesIO(b"rate limit"))
+                return self._response(ids)
+
+            with patch("urllib.request.urlopen", urlopen), patch("time.sleep"):
+                translate_units(units, root / "out.jsonl", request=self._request(), concurrency=1)
+            self.assertEqual(calls, [8, 8, 8])
+            self.assertEqual(len((root / "out.jsonl").read_text(encoding="utf-8").splitlines()), 8)
+
+    def test_unknown_request_error_is_not_retried_or_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            units = self._units(root)
+            with patch("time.sleep") as sleep:
+                from unittest.mock import Mock
+                request = Mock(side_effect=SemanticTranslationError("unclassified request failure"))
+                with self.assertRaisesRegex(SemanticTranslationError, "unclassified"):
+                    translate_units(units, root / "out.jsonl", request=request, concurrency=1)
+            self.assertEqual(request.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_successful_cache_survives_failure_and_bad_cache_fails_without_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            units = self._units(root)
+            calls = []
+
+            def urlopen(request, **kwargs):
+                ids = self._ids(request)
+                calls.append(ids[0])
+                if ids[0].startswith("b"):
+                    raise HTTPError(request.full_url, 401, "offline", {}, io.BytesIO(b"offline"))
+                return self._response(ids)
+
+            with patch("urllib.request.urlopen", urlopen):
+                with self.assertRaises(SemanticRequestError):
+                    translate_units(units, root / "out.jsonl", cache_dir=root / "cache", request=self._request(), concurrency=1)
+            self.assertEqual(calls, ["a-1", "b-1"])
+            calls.clear()
+
+            def recovered(request, **kwargs):
+                ids = self._ids(request)
+                calls.append(ids[0])
+                return self._response(ids)
+
+            with patch("urllib.request.urlopen", recovered):
+                report = translate_units(units, root / "out.jsonl", cache_dir=root / "cache", request=self._request(), concurrency=1)
+            self.assertEqual(report["cache_hits"], 1)
+            self.assertEqual(calls, ["b-1"])
+            for corrupt in ("not JSON", json.dumps({"model_output": "broken markers"})):
+                for cache in (root / "cache").glob("*.json"):
+                    cache.write_text(corrupt, encoding="utf-8")
+                with patch("urllib.request.urlopen") as transport, patch("time.sleep") as sleep:
+                    with self.assertRaisesRegex(SemanticTranslationError, "invalid batch cache"):
+                        translate_units(units, root / "bad.jsonl", cache_dir=root / "cache", request=self._request(), concurrency=1)
+                transport.assert_not_called()
+                sleep.assert_not_called()
+                self.assertFalse((root / "bad.jsonl").exists())
+
+    def test_inflight_request_finishes_but_no_more_work_or_retry_starts(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor as RealExecutor
+
+        for inflight_succeeds in (True, False):
+            with self.subTest(success=inflight_succeeds), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                units = self._units(root, "abcd")
+                barrier = threading.Barrier(2)
+                failed = threading.Event()
+                calls = []
+
+                class ObservedExecutor(RealExecutor):
+                    def submit(self, fn, *args, **kwargs):
+                        future = super().submit(fn, *args, **kwargs)
+                        future.add_done_callback(lambda f: failed.set() if f.exception() is not None else None)
+                        return future
+
+                def urlopen(request, **kwargs):
+                    ids = self._ids(request)
+                    calls.append(ids[0])
+                    barrier.wait(timeout=3)
+                    if ids[0].startswith("a"):
+                        raise HTTPError(request.full_url, 403, "offline", {}, io.BytesIO(b"offline"))
+                    self.assertTrue(failed.wait(timeout=3))
+                    if not inflight_succeeds:
+                        raise HTTPError(request.full_url, 503, "offline", {}, io.BytesIO(b"offline"))
+                    return self._response(ids)
+
+                with patch("translation_agent.semantic.semantic_translation_runner.ThreadPoolExecutor", ObservedExecutor), patch("urllib.request.urlopen", urlopen), patch("time.sleep"):
+                    with self.assertRaises(SemanticRequestError) as caught:
+                        translate_units(units, root / "out.jsonl", cache_dir=root / "cache", request=self._request(), concurrency=2)
+                self.assertEqual(caught.exception.status_code, 403)
+                self.assertCountEqual(calls, ["a-1", "b-1"])
+                self.assertEqual(len(list((root / "cache").glob("*.json"))), int(inflight_succeeds))
+                self.assertFalse((root / "out.jsonl").exists())
+
+    def test_http_envelope_failure_does_not_trigger_content_split(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            units = self._units(root)
+            with patch("urllib.request.urlopen", return_value=io.BytesIO(b'{"choices": []}')) as transport:
+                with self.assertRaisesRegex(SemanticRequestError, "no message content"):
+                    translate_units(units, root / "out.jsonl", request=self._request(), concurrency=1)
+            self.assertEqual(transport.call_count, 1)
 
 
 class OpenAICompatibleTransportTests(unittest.TestCase):
