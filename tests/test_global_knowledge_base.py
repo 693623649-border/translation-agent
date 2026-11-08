@@ -161,6 +161,100 @@ class IncrementalSyncTests(unittest.TestCase):
         self.assertEqual(status(self.db)["workspace_count"], 5)
         self.assertTrue(verify_sources(self.db)["current"])
 
+    def _manifest_chapter(self, filename):
+        folder = self._workspace("book", kb=False)
+        self._workspace("untouched")
+        chapter = folder / "chapters" / filename
+        chapter.parent.mkdir(parents=True, exist_ok=True)
+        (folder / "chapters" / "001.md").replace(chapter)
+        chapter.write_text("# One\n\nOLDMARKER alpha text.\n", encoding="utf-8")
+        manifest = folder / "chapters.json"
+        rows = json.loads(manifest.read_text(encoding="utf-8"))
+        rows[0]["filename"] = filename
+        manifest.write_text(json.dumps(rows), encoding="utf-8")
+        return chapter
+
+    def test_nested_manifest_chapter_changes_refresh_only_its_workspace(self):
+        chapter = self._manifest_chapter("part/one.md")
+        self._sync(["book", "untouched"])
+        self._sync([])
+        self.assertEqual(len(search("OLDMARKER", db_path=self.db)), 1)
+        chapter.write_text("# One\n\nNEWMARKER beta text.\n", encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(search("OLDMARKER", db_path=self.db), [])
+        self.assertEqual(len(search("NEWMARKER", db_path=self.db)), 1)
+        self.assertTrue(verify_sources(self.db)["current"])
+
+    def test_manifest_chapter_with_other_extension_is_tracked(self):
+        chapter = self._manifest_chapter("part/one.txt")
+        self._sync(["book", "untouched"])
+        self._sync([])
+        chapter.write_text("# One\n\nNEWMARKER beta text.\n", encoding="utf-8")
+        self._sync(["book"])
+        self.assertEqual(search("OLDMARKER", db_path=self.db), [])
+        self.assertEqual(len(search("NEWMARKER", db_path=self.db)), 1)
+        self.assertTrue(verify_sources(self.db)["current"])
+
+    def _symlink(self, link, target):
+        try:
+            link.symlink_to(target)
+        except OSError as exc:
+            if os.name == "nt" and exc.winerror == 1314:
+                self.skipTest(f"Windows symbolic-link privilege is unavailable: {exc}")
+            raise
+
+    def test_same_content_external_chapter_link_is_rejected_before_hot_cache_hit(self):
+        folder = self._workspace("book", kb=False)
+        self._sync(["book"])
+        original = self.db.read_bytes()
+        chapter = folder / "chapters" / "001.md"
+        outside = self.root / "outside.md"
+        outside.write_bytes(chapter.read_bytes())
+        chapter.unlink()
+        self._symlink(chapter, outside)
+        with patch.object(kb_index, "_ingest_workspace") as ingest:
+            with self.assertRaisesRegex(ValueError, "Missing or unsafe chapter file"):
+                sync_outputs(self.outputs, self.db)
+        ingest.assert_not_called()
+        self.assertEqual(self.db.read_bytes(), original)
+        with self.assertRaisesRegex(ValueError, "Missing or unsafe chapter file"):
+            sync_outputs(self.outputs, self.root / "fresh.sqlite3")
+
+    def test_same_content_external_reviewed_link_is_rejected_before_hot_cache_hit(self):
+        folder = self._workspace("book", kb=False)
+        reviewed = folder / "reviewed_chapters" / "chapter-1.md"
+        reviewed.parent.mkdir()
+        reviewed.write_bytes((folder / "chapters" / "001.md").read_bytes())
+        self._sync(["book"])
+        original = self.db.read_bytes()
+        outside = self.root / "outside.md"
+        outside.write_bytes(reviewed.read_bytes())
+        reviewed.unlink()
+        self._symlink(reviewed, outside)
+        with patch.object(kb_index, "_ingest_workspace") as ingest:
+            with self.assertRaisesRegex(ValueError, "Unsafe reviewed chapter file"):
+                sync_outputs(self.outputs, self.db)
+        ingest.assert_not_called()
+        self.assertEqual(self.db.read_bytes(), original)
+
+    def test_same_content_internal_chapter_link_keeps_cold_and_hot_behavior(self):
+        folder = self._workspace("book", kb=False)
+        self._sync(["book"])
+        chapter = folder / "chapters" / "001.md"
+        inside = folder / "chapters" / "part" / "body.txt"
+        inside.parent.mkdir()
+        inside.write_bytes(chapter.read_bytes())
+        chapter.unlink()
+        self._symlink(chapter, inside)
+        original = self.db.read_bytes()
+        self._sync([])
+        self.assertEqual(self.db.read_bytes(), original)
+        fresh = self.root / "fresh.sqlite3"
+        result = sync_outputs(self.outputs, fresh)
+        self.assertEqual(result["updated_workspaces"], ["book"])
+        self.assertEqual(search("章节正文", db_path=self.db)[0]["content"],
+                         search("章节正文", db_path=fresh)[0]["content"])
+
     def test_added_and_removed_books_refresh_fts_and_leave_other_books(self):
         self._workspace("book0")
         self._workspace("book1")
@@ -334,7 +428,7 @@ class IncrementalSyncTests(unittest.TestCase):
                 elif kind == "normalization":
                     db.execute("UPDATE meta SET value='nfkc-old' WHERE key='search_normalization'")
                 elif kind == "sync_version":
-                    db.execute("UPDATE meta SET value='0' WHERE key='sync_version'")
+                    db.execute("UPDATE meta SET value='1' WHERE key='sync_version'")
                 else:
                     db.execute("DELETE FROM meta WHERE key='workspace_fingerprints'")
                 db.commit()

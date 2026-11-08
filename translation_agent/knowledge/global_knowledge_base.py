@@ -61,7 +61,7 @@ ASSET_SUFFIXES = {".docx", ".epub", ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".
 REQUIRED_KB_FIELDS = {"id", "title", "chapter_id", "chapter_order", "content"}
 SCHEMA_VERSION = 2
 # Bump when ingestion or normalization rules change, even without a SQL change.
-SYNC_VERSION = 1
+SYNC_VERSION = 2
 _T2S = OpenCC("t2s") if OpenCC is not None else None
 _NORMALIZATION = "nfkc+t2s" if _T2S is not None else "nfkc"
 
@@ -149,6 +149,24 @@ def _manifest(workspace: Path) -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError(f"Invalid chapter manifest: {path}")
     return [item for item in payload if isinstance(item, dict)]
+
+
+def _chapter_paths(workspace: Path, item: dict[str, Any]) -> tuple[Path, Path | None]:
+    chapter_id = str(item.get("id") or "")
+    filename = item.get("filename")
+    if not chapter_id or not isinstance(filename, str):
+        raise ValueError(f"Invalid chapter entry in {workspace / 'chapters.json'}")
+    chapter_dir = workspace / "chapters"
+    chapter_path = chapter_dir / filename
+    if not chapter_path.is_file() or not _within(chapter_path, chapter_dir):
+        raise ValueError(f"Missing or unsafe chapter file: {chapter_path}")
+    reviewed_dir = workspace / "reviewed_chapters"
+    reviewed_path = reviewed_dir / f"{chapter_id}.md"
+    if not reviewed_path.is_file():
+        return chapter_path, None
+    if not _within(reviewed_path, reviewed_dir):
+        raise ValueError(f"Unsafe reviewed chapter file: {reviewed_path}")
+    return chapter_path, reviewed_path
 
 
 def _release_report_path(workspace: Path) -> Path | None:
@@ -344,12 +362,7 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
         kind = ("chapter_snapshot" if chapter_id in covered or
                 (kb_path.is_file() and not manifest_uses_kb_ids)
                 else "chapter_fallback")
-        filename = item.get("filename")
-        if not chapter_id or not isinstance(filename, str):
-            raise ValueError(f"Invalid chapter entry in {workspace / 'chapters.json'}")
-        chapter_path = chapter_dir / filename
-        if not chapter_path.is_file() or not _within(chapter_path, chapter_dir):
-            raise ValueError(f"Missing or unsafe chapter file: {chapter_path}")
+        chapter_path, reviewed_path = _chapter_paths(workspace, item)
         raw = _read_bytes(chapter_path)
         relative = chapter_path.relative_to(root).as_posix()
         sources.append((relative, name, kind, _sha256(raw)))
@@ -367,10 +380,7 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
                 source_metadata={"source_format": item.get("source_format", "")},
             )
             counts["archive_chunks" if kind == "chapter_snapshot" else "reader_chunks"] += 1
-        reviewed_path = workspace / "reviewed_chapters" / f"{chapter_id}.md"
-        if reviewed_path.is_file():
-            if not _within(reviewed_path, workspace / "reviewed_chapters"):
-                raise ValueError(f"Unsafe reviewed chapter file: {reviewed_path}")
+        if reviewed_path is not None:
             reviewed_raw = _read_bytes(reviewed_path)
             reviewed_relative = reviewed_path.relative_to(root).as_posix()
             sources.append((reviewed_relative, name, "reviewed_chapter",
@@ -456,6 +466,13 @@ def _workspace_fingerprint(workspace: Path) -> str:
         ) if (workspace / name).is_file()
     }
     reader_paths = {workspace / "chapters.json", workspace / "knowledge_base.jsonl"}
+    for item in _manifest(workspace):
+        chapter_path, reviewed_path = _chapter_paths(workspace, item)
+        paths.add(chapter_path)
+        reader_paths.add(chapter_path)
+        if reviewed_path is not None:
+            paths.add(reviewed_path)
+            reader_paths.add(reviewed_path)
     for pattern in ("chapters/*.md", "reviewed_chapters/*.md", "pages/page_*.json"):
         found = {path for path in workspace.glob(pattern) if path.is_file()}
         paths.update(found)
