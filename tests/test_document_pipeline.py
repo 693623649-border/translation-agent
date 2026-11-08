@@ -596,6 +596,26 @@ class DocumentPipelineTests(unittest.TestCase):
                         )
                     )
 
+    def test_explicit_null_options_plan_like_omitted_options(self) -> None:
+        for name in (
+            "force_nodes",
+            "translation_temperature",
+            "translation_max_chars",
+            "translation_max_tokens",
+            "translation_retries",
+        ):
+            with self.subTest(option=name), tempfile.TemporaryDirectory() as directory:
+                source = Path(directory) / "book.epub"
+                _write_epub(source)
+                RunExecutionService().plan(
+                    RunSpec(
+                        source=source,
+                        source_mode="epub",
+                        output_dir=Path(directory) / "output",
+                        options={name: None},
+                    )
+                )
+
     def test_epub_recipe_is_rejected_instead_of_silently_ignored(self) -> None:
         with self.assertRaisesRegex(
             RunResolutionError,

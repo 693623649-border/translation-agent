@@ -477,7 +477,7 @@ def _graph_request(
         targets=targets,
         include_proofread=bool(options.get("include_proofread", False)),
         toc_source=str(options.get("toc_source") or "pipeline"),
-        force_nodes=tuple(options.get("force_nodes", ())),
+        force_nodes=tuple(options.get("force_nodes") or ()),
         force_all=bool(options.get("force_all", False)),
         adopt_existing_output=bool(options.get("adopt_existing_output", False)),
         source_mode=(spec.source_mode if spec.source_mode != "epub" else None),
@@ -626,8 +626,8 @@ class RunExecutionService:
             else:
                 credential_env = "DEEPSEEK_API_KEY"
 
-            temperature = float(options.get("translation_temperature", 0.0))
-            max_tokens = int(options.get("translation_max_tokens", 32768))
+            temperature = float(options.get("translation_temperature") or 0.0)
+            max_tokens = int(options.get("translation_max_tokens") or 32768)
             request_identity = {
                 "provider": provider,
                 "base_url": base_url.rstrip("/"),
@@ -687,17 +687,17 @@ class RunExecutionService:
             translation_prompt_profile=prompt_profile,
             translation_thinking=thinking,
             translation_temperature=float(
-                options.get("translation_temperature", 0.0)
+                options.get("translation_temperature") or 0.0
             ),
             translation_max_chars=int(
-                options.get("translation_max_chars", 9000)
+                options.get("translation_max_chars") or 9000
             ),
             translation_concurrency=concurrency,
-            translation_retries=int(options.get("translation_retries", 3)),
+            translation_retries=int(options.get("translation_retries") or 3),
             translation_cache_dir=resolved.semantic_cache_dir,
             book_title=spec.title,
             author=spec.author,
-            force_nodes=frozenset(options.get("force_nodes", ())),
+            force_nodes=frozenset(options.get("force_nodes") or ()),
             force_all=bool(options.get("force_all", False)),
         )
         return prepare_epub_graph(
