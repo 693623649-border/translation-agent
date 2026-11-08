@@ -555,7 +555,7 @@ def _knowledge_base_is_current(
         return False
     args = _parsed_args(context)
     if not rag_knowledge_base.zhipu_embedding_enabled(
-        getattr(args, "rag_embed", None)
+        args.rag_embed
     ):
         return True
     try:
@@ -1094,7 +1094,7 @@ def _publisher_fingerprint(kind: str) -> Any:
             value["source_filename"] = Path(str(source["path"])).name
             value["rag_embedding_enabled"] = (
                 rag_knowledge_base.zhipu_embedding_enabled(
-                    getattr(args, "rag_embed", None)
+                    args.rag_embed
                 )
             )
             value["rag_embedding_model"] = os.getenv(
@@ -2117,11 +2117,8 @@ def _semantic_handler(*, allow_missing_audit: bool) -> Any:
             context,
             ART_CHAPTERS,
         )
+        # _chapter_bundle has already rejected a non-object artifact.
         chapter_artifact = context.require(ART_CHAPTERS)
-        if not isinstance(chapter_artifact, dict):
-            raise SemanticReconstructionError(
-                f"{ART_CHAPTERS} artifact must be an object"
-            )
 
         inventories: list[dict[str, Any]] = []
         failures: list[str] = []
@@ -2369,7 +2366,7 @@ def _validate_source_artifact_value(
     if path.suffix.lower() != ".pdf":
         return False
     with fitz.open(path) as document:
-        declared = value.get("page_count") if isinstance(value, dict) else None
+        declared = value.get("page_count")
         return declared is None or int(declared) == document.page_count
 
 
@@ -2427,8 +2424,6 @@ def _validate_semantic_chapter_artifact_value(
     value: Any,
 ) -> bool:
     if not _validate_chapter_artifact_value(context, value):
-        return False
-    if not isinstance(value, dict):
         return False
     if (
         value.get("semantic_contract_version")
@@ -2563,7 +2558,7 @@ def _publish_reader_bundle_to_canonical(context: GraphContext) -> None:
         context.output_dir,
         context.output_dir / "chapters",
     )
-    filenames = _validated_chapter_filenames(manifest, _manifest_path)
+    filenames = [item["filename"] for item in manifest]
     expected: set[str] = set()
     if chapter_dir.resolve() != target_dir:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -2603,7 +2598,6 @@ def _reader_semantic_audit(
     audit_by_filename = {
         str(item.get("filename") or ""): item
         for item in payload["chapters"]
-        if isinstance(item, dict)
     }
     for item in manifest:
         filename = str(item["filename"])
@@ -2901,7 +2895,7 @@ def _knowledge_base_handler(context: GraphContext) -> NodeResult:
     try:
         rag_knowledge_base.maybe_build_zhipu_embedding_index(
             path,
-            requested=getattr(args, "rag_embed", None),
+            requested=args.rag_embed,
         )
     except rag_knowledge_base.RagError as exc:
         print(

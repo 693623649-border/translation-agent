@@ -329,25 +329,25 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
         knowledge_base = RagKnowledgeBase.open(knowledge_base_path)
     # Explicit --mode wins; the legacy --semantic flag keeps its meaning;
     # otherwise default to hybrid ranking per the retrieval plan.
-    mode = getattr(args, "mode", None) or ("semantic" if args.semantic else "hybrid")
+    mode = args.mode or ("semantic" if args.semantic else "hybrid")
     provider = (
         _provider_from_manifest(knowledge_base_path, args)
         if mode in ("semantic", "hybrid")
         else None
     )
-    per_book_cap = max(0, int(getattr(args, "per_book_cap", 3) or 0)) or None
+    per_book_cap = max(0, int(args.per_book_cap or 0)) or None
     inferred_routes = {"book_ids": frozenset(), "authors": frozenset()}
-    auto_route = bool(getattr(args, "auto_route", True))
+    auto_route = bool(args.auto_route)
     if auto_route and not args.book and not args.author:
         inferred_routes = knowledge_base.infer_query_routes(args.query)
     filters = {
         "book_ids": (
             set(args.book)
-            if getattr(args, "book", None)
+            if args.book
             else set(inferred_routes["book_ids"]) or None
         ),
-        "authors": set(getattr(args, "author", None) or []) or None,
-        "languages": set(getattr(args, "language", None) or []) or None,
+        "authors": set(args.author or []) or None,
+        "languages": set(args.language or []) or None,
     }
     semantic_error: str | None = None
     try:
@@ -359,7 +359,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
             embedding_provider=provider,
             mode=mode,
             per_book_cap=per_book_cap,
-            candidate_depth=int(getattr(args, "candidate_depth", 30) or 30),
+            candidate_depth=int(args.candidate_depth or 30),
             apparatus_weight=args.apparatus_weight,
             **filters,
         )
@@ -385,7 +385,7 @@ def _command_retrieve(args: argparse.Namespace, stdout: TextIO) -> int:
                 context.hits[0].retrieval_mode if context.hits else mode
             ),
             "requested_mode": mode,
-            "books": sorted(set(args.book)) if getattr(args, "book", None) else [],
+            "books": sorted(set(args.book)) if args.book else [],
             "routing": {
                 "automatic": auto_route,
                 "inferred_books": sorted(inferred_routes["book_ids"]),

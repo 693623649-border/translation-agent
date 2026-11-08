@@ -958,6 +958,12 @@ class GraphExecutor:
             node.provides
         ):
             return None
+        # state.json is persisted input: a damaged fingerprint must force a rerun
+        # instead of failing later when GraphContext rejects it.
+        if not all(
+            isinstance(value, str) and value for value in output_fingerprints.values()
+        ):
+            return None
         if node.cache_validator is not None and not node.cache_validator(context, outputs):
             return None
         for name, value in outputs.items():

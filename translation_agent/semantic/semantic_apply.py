@@ -530,7 +530,6 @@ def validate_translation_set(
         raise SemanticApplyError("glossary must contain non-empty string pairs")
 
     source_ids: set[str] = set()
-    translated_ids: set[str] = set()
     chapter_order: list[str] = []
     closed_chapters: set[str] = set()
     current_chapter = ""
@@ -553,19 +552,17 @@ def validate_translation_set(
         translated_id = str(translated.get("id") or "").strip()
         chapter_id = canonical.chapter_id
         translated_chapter = str(translated.get("chapter_id") or "").strip()
+        sequence = canonical.sequence
         try:
-            sequence = canonical.sequence
             translated_sequence = int(translated.get("sequence"))
         except (TypeError, ValueError) as exc:
             raise SemanticApplyError(f"semantic unit sequence is invalid: {unit_id!r}") from exc
-        if not unit_id or not chapter_id or sequence < 1:
-            raise SemanticApplyError(f"semantic unit identity is incomplete at position {index}")
-        if unit_id in source_ids or translated_id in translated_ids:
+        # Every earlier translated id equals its source id, so one set covers both.
+        if unit_id in source_ids or translated_id in source_ids:
             raise SemanticApplyError(f"source or translated unit ids are duplicated: {unit_id!r}")
         if translated_id != unit_id or translated_chapter != chapter_id or translated_sequence != sequence:
             raise SemanticApplyError(f"translated unit identity/order mismatch: {unit_id!r}")
         source_ids.add(unit_id)
-        translated_ids.add(translated_id)
 
         if chapter_id != current_chapter:
             if chapter_id in closed_chapters:
@@ -584,7 +581,7 @@ def validate_translation_set(
 
         kind = canonical.kind
         source_markdown = canonical.source_markdown
-        actual_sha256 = sha256_bytes(source_markdown.encode("utf-8"))
+        actual_sha256 = canonical.source_sha256
         if translated.get("source_sha256") != actual_sha256:
             raise SemanticApplyError(f"translated unit is bound to different source bytes: {unit_id}")
         translated_markdown = translated.get("translated_markdown")
@@ -610,8 +607,6 @@ def validate_translation_set(
             )
         )
 
-    if source_ids != translated_ids:
-        raise SemanticApplyError("translation unit set does not match the imported source")
     return ValidatedTranslationSet(
         schema_version=TRANSLATION_SET_SCHEMA_VERSION,
         units=tuple(validated),
@@ -859,9 +854,7 @@ def apply_translation_transaction(
         for item in manifest:
             chapter_id = str(item["id"])
             filename = _safe_filename(item.get("filename"))
-            units = by_chapter.get(chapter_id, ())
-            if not units:
-                raise SemanticApplyError(f"translation is missing chapter: {chapter_id}")
+            units = by_chapter[chapter_id]
             translated_markdown = "\n\n".join(
                 unit.translated_markdown for unit in units
             ).rstrip() + "\n"

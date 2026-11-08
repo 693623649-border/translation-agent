@@ -402,6 +402,41 @@ class GraphExecutorTests(unittest.TestCase):
             self.assertIn("node_succeeded", {event["event"] for event in events})
             self.assertIn("node_skipped", {event["event"] for event in events})
 
+    def test_damaged_cached_output_fingerprint_reruns_producer(self):
+        for damaged in ([], 12, "", None, {}, False):
+            with self.subTest(damaged=damaged), tempfile.TemporaryDirectory() as directory:
+                calls = []
+                graph = PipelineGraph(
+                    [
+                        node(
+                            "ocr",
+                            lambda ctx: calls.append("ocr") or NodeResult(outputs={"pages": "p"}),
+                            requires={"pdf"},
+                            provides={"pages"},
+                        ),
+                        node(
+                            "compile",
+                            lambda ctx: calls.append("compile")
+                            or NodeResult(outputs={"docx": ctx["pages"] + ".docx"}),
+                            requires={"pages"},
+                            provides={"docx"},
+                        ),
+                    ]
+                )
+                executor = GraphExecutor(graph)
+                first_run = executor.execute(GraphContext(directory, {"pdf": "book.pdf"}))
+                state = json.loads(first_run.state_path.read_text(encoding="utf-8"))
+                state["nodes"]["ocr"]["output_fingerprints"]["pages"] = damaged
+                first_run.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+                second_run = executor.execute(GraphContext(directory, {"pdf": "book.pdf"}))
+
+                self.assertIn("ocr", second_run.executed)
+                self.assertEqual(second_run.values["docx"], "p.docx")
+                self.assertEqual(calls.count("ocr"), 2)
+                repaired = json.loads(second_run.state_path.read_text(encoding="utf-8"))
+                self.assertIsInstance(repaired["nodes"]["ocr"]["output_fingerprints"]["pages"], str)
+
     def test_changed_input_invalidates_node_and_downstream(self):
         calls = []
         graph = PipelineGraph(
