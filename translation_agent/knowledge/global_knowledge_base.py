@@ -504,8 +504,6 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
               or (path / "knowledge_base.jsonl").is_file())),
         key=lambda path: path.name,
     )
-    if not workspaces:
-        raise ValueError(f"No output workspaces found in {root}")
     if target.is_relative_to(root) and any(target.is_relative_to(path) for path in workspaces):
         raise ValueError("The global database must not overwrite an output workspace")
     fingerprints = {workspace.name: _workspace_fingerprint(workspace) for workspace in workspaces}
@@ -531,6 +529,8 @@ def sync_outputs(outputs_root: Path | str = DEFAULT_OUTPUTS,
                             "workspaces": len(workspaces), "counts": _sync_counts(old),
                             "updated_workspaces": [], "removed_workspaces": [], "rebuilt": False}
     if not incremental:
+        if not workspaces:
+            raise ValueError(f"No output workspaces found in {root}")
         previous = {}
     changed = [workspace for workspace in workspaces
                if previous.get(workspace.name) != fingerprints[workspace.name]]

@@ -173,6 +173,21 @@ class IncrementalSyncTests(unittest.TestCase):
         self.assertEqual({hit["workspace"] for hit in search("正式正文", db_path=self.db)}, {"book1", "book2"})
         self.assertTrue(verify_sources(self.db)["current"])
 
+    def test_removing_last_book_publishes_empty_index_but_empty_first_sync_still_fails(self):
+        with self.assertRaisesRegex(ValueError, "No output workspaces"):
+            sync_outputs(self.outputs, self.db)
+        self._workspace("book")
+        self._sync(["book"])
+        shutil.rmtree(self.outputs / "book")
+        result = self._sync([])
+        self.assertEqual(result["removed_workspaces"], ["book"])
+        self.assertEqual(result["workspaces"], 0)
+        self.assertEqual(search("正式正文", db_path=self.db), [])
+        self.assertTrue(verify_sources(self.db)["current"])
+        before = self.db.read_bytes()
+        self._sync([])
+        self.assertEqual(self.db.read_bytes(), before)
+
     def test_chapter_page_and_asset_add_change_delete_refresh_only_their_book(self):
         folder = self._workspace("book", kb=False, page=True)
         self._workspace("untouched")
