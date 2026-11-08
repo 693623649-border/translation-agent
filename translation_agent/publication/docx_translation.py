@@ -27,7 +27,6 @@ from typing import Any, Protocol
 from translation_agent.pipeline.book_pipeline import detect_language
 from translation_agent.knowledge.kb_translation import translate_texts
 
-VERSION = 1
 CHINESE_SUFFIX = "_中文"
 CHINESE = "zh"
 
@@ -37,9 +36,8 @@ _NON_PROSE_RE = re.compile(r"^[\s\d\-–—·・.．、,，:：;；()（）\[\]�
 _RIGHTS_RE = re.compile(r"^[©Ⓒ\(]?\s*(?:copyright|©|Ⓒ)", re.I)
 # Letter kana only: the katakana block also holds punctuation (U+30FB middle dot,
 # U+30A0 double hyphen) that must not be mistaken for evidence of Japanese.
-_KANA_RE = re.compile(r"[\u3041-\u3096\u309d\u309e\u30a1-\u30fa\u30fd\u30fe]")
+_KANA_RE = re.compile(r"[\u3041-\u3096\u309d-\u309f\u30a1-\u30fa\u30fd-\u30ff]")
 _HAN_RE = re.compile(r"[\u3400-\u9fff]")
-_KANA_RE = re.compile(r"[\u3040-\u30ff]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 # A printed page's running head survived OCR as "<folio> <section word>
 # <damaged title fragment> <year range>" and sits where the page break used to
@@ -69,10 +67,6 @@ class Translator(Protocol):
     model: str
 
     def translate(self, prompt: str) -> str: ...
-
-
-def _prose_mass(text: str) -> int:
-    return len(re.sub(r"\s+", "", text))
 
 
 # A printed page's running head survived OCR as "<folio> <section> <title>
@@ -365,11 +359,9 @@ def translate_docx(
     )
     flattened = 0
     unchanged = 0
-    stripped_heads = 0
     titles = _section_titles(paragraphs)
     for index, text in zip(targets, translated, strict=True):
-        text, removed = strip_running_heads(text, titles)
-        stripped_heads += removed
+        text, _ = strip_running_heads(text, titles)
         if text.strip() == _paragraph_text(paragraphs[index]).strip():
             unchanged += 1
             continue

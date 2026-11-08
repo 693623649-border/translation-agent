@@ -97,6 +97,16 @@ class NeedsTranslationTests(unittest.TestCase):
         for heading in ("意識と自然", "漱石とジンル", "内側から見た生"):
             self.assertTrue(needs_translation(heading), heading)
 
+    def test_katakana_block_punctuation_is_not_kana(self) -> None:
+        """U+30FB middle dot and U+30A0 double hyphen also separate Chinese names."""
+
+        for text in ("中文・正文", "张三゠李四"):
+            self.assertFalse(needs_translation(text), text)
+
+    def test_kana_digraphs_are_kana(self) -> None:
+        for text in ("ゟ", "ヿ", "漢字ヿ"):
+            self.assertTrue(needs_translation(text), text)
+
     def test_kanji_only_short_string_is_left_alone(self) -> None:
         """Kanji-only names and titles read as Chinese."""
 

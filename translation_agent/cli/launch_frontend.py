@@ -49,8 +49,7 @@ def main(argv: list[str] | None = None) -> int:
             "Web UI is local-only: --host must be localhost, 127.0.0.1, or ::1. "
             "Use an authenticated local tunnel for remote access."
         )
-    # ``frontend_app.py`` remains an import-compatible shim; new launches use
-    # the canonical st.navigation entry point.
+    # Launch the st.navigation entry point; it registers every page itself.
     app = Path(__file__).resolve().parents[1] / "ui" / "streamlit_app.py"
     command = [
         sys.executable,
