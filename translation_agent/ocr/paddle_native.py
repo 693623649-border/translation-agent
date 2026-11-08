@@ -37,6 +37,7 @@ import statistics
 import tarfile
 import tempfile
 import threading
+import traceback
 import urllib.request
 
 MODEL_BASE = "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0"
@@ -179,6 +180,29 @@ def ordered_text(result, direction: str) -> str:
     return "\n".join(r[4] for r in rows)
 
 
+def _drop_model_frame_locals(exc: BaseException) -> None:
+    """Clear locals of the finished frames an escaping model exception captured.
+
+    Frames inside ``PaddleOCR(...)`` and ``engine.predict(...)`` bind the
+    engine as ``self``.  Without this, a caller that keeps the exception (or
+    its traceback) would keep the model alive after the lease is released.
+    The exception, its chain and its printable traceback (files, lines,
+    function names) are unchanged.  Only frames at or below the current
+    frame are in these tracebacks, and executing frames are skipped by
+    ``traceback.clear_frames``.
+    """
+
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
+
+
 class PaddleNativeOCR:
     """One lazily loaded model per OCR stage, serialized across local jobs."""
 
@@ -230,7 +254,8 @@ class PaddleNativeOCR:
                 use_textline_orientation=False,
             )
             return self._engine
-        except BaseException:
+        except BaseException as exc:
+            _drop_model_frame_locals(exc)
             self._cleanup()
             raise
 
@@ -246,8 +271,16 @@ class PaddleNativeOCR:
                 with Image.open(image_path) as source:
                     image = source.convert("RGB")
                     image.thumbnail((2000, 2000))
-                    # Paddle image arrays use OpenCV's BGR ordering.
-                    results = list(engine.predict(np.asarray(image)[:, :, ::-1].copy()))
+                    try:
+                        # Paddle image arrays use OpenCV's BGR ordering.
+                        results = list(engine.predict(np.asarray(image)[:, :, ::-1].copy()))
+                    except BaseException as exc:
+                        _drop_model_frame_locals(exc)
+                        raise
+                    finally:
+                        # self._engine is the only owner; a traceback of a
+                        # later error must not keep this frame's reference.
+                        del engine
                 if len(results) != 1:
                     raise RuntimeError("PaddleOCR returned an unexpected number of pages")
                 text = ordered_text(results[0], self.options.reading_direction)

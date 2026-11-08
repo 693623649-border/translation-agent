@@ -4,7 +4,9 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import threading
+import traceback
 import types
+import weakref
 import unittest
 from unittest.mock import Mock, patch
 
@@ -131,6 +133,121 @@ class NativeOCRTests(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertTrue(errors)
         self.assertIsNone(backend._engine)
+
+    def lifecycle_backend(self, predict):
+        """Backend whose factory builds a weakref-able engine (no Mock caches).
+
+        Records the order of engine finalization and lease release so a test
+        can prove the engine is gone before another job may take the lease.
+        """
+
+        events = []
+        engines = []
+
+        class Engine:
+            def __init__(self, **_kwargs):
+                engines.append(weakref.ref(self, lambda _ref: events.append('engine-freed')))
+
+            def predict(self, array):
+                return predict(self, array)
+
+        from translation_agent.runtime import model_lease
+
+        real_release = model_lease.release_heavy_model_lease
+
+        def release(purpose, lock):
+            events.append('lease-released')
+            real_release(purpose, lock)
+
+        patches = (
+            patch.dict('sys.modules', {'paddleocr': types.SimpleNamespace(PaddleOCR=Engine)}),
+            patch.object(model_lease, 'release_heavy_model_lease', release),
+        )
+        for active in patches:
+            active.start()
+            self.addCleanup(active.stop)
+        return self.backend(), engines, events
+
+    @staticmethod
+    def page_result():
+        return [{'rec_texts': ['text'], 'rec_boxes': [[0, 0, 10, 10]]}]
+
+    def test_cancel_during_predict_frees_engine_before_lease_even_if_error_is_kept(self):
+        backend = None
+
+        def predict(_engine, _array):
+            backend.close()  # another thread cancels mid-inference
+            return self.page_result()
+
+        backend, engines, events = self.lifecycle_backend(predict)
+        kept = []
+        try:
+            backend.ocr_image(self.image)
+        except RuntimeError as exc:
+            kept.append(exc)  # a caller that keeps the error and its traceback
+        self.assertEqual(str(kept[0]), 'Native OCR cancelled')
+        self.assertIsNone(backend._engine)
+        self.assertIsNone(engines[0](), 'kept traceback must not keep the model alive')
+        self.assertEqual(events, ['engine-freed', 'lease-released'])
+        self.assertIsNotNone(kept[0].__traceback__, 'the traceback itself is preserved')
+
+    def test_predict_failure_kept_by_caller_does_not_retain_engine_after_close(self):
+        def predict(_engine, _array):
+            raise ValueError('native inference failed')
+
+        backend, engines, events = self.lifecycle_backend(predict)
+        kept = []
+        try:
+            backend.ocr_image(self.image)
+        except ValueError as exc:
+            kept.append(exc)
+        # A failed page does not unload: the stage may continue with the next page.
+        self.assertIsNotNone(engines[0]())
+        self.assertIs(backend._engine, engines[0]())
+        backend.close()
+        self.assertIsNone(engines[0](), 'traceback frames must not pin the engine')
+        self.assertEqual(events, ['engine-freed', 'lease-released'])
+        self.assertEqual(str(kept[0]), 'native inference failed')
+        self.assertIn('predict', ''.join(traceback.format_exception(kept[0])))
+
+    def test_load_failure_does_not_retain_partial_engine_in_kept_error(self):
+        from translation_agent.runtime import model_lease
+
+        partial = []
+        events = []
+
+        class Engine:
+            def __init__(self, **_kwargs):
+                partial.append(weakref.ref(self, lambda _ref: events.append('engine-freed')))
+                raise OSError('weights unreadable')
+
+        real_release = model_lease.release_heavy_model_lease
+
+        def release(purpose, lock):
+            events.append('lease-released')
+            real_release(purpose, lock)
+
+        with patch.dict('sys.modules', {'paddleocr': types.SimpleNamespace(PaddleOCR=Engine)}), \
+                patch.object(model_lease, 'release_heavy_model_lease', release):
+            backend = self.backend()
+            kept = []
+            try:
+                backend.ocr_image(self.image)
+            except OSError as exc:
+                kept.append(exc)
+        self.assertIsNone(partial[0]())
+        self.assertEqual(events, ['engine-freed', 'lease-released'])
+        self.assertIsNone(backend._process_lock)
+
+    def test_success_path_reuses_one_engine_until_close(self):
+        backend, engines, events = self.lifecycle_backend(lambda _engine, _array: self.page_result())
+        self.assertEqual(backend.ocr_image(self.image)[0], 'text')
+        self.assertEqual(backend.ocr_image(self.image)[0], 'text')
+        self.assertEqual(len(engines), 1, 'the model is loaded once per stage')
+        self.assertIs(backend._engine, engines[0]())
+        backend.close()
+        self.assertIsNone(engines[0]())
+        self.assertEqual(events, ['engine-freed', 'lease-released'])
 
     def test_legacy_cli_resume_blank_cache_and_weight_invalidation(self):
         pdf = self.root / 'input.pdf'
