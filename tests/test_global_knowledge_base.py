@@ -252,8 +252,8 @@ class IncrementalSyncTests(unittest.TestCase):
         fresh = self.root / "fresh.sqlite3"
         result = sync_outputs(self.outputs, fresh)
         self.assertEqual(result["updated_workspaces"], ["book"])
-        self.assertEqual(search("章节正文", db_path=self.db)[0]["content"],
-                         search("章节正文", db_path=fresh)[0]["content"])
+        self.assertEqual(search("章节正文", db_path=self.db)[0]["excerpt"],
+                         search("章节正文", db_path=fresh)[0]["excerpt"])
 
     def test_added_and_removed_books_refresh_fts_and_leave_other_books(self):
         self._workspace("book0")
