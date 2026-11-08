@@ -243,12 +243,12 @@ def _files_digest(paths: Iterable[Path]) -> str:
     return digest.hexdigest()
 
 
-def _file_artifact(path: Path) -> dict[str, Any]:
+def _file_artifact(path: Path, *, context: GraphContext | None = None) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(path)
     return {
         "path": str(path.resolve()),
-        "sha256": sha256_file(path),
+        "sha256": context._file_digests.sha256(path, hash_file=sha256_file) if context else sha256_file(path),
         "size": path.stat().st_size,
     }
 
@@ -1024,7 +1024,7 @@ def _source_fingerprint(context: GraphContext) -> dict[str, Any]:
         "source_adapter": _source_adapter(source_mode),
         "source_mode": source_mode,
         "path": str(path) if path is not None else None,
-        "source_sha256": sha256_file(path) if path and path.is_file() else None,
+        "source_sha256": context._file_digests.sha256(path, hash_file=sha256_file) if path and path.is_file() else None,
     }
 
 
@@ -1190,7 +1190,7 @@ def _validate_and_bind_source_artifact(
 ) -> Path:
     """Enforce source hash binding even when a plugin provides ``source.pdf``."""
 
-    path = _validated_file_from_artifact(artifact, name=ART_SOURCE)
+    path = _validated_file_from_artifact(artifact, name=ART_SOURCE, context=context)
     if path.suffix.lower() != ".pdf":
         raise FileNotFoundError(f"Input must be a PDF: {path}")
     with fitz.open(path) as document:
@@ -1200,7 +1200,7 @@ def _validate_and_bind_source_artifact(
         raise SourceBindingError(
             f"source.pdf page_count mismatch: declared={declared_count}, actual={page_count}"
         )
-    source_sha = sha256_file(path)
+    source_sha = context._file_digests.sha256(path, hash_file=sha256_file)
     source_mode = _source_mode(context)
     source_adapter = _source_adapter(source_mode)
     binding_path = context.output_dir / ".pipeline_graph" / "source.json"
@@ -1317,7 +1317,7 @@ def _source_handler(context: GraphContext) -> NodeResult:
     with fitz.open(path) as document:
         page_count = document.page_count
     artifact = {
-        **_file_artifact(path),
+        **_file_artifact(path, context=context),
         "page_count": page_count,
         "adapter": _source_adapter(_source_mode(context)),
         "source_mode": _source_mode(context),
@@ -2327,14 +2327,15 @@ def _atomic_copy_file(source: Path, target: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _validated_file_from_artifact(artifact: Any, *, name: str) -> Path:
+def _validated_file_from_artifact(artifact: Any, *, name: str, context: GraphContext | None = None) -> Path:
     if not isinstance(artifact, dict) or not artifact.get("path"):
         raise ValueError(f"{name} artifact must contain a file path")
     path = Path(str(artifact["path"])).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
     expected_sha = _required_artifact_sha256(artifact, name=name)
-    if expected_sha != sha256_file(path):
+    actual_sha = context._file_digests.sha256(path, hash_file=sha256_file) if context else sha256_file(path)
+    if expected_sha != actual_sha:
         raise ValueError(f"{name} artifact content no longer matches its digest")
     return path
 
@@ -2359,10 +2360,10 @@ def _validate_file_artifact_value(
 
 
 def _validate_source_artifact_value(
-    _context: GraphContext,
+    context: GraphContext,
     value: Any,
 ) -> bool:
-    path = _validated_file_from_artifact(value, name=ART_SOURCE)
+    path = _validated_file_from_artifact(value, name=ART_SOURCE, context=context)
     if path.suffix.lower() != ".pdf":
         return False
     with fitz.open(path) as document:
@@ -3167,7 +3168,7 @@ def _source_cache_validator(
     source_adapter = _source_adapter(source_mode)
     return (
         path.is_file()
-        and saved.get("sha256") == sha256_file(path)
+        and saved.get("sha256") == context._file_digests.sha256(path, hash_file=sha256_file)
         and saved.get("source_mode") == source_mode
         and saved.get("adapter") == source_adapter
         and isinstance(binding, dict)
