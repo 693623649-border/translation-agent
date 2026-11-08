@@ -394,7 +394,7 @@ def translate_texts(
         return output
 
     def run(batch: list[str]) -> list[str]:
-        last: KbTranslationError | None = None
+        last: KbTranslationError
         for _attempt in range(_BATCH_ATTEMPTS):
             try:
                 output = run_batch(batch)
@@ -410,8 +410,6 @@ def translate_texts(
                 # Ask again one segment at a time, where each reads as content.
                 return [segment for single in batch for segment in run_batch([single])]
             return output
-        if last is None:  # pragma: no cover - the loop always sets it
-            raise KbTranslationError("batch retry loop produced no result")
         if len(batch) == 1:
             # A single segment cannot be degraded further, but it has already
             # been retried; surface the marker contract failure.
@@ -420,7 +418,7 @@ def translate_texts(
         # single-segment calls, where the marker contract is trivially met.
         return [segment for single in batch for segment in run_batch([single])]
 
-    if len(batches) == 1 or concurrency == 1:
+    if len(batches) <= 1 or concurrency == 1:
         translated_pieces = [segment for batch in batches for segment in run(batch)]
     else:
         from concurrent.futures import ThreadPoolExecutor
@@ -428,17 +426,11 @@ def translate_texts(
         with ThreadPoolExecutor(max_workers=min(concurrency, len(batches))) as pool:
             batches_of_segments = list(pool.map(run, batches))
         translated_pieces = [segment for batch in batches_of_segments for segment in batch]
-    if len(translated_pieces) != len(flat):
-        raise KbTranslationError(
-            f"translated {len(translated_pieces)} segments for {len(flat)} request pieces"
-        )
     results: list[str] = []
     cursor = 0
     for pieces in pieces_by_parent:
         results.append("".join(translated_pieces[cursor:cursor + len(pieces)]))
         cursor += len(pieces)
-    if len(results) != len(texts):
-        raise KbTranslationError(f"translated {len(results)} segments for {len(texts)} chunks")
     return results
 
 

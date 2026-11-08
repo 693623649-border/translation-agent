@@ -507,9 +507,6 @@ def build_openai_chat_request(*, api_key: str, base_url: str, model: str, timeou
     return request
 
 
-# Backward-compatible alias for archived callers. New orchestration code uses
-# the public transport factory above rather than coupling to a private seam.
-_deepseek_request = build_openai_chat_request
 
 
 def build_parser() -> argparse.ArgumentParser:

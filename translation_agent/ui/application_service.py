@@ -195,7 +195,6 @@ class ApplicationService:
         job_id = uuid.uuid4().hex
         workspace, input_dir, output = self._job_paths(job_id)
         workspace.mkdir(parents=True, mode=0o700)
-        registered = False
         try:
             input_dir.mkdir()
             output.mkdir(parents=True)
@@ -222,10 +221,8 @@ class ApplicationService:
                 resolved_targets=plan.targets,
                 release_profile=plan.release_profile,
             )
-            registered = True
         except Exception:
-            if not registered:
-                shutil.rmtree(workspace)
+            shutil.rmtree(workspace)
             raise
         return (
             start_job_process(self.registry, job.id, credentials=credentials)
@@ -245,7 +242,6 @@ class ApplicationService:
         job_id = uuid.uuid4().hex
         workspace, input_dir, output = self._job_paths(job_id)
         workspace.mkdir(parents=True, mode=0o700)
-        registered = False
         try:
             input_dir.mkdir()
             output.mkdir()
@@ -265,10 +261,8 @@ class ApplicationService:
                 resolved_targets=plan.targets,
                 release_profile=plan.release_profile,
             )
-            registered = True
         except Exception:
-            if not registered:
-                shutil.rmtree(workspace)
+            shutil.rmtree(workspace)
             raise
         return (
             start_job_process(self.registry, job.id, credentials=credentials)

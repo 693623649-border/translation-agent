@@ -13,7 +13,6 @@ from translation_agent.runtime.translation_agent_api import GraphRunRequest, Run
 
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ARTIFACT_SUFFIXES = {".epub", ".docx", ".pdf", ".jsonl"}
 
 

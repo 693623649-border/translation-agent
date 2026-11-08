@@ -205,6 +205,12 @@ class TranslateTextsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             translate_texts([""], _FakeTranslator())
 
+    def test_empty_list_returns_empty_at_any_concurrency(self) -> None:
+        for concurrency in (1, 8):
+            translator = _FakeTranslator()
+            self.assertEqual(translate_texts([], translator, concurrency=concurrency), [])
+            self.assertEqual(translator.calls, 0)
+
 
 class EnsureChineseRowsTests(unittest.TestCase):
     def _rows(self) -> list[dict]:

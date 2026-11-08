@@ -31,21 +31,6 @@ def _issue(
     return value
 
 
-def _result(
-    summary: str,
-    *,
-    metrics: dict[str, Any] | None = None,
-    issues: list[dict[str, Any]] | None = None,
-    warnings: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    return {
-        "summary": summary,
-        "metrics": metrics or {},
-        "issues": issues or [],
-        "warnings": warnings or [],
-    }
-
-
 def check_runtime_hygiene(output_dir: Path) -> dict[str, Any]:
     """Return the canonical ``runtime.hygiene`` check payload."""
 
@@ -162,17 +147,18 @@ def check_runtime_hygiene(output_dir: Path) -> dict[str, Any]:
             )
         )
 
-    return _result(
-        "未发现临时产物或残留流水线进程。"
+    return {
+        "summary": "未发现临时产物或残留流水线进程。"
         if not issues
         else "发现临时产物或残留流水线进程。",
-        metrics={
+        "metrics": {
             "temporary_path_count": len(temporary_paths),
             "active_stage_lock_count": len(active_stage_locks),
             "active_process_count": len(active_processes),
         },
-        issues=issues,
-    )
+        "issues": issues,
+        "warnings": [],
+    }
 
 
 __all__ = ["check_runtime_hygiene"]

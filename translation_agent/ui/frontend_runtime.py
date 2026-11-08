@@ -59,8 +59,6 @@ from translation_agent.runtime.digests import sha256_file
 
 
 DEFAULT_RUNTIME_ROOT = Path.home() / ".translation-agent" / "webui"
-DEFAULT_DATABASE = DEFAULT_RUNTIME_ROOT / "jobs.sqlite3"
-DEFAULT_JOBS_ROOT = DEFAULT_RUNTIME_ROOT / "jobs"
 DEFAULT_UPLOAD_LIMIT = 256 * 1024 * 1024
 DATABASE_SCHEMA_VERSION = 3
 REDACTION_ENV_NAMES = "TRANSLATION_AGENT_REDACTION_ENV_NAMES"
@@ -117,7 +115,6 @@ JOB_STATUSES = frozenset(
         "interrupted",
     }
 )
-TERMINAL_STATUSES = frozenset({"cancelled", "succeeded", "failed", "interrupted"})
 RELEASE_PROFILES = frozenset({"draft", "draft-only", "epub", "word", "full"})
 SOURCE_EXTENSIONS = {
     "scanned-pdf": frozenset({".pdf"}),

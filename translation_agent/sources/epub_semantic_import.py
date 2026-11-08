@@ -65,8 +65,6 @@ from translation_agent.runtime.digests import sha256_bytes
 
 EPUB_NS = "http://www.idpf.org/2007/ops"
 CONTAINER_NS = "urn:oasis:names:tc:opendocument:xmlns:container"
-OPF_NS = "http://www.idpf.org/2007/opf"
-DC_NS = "http://purl.org/dc/elements/1.1/"
 SCHEMA_VERSION = 1
 IMPORTER_VERSION = "epub-semantic-v7"
 MARKDOWN_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
@@ -106,8 +104,6 @@ class EpubMetadata:
 class _SpineDocument:
     item_id: str
     href: str
-    media_type: str
-    properties: frozenset[str]
     root: etree._Element
     raw_sha256: str
 
@@ -323,8 +319,6 @@ def _package_documents(
                 _SpineDocument(
                     item_id=item_id,
                     href=item["href"],
-                    media_type=item["media_type"],
-                    properties=frozenset(item["properties"].split()),
                     root=all_roots[item["href"]],
                     raw_sha256=sha256_bytes(raw),
                 )
@@ -357,7 +351,6 @@ class _XhtmlRenderer:
         *,
         publication_hrefs: Mapping[str, str] | None = None,
     ):
-        self.documents = documents
         self.publication_hrefs = dict(publication_hrefs or {})
         self.note_roots: set[etree._Element] = set()
         self.targets: dict[tuple[str, str], etree._Element] = {}

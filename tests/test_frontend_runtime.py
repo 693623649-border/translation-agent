@@ -31,6 +31,7 @@ from translation_agent.ui.frontend_runtime import (
 )
 from translation_agent.runtime.product_contracts import RunSpec
 from translation_agent.semantic.semantic_review_policy import refresh_semantic_review
+from tests.test_epub_graph import _write_epub as write_graph_epub
 from tests.test_epub_semantic_import import _write_epub
 
 
@@ -1439,8 +1440,7 @@ class FrontendRuntimeTests(unittest.TestCase):
             )
             service = ApplicationService(settings)
             source = root / "book.epub"
-            from test_epub_graph import _write_epub
-            _write_epub(source)
+            write_graph_epub(source)
             spec = RunSpec(
                 source=source,
                 source_mode="epub",
