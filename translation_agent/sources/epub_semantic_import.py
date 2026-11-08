@@ -60,6 +60,7 @@ from translation_agent.semantic.semantic_apply import SemanticApplyError, apply_
 from translation_agent.semantic.semantic_ir import SourceLocator, TranslationUnit
 from translation_agent.semantic.semantic_review import SemanticReviewError
 from translation_agent.semantic.semantic_review_policy import refresh_semantic_review
+from translation_agent.runtime.digests import sha256_bytes
 
 
 EPUB_NS = "http://www.idpf.org/2007/ops"
@@ -79,7 +80,7 @@ def _refresh_review_audit(output_dir: Path):
     """Initialize the append-only log and refresh its derived review audit."""
 
     try:
-        reconstruction_sha256 = _sha256_bytes(
+        reconstruction_sha256 = sha256_bytes(
             (output_dir / "audit" / "semantic-reconstruction.json").read_bytes()
         )
         return refresh_semantic_review(
@@ -109,10 +110,6 @@ class _SpineDocument:
     properties: frozenset[str]
     root: etree._Element
     raw_sha256: str
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _atomic_write_text(path: Path, value: str) -> None:
@@ -329,7 +326,7 @@ def _package_documents(
                     media_type=item["media_type"],
                     properties=frozenset(item["properties"].split()),
                     root=all_roots[item["href"]],
-                    raw_sha256=_sha256_bytes(raw),
+                    raw_sha256=sha256_bytes(raw),
                 )
             )
     return metadata, documents, all_roots, title_hints, opf_member
@@ -910,7 +907,7 @@ def _translation_units(chapter_id: str, markdown: str, source_href: str) -> list
         footnote_index = None
     units: list[dict[str, Any]] = []
     for index, block in enumerate(blocks, start=1):
-        source_sha256 = _sha256_bytes(block.encode("utf-8"))
+        source_sha256 = sha256_bytes(block.encode("utf-8"))
         unit_digest = hashlib.sha256(
             f"{source_href}\0{index}\0{source_sha256}".encode()
         ).hexdigest()[:16]
@@ -1009,7 +1006,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
                 member = _resolve_member(document.href, unquote(parsed.path))
                 raw = _read_member(archive, member)
                 name = PurePosixPath(member).name
-                digest = _sha256_bytes(raw)
+                digest = sha256_bytes(raw)
                 previous = seen_images.get(name)
                 if previous is not None and previous != digest:
                     raise EpubSemanticError(
@@ -1023,7 +1020,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
                     )
                 markdown = markdown.replace(f"]({src})", f"](../images/{name})")
                 target = images_dir / name
-                if not target.exists() or _sha256_bytes(target.read_bytes()) != digest:
+                if not target.exists() or sha256_bytes(target.read_bytes()) != digest:
                     _atomic_write_bytes(target, raw)
             inventory = parse_markdown_footnotes(markdown)
             for code, values in (
@@ -1071,7 +1068,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
                     "filename": filename,
                     "source_href": document.href,
                     "source_sha256": document.raw_sha256,
-                    "markdown_sha256": _sha256_bytes(markdown.encode("utf-8")),
+                    "markdown_sha256": sha256_bytes(markdown.encode("utf-8")),
                     "footnote_contract_sha256": markdown_footnote_contract_sha256(markdown),
                     "footnote_count": len(inventory.definitions),
                     "translation_unit_count": len(chapter_units),
@@ -1107,7 +1104,7 @@ def import_epub(source: Path, output_dir: Path) -> dict[str, Any]:
         "importer_version": IMPORTER_VERSION,
         "source": {
             "path": str(source),
-            "sha256": _sha256_bytes(source.read_bytes()),
+            "sha256": sha256_bytes(source.read_bytes()),
             "package_document": opf_member,
             "metadata": metadata.__dict__,
         },
@@ -1257,7 +1254,7 @@ def prune_long_footnotes(
             manifest_item["suppressed_source_page_marker_count"] = len(
                 removed_page_markers
             )
-        digest = _sha256_bytes(publication_markdown.encode("utf-8"))
+        digest = sha256_bytes(publication_markdown.encode("utf-8"))
         audited["markdown_sha256"] = digest
         if "translated_markdown_sha256" in audited:
             audited["translated_markdown_sha256"] = digest

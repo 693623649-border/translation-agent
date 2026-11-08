@@ -49,6 +49,7 @@ from translation_agent.semantic.semantic_apply import SemanticApplyError, apply_
 from translation_agent.semantic.semantic_ir import SourceLocator, TranslationUnit
 from translation_agent.semantic.semantic_review import SemanticReviewError
 from translation_agent.semantic.semantic_review_policy import refresh_semantic_review
+from translation_agent.runtime.digests import sha256_bytes
 
 
 SCHEMA_VERSION = 1
@@ -63,7 +64,7 @@ def _refresh_review_audit(output_dir: Path):
     """Initialize the append-only log and refresh its derived review audit."""
 
     try:
-        reconstruction_sha256 = _sha256_bytes(
+        reconstruction_sha256 = sha256_bytes(
             (output_dir / "audit" / "semantic-reconstruction.json").read_bytes()
         )
         return refresh_semantic_review(
@@ -75,10 +76,6 @@ def _refresh_review_audit(output_dir: Path):
         raise BornDigitalPdfError(
             f"cannot initialize semantic reconstruction review: {exc}"
         ) from exc
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _atomic_text(path: Path, value: str) -> None:
@@ -458,7 +455,7 @@ def _translation_units(
         )
     units: list[dict[str, Any]] = []
     for sequence, (block, page) in enumerate(zip(blocks, block_pages), start=1):
-        source_sha = _sha256_bytes(block.encode())
+        source_sha = sha256_bytes(block.encode())
         digest = hashlib.sha256(f"{chapter_id}\0{sequence}\0{source_sha}".encode()).hexdigest()[:16]
         kind = "heading" if re.match(r"^#{1,6}\s", block) else "table" if block.startswith("| ") else "paragraph"
         units.append(
@@ -498,7 +495,7 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
         issues = _quality_issues(quality)
         source_record = {
             "path": str(source),
-            "sha256": _sha256_bytes(source.read_bytes()),
+            "sha256": sha256_bytes(source.read_bytes()),
             "metadata": {"title": book_title, "author": author},
             "text_layer_quality": quality,
         }
@@ -647,7 +644,7 @@ def import_born_digital_pdf(source: Path, output_dir: Path) -> dict[str, Any]:
                 "chapter_id": chapter_id,
                 "filename": filename,
                 "source_pages": source_pages,
-                "markdown_sha256": _sha256_bytes(markdown.encode()),
+                "markdown_sha256": sha256_bytes(markdown.encode()),
                 "footnote_contract_sha256": markdown_footnote_contract_sha256(markdown),
                 "footnote_count": len(inventory.definitions),
                 "translation_unit_count": len(chapter_units),

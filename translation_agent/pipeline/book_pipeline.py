@@ -5458,13 +5458,6 @@ def _docx_manifest_body_style(item: dict[str, Any]) -> str | None:
 
 
 
-def _sha256_file(path: Path) -> str:
-    with open(path, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()
-
-
-
-
 def _set_docx_style_font(
     style: Any,
     *,

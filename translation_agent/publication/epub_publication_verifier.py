@@ -29,6 +29,7 @@ from translation_agent.semantic.semantic_review import SemanticReviewError
 from translation_agent.semantic.semantic_review_policy import validate_semantic_review
 
 import translation_agent.knowledge.knowledge_base_audit as knowledge_base_audit
+from translation_agent.runtime.digests import sha256_bytes, sha256_file
 
 
 SCHEMA_VERSION = 1
@@ -82,24 +83,12 @@ class _CheckFailure(ValueError):
         ]
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
 def _files_digest(paths: Iterable[Path]) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths, key=lambda item: item.as_posix()):
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(sha256_file(path).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -113,7 +102,7 @@ def _json_file(path: Path, *, label: str) -> tuple[dict[str, Any], str]:
         raise _CheckFailure("invalid_json", f"{label} is not valid UTF-8 JSON: {path}") from exc
     if not isinstance(payload, dict):
         raise _CheckFailure("invalid_json_root", f"{label} must contain a JSON object: {path}")
-    return payload, _sha256_bytes(raw)
+    return payload, sha256_bytes(raw)
 
 
 def _lstat(path: Path) -> os.stat_result | None:
@@ -452,7 +441,7 @@ class _Verifier:
 
     def source_identity(self) -> Mapping[str, Any]:
         source_stat = _require_regular_file(self.source_epub, label="source EPUB")
-        source_sha = _sha256_file(self.source_epub)
+        source_sha = sha256_file(self.source_epub)
         publication_audit = self.output_dir / "audit" / "semantic-reconstruction.json"
         draft_audit = self.output_dir / ".pipeline_graph" / "draft-semantic-audit.json"
         # The Graph keeps the pre-sanitize audit separately.  Prefer that
@@ -508,7 +497,7 @@ class _Verifier:
             _require_regular_file(source_path, label=f"immutable source chapter {safe_name}")
             markdown = source_path.read_text(encoding="utf-8")
             source_digest = item.get("source_markdown_sha256") or item.get("markdown_sha256")
-            if source_digest != _sha256_bytes(markdown.encode("utf-8")):
+            if source_digest != sha256_bytes(markdown.encode("utf-8")):
                 raise _CheckFailure("reconstruction_hash_mismatch", f"reconstruction hash is stale for {safe_name}")
             if (
                 not item.get("source_markdown_sha256")
@@ -622,7 +611,7 @@ class _Verifier:
             for key, value in effective_bundle.items()
             if key not in {"status", "sha256"}
         }
-        expected_effective_sha256 = _sha256_bytes(
+        expected_effective_sha256 = sha256_bytes(
             b"semantic-effective-bundle-v1\0"
             + json.dumps(
                 effective_identity,
@@ -758,7 +747,7 @@ class _Verifier:
                     "footnote_closure_failed",
                     f"canonical footnotes are not one-to-one closed for {filename}",
                 )
-            digest = _sha256_bytes(markdown.encode("utf-8"))
+            digest = sha256_bytes(markdown.encode("utf-8"))
             if audit.get("markdown_sha256") != digest:
                 raise _CheckFailure("canonical_hash_mismatch", f"active semantic audit hash is stale for {filename}")
             contract = markdown_footnote_contract_sha256(markdown)
@@ -788,7 +777,7 @@ class _Verifier:
         if tuple(active) != tuple(filenames):
             raise _CheckFailure("audit_manifest_mismatch", "active semantic audit order differs from manifest")
         if reader_payload is not None:
-            if reader_payload.get("reader_manifest_sha256") != _sha256_file(manifest_path):
+            if reader_payload.get("reader_manifest_sha256") != sha256_file(manifest_path):
                 raise _CheckFailure(
                     "reader_manifest_hash_mismatch",
                     "reader audit manifest hash is stale",
@@ -802,7 +791,7 @@ class _Verifier:
         chapter_paths = [
             self.output_dir / "chapters" / filename for filename in filenames
         ]
-        self.context["canonical_manifest_sha256"] = _sha256_file(manifest_path)
+        self.context["canonical_manifest_sha256"] = sha256_file(manifest_path)
         self.context["canonical_chapters_sha256"] = _files_digest(chapter_paths)
         self.context["manifest"] = manifest
         self.context["chapters"] = chapters
@@ -845,7 +834,7 @@ class _Verifier:
 
     def package(self) -> Mapping[str, Any]:
         artifact_stat = _require_regular_file(self.artifact_path, label="published EPUB")
-        before_sha = _sha256_file(self.artifact_path)
+        before_sha = sha256_file(self.artifact_path)
         try:
             archive = zipfile.ZipFile(self.artifact_path)
         except zipfile.BadZipFile as exc:
@@ -1150,7 +1139,7 @@ class _Verifier:
 
     def artifact_identity(self) -> Mapping[str, Any]:
         entry = _require_regular_file(self.artifact_path, label="published EPUB")
-        digest = _sha256_file(self.artifact_path)
+        digest = sha256_file(self.artifact_path)
         if digest != self.context.get("artifact_sha256_before"):
             raise _CheckFailure("artifact_changed_during_verification", "published EPUB changed during verification")
         self.context["artifact_sha256"] = digest

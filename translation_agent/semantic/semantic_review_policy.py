@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, UTC
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,6 +32,7 @@ from translation_agent.semantic.semantic_review import (
     resolve_review_decisions,
     write_semantic_review_audit,
 )
+from translation_agent.runtime.digests import sha256_bytes
 
 
 DECISION_LOG_RELATIVE = Path("audit/review-decisions.jsonl")
@@ -52,10 +52,6 @@ ACCEPT_AS_TEXT_REASON = "accept_as_text"
 
 class SemanticReviewPolicyError(SemanticReviewError):
     """Raised when a raw audit and the central review policy disagree."""
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
 
 
 def _require_sha256(value: object, *, field: str) -> str:
@@ -285,7 +281,7 @@ def collect_reconstruction_review(
         raise SemanticReviewPolicyError(
             "unsupported semantic reconstruction audit schema"
         )
-    reconstruction_sha256 = _sha256_bytes(raw)
+    reconstruction_sha256 = sha256_bytes(raw)
     if expected_reconstruction_sha256 is not None and _require_sha256(
         expected_reconstruction_sha256,
         field="expected reconstruction sha256",
@@ -454,7 +450,7 @@ def _assert_reconstruction_current(context: ReconstructionReviewContext) -> None
         context.reconstruction_path,
         label="semantic reconstruction audit",
     )
-    if _sha256_bytes(raw) != context.reconstruction_sha256:
+    if sha256_bytes(raw) != context.reconstruction_sha256:
         raise SemanticReviewPolicyError(
             "semantic reconstruction audit changed during review resolution"
         )
@@ -513,7 +509,7 @@ def resolve_semantic_review(
         raise
     except SemanticReviewError as exc:
         raise SemanticReviewPolicyError(str(exc)) from exc
-    if resolution.decision_log_sha256 != _sha256_bytes(decision_log_before):
+    if resolution.decision_log_sha256 != sha256_bytes(decision_log_before):
         raise SemanticReviewPolicyError(
             "semantic review decision log changed during resolution"
         )
@@ -566,7 +562,7 @@ def refresh_semantic_review(
         context.review_audit_path,
         label="semantic review audit",
     )
-    if _sha256_bytes(written) != artifact.audit_sha256 or written != _resolution_bytes(
+    if sha256_bytes(written) != artifact.audit_sha256 or written != _resolution_bytes(
         resolution
     ):
         raise SemanticReviewPolicyError(
@@ -587,7 +583,7 @@ def validate_semantic_review(
         expected_reconstruction_sha256=expected_reconstruction_sha256,
     )
     expected = _resolution_bytes(resolution)
-    digest = _sha256_bytes(expected)
+    digest = sha256_bytes(expected)
     actual = _read_regular_bytes(
         context.review_audit_path,
         label="semantic review audit",

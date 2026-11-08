@@ -56,6 +56,7 @@ from .core import (
     PipelineGraph,
     stable_fingerprint,
 )
+from translation_agent.runtime.digests import sha256_file
 
 
 EPUB_GRAPH_ADAPTER_VERSION = "epub-graph-v1"
@@ -135,7 +136,7 @@ class _FileSnapshot:
                 f"input must have the {suffix} extension: {path}"
             )
         before = path.stat()
-        sha256 = _sha256_file(path)
+        sha256 = sha256_file(path)
         inspection = _inspect_epub_archive(path) if suffix == ".epub" else None
         after = path.stat()
         if (
@@ -164,7 +165,7 @@ class _FileSnapshot:
         try:
             _assert_regular_file(self.path)
             before = self.path.stat()
-            current_sha256 = _sha256_file(self.path)
+            current_sha256 = sha256_file(self.path)
             inspection = (
                 _inspect_epub_archive(self.path)
                 if self.entry_count is not None or self.uncompressed_size is not None
@@ -426,14 +427,6 @@ def _assert_regular_file(path: Path) -> None:
         )
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _normalized_zip_member(value: str) -> str:
     if (
         not isinstance(value, str)
@@ -579,7 +572,7 @@ def _file_artifact(path: Path) -> dict[str, Any]:
     _assert_regular_file(path)
     return {
         "path": str(path.resolve()),
-        "sha256": _sha256_file(path),
+        "sha256": sha256_file(path),
         "size": path.stat().st_size,
     }
 
@@ -640,7 +633,7 @@ def _file_artifact_is_current(
         _assert_regular_file(candidate)
         path = candidate.resolve()
         return (
-            value.get("sha256") == _sha256_file(path)
+            value.get("sha256") == sha256_file(path)
             and value.get("size") == path.stat().st_size
         )
     except (KeyError, OSError, ValueError, EpubGraphConfigurationError):
@@ -863,7 +856,7 @@ def _bundle_digest(
         _assert_regular_file(path)
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(sha256_file(path).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -1067,7 +1060,7 @@ def _review_handler(context: GraphContext) -> NodeResult:
             "chapters.semantic no longer matches its artifact"
         )
     semantic_audit = Path(str(semantic["semantic_audit"])).resolve()
-    reconstruction_sha256 = _sha256_file(semantic_audit)
+    reconstruction_sha256 = sha256_file(semantic_audit)
     try:
         resolved = validate_semantic_review(
             context.output_dir,
@@ -1187,7 +1180,7 @@ def _assert_publishable(
                 "EPUB semantic review is unresolved or blocked"
             )
         semantic_audit = Path(str(bundle["semantic_audit"])).resolve()
-        if review.get("reconstruction_sha256") != _sha256_file(semantic_audit):
+        if review.get("reconstruction_sha256") != sha256_file(semantic_audit):
             raise EpubSemanticBlockedError(
                 "EPUB semantic review is bound to different reconstruction bytes"
             )

@@ -36,6 +36,7 @@ from translation_agent.publication.publication_semantics import (
     parse_markdown_footnotes,
     semantic_audit_summary,
 )
+from translation_agent.runtime.digests import sha256_file
 
 
 W = "{%s}" % W_NS
@@ -175,14 +176,6 @@ class DocxSemanticMigration:
             item["reviewed_override"] = True
             output.append(item)
         return output
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _xml(data: bytes, member: str) -> etree._Element:
@@ -561,7 +554,7 @@ def extract_docx_semantic_markdown(
         )
     return DocxSemanticMigration(
         source_docx=path,
-        source_sha256=_sha256_file(path),
+        source_sha256=sha256_file(path),
         chapters=tuple(chapters),
         front_matter=tuple(front_matter),
     )
@@ -667,7 +660,7 @@ def backup_semantic_migration_sources(
         inventory.append(
             {
                 "path": relative.as_posix(),
-                "sha256": _sha256_file(resolved),
+                "sha256": sha256_file(resolved),
                 "size": resolved.stat().st_size,
             }
         )
@@ -742,7 +735,7 @@ def apply_semantic_migration(
     else:
         source_manifest = manifest
 
-    if _sha256_file(migration.source_docx) != migration.source_sha256:
+    if sha256_file(migration.source_docx) != migration.source_sha256:
         raise DocxSemanticMigrationError(
             "accepted DOCX changed after semantic extraction"
         )

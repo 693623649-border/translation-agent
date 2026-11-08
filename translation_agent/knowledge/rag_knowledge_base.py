@@ -24,6 +24,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
+from translation_agent.runtime.digests import sha256_file
 
 
 RAG_SCHEMA_VERSION = 1
@@ -365,14 +366,6 @@ def load_metadata_sidecar(
     return sidecar
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -622,7 +615,7 @@ def _load_embedding_index(
             dimensions=dimensions,
             chunk_count=chunk_count,
             documents_sha256=documents_sha256,
-            index_sha256=_sha256_file(index_path),
+            index_sha256=sha256_file(index_path),
             index_path=index_path,
         ),
         vectors,
@@ -634,7 +627,7 @@ def read_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
 
     source = Path(knowledge_base_path)
     rows = load_knowledge_rows(source)
-    documents_sha256 = _sha256_file(source)
+    documents_sha256 = sha256_file(source)
     manifest = _read_manifest_file(source)
     if (
         manifest.get("schema_version") != RAG_SCHEMA_VERSION
@@ -678,7 +671,7 @@ def read_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
         index_path = vector_index_path_for(source)
         if not index_path.is_file():
             raise RagFormatError(f"Embedding index does not exist: {index_path}")
-        actual_index_sha256 = _sha256_file(index_path)
+        actual_index_sha256 = sha256_file(index_path)
         if actual_index_sha256 != expected_index_sha256:
             raise RagIndexStaleError(
                 f"Embedding index checksum does not match the RAG manifest: "
@@ -720,7 +713,7 @@ def initialize_rag_manifest(knowledge_base_path: Path | str) -> dict[str, Any]:
 
     source = Path(knowledge_base_path)
     rows = load_knowledge_rows(source)
-    documents_sha256 = _sha256_file(source)
+    documents_sha256 = sha256_file(source)
     from translation_agent.knowledge.rag_apparatus import annotate_apparatus
     annotate_apparatus(source)
     try:
@@ -755,7 +748,7 @@ def build_embedding_index(
     source = Path(knowledge_base_path)
     manifest = initialize_rag_manifest(source)
     rows = load_knowledge_rows(source)
-    documents_sha256 = _sha256_file(source)
+    documents_sha256 = sha256_file(source)
     provider_name, model = _provider_identity(provider)
     existing_embedding = manifest["retrieval"]["embedding"]
     requested_dimensions = getattr(provider, "dimensions", None)
@@ -835,7 +828,7 @@ def build_embedding_index(
         for row, vector in zip(rows, vectors, strict=True)
     )
     _atomic_write_text(index_path, "\n".join(index_lines) + "\n")
-    index_sha256 = _sha256_file(index_path)
+    index_sha256 = sha256_file(index_path)
 
     manifest = _pending_manifest(
         source,
@@ -1083,7 +1076,7 @@ class RagKnowledgeBase:
         if embedding["status"] == "ready":
             metadata, vectors = _load_embedding_index(
                 source,
-                expected_documents_sha256=_sha256_file(source),
+                expected_documents_sha256=sha256_file(source),
                 expected_ids=[str(row["id"]) for row in rows],
             )
         return cls(

@@ -16,7 +16,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import copy
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,6 +40,7 @@ from translation_agent.semantic.semantic_review_policy import (
     collect_reconstruction_review,
     refresh_semantic_review,
 )
+from translation_agent.runtime.digests import sha256_bytes
 
 
 TRANSLATION_SET_SCHEMA_VERSION = SEMANTIC_SCHEMA_VERSION
@@ -89,10 +89,6 @@ class _ReviewAuthorization:
     artifact: SemanticReviewArtifact
 
 
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
 def _read_jsonl_with_sha256(path: Path) -> tuple[list[dict[str, Any]], str]:
     records: list[dict[str, Any]] = []
     try:
@@ -112,7 +108,7 @@ def _read_jsonl_with_sha256(path: Path) -> tuple[list[dict[str, Any]], str]:
         records.append(value)
     if not records:
         raise SemanticApplyError(f"translation JSONL contains no units: {path}")
-    return records, _sha256_bytes(raw)
+    return records, sha256_bytes(raw)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -127,7 +123,7 @@ def _read_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
         raise SemanticApplyError("semantic reconstruction audit is missing or invalid") from exc
     if not isinstance(value, dict):
         raise SemanticApplyError("semantic reconstruction audit root must be an object")
-    return value, _sha256_bytes(raw)
+    return value, sha256_bytes(raw)
 
 
 def load_reconstruction_audit(path: Path) -> tuple[dict[str, Any], str]:
@@ -188,7 +184,7 @@ def _regular_file_sha256(path: Path, *, label: str) -> str:
     if stat.S_ISLNK(entry.st_mode) or not stat.S_ISREG(entry.st_mode):
         raise SemanticApplyError(f"{label} is not a non-symlink regular file: {path}")
     try:
-        return _sha256_bytes(path.read_bytes())
+        return sha256_bytes(path.read_bytes())
     except OSError as exc:
         raise SemanticApplyError(f"{label} is unreadable: {path}") from exc
 
@@ -305,7 +301,7 @@ def _review_provenance(
     effective_bundle = {
         **identity,
         "status": "passed",
-        "sha256": _sha256_bytes(
+        "sha256": sha256_bytes(
             b"semantic-effective-bundle-v1\0"
             + json.dumps(
                 identity,
@@ -588,7 +584,7 @@ def validate_translation_set(
 
         kind = canonical.kind
         source_markdown = canonical.source_markdown
-        actual_sha256 = _sha256_bytes(source_markdown.encode("utf-8"))
+        actual_sha256 = sha256_bytes(source_markdown.encode("utf-8"))
         if translated.get("source_sha256") != actual_sha256:
             raise SemanticApplyError(f"translated unit is bound to different source bytes: {unit_id}")
         translated_markdown = translated.get("translated_markdown")
@@ -874,7 +870,7 @@ def apply_translation_transaction(
                 source_markdown = source_path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as exc:
                 raise SemanticApplyError(f"source chapter is missing: {chapter_id}") from exc
-            source_chapter_sha256[source_path] = _sha256_bytes(
+            source_chapter_sha256[source_path] = sha256_bytes(
                 source_markdown.encode("utf-8")
             )
 
@@ -906,9 +902,9 @@ def apply_translation_transaction(
                 {
                     "chapter_id": chapter_id,
                     "filename": filename,
-                    "source_markdown_sha256": _sha256_bytes(source_markdown.encode("utf-8")),
-                    "translated_markdown_sha256": _sha256_bytes(translated_markdown.encode("utf-8")),
-                    "markdown_sha256": _sha256_bytes(translated_markdown.encode("utf-8")),
+                    "source_markdown_sha256": sha256_bytes(source_markdown.encode("utf-8")),
+                    "translated_markdown_sha256": sha256_bytes(translated_markdown.encode("utf-8")),
+                    "markdown_sha256": sha256_bytes(translated_markdown.encode("utf-8")),
                     "footnote_contract_sha256": markdown_footnote_contract_sha256(translated_markdown),
                     "footnote_count": len(translated_inventory.definitions),
                     "translation_unit_count": len(units),
@@ -917,7 +913,7 @@ def apply_translation_transaction(
                 }
             )
 
-        source_manifest_sha256 = _sha256_bytes(raw_manifest_bytes)
+        source_manifest_sha256 = sha256_bytes(raw_manifest_bytes)
         review_resolution, effective_bundle = _review_provenance(
             output_dir,
             review_authorization,
@@ -975,20 +971,20 @@ def apply_translation_transaction(
         )
 
         # Refuse to commit against an audit changed while staging.
-        if _sha256_bytes(reconstruction_path.read_bytes()) != reconstruction_sha256:
+        if sha256_bytes(reconstruction_path.read_bytes()) != reconstruction_sha256:
             raise SemanticApplyError("semantic reconstruction audit changed during translation apply")
         _assert_review_authorization_current(
             output_dir,
             review_authorization,
         )
-        if _sha256_bytes(source_units_path.read_bytes()) != source_units_sha256:
+        if sha256_bytes(source_units_path.read_bytes()) != source_units_sha256:
             raise SemanticApplyError("semantic translation units changed during translation apply")
-        if _sha256_bytes(translations_path.read_bytes()) != translation_input_sha256:
+        if sha256_bytes(translations_path.read_bytes()) != translation_input_sha256:
             raise SemanticApplyError("translation input changed during translation apply")
-        if _sha256_bytes(manifest_path.read_bytes()) != _sha256_bytes(raw_manifest_bytes):
+        if sha256_bytes(manifest_path.read_bytes()) != sha256_bytes(raw_manifest_bytes):
             raise SemanticApplyError("chapter manifest changed during translation apply")
         for source_path, expected_sha256 in source_chapter_sha256.items():
-            if _sha256_bytes(source_path.read_bytes()) != expected_sha256:
+            if sha256_bytes(source_path.read_bytes()) != expected_sha256:
                 raise SemanticApplyError(
                     f"source chapter changed during translation apply: {source_path.name}"
                 )

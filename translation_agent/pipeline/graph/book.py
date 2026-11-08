@@ -46,6 +46,7 @@ from .core import (
     stable_fingerprint,
 )
 from .recipe import NodeRegistry, Recipe
+from translation_agent.runtime.digests import sha256_file
 
 
 GRAPH_ADAPTER_VERSION = "book-graph-v3"
@@ -232,20 +233,12 @@ class PreparedBookGraph:
         )
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _files_digest(paths: Iterable[Path]) -> str:
     digest = hashlib.sha256()
     for path in sorted(paths, key=lambda item: item.as_posix()):
         digest.update(path.name.encode("utf-8"))
         digest.update(b"\0")
-        digest.update(_sha256_file(path).encode("ascii"))
+        digest.update(sha256_file(path).encode("ascii"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -255,7 +248,7 @@ def _file_artifact(path: Path) -> dict[str, Any]:
         raise FileNotFoundError(path)
     return {
         "path": str(path.resolve()),
-        "sha256": _sha256_file(path),
+        "sha256": sha256_file(path),
         "size": path.stat().st_size,
     }
 
@@ -520,7 +513,7 @@ def _compile_inputs_are_current(page_artifact: str) -> Any:
         canonical_toc = context.output_dir / "toc.json"
         return (
             canonical_toc.is_file()
-            and _sha256_file(canonical_toc) == _sha256_file(toc_source)
+            and sha256_file(canonical_toc) == sha256_file(toc_source)
         )
 
     return validate
@@ -544,7 +537,7 @@ def _single_file_is_current(
     return (
         resolved.is_file()
         and str(resolved) == str(path)
-        and saved.get("sha256") == _sha256_file(resolved)
+        and saved.get("sha256") == sha256_file(resolved)
     )
 
 
@@ -711,7 +704,7 @@ def _sanitized_control_argv(argv: Iterable[str]) -> list[str]:
                 config_value = ""
             config_path = Path(config_value).expanduser().resolve()
             config_digest = (
-                _sha256_file(config_path) if config_path.is_file() else "missing"
+                sha256_file(config_path) if config_path.is_file() else "missing"
             )
             output.extend(["--config", f"{config_path}#sha256={config_digest}"])
         else:
@@ -927,7 +920,7 @@ def _toc_stage_semantics(args: Any) -> dict[str, Any]:
     return {
         "mode": "manual" if toc_json is not None else "model",
         "manual_sha256": (
-            _sha256_file(toc_json)
+            sha256_file(toc_json)
             if toc_json is not None and toc_json.is_file()
             else None
         ),
@@ -1031,7 +1024,7 @@ def _source_fingerprint(context: GraphContext) -> dict[str, Any]:
         "source_adapter": _source_adapter(source_mode),
         "source_mode": source_mode,
         "path": str(path) if path is not None else None,
-        "source_sha256": _sha256_file(path) if path and path.is_file() else None,
+        "source_sha256": sha256_file(path) if path and path.is_file() else None,
     }
 
 
@@ -1207,7 +1200,7 @@ def _validate_and_bind_source_artifact(
         raise SourceBindingError(
             f"source.pdf page_count mismatch: declared={declared_count}, actual={page_count}"
         )
-    source_sha = _sha256_file(path)
+    source_sha = sha256_file(path)
     source_mode = _source_mode(context)
     source_adapter = _source_adapter(source_mode)
     binding_path = context.output_dir / ".pipeline_graph" / "source.json"
@@ -1371,7 +1364,7 @@ def _import_pages_handler(context: GraphContext) -> NodeResult:
         )
         # Delete only a page that this import node previously wrote and that
         # no later OCR/proofread/translation/manual operation has changed.
-        if destination.is_file() and _sha256_file(destination) == imported_sha:
+        if destination.is_file() and sha256_file(destination) == imported_sha:
             destination.unlink()
             destination.with_suffix(".md").unlink(missing_ok=True)
             removed_pages.append(page_number)
@@ -1381,7 +1374,7 @@ def _import_pages_handler(context: GraphContext) -> NodeResult:
             context.output_dir / "pages" / f"page_{page_number:04d}.json"
         )
         if destination.is_file():
-            managed_pages[str(page_number)] = _sha256_file(destination)
+            managed_pages[str(page_number)] = sha256_file(destination)
     legacy.write_json(
         management_path,
         {
@@ -1843,7 +1836,7 @@ def _load_chapters_handler(context: GraphContext) -> NodeResult:
         reuse_draft = bool(
             reader_audit.get("reader_chapters_sha256") == reader_digest
             and reader_audit.get("reader_manifest_sha256")
-            == _sha256_file(manifest_path)
+            == sha256_file(manifest_path)
         )
         if reuse_draft:
             _draft_chapters_artifact(context.output_dir)
@@ -2113,7 +2106,7 @@ def _semantic_artifact(
         "count": len(manifest),
         "semantic_contract_version": SEMANTIC_AUDIT_SCHEMA_VERSION,
         "semantic_audit": str(audit_path.resolve()),
-        "semantic_audit_sha256": _sha256_file(audit_path),
+        "semantic_audit_sha256": sha256_file(audit_path),
         "semantic_release_blocked": False,
     }
 
@@ -2142,7 +2135,7 @@ def _semantic_handler(*, allow_missing_audit: bool) -> Any:
                 {
                     "filename": filename,
                     "footnote_count": len(inventory.definitions),
-                    "markdown_sha256": _sha256_file(chapter_path),
+                    "markdown_sha256": sha256_file(chapter_path),
                     "footnote_contract_sha256": (
                         legacy.markdown_footnote_contract_sha256(
                             chapter_path.read_text(encoding="utf-8")
@@ -2344,7 +2337,7 @@ def _validated_file_from_artifact(artifact: Any, *, name: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(path)
     expected_sha = _required_artifact_sha256(artifact, name=name)
-    if expected_sha != _sha256_file(path):
+    if expected_sha != sha256_file(path):
         raise ValueError(f"{name} artifact content no longer matches its digest")
     return path
 
@@ -2451,7 +2444,7 @@ def _validate_semantic_chapter_artifact_value(
         isinstance(expected_sha, str)
         and len(expected_sha) == 64
         and audit_path.is_file()
-        and _sha256_file(audit_path) == expected_sha.lower()
+        and sha256_file(audit_path) == expected_sha.lower()
     ):
         return False
     payload = _read_semantic_audit(audit_path)
@@ -2631,7 +2624,7 @@ def _reader_semantic_audit(
         if not source_digest:
             source_digest = str(audited.get("markdown_sha256") or "")
         audited["source_markdown_sha256"] = source_digest
-        audited["markdown_sha256"] = _sha256_file(path)
+        audited["markdown_sha256"] = sha256_file(path)
         audited["footnote_contract_sha256"] = (
             legacy.markdown_footnote_contract_sha256(markdown)
         )
@@ -2642,7 +2635,7 @@ def _reader_semantic_audit(
             for item in manifest
         ]
     )
-    payload["reader_manifest_sha256"] = _sha256_file(
+    payload["reader_manifest_sha256"] = sha256_file(
         context.output_dir / "chapters.json"
     )
     audit_path = _require_output_directory(
@@ -2669,7 +2662,7 @@ def _reader_chapters_artifact(output_dir: Path) -> dict[str, Any]:
     artifact.update(
         {
             "reader_semantic_audit": str(audit_path),
-            "reader_semantic_audit_sha256": _sha256_file(audit_path),
+            "reader_semantic_audit_sha256": sha256_file(audit_path),
         }
     )
     return artifact
@@ -2741,12 +2734,12 @@ def _register_managed_publication(
             previous_path = resolved
         if previous_path != resolved and previous_path.is_file():
             expected_sha = previous.get("sha256")
-            if expected_sha and _sha256_file(previous_path) == expected_sha:
+            if expected_sha and sha256_file(previous_path) == expected_sha:
                 previous_path.unlink()
 
     managed[artifact_name] = {
         "path": str(resolved),
-        "sha256": _sha256_file(resolved),
+        "sha256": sha256_file(resolved),
     }
     legacy.write_json(
         identity_path,
@@ -3180,7 +3173,7 @@ def _source_cache_validator(
     source_adapter = _source_adapter(source_mode)
     return (
         path.is_file()
-        and saved.get("sha256") == _sha256_file(path)
+        and saved.get("sha256") == sha256_file(path)
         and saved.get("source_mode") == source_mode
         and saved.get("adapter") == source_adapter
         and isinstance(binding, dict)

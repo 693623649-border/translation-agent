@@ -8,7 +8,6 @@ resolution bytes used by a publication run.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -23,6 +22,7 @@ from translation_agent.semantic.semantic_ir import (
     ReviewDecision,
     SemanticContractError,
 )
+from translation_agent.runtime.digests import sha256_bytes
 
 try:  # pragma: no cover - platform-specific import.
     import fcntl
@@ -64,10 +64,6 @@ class SemanticReviewError(SemanticContractError):
     """Raised when review evidence cannot be resolved without ambiguity."""
 
 
-def _sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
 def _sha256(value: object, field_name: str) -> str:
     if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
         raise SemanticReviewError(f"{field_name} must be lowercase SHA-256 hex")
@@ -97,7 +93,7 @@ def _canonical_json(value: object) -> bytes:
 def canonical_review_evidence_sha256(value: object) -> str:
     """Hash a canonical locator/evidence object for use in issue identity."""
 
-    return _sha256_bytes(
+    return sha256_bytes(
         b"semantic-review-evidence-v1\0" + _canonical_json(value)
     )
 
@@ -143,7 +139,7 @@ def stable_review_issue_id(
         "source_sha256": source,
         "evidence_sha256": evidence,
     }
-    return ISSUE_ID_PREFIX + _sha256_bytes(
+    return ISSUE_ID_PREFIX + sha256_bytes(
         b"semantic-review-issue-v1\0" + _canonical_json(identity)
     )
 
@@ -692,7 +688,7 @@ def _snapshot_locked(path: Path) -> DecisionLogSnapshot:
     records = _parse_decision_log(data, path=path)
     return DecisionLogSnapshot(
         path=path,
-        sha256=_sha256_bytes(data),
+        sha256=sha256_bytes(data),
         byte_count=len(data),
         records=records,
     )
@@ -801,7 +797,7 @@ def review_issue_set_sha256(
     """Digest the complete canonical issue set, including review policy flags."""
 
     normalized = _coerce_issues(issues)
-    return _sha256_bytes(
+    return sha256_bytes(
         b"semantic-review-issue-set-v1\0"
         + _canonical_json([issue.to_dict() for issue in normalized])
     )
@@ -825,7 +821,7 @@ def review_policy_fingerprint(
             for issue in normalized
         ],
     }
-    return _sha256_bytes(
+    return sha256_bytes(
         b"semantic-review-policy-v1\0" + _canonical_json(policy)
     )
 
@@ -1086,7 +1082,7 @@ def write_semantic_review_audit(
         indent=2,
         allow_nan=False,
     ).encode("utf-8") + b"\n"
-    digest = _sha256_bytes(payload)
+    digest = sha256_bytes(payload)
     normalized = _safe_absolute_path(path, label="review audit")
     snapshot = (
         normalized.with_name(f"{normalized.stem}.{digest}{normalized.suffix}")

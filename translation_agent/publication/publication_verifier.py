@@ -31,6 +31,7 @@ from translation_agent.publication.publication_semantics import (
 )
 from translation_agent.semantic.semantic_review import SemanticReviewError
 from translation_agent.semantic.semantic_review_policy import validate_semantic_review
+from translation_agent.runtime.digests import sha256_file
 
 
 SCHEMA_VERSION = "1.2"
@@ -89,14 +90,6 @@ def _result(
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _read_utf8_exact(path: Path) -> str:
@@ -1218,7 +1211,7 @@ def _check_ocr_quality(
         return _result("OCR 抽样基准格式无效。", metrics=metrics, issues=issues)
     if context.source_pdf is not None and context.source_pdf.is_file():
         digest = str(audit.get("source_pdf_sha256") or "")
-        if digest != _sha256_file(context.source_pdf):
+        if digest != sha256_file(context.source_pdf):
             issues.append(_issue(
                 "ocr_quality_source_mismatch",
                 "OCR 抽样基准没有绑定当前源 PDF 的 SHA-256。",
@@ -1986,7 +1979,7 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
         )
 
     reconstruction_sha256 = (
-        _sha256_file(audit_path) if audit_path.is_file() else None
+        sha256_file(audit_path) if audit_path.is_file() else None
     )
     review_paths = (
         context.output_dir / "audit" / "semantic-review.json",
@@ -2178,7 +2171,7 @@ def _check_semantics(context: _VerificationContext) -> dict[str, Any]:
                 )
             )
             continue
-        expected_markdown_digest = _sha256_file(chapter_path)
+        expected_markdown_digest = sha256_file(chapter_path)
         actual_markdown_digest = str(audited.get("markdown_sha256") or "")
         if actual_markdown_digest != expected_markdown_digest:
             issues.append(

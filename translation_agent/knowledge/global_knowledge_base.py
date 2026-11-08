@@ -43,6 +43,7 @@ from contextlib import closing
 from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any, Iterable
+from translation_agent.runtime.digests import sha256_file
 
 try:
     from opencc import OpenCC
@@ -78,14 +79,6 @@ def _normalize_search_text(value: str, mode: str) -> str:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def _read_bytes(path: Path) -> bytes:
@@ -439,7 +432,7 @@ def _ingest_workspace(db: sqlite3.Connection, root: Path, workspace: Path) -> di
                 and path.suffix.lower() in ASSET_SUFFIXES):
             assets.append((path.relative_to(root).as_posix(), name,
                            path.suffix.lower().lstrip("."), path.stat().st_size,
-                           _sha256_file(path)))
+                           sha256_file(path)))
     db.execute("UPDATE workspaces SET reader_chunks=?, page_chunks=?, archive_chunks=?, asset_count=?, "
                "report_status=? WHERE name=?",
                (counts["reader_chunks"], counts["page_chunks"], counts["archive_chunks"], len(assets),
@@ -562,7 +555,7 @@ def verify_sources(db_path: Path | str = DEFAULT_DB) -> dict[str, Any]:
     changed_assets = [relative for relative, (size, digest) in expected_assets.items()
                       if not (root / relative).is_file()
                       or (root / relative).stat().st_size != size
-                      or _sha256_file(root / relative) != digest]
+                      or sha256_file(root / relative) != digest]
     actual_assets = {
         item.relative_to(root).as_posix()
         for workspace_name in actual_workspaces

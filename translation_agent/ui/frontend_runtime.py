@@ -55,6 +55,7 @@ from translation_agent.runtime.product_contracts import (
     RunSpec,
 )
 from translation_agent.runtime.run_execution_service import RunExecutionService
+from translation_agent.runtime.digests import sha256_file
 
 
 DEFAULT_RUNTIME_ROOT = Path.home() / ".translation-agent" / "webui"
@@ -182,14 +183,6 @@ def _plan_metadata(
     if release_profile is not None and release_profile not in RELEASE_PROFILES:
         raise ValueError(f"unsupported release profile: {release_profile!r}")
     return json.dumps(list(normalized_targets), separators=(",", ":")), release_profile
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -1264,7 +1257,7 @@ def _release_report(
             _is_relative_to(path, output_dir)
             and path.is_file()
             and not path.is_symlink()
-            and _sha256_file(path) == expected_hash
+            and sha256_file(path) == expected_hash
         ):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1338,7 +1331,7 @@ def _semantic_review_report_binding_is_current(
         if (
             not reconstruction_audit.is_file()
             or reconstruction_audit.is_symlink()
-            or _sha256_file(reconstruction_audit) != expected_reconstruction
+            or sha256_file(reconstruction_audit) != expected_reconstruction
         ):
             return False
         from translation_agent.semantic.semantic_review_policy import validate_semantic_review
@@ -1415,7 +1408,7 @@ def _pdf_report_semantics_are_current(
             isinstance(expected_reconstruction, str)
             and reconstruction_audit.is_file()
             and not reconstruction_audit.is_symlink()
-            and _sha256_file(reconstruction_audit) == expected_reconstruction
+            and sha256_file(reconstruction_audit) == expected_reconstruction
             and all(
                 key in semantic and semantic.get(key) is None
                 for key in review_identity_keys
@@ -1473,7 +1466,7 @@ def _epub_report_semantics_are_current(
         or not identity_path.is_file()
         or not _is_relative_to(identity_path, output_dir)
         or Path(report_artifact_path).expanduser().resolve() != identity_path
-        or _sha256_file(identity_path) != identity_hash
+        or sha256_file(identity_path) != identity_hash
     ):
         return False
     expected_source_path = source.get("path")
@@ -1487,7 +1480,7 @@ def _epub_report_semantics_are_current(
         Path(expected_source_path).expanduser().resolve() != resolved_source
         or not resolved_source.is_file()
         or resolved_source.is_symlink()
-        or _sha256_file(resolved_source) != expected_source_hash
+        or sha256_file(resolved_source) != expected_source_hash
     ):
         return False
     draft_audit = output_dir / ".pipeline_graph" / "draft-semantic-audit.json"
@@ -1512,7 +1505,7 @@ def _epub_report_semantics_are_current(
             or not isinstance(expected_translation_input, str)
             or not translation_audit.is_file()
             or translation_audit.is_symlink()
-            or _sha256_file(translation_audit) != expected_translation
+            or sha256_file(translation_audit) != expected_translation
         ):
             return False
         if not isinstance(translation_identity, Mapping):
@@ -1529,7 +1522,7 @@ def _epub_report_semantics_are_current(
         if (
             translation_path_value.is_symlink()
             or not translation_path.is_file()
-            or _sha256_file(translation_path) != expected_translation_input
+            or sha256_file(translation_path) != expected_translation_input
         ):
             return False
         try:
@@ -1564,7 +1557,7 @@ def _epub_report_semantics_are_current(
     if not manifest_path.is_file() or manifest_path.is_symlink():
         return False
     try:
-        if _sha256_file(manifest_path) != expected_manifest:
+        if sha256_file(manifest_path) != expected_manifest:
             return False
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, list) or not manifest:
@@ -1584,7 +1577,7 @@ def _epub_report_semantics_are_current(
         for chapter in sorted(chapter_paths, key=lambda path: path.as_posix()):
             digest.update(chapter.name.encode("utf-8"))
             digest.update(b"\0")
-            digest.update(_sha256_file(chapter).encode("ascii"))
+            digest.update(sha256_file(chapter).encode("ascii"))
             digest.update(b"\0")
         return digest.hexdigest() == expected_chapters
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -1687,7 +1680,7 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
         if not _is_relative_to(path, output) or not path.is_file() or path.is_symlink():
             continue
         expected_hash = identity.get("sha256")
-        actual_hash = _sha256_file(path)
+        actual_hash = sha256_file(path)
         identity_valid = isinstance(expected_hash, str) and expected_hash == actual_hash
         covered = artifact_name in covered_artifacts
         status = (
@@ -1726,7 +1719,7 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
                     kind=kind,
                     path=path,
                     status="draft",
-                    sha256=_sha256_file(path),
+                    sha256=sha256_file(path),
                     media_type=MEDIA_TYPES[kind],
                     report_path=None,
                 )
@@ -1739,7 +1732,7 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
                 kind="release_report",
                 path=report_path,
                 status="released" if release_ready else "blocked",
-                sha256=_sha256_file(report_path),
+                sha256=sha256_file(report_path),
                 media_type=MEDIA_TYPES["release_report"],
                 report_path=report_path,
             )
@@ -1758,7 +1751,7 @@ def artifact_catalog(job: JobRecord) -> list[ArtifactRecord]:
                     kind=kind,
                     path=path,
                     status="draft",
-                    sha256=_sha256_file(path),
+                    sha256=sha256_file(path),
                     media_type=MEDIA_TYPES[kind],
                     report_path=report_path,
                 )
