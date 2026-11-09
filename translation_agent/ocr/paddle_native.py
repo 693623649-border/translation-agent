@@ -133,7 +133,9 @@ def model_identity(options: NativeOptions, *, dpi=200, max_side=3000, quality=90
         except importlib.metadata.PackageNotFoundError:
             versions[name] = "missing"
     payload = {
-        "version": 1, "variant": options.variant, "det_limit": options.det_limit,
+        # version 2: vertical pages are read tier by tier, dotted lines are
+        # re-read and the page frame above the text block is dropped.
+        "version": 2, "variant": options.variant, "det_limit": options.det_limit,
         "threads": options.threads, "direction": options.reading_direction,
         "rec_batch": 1, "image_limit": 2000, "device": "cpu", "mkldnn": False,
         "render": [dpi, max_side, quality], "packages": versions,
@@ -172,12 +174,77 @@ def ordered_text(result, direction: str) -> str:
     if not rows:
         return ""
     if direction == "vertical":
-        band = max(8.0, statistics.median(max(1, r[2] - r[0]) for r in rows) * .55)
-        rows.sort(key=lambda r: (-round(r[2] / band), r[1], -r[2]))
+        width = _column_width(rows)
+        band = max(8.0, width * .55)
+        tiers = _vertical_tiers(rows, width)
+        # The page frame (printed folio, running head) is one flat line no
+        # taller than two glyphs, wider than tall, wholly above the first
+        # tier and within two glyph heights of it. Kept, it lands between
+        # body columns or is merged into prose by translation. Vertical
+        # titles, captions and headings far above the body are content.
+        if tiers:
+            top = tiers[0][0]
+            rows = [r for r in rows if not (
+                r[3] <= top
+                and top - r[3] <= 2 * width
+                and r[3] - r[1] <= 2 * width
+                and r[2] - r[0] >= r[3] - r[1]
+            )]
+        rows.sort(key=lambda r: (_tier_index(r, tiers), -round(r[2] / band), r[1], -r[2]))
     else:
         band = max(8.0, statistics.median(max(1, r[3] - r[1]) for r in rows) * .55)
         rows.sort(key=lambda r: (round(r[1] / band), r[0], r[1]))
     return "\n".join(r[4] for r in rows)
+
+
+def _column_width(rows) -> float:
+    """Body column width of a vertical page: box width, weighted by height.
+
+    Long body columns dominate; many short boxes (ruby, folios, captions)
+    cannot pull the estimate to their own width as a plain median would.
+    """
+    weighted = sorted((max(1.0, r[2] - r[0]), max(1.0, r[3] - r[1])) for r in rows)
+    half = sum(height for _width, height in weighted) / 2
+    seen = 0.0
+    for width, height in weighted:
+        seen += height
+        if seen >= half:
+            return width
+    return weighted[-1][0]
+
+
+def _vertical_tiers(rows, width: float) -> list[tuple[float, float]]:
+    """Vertical extents of the stacked text blocks (段) of a tategaki page.
+
+    Books and magazines often set vertical text in two or more tiers, read
+    tier by tier, each right to left. Only body-like boxes (about one column
+    wide and taller than two characters) define tiers, so headings, folios
+    and other wide or short boxes cannot merge or split them. Spans closer
+    than one column width belong to the same tier.
+    """
+    spans = sorted(
+        (r[1], r[3]) for r in rows
+        if .6 * width <= r[2] - r[0] <= 1.6 * width and r[3] - r[1] > 2 * width
+    )
+    tiers: list[list[float]] = []
+    for top, bottom in spans:
+        if tiers and top - tiers[-1][1] <= width:
+            tiers[-1][1] = max(tiers[-1][1], bottom)
+        else:
+            tiers.append([top, bottom])
+    return [(top, bottom) for top, bottom in tiers]
+
+
+def _tier_index(row, tiers: list[tuple[float, float]]) -> int:
+    """First tier the row overlaps (a spanning heading is read first), else
+    the nearest one."""
+    if len(tiers) < 2:
+        return 0
+    for index, (top, bottom) in enumerate(tiers):
+        if min(row[3], bottom) > max(row[1], top):
+            return index
+    return min(range(len(tiers)), key=lambda i: min(abs(row[1] - tiers[i][1]),
+                                                     abs(row[3] - tiers[i][0])))
 
 
 def _drop_model_frame_locals(exc: BaseException) -> None:
@@ -279,12 +346,15 @@ class PaddleNativeOCR:
                     # stays its only owner and a kept traceback of any error
                     # in this method cannot pin the model after _cleanup.
                     results = list(self._ensure_engine().predict(array))
+                    if len(results) != 1:
+                        raise RuntimeError("PaddleOCR returned an unexpected number of pages")
+                    result = results[0]
+                    if self.options.reading_direction == "vertical":
+                        result = self._rerecognize_emphasis_columns(result, array)
                 except BaseException as exc:
                     _drop_model_frame_locals(exc)
                     raise
-                if len(results) != 1:
-                    raise RuntimeError("PaddleOCR returned an unexpected number of pages")
-                text = ordered_text(results[0], self.options.reading_direction)
+                text = ordered_text(result, self.options.reading_direction)
                 if not text:
                     from translation_agent.pipeline.book_pipeline import is_visually_blank_page
                     if not is_visually_blank_page(image_path)[0]:
@@ -295,6 +365,48 @@ class PaddleNativeOCR:
             finally:
                 if self._closed.is_set():
                     self._cleanup()
+
+    def _rerecognize_emphasis_columns(self, result, array):
+        """Re-read vertical lines widened by emphasis dots (傍点).
+
+        Dots set beside a tategaki column make the detector return a box up
+        to twice the column width, and the recognizer then misreads kana in
+        that line. For each such box this reads only the left column-width
+        strip (the dots sit on the right) with the already loaded recognizer
+        and keeps the new text only when its score is higher. Headings and
+        other wide boxes keep their original text because the narrow crop
+        scores lower for them.
+        """
+        texts = [str(text) for text in result["rec_texts"]]
+        scores = [float(score) for score in result["rec_scores"]]
+        boxes = result["rec_boxes"]
+        boxes = boxes.tolist() if hasattr(boxes, "tolist") else boxes
+        if not boxes:
+            return result
+        width = _column_width(boxes)
+        wide = [
+            index for index, (x1, y1, x2, y2) in enumerate(boxes)
+            if x2 - x1 > 1.25 * width and y2 - y1 > 3 * width
+        ]
+        if not wide:
+            return result
+        import numpy as np
+
+        crops = []
+        for index in wide:
+            x1, y1, _x2, y2 = (int(value) for value in boxes[index])
+            # Same orientation as PaddleX's own crop: rotate a tall line
+            # 90 degrees counter-clockwise into a horizontal text line.
+            crops.append(np.rot90(array[y1:y2, x1:x1 + int(width) + 2]).copy())
+        rereads = list(self._engine.paddlex_pipeline.text_rec_model(crops))
+        for index, reread in zip(wide, rereads):
+            # A real dotted line keeps its glyph count; the left half of an
+            # oversized heading reads as fewer, radical-only glyphs.
+            if (float(reread["rec_score"]) > scores[index]
+                    and len(str(reread["rec_text"])) >= .8 * len(texts[index])):
+                texts[index] = str(reread["rec_text"])
+                scores[index] = float(reread["rec_score"])
+        return {**result, "rec_texts": texts, "rec_scores": scores}
 
     def _cleanup(self) -> None:
         loaded = self._engine is not None

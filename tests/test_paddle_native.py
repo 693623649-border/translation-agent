@@ -84,6 +84,44 @@ class NativeOCRTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             ordered_text({'rec_texts': ['lost box'], 'rec_boxes': []}, 'horizontal')
 
+    def test_vertical_two_tier_page_reads_upper_tier_before_lower(self):
+        # Two-tier tategaki: columns 20 wide, upper tier y 40-300, lower y 400-700.
+        # A wide heading sits at the right edge; a folio and running head sit
+        # above the text block on the left and are dropped as page frame.
+        result = {
+            'rec_texts': ['lower right', 'upper left', 'heading', 'lower left',
+                          'upper right', 'author', '37'],
+            'rec_boxes': [[100, 400, 120, 700], [40, 40, 60, 300], [140, 50, 190, 600],
+                          [40, 400, 60, 700], [100, 40, 120, 300], [30, 10, 80, 30],
+                          [2, 10, 28, 30]],
+        }
+        self.assertEqual(
+            ordered_text(result, 'vertical'),
+            'heading\nupper right\nupper left\nlower right\nlower left',
+        )
+
+    def test_vertical_content_above_first_tier_is_kept(self):
+        # A tall vertical title above the body is content, not page frame, and
+        # ruby boxes beside the columns must not set the column width.
+        result = {
+            'rec_texts': ['title', 'col R', 'ruby a', 'ruby b', 'ruby c', 'col L'],
+            'rec_boxes': [[500, 40, 560, 330], [300, 400, 320, 700],
+                          [322, 420, 330, 440], [322, 500, 330, 520], [322, 600, 330, 620],
+                          [260, 400, 280, 700]],
+        }
+        lines = ordered_text(result, 'vertical').split('\n')
+        self.assertEqual(sorted(lines), sorted(result['rec_texts']))
+        self.assertEqual(lines[0], 'title')
+        self.assertLess(lines.index('col R'), lines.index('col L'))
+
+    def test_vertical_heading_spanning_both_tiers_is_read_first(self):
+        result = {
+            'rec_texts': ['l1', 'u1', 'TITLE', 'u2', 'l2'],
+            'rec_boxes': [[200, 400, 220, 720], [200, 40, 220, 300], [300, 40, 360, 720],
+                          [160, 40, 180, 300], [160, 400, 180, 720]],
+        }
+        self.assertEqual(ordered_text(result, 'vertical'), 'TITLE\nu1\nu2\nl1\nl2')
+
     def test_engine_is_reused_and_images_are_bounded(self):
         result = {'rec_texts': ['test'], 'rec_boxes': [[0, 0, 20, 20]]}
         engine = Mock()
@@ -102,6 +140,38 @@ class NativeOCRTests(unittest.TestCase):
         backend.close()
         self.assertIsNone(backend._engine)
         self.assertIsNone(backend._process_lock)
+
+    def test_vertical_emphasis_columns_keep_only_higher_scoring_rereads(self):
+        # Body columns are 40 wide; boxes 1 and 2 are widened by emphasis dots.
+        result = {
+            'rec_texts': ['body 1', 'body 2', 'body 3', 'dotted misread', 'heading'],
+            'rec_scores': [0.99, 0.99, 0.99, 0.80, 0.99],
+            'rec_boxes': [[500, 0, 540, 400], [440, 0, 480, 400], [380, 0, 420, 400],
+                          [300, 0, 360, 400], [200, 0, 280, 400]],
+        }
+        engine = Mock()
+        engine.predict.return_value = [result]
+        # The heading reread scores higher but loses glyphs (radicals only).
+        rec = Mock(return_value=[{'rec_text': 'dotted fixed', 'rec_score': 0.97},
+                                 {'rec_text': 'hea', 'rec_score': 0.999}])
+        engine.paddlex_pipeline.text_rec_model = rec
+        page = Image.new('RGB', (600, 400), 'white')
+        page.paste((255, 0, 0), (300, 0, 343, 400))  # body glyphs of the dotted line
+        page.paste((0, 0, 255), (345, 0, 360, 400))  # emphasis dots on its right
+        page.save(self.image)
+        backend = PaddleNativeOCR(replace(self.options, reading_direction='vertical'),
+                                  model_id='test')
+        backend._engine = engine
+        backend._process_lock = object()
+        text = backend.ocr_image(self.image)[0]
+        self.assertEqual(text, 'body 1\nbody 2\nbody 3\ndotted fixed\nheading')
+        crops = rec.call_args.args[0]
+        # Only the two wide boxes are re-read, each as a rotated left strip.
+        self.assertEqual([crop.shape[:2] for crop in crops], [(42, 400), (42, 400)])
+        # The strip is the left part of the box: the dotted box (x 300-360)
+        # has red ink at x 300-340 and blue emphasis dots at x 345-360.
+        self.assertTrue((crops[0][..., 2] > 200).all() and (crops[0][..., 0] < 50).all())
+        backend._process_lock = None
 
     def test_no_text_on_nonblank_page_is_failure_not_a_cached_success(self):
         backend = self.backend()
