@@ -25,8 +25,33 @@ PROFILE_FIELDS = frozenset(
         "thinking",
         "command",
         "reading_direction",
+        "local",
     }
 )
+LOCAL_LLAMA_ADAPTER = "llama-cpp-local"
+# Prompt contract used by the PDF page path for the local translation model
+# (Hy-MT2 official default instruction).  Bump when that prompt changes.
+LOCAL_PAGE_PROMPT_STYLE = "hy-mt-default-v1"
+LOCAL_FIELDS = frozenset(
+    {
+        "server_binary",
+        "server_sha256",
+        "model_file",
+        "model_sha256",
+        "context_size",
+        "max_output_tokens",
+        "max_input_chars",
+        "gpu_layers",
+        "threads",
+        "port",
+        "temperature",
+        "top_p",
+        "top_k",
+        "repeat_penalty",
+        "critical_pressure_seconds",
+    }
+)
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 PIPELINE_FIELDS = frozenset(
     {
         "ocr_profile",
@@ -90,6 +115,80 @@ class ModelIdentity:
 
 
 @dataclass(frozen=True)
+class LocalModelSettings:
+    """Pinned llama.cpp runtime/model and bounded generation for local translation."""
+
+    server_binary: Path
+    server_sha256: str
+    model_file: Path
+    model_sha256: str
+    context_size: int = 4096
+    max_output_tokens: int = 2048
+    max_input_chars: int = 1500
+    gpu_layers: int = 99
+    threads: int = 4
+    port: int = 0
+    # Hy-MT2 1.8B official sampling recommendation.
+    temperature: float = 0.7
+    top_p: float = 0.6
+    top_k: int = 20
+    repeat_penalty: float = 1.05
+    critical_pressure_seconds: int = 5
+
+    def __post_init__(self) -> None:
+        for name in ("server_sha256", "model_sha256"):
+            if not SHA256_PATTERN.fullmatch(getattr(self, name)):
+                raise ValueError(f"local.{name} must be a lowercase SHA-256 hex digest")
+        if not 1024 <= self.context_size <= 8192:
+            raise ValueError("local.context_size must be between 1024 and 8192")
+        if not 64 <= self.max_output_tokens < self.context_size or self.max_output_tokens > 4096:
+            raise ValueError("local.max_output_tokens must be 64-4096 and below context_size")
+        if not 200 <= self.max_input_chars <= self.context_size:
+            raise ValueError("local.max_input_chars must be between 200 and context_size")
+        if not 0 <= self.gpu_layers <= 999 or not 1 <= self.threads <= 8:
+            raise ValueError("local.gpu_layers must be 0-999 and local.threads 1-8")
+        if self.port and not 1024 <= self.port <= 65535:
+            raise ValueError("local.port must be 0 (pick a free port) or 1024-65535")
+        if not 0 <= self.temperature <= 2 or not 0 < self.top_p <= 1 or self.top_k < 0:
+            raise ValueError("local sampling values are out of range")
+        if self.critical_pressure_seconds < 1:
+            raise ValueError("local.critical_pressure_seconds must be positive")
+
+    def semantics(self) -> dict[str, object]:
+        """Cache-relevant identity: pinned hashes and generation settings."""
+
+        return {
+            "server_sha256": self.server_sha256,
+            "model_sha256": self.model_sha256,
+            "context_size": self.context_size,
+            "max_output_tokens": self.max_output_tokens,
+            "max_input_chars": self.max_input_chars,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
+        }
+
+
+def _local_settings(name: str, raw: object) -> LocalModelSettings:
+    if not isinstance(raw, dict):
+        raise ValueError(f"Profile {name!r} adapter {LOCAL_LLAMA_ADAPTER!r} requires a [local] table.")
+    unknown = sorted(set(raw) - LOCAL_FIELDS)
+    if unknown:
+        raise ValueError(f"Profile {name!r} [local] has unknown fields: {unknown}")
+    missing = sorted({"server_binary", "server_sha256", "model_file", "model_sha256"} - set(raw))
+    if missing:
+        raise ValueError(f"Profile {name!r} [local] requires: {missing}")
+    values = dict(raw)
+    for key in ("server_binary", "model_file"):
+        values[key] = Path(str(values[key])).expanduser()
+    try:
+        return LocalModelSettings(**values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Profile {name!r} [local]: {exc}") from exc
+
+
+@dataclass(frozen=True)
 class ModelProfile:
     name: str
     adapter: str
@@ -102,8 +201,19 @@ class ModelProfile:
     thinking: str = "disabled"
     command: tuple[str, ...] = ()
     reading_direction: str = ""
+    local: LocalModelSettings | None = None
 
     def __post_init__(self) -> None:
+        if (self.adapter == LOCAL_LLAMA_ADAPTER) != (self.local is not None):
+            raise ValueError(
+                f"Profile {self.name!r}: a [local] table is required for and only "
+                f"valid with adapter={LOCAL_LLAMA_ADAPTER!r}."
+            )
+        if self.local is not None and (self.concurrency != 1 or self.credential_env or self.base_url):
+            raise ValueError(
+                f"Profile {self.name!r}: local profiles use concurrency=1 and no "
+                "base_url/credential_env (the server is managed by the workflow)."
+            )
         if self.credential_env and not ENV_NAME_PATTERN.fullmatch(self.credential_env):
             raise ValueError(
                 f"Profile {self.name!r} credential_env must be an environment "
@@ -135,6 +245,20 @@ class ModelProfile:
         target_language: str,
         prompt_version: str,
     ) -> ModelIdentity:
+        if self.local is not None:
+            # Pin the exact weights/runtime/sampling instead of a URL.
+            local_digest = hashlib.sha256(
+                json.dumps(self.local.semantics(), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            return ModelIdentity(
+                provider=self.provider,
+                adapter=self.adapter,
+                base_url=f"local://llama.cpp/{local_digest}",
+                model=f"{self.model}@sha256:{self.local.model_sha256}",
+                target_language=target_language,
+                prompt_version=f"{prompt_version}+{LOCAL_PAGE_PROMPT_STYLE}",
+                thinking=self.thinking,
+            )
         return ModelIdentity(
             provider=self.provider,
             adapter=self.adapter,
@@ -174,7 +298,14 @@ class PipelineProfiles:
             # second credential setting for the common DeepSeek setup.
             "proofread": self.proofread_profile or self.translation_profile,
         }.get(stage, "")
-        return self.get(selected) if selected else None
+        profile = self.get(selected) if selected else None
+        if profile is not None and profile.local is not None and stage != "translation":
+            # The local model is validated for translation only.
+            raise ValueError(
+                f"Profile {profile.name!r} ({profile.adapter}) is translation-only; "
+                f"set an explicit {stage}_profile."
+            )
+        return profile
 
 
 def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
@@ -244,6 +375,11 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
             thinking=thinking,
             command=command,
             reading_direction=str(raw.get("reading_direction") or "").strip().lower(),
+            local=(
+                _local_settings(name, raw.get("local"))
+                if adapter == LOCAL_LLAMA_ADAPTER or "local" in raw
+                else None
+            ),
         )
     pipeline = payload.get("pipeline", {})
     if not isinstance(pipeline, dict):
@@ -262,6 +398,8 @@ def load_pipeline_profiles(path: str | Path) -> PipelineProfiles:
         proofread_profile=str(pipeline.get("proofread_profile") or "").strip(),
         schema_version=schema_version,
     )
-    for stage in ("ocr", "toc", "translation", "proofread"):
+    for stage in ("ocr", "toc", "translation"):
         result.for_stage(stage)
+    if result.proofread_profile:
+        result.for_stage("proofread")
     return result

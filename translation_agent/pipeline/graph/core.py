@@ -28,6 +28,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
+from translation_agent.runtime.digests import FileDigestCache
+
 try:  # pragma: no cover - platform-specific import.
     import fcntl
 except ImportError:  # pragma: no cover - Windows.
@@ -341,6 +343,11 @@ class GraphContext:
         default_factory=dict,
         repr=False,
     )
+    _file_digests: FileDigestCache = field(
+        default_factory=FileDigestCache,
+        init=False,
+        repr=False,
+    )
     run_id: str | None = field(default=None, init=False)
     node_name: str | None = field(default=None, init=False)
     _initial_value_names: frozenset[str] = field(
@@ -452,6 +459,7 @@ class GraphContext:
             allowed=node.requires,
             values=required_fingerprints,
         )
+        invocation._file_digests = self._file_digests
         invocation.run_id = self.run_id
         invocation.node_name = node.name
         return invocation
@@ -671,15 +679,29 @@ class OutputDirectoryLock:
         *,
         timeout: float = 0.0,
         poll_interval: float = 0.05,
+        purpose: str | None = None,
     ) -> None:
         if timeout < 0 or poll_interval <= 0:
             raise ValueError("lock timeout must be non-negative and poll interval positive")
         self.path = path
         self.timeout = timeout
         self.poll_interval = poll_interval
+        self.purpose = purpose
         self.token = uuid.uuid4().hex
         self._owned = False
         self._handle: Any | None = None
+
+    def fileno(self) -> int:
+        """Descriptor carrying the kernel lock; children may inherit it.
+
+        A child that inherits this descriptor shares the same open file
+        description, so the lock stays held until every holder has exited.
+        Only the original owner may call :meth:`release`.
+        """
+
+        if not self._owned or self._handle is None:
+            raise RuntimeError(f"lock is not held: {self.path}")
+        return self._handle.fileno()
 
     @staticmethod
     def _try_lock(handle: Any) -> bool:
@@ -734,6 +756,8 @@ class OutputDirectoryLock:
             "token": self.token,
             "acquired_at": _utc_now(),
         }
+        if self.purpose:
+            owner["purpose"] = self.purpose
         payload = (_canonical_json(_json_value(owner)) + "\n").encode("utf-8")
         while True:
             flags = os.O_RDWR | os.O_CREAT
@@ -1050,6 +1074,7 @@ class GraphExecutor:
             skipped: list[str] = []
             try:
                 for node in plan:
+                    context._file_digests.clear()
                     context.node_name = node.name
                     required_snapshot = self._required_input_snapshot(node, context)
                     fingerprint = self._node_fingerprint(
@@ -1245,4 +1270,5 @@ class GraphExecutor:
                 )
                 raise
             finally:
+                context._file_digests.clear()
                 context.node_name = None

@@ -504,6 +504,31 @@ def _emit(
         )
 
 
+class _UnloadAfterRun:
+    """Prepared EPUB graph whose local model is unloaded however the run ends.
+
+    The translate node already closes the request when it finishes; this
+    covers runs that fail or stop before reaching that node.
+    """
+
+    def __init__(self, prepared: Any, request: Any) -> None:
+        self._prepared = prepared
+        self._request = request
+
+    @property
+    def targets(self):
+        return self._prepared.targets
+
+    def plan(self):
+        return self._prepared.plan()
+
+    def execute(self):
+        try:
+            return self._prepared.execute()
+        finally:
+            self._request.close()
+
+
 class RunExecutionService:
     """Compile and execute RunSpec with one source/target capability policy."""
 
@@ -570,6 +595,7 @@ class RunExecutionService:
         from translation_agent.semantic.semantic_translation_runner import (
             PROMPT_CONTRACT_SHA256,
             RUNNER_VERSION,
+            SYSTEM_PROMPT,
             build_openai_chat_request,
             load_glossary,
         )
@@ -592,6 +618,9 @@ class RunExecutionService:
         thinking = "disabled"
         timeout = 120
         concurrency = int(options.get("translation_concurrency") or 16)
+        max_chars = int(options.get("translation_max_chars") or 9000)
+        recorded_temperature = float(options.get("translation_temperature") or 0.0)
+        local_request = None
 
         if spec.translate:
             profile = None
@@ -606,7 +635,42 @@ class RunExecutionService:
                 raise RunResolutionError(
                     "translation_profile requires a RunSpec.config profile file"
                 )
-            if profile is not None:
+            if profile is not None and profile.local is not None:
+                from translation_agent.runtime.local_llm_server import LocalSemanticRequest
+
+                if int(options.get("translation_concurrency") or 1) != 1:
+                    raise RunResolutionError(
+                        f"local translation profile {profile.name!r} supports "
+                        "translation_concurrency=1 only"
+                    )
+                provider = profile.provider
+                identity = profile.identity(
+                    target_language=spec.target_language,
+                    prompt_version=RUNNER_VERSION,
+                )
+                base_url = identity.base_url
+                model = identity.model
+                prompt_profile = profile.name
+                thinking = profile.thinking
+                timeout = profile.timeout
+                concurrency = 1
+                max_chars = min(max_chars, profile.local.max_input_chars)
+                # Record the sampling the local server actually uses.
+                recorded_temperature = profile.local.temperature
+                # Prepared lazily: plan/status and full cache hits never call it.
+                local_request = LocalSemanticRequest(profile, system_prompt=SYSTEM_PROMPT)
+                request_fingerprint = hashlib.sha256(
+                    json.dumps(
+                        {
+                            "adapter": profile.adapter,
+                            "identity": identity.fingerprint,
+                            "prompt_contract_sha256": PROMPT_CONTRACT_SHA256,
+                            "max_chars": max_chars,
+                        },
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()
+            elif profile is not None:
                 if profile.adapter != "openai-chat":
                     raise RunResolutionError(
                         "semantic EPUB translation requires an openai-chat "
@@ -626,6 +690,9 @@ class RunExecutionService:
             else:
                 credential_env = "DEEPSEEK_API_KEY"
 
+        if spec.translate and local_request is not None:
+            request = local_request
+        elif spec.translate:
             temperature = float(options.get("translation_temperature") or 0.0)
             max_tokens = int(options.get("translation_max_tokens") or 32768)
             request_identity = {
@@ -686,12 +753,8 @@ class RunExecutionService:
             translation_model=model,
             translation_prompt_profile=prompt_profile,
             translation_thinking=thinking,
-            translation_temperature=float(
-                options.get("translation_temperature") or 0.0
-            ),
-            translation_max_chars=int(
-                options.get("translation_max_chars") or 9000
-            ),
+            translation_temperature=recorded_temperature,
+            translation_max_chars=max_chars,
             translation_concurrency=concurrency,
             translation_retries=int(options.get("translation_retries") or 3),
             translation_cache_dir=resolved.semantic_cache_dir,
@@ -700,12 +763,15 @@ class RunExecutionService:
             force_nodes=frozenset(options.get("force_nodes") or ()),
             force_all=bool(options.get("force_all", False)),
         )
-        return prepare_epub_graph(
+        prepared = prepare_epub_graph(
             Path(str(spec.source)).expanduser().resolve(),
             Path(spec.output_dir).expanduser().resolve(),
             options=graph_options,
             redaction_values=redaction_values,
         )
+        if local_request is not None:
+            return _UnloadAfterRun(prepared, local_request)
+        return prepared
 
     def _prepare_plan(self, resolved: ResolvedRun) -> tuple[RunPlan, Any | None]:
         """Compile once and retain the exact Graph instance for execution."""

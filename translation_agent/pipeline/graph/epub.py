@@ -1134,23 +1134,29 @@ def _translate_handler(
         )
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_dir = _secure_translation_cache_dir(context.output_dir, cache_dir)
-        result = translate_units(
-            units_path,
-            output_path,
-            target_language=options.target_language,
-            glossary=dict(options.glossary),
-            model=options.translation_model,
-            provider=options.translation_provider,
-            base_url=options.translation_base_url,
-            prompt_profile=options.translation_prompt_profile,
-            thinking=options.translation_thinking,
-            temperature=float(options.translation_temperature),
-            cache_dir=cache_dir,
-            request=request,
-            max_chars=options.translation_max_chars,
-            concurrency=options.translation_concurrency,
-            retries=options.translation_retries,
-        )
+        try:
+            result = translate_units(
+                units_path,
+                output_path,
+                target_language=options.target_language,
+                glossary=dict(options.glossary),
+                model=options.translation_model,
+                provider=options.translation_provider,
+                base_url=options.translation_base_url,
+                prompt_profile=options.translation_prompt_profile,
+                thinking=options.translation_thinking,
+                temperature=float(options.translation_temperature),
+                cache_dir=cache_dir,
+                request=request,
+                max_chars=options.translation_max_chars,
+                concurrency=options.translation_concurrency,
+                retries=options.translation_retries,
+            )
+        finally:
+            # A stage-owned local model unloads here, before apply/publish.
+            close = getattr(request, "close", None)
+            if close is not None:
+                close()
         if result.get("status") != "passed" or result.get("mode") != "run":
             raise RuntimeError("semantic translation runner did not produce translations")
         artifact = _file_artifact(output_path)

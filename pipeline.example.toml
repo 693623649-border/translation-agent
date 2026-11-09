@@ -59,3 +59,27 @@ toc_profile = "glm_toc"
 translation_profile = "deepseek_flash"
 # Optional. When omitted, proofreading safely reuses translation_profile.
 proofread_profile = "deepseek_flash"
+
+# Optional local translation (Apple silicon, llama.cpp Metal). Select it
+# explicitly with --translation-profile hy_mt2_local; it is never a default
+# and is not used for TOC or proofreading. The workflow starts llama-server
+# on 127.0.0.1 when the first uncached request arrives, shares one model
+# lease with native OCR, and unloads it when the stage ends. Pinned files:
+#   https://github.com/ggml-org/llama.cpp/releases/tag/b12202 (macos-arm64)
+#   https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF @ a0c709d9fac510f2c807aa3af52872340dc37a4a
+[profiles.hy_mt2_local]
+adapter = "llama-cpp-local"
+provider = "tencent-hunyuan"
+model = "Hy-MT2-1.8B-Q4_K_M"
+timeout = 300
+concurrency = 1
+thinking = "omit"
+
+[profiles.hy_mt2_local.local]
+server_binary = "~/.translation-agent/local-llm/runtime/llama-b12202/llama-server"
+server_sha256 = "e7e3c60a5e612460d095bfd219047040d6bb9d0b56466aae30a480980b676959"
+model_file = "~/.translation-agent/local-llm/models/tencent-Hy-MT2-1.8B-GGUF-a0c709d9/Hy-MT2-1.8B-Q4_K_M.gguf"
+model_sha256 = "dc5f44fcf1fa496ee7ad725982c0c8c553a4de00259b53af84c4b89fb0c06699"
+context_size = 4096
+max_output_tokens = 2048
+max_input_chars = 1500

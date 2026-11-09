@@ -66,6 +66,7 @@ from translation_agent.runtime.product_paths import dotenv_path, repository_root
 from translation_agent.pipeline.compile_service import ChapterCompileRequest, run_chapter_compile
 import translation_agent.knowledge.rag_knowledge_base as rag_knowledge_base
 from translation_agent.runtime.pipeline_profiles import (
+    LOCAL_LLAMA_ADAPTER,
     THINKING_VALUES,
     ModelIdentity,
     ModelProfile,
@@ -1999,10 +2000,28 @@ def _split_translation_body(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
+# Official Hy-MT2 default translation instruction.  The local 1.8B model was
+# measured to rewrite footnote labels ("1 " -> "1. ") under the long book
+# prompt, so local profiles use this short form; the structural gates below
+# still apply unchanged.
+HY_MT_PAGE_PROMPT = (
+    "将以下文本翻译为{target_language}，注意只需要输出翻译后的结果，不要额外解释：\n\n{source_text}"
+)
+
+
 class ChatTranslator:
-    def __init__(self, client: TextChatBackend, *, max_chars: int = 12000) -> None:
+    def __init__(
+        self,
+        client: TextChatBackend,
+        *,
+        max_chars: int = 12000,
+        prompt_style: str = "book",
+    ) -> None:
+        if prompt_style not in {"book", "hy-mt"}:
+            raise ValueError("prompt_style must be 'book' or 'hy-mt'")
         self.client = client
         self.max_chars = max_chars
+        self.prompt_style = prompt_style
 
     def translate(self, text: str, *, source_language: str, target_language: str) -> str:
         # Reviewed/imported Markdown headings are structural metadata, not
@@ -2048,6 +2067,19 @@ class ChatTranslator:
                 else ""
             )
             output_budget = min(32768, max(4096, len(chunk) * 4))
+            if self.prompt_style == "hy-mt":
+                output = clean_translation_text(
+                    self.client.chat_text(
+                        HY_MT_PAGE_PROMPT.format(
+                            target_language=target_language,
+                            source_text=chunk,
+                        ),
+                        system="",
+                        max_tokens=output_budget,
+                    )
+                )
+                translated.append(normalize_target_script(output, target_language))
+                continue
             prompt = f"""
 请把下面的 OCR 原文完整翻译成{target_language}。
 源语言标签：{source_language}
@@ -6585,6 +6617,11 @@ def build_translation_client(
     glm_api_base: str,
     profile: ModelProfile | None = None,
 ) -> TextChatBackend | None:
+    if profile is not None and profile.local is not None:
+        from translation_agent.runtime.local_llm_server import LocalLlamaChatClient
+
+        # The workflow starts the server lazily on the first real request.
+        return LocalLlamaChatClient(profile)
     key = resolve_translation_api_key(args, profile)
     if not key:
         return None
@@ -6660,6 +6697,11 @@ def resolve_translation_identity(
     glm_api_base: str,
     profile: ModelProfile | None = None,
 ) -> ModelIdentity:
+    if profile is not None and profile.local is not None:
+        return profile.identity(
+            target_language=args.target_language,
+            prompt_version=TRANSLATION_PROMPT_VERSION,
+        )
     provider = (
         profile.provider.strip().lower()
         if profile is not None
@@ -7279,7 +7321,8 @@ def _main_unlocked(
         )
     if (
         translation_profile is not None
-        and translation_profile.adapter not in {"openai-chat", "glm-chat"}
+        and translation_profile.adapter
+        not in {"openai-chat", "glm-chat", LOCAL_LLAMA_ADAPTER}
     ):
         parser.error(
             f"Translation profile {translation_profile.name!r} requires an OpenAI-compatible chat adapter."
@@ -7456,6 +7499,14 @@ def _main_unlocked(
         and args.concurrency is None
     ):
         translation_workers = translation_profile.concurrency
+    if translation_profile is not None and translation_profile.local is not None:
+        if translation_workers != 1:
+            print(
+                f"[warning] local translation profile {translation_profile.name!r} "
+                f"uses one generation slot; ignoring concurrency={translation_workers}.",
+                file=sys.stderr,
+            )
+        translation_workers = 1
     proofread_workers = (
         args.proofread_concurrency
         if args.proofread_concurrency is not None
@@ -7771,23 +7822,40 @@ def _main_unlocked(
                 for record in records
                 if args.start_page <= record.pdf_page <= end_page
             ]
-            translate_non_chinese_pages(
-                translation_records,
-                output_dir,
-                ChatTranslator(translation_client, max_chars=args.translation_max_chars),
-                target_language=args.target_language,
-                force=args.force,
-                concurrency=translation_workers,
-                request_delay=args.translation_delay,
-                source_language=(
-                    None
-                    if args.translation_source_language.strip().lower() == "auto"
-                    else args.translation_source_language.strip().lower()
-                ),
-                translation_provider=args.translation_provider,
-                translation_model=translation_identity.model,
-                translation_identity=translation_identity,
+            local_settings = (
+                translation_profile.local if translation_profile is not None else None
             )
+            translator = ChatTranslator(
+                translation_client,
+                max_chars=(
+                    min(args.translation_max_chars, local_settings.max_input_chars)
+                    if local_settings is not None
+                    else args.translation_max_chars
+                ),
+                prompt_style="hy-mt" if local_settings is not None else "book",
+            )
+            try:
+                translate_non_chinese_pages(
+                    translation_records,
+                    output_dir,
+                    translator,
+                    target_language=args.target_language,
+                    force=args.force,
+                    concurrency=translation_workers,
+                    request_delay=args.translation_delay,
+                    source_language=(
+                        None
+                        if args.translation_source_language.strip().lower() == "auto"
+                        else args.translation_source_language.strip().lower()
+                    ),
+                    translation_provider=args.translation_provider,
+                    translation_model=translation_identity.model,
+                    translation_identity=translation_identity,
+                )
+            finally:
+                if local_settings is not None:
+                    # Unload the local model before TOC/compile/verify run.
+                    translation_client.close()
             records = load_page_records(output_dir)
         if args.phase == "translate":
             if not args.translate_non_chinese:

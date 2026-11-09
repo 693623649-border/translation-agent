@@ -37,6 +37,7 @@ import statistics
 import tarfile
 import tempfile
 import threading
+import traceback
 import urllib.request
 
 MODEL_BASE = "https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0"
@@ -179,6 +180,29 @@ def ordered_text(result, direction: str) -> str:
     return "\n".join(r[4] for r in rows)
 
 
+def _drop_model_frame_locals(exc: BaseException) -> None:
+    """Clear locals of the finished frames an escaping model exception captured.
+
+    Frames inside ``PaddleOCR(...)`` and ``engine.predict(...)`` bind the
+    engine as ``self``.  Without this, a caller that keeps the exception (or
+    its traceback) would keep the model alive after the lease is released.
+    The exception, its chain and its printable traceback (files, lines,
+    function names) are unchanged.  Only frames at or below the current
+    frame are in these tracebacks, and executing frames are skipped by
+    ``traceback.clear_frames``.
+    """
+
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
+
+
 class PaddleNativeOCR:
     """One lazily loaded model per OCR stage, serialized across local jobs."""
 
@@ -196,23 +220,20 @@ class PaddleNativeOCR:
     def _ensure_engine(self):
         if self._engine is not None:
             return self._engine
-        from translation_agent.pipeline.graph.core import OutputDirectoryLock, OutputDirectoryLockedError
+        from translation_agent.runtime.model_lease import (
+            HeavyModelLeaseCancelled,
+            acquire_heavy_model_lease,
+            lease_log,
+        )
 
-        # Different Web tasks run in different processes. Hold a single CPU
-        # reservation for the entire stage to avoid loading several models.
-        lock = OutputDirectoryLock(Path.home() / ".translation-agent" / "paddleocr" / "cpu.lock")
-        announced = False
-        while True:
-            if self._closed.is_set():
-                raise RuntimeError("Native OCR cancelled")
-            try:
-                lock.acquire()
-                break
-            except OutputDirectoryLockedError:
-                if not announced:
-                    print("[paddleocr-native] waiting for another local CPU OCR task", flush=True)
-                    announced = True
-                self._closed.wait(.2)
+        # Different Web tasks run in different processes, and the managed
+        # local LLM uses the same lease. Hold it for the whole OCR stage so
+        # two heavy models are never loaded at the same time.
+        try:
+            lock = acquire_heavy_model_lease(BACKEND, cancelled=self._closed)
+        except HeavyModelLeaseCancelled as exc:
+            raise RuntimeError("Native OCR cancelled") from exc
+        lease_log(BACKEND, f"loading PP-OCRv5 {self.options.variant}")
         self._process_lock = lock
         try:
             # Only local weights are allowed; setup is the explicit network step.
@@ -233,7 +254,8 @@ class PaddleNativeOCR:
                 use_textline_orientation=False,
             )
             return self._engine
-        except BaseException:
+        except BaseException as exc:
+            _drop_model_frame_locals(exc)
             self._cleanup()
             raise
 
@@ -242,15 +264,24 @@ class PaddleNativeOCR:
             if self._closed.is_set():
                 raise RuntimeError("Native OCR cancelled")
             try:
-                engine = self._ensure_engine()
                 import numpy as np
                 from PIL import Image
 
+                # Decode the page before touching the model: a missing or
+                # corrupt image never loads weights or takes the lease.
                 with Image.open(image_path) as source:
                     image = source.convert("RGB")
                     image.thumbnail((2000, 2000))
                     # Paddle image arrays use OpenCV's BGR ordering.
-                    results = list(engine.predict(np.asarray(image)[:, :, ::-1].copy()))
+                    array = np.asarray(image)[:, :, ::-1].copy()
+                try:
+                    # No local name ever binds the engine, so self._engine
+                    # stays its only owner and a kept traceback of any error
+                    # in this method cannot pin the model after _cleanup.
+                    results = list(self._ensure_engine().predict(array))
+                except BaseException as exc:
+                    _drop_model_frame_locals(exc)
+                    raise
                 if len(results) != 1:
                     raise RuntimeError("PaddleOCR returned an unexpected number of pages")
                 text = ordered_text(results[0], self.options.reading_direction)
@@ -266,10 +297,15 @@ class PaddleNativeOCR:
                     self._cleanup()
 
     def _cleanup(self) -> None:
+        loaded = self._engine is not None
         self._engine = None
         gc.collect()
         if self._process_lock is not None:
-            self._process_lock.release()
+            from translation_agent.runtime.model_lease import lease_log, release_heavy_model_lease
+
+            if loaded:
+                lease_log(BACKEND, "unloaded")
+            release_heavy_model_lease(BACKEND, self._process_lock)
             self._process_lock = None
 
     def close(self) -> None:
