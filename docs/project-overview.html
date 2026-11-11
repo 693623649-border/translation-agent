@@ -85,7 +85,7 @@ svg text{fill:var(--ink);font-family:system-ui,"PingFang SC",sans-serif}
 <!-- 模块 1：概览。数据来自 git ls-files 行数统计、unittest 运行和 selfcheck_pipeline_nodes.py -->
 <section id="overview">
 <h1>模块化工程总览：从来源文件到可签发成品</h1>
-<p class="sub">本地优先的书籍翻译与出版系统。扫描 PDF、文字层 PDF 和 EPUB 进入同一个依赖图（DAG），翻译后生成 EPUB、Word、知识库和参考 PDF，并由发布门决定是否 <code>release_ready</code>。本页数据基于 <code>macos</code> 分支 <code>36c5331</code>，均为静态统计或本机实际运行结果。</p>
+<p class="sub">本地优先的书籍翻译与出版系统。扫描 PDF、文字层 PDF 和 EPUB 进入同一个依赖图（DAG），翻译后生成 EPUB、Word、知识库和参考 PDF，并由发布门决定是否 <code>release_ready</code>。本页数据基于 <code>macos</code> 分支 <code>50b61c9</code>：代码规模与节点取自静态核对，测试与 OCR 指标注明各自基线。</p>
 <div class="grid g6" id="stats"></div>
 </section>
 
@@ -140,29 +140,29 @@ svg text{fill:var(--ink);font-family:system-ui,"PingFang SC",sans-serif}
 <div class="grid g3" style="margin-top:14px" id="profiles"></div>
 </section>
 
-<!-- 模块 7：近期变更时间线（c4733cc..36c5331） -->
+<!-- 模块 7：近期变更时间线（c4733cc..50b61c9） -->
 <section id="changes">
-<h2>近期变更（c4733cc → 36c5331）</h2>
-<p class="sub">上一版总览之后合入 macos 的工作：本地翻译档位、生命周期修复和三项性能修复。</p>
+<h2>近期变更（c4733cc → 50b61c9）</h2>
+<p class="sub">上一版总览之后合入 macos 的工作：本地翻译档位、生命周期修复、三项性能修复，以及竖排 OCR 阅读顺序和 OCR 工具链。</p>
 <div class="grid g2"><div class="tl" id="timeline"></div><div class="card"><h3>性能修复的实测效果</h3><div class="bars" id="perf" style="margin-top:10px"></div><p class="note">数据来自对应提交的回归测试和说明，比较的是调用或导入次数，不是墙钟耗时。</p></div></div>
 </section>
 
 <!-- 模块 8：规模、测试与当前风险 -->
 <section id="health">
 <h2>代码规模、测试与当前风险</h2>
-<p class="sub">左边是各包的代码行数，右边是测试最多的文件。测试为本机 <code>.venv</code> 下执行 <code>python -m unittest discover -s tests</code> 的结果。</p>
+<p class="sub">左边是各包的代码行数，右边是测试最多的文件。用例总数为 HEAD 静态计数；页面保留 2026-11-09 的全量基线，新增 4 项竖排 OCR 用例已单独验证。</p>
 <div class="grid g2"><div class="card"><h3>包代码行数</h3><div class="bars" id="sizeBars" style="margin-top:10px"></div></div><div class="card"><h3>测试分布（def test_ 数量）</h3><div class="bars" id="testBars" style="margin-top:10px"></div></div></div>
 <div class="grid g2" style="margin-top:12px" id="risks"></div>
 </section>
 
-<p class="footer">数据来源：<code>git ls-files</code> 行数统计；<code>ast</code> 解析内部 import；<code>tools/selfcheck_pipeline_nodes.py --json</code> 输出的节点计划；<code>CHECK_IDS</code> 常量；<code>git log c4733cc^..36c5331</code>；2026-11-09 本机 unittest 运行。样书 OCR 指标来自一次 20 页竖排扫描样书实测，不外推到其他版式。</p>
+<p class="footer">数据来源：<code>git ls-files</code> 行数统计；<code>ast</code> 解析内部 import；<code>tools/selfcheck_pipeline_nodes.py --json</code> 输出的节点计划；<code>CHECK_IDS</code> 常量；<code>git log c4733cc^..50b61c9</code>；测试总数为 HEAD 静态计数，新增 OCR 用例已单独运行。样书 OCR 指标来自一次 20 页竖排扫描样书实测，测量早于 8cb3bd8 的竖排排序更新，不外推到其他版式或更新后的效果。</p>
 </main>
 
 <script>
 /* ===== 数据层：页面上的所有数字和名称都集中在 DATA，渲染函数只负责把数据画出来 ===== */
 const C={entry:"#2d6cdf",runtime:"#5b6475",orch:"#c27c05",domain:"#0f8f78",model:"#7357c8",red:"#c4473a",violet:"#7357c8"};
 const DATA={
-stats:[["Python 模块","76","translation_agent/ 内 49,328 行"],["单元测试","882","881 通过 · 1 失败"],["DAG 节点","29","书籍 + EPUB 两个图"],["发布门","14 + 9","PDF 全量 / EPUB 原生"],["命令入口","8","pyproject [project.scripts]"],["模型档位","6","含本地 hy_mt2_local"]],
+stats:[["Python 模块","76","translation_agent/ 内 49,440 行"],["单元测试","886","60 个测试文件 · 新增 4 项竖排 OCR"],["DAG 节点","29","书籍 + EPUB 两个图"],["发布门","14 + 9","PDF 全量 / EPUB 原生"],["命令入口","8","pyproject [project.scripts]"],["模型档位","6","含本地 hy_mt2_local"]],
 
 /* 分层：每层若干包，pkg 对应 PKGS 中的键 */
 layers:[
@@ -245,17 +245,20 @@ knowledge:{lines:4210,sum:"单书 RAG 检索（词法 + 向量混合、重排、
  ["knowledge/kb_translation.py","知识库语料中文标准化与分块翻译","原始分块、模型凭据","中文分块、.translation.json 审计","ensure_chinese_rows,DeepSeekTranslator"],
  ["knowledge/knowledge_base_audit.py","知识库结构与章节完整性审计","knowledge_base.jsonl、章节元数据","Issue 列表与覆盖率","audit_knowledge_base,audit_rows"]],
  flows:["RagKnowledgeBase.retrieve → rag_apparatus：对目录、索引等结构性分块降权","RagKnowledgeBase.retrieve → OpenAICompatibleReranker.rerank：混合召回后做模型精排","global_knowledge_base._ingest_workspace：比较工作区指纹，只重建变化的书，失败保留旧库"]},
-ocr:{lines:364,sum:"离线 PP-OCRv5 CPU 原生 OCR，与本地翻译模型共享同一把租约锁。",mods:[
- ["ocr/paddle_native.py","离线 CPU 原生 OCR 后端","页面图片、NativeOptions、本地模型目录","按阅读方向排序的文本、native-cpu/<variant> 模型身份","PaddleNativeOCR,NativeOptions,model_identity,ordered_text"]],
- flows:["ocr_image：先解码页面图片，再获取引擎；坏图在加载模型和占租约前失败（19b9d48）","引擎释放 → 清理异常回溯帧 → 释放租约，避免异常对象钉住模型（e488251）"]},
-tools:{lines:6021,sum:"外围工具与部署：PaddleOCR 容器、单书体例修复、产物注册、DAG 结构自检。",mods:[
+ocr:{lines:476,sum:"离线 PP-OCRv5 CPU 原生 OCR：竖排按段分组，段间自上而下、段内从右到左，过滤版心页框并对傍点加宽列重识别；与本地翻译模型共享租约锁。",mods:[
+ ["ocr/paddle_native.py","离线 CPU 原生 OCR 后端（竖排阅读顺序 + 傍点重识别）","页面图片、NativeOptions、本地模型目录","按阅读方向排序的文本、native-cpu/<variant> 模型身份","PaddleNativeOCR,NativeOptions,model_identity,ordered_text,_column_width,_vertical_tiers,_tier_index"]],
+ flows:["ocr_image：先解码页面图片，再获取引擎；坏图在加载模型和占租约前失败（19b9d48）","竖排排序：按文字高度加权估计正文列宽，识别多段版面；段间自上而下、同段内从右到左，跨段标题按首个重叠段排序；删除首段上方两列宽内、宽大于高的扁平页框行，保留标题与图注（8cb3bd8）","傍点重识别：对宽于 1.25 倍列宽、高过 3 倍列宽的行，只重识别左侧正文列；仅当分数提高且字符数不低于原识别 80% 时替换（8cb3bd8）","缓存身份：原生 OCR 的 model_identity 版本升到 2，阅读方向、渲染参数和权重哈希都进入身份，旧竖排检查点不再命中（8cb3bd8）","引擎释放 → 清理异常回溯帧 → 释放租约，避免异常对象钉住模型（e488251）"]},
+tools:{lines:6694,sum:"外围工具与部署：Magpie 视觉 OCR、OCR 质量抽样、单书体例修复、产物注册、DAG 结构自检。",mods:[
  ["tools/selfcheck_pipeline_nodes.py","不跑模型的 DAG 结构自检","prepare_*_graph、recipes/*.toml、假 PDF / EPUB","节点 requires / provides 计划、问题清单","_check_graph,_check_book_variants"],
  ["tools/outputs_registry.py","汇总 outputs 版本注册表","outputs/* 的 manifest、报告","outputs/MANIFEST.json 与 .md","_book_entry,_report_status"],
  ["tools/audit_output_quality.py","扫描章节 / 页 / 知识库的截断与顺序缺陷","outputs/<book>/","缺陷计数与热点清单","audit_book,audit_pages_dir"],
+ ["tools/magpie_ocr.py","Magpie 视觉 OCR 独立驱动","PDF、页范围、Magpie PC 凭据","PageRecord 检查点、ocr_manifest.json、审计页图","transcribe_once,PageRecord,POST /v1/chat/completions"],
+ ["tools/select_ocr_samples.py","固定种子分层抽取 OCR 质量样本","pages/、候选页字符阈值、样本数","ocr_sample_pages.json、450 DPI 校对切片","PageStore,random.Random,buckets"],
  ["tools/local_paddleocr_import.py","本地 PaddleOCR 后端：渲染、分片 OCR、导入","源 PDF、页范围、shard 参数","PageRecord 检查点","_render_pages,_run_ocr"],
+ ["tools/books/clean_karatani_page_frames.py","单书：剥离印刷页码与章题跑眉","柄谷行人 PageRecord","改写后的 pages，需重编译并刷新语义审计","_is_frame_title_line,_is_pure_folio_line"],
  ["tools/books/*","单书体例模板：尾注转换、目录修复、知识库与 DOCX","各书 outputs 工作目录","章节、toc.json、knowledge_base.jsonl","transform,build_rows,publish_work"],
  ["deploy/paddleocr/*","GPU / CPU OCR 容器、权重下载、基准","models.manifest.json、io 目录","page_NNNN.json、基准 JSON","batch_ocr,bench_ocr,download_models"]],
- flows:["book_pipeline → local_paddleocr_import → deploy/paddleocr/batch_ocr：页图与分片参数进入容器，结果由 import_existing_ocr 写回 PageRecord","tools/books/endnote_*.py → publication_verifier：重写章节并刷新语义审计，供 semantics.integrity 校验"]},
+ flows:["book_pipeline → local_paddleocr_import → deploy/paddleocr/batch_ocr：页图与分片参数进入容器，结果由 import_existing_ocr 写回 PageRecord","tools/magpie_ocr.py → PageRecord：视觉转写先写入 pages；运行 core.pages.ocr 时用 --ocr-cache-model magpie/group/cheap-first/vision-v1 绑定该身份，逐页检查点即可复用（50b61c9）","tools/select_ocr_samples.py → work/.../ocr_sample_pages.json：固定种子分层抽样并渲染 450 DPI 校对图；人工按图转写 audit/ocr-quality-samples.json 后供 ocr.quality 门使用","tools/books/clean_karatani_page_frames.py → compile：只删完整跑眉与纯数字页码行，正文中的章题引用保留；改页后需重新翻译并刷新语义审计","tools/books/endnote_*.py → publication_verifier：重写章节并刷新语义审计，供 semantics.integrity 校验"]},
 legacy:{lines:2699,sum:"旧版逐页 CLI 与维护脚本，检查点可被新管线兼容导入。",mods:[
  ["legacy/pdf_text_agent.py","旧版逐页 OCR / 翻译 / 总结 CLI","PDF / 图片、Provider Profile","_checkpoints/page_XXXX.json、summary.docx","LLMAgent,process_pdf"],
  ["maintenance/regenerate_reviewed_chapters.py","从连续页文本重建整章审定稿","pages、toc.json","reviewed_chapters/<id>.md、audit.json","reconstruct_chapter,translate_unit"],
@@ -317,6 +320,11 @@ nodeModel:{
  "core.toc.resolve":["LLM","GlmClient.chat_json → extract_toc，使用 toc_profile（示例 glm_toc / glm-5.2）。传入 --toc-json 人工目录时不调用模型；toc_source=outline 时换成 core.toc.from_outline，直接读 PDF 书签，不调用模型"],
  "core.semantic.translate":["LLM","RunExecutionService._prepare_epub_graph 构造请求函数：build_openai_chat_request｜LocalSemanticRequest → translate_units 分批调用"],
  "core.publish.knowledge_base":["嵌入","仅在 --rag-embed 时调用 maybe_build_zhipu_embedding_index → ZhipuEmbeddingProvider；失败只延后向量索引，不阻断出版"]},
+/* 节点内的关键行为：缓存、排序和重试策略不塞进“模型客户端”链 */
+nodeNotes:{
+ "core.pages.ocr":"native 竖排：列宽按文字高度加权估计；多段版面段间自上而下、段内从右到左；首段上方两列宽内、宽大于高的扁平框按印刷页码 / 跑眉删除，标题与图注保留。傍点加宽行只重识别左侧正文列。原生 OCR 的 model_identity version=2，旧竖排检查点不再命中。图外的 tools/magpie_ocr.py 也可预写 PageRecord；用 --ocr-cache-model magpie/group/cheap-first/vision-v1 绑定后，本节点直接续跑。",
+ "core.pages.translate":"节点本身不缓存，但页级 translation overlay 按模型身份、提示词版本和目标语言判断是否新鲜；本地档位用 hy-mt 提示词，远端档位用 book 提示词，换模型只重译受影响页。",
+ "core.semantic.translate":"EPUB 语义翻译按批次缓存，缓存键含模型、提示词、思考档与温度；translation_mode=run 调模型，apply 只导入外部译文。本地档位经 LocalSemanticRequest 复用托管 llama-server。"},
 dagColors:{source:"#2d6cdf",page:"#0f8f78",translate:"#7357c8",struct:"#c27c05",semantic:"#5b6475",publish:"#0f8f78",verify:"#c4473a"},
 dagNames:{source:"来源绑定",page:"逐页处理",translate:"翻译（可选）",struct:"结构与复核",semantic:"语义重建",publish:"出版",verify:"验收"},
 
@@ -331,7 +339,7 @@ clients:{
   [2,"paddle","PaddleNativeOCR"],[2,"vision","CodingPlanVisionOCR"],[2,"tess","TesseractOCR"],[2,"plocal","paddleocr-local 批量导入"],[2,"glm","GlmClient"],[2,"ds","DeepSeekClient(GlmClient)"],[2,"local","LocalLlamaChatClient"],[2,"oai","build_openai_chat_request"],[2,"lsr","LocalSemanticRequest"],[2,"zhipu","ZhipuEmbeddingProvider"],[2,"rr","OpenAICompatibleReranker / DeepSeekTranslator"],
   [3,"T_cpu","本地 CPU 进程（PP-OCRv5）"],[3,"T_mcp","McpStdioClient → npx @z_ai/mcp-server"],[3,"T_bin","tesseract 命令行"],[3,"T_docker","Docker GPU 容器"],[3,"T_http","HTTPS {base_url}/chat/completions"],[3,"T_llama","ManagedLlamaServer → 127.0.0.1 llama-server"],[3,"T_sdk","openai SDK（embeddings / chat）"]],
  rows:[
-  ["OCR","core.pages.ocr","paddle_native / glm_vision","paddleocr-native · coding-plan-mcp · glm-ocr · tesseract · paddleocr-local","resolve_ocr_backend_name 选后端 → OCRBackend.ocr_image 逐页识别","本地 CPU / MCP stdio / HTTPS / 命令行 / Docker","book_pipeline.py:6893 · ocr/paddle_native.py:206",["ocr","W_ocr","paddle","vision","tess","plocal","glm","T_cpu","T_mcp","T_bin","T_docker","T_http"]],
+  ["OCR","core.pages.ocr","paddle_native / glm_vision","paddleocr-native · coding-plan-mcp · glm-ocr · tesseract · paddleocr-local","resolve_ocr_backend_name 选后端 → OCRBackend.ocr_image 逐页识别","本地 CPU / MCP stdio / HTTPS / 命令行 / Docker","book_pipeline.py:6893 · ocr/paddle_native.py:154, 273, 369",["ocr","W_ocr","paddle","vision","tess","plocal","glm","T_cpu","T_mcp","T_bin","T_docker","T_http"]],
   ["OCR 校勘","core.pages.proofread","deepseek_flash","openai-chat · glm-chat","build_proofread_client → DeepSeekClient / GlmClient → ChatOCRProofreader.proofread（拒绝本地档位）","HTTPS","book_pipeline.py:6683, 2141",["proof","W_proof","glm","ds","T_http"]],
   ["目录解析","core.toc.resolve","glm_toc（glm-5.2）","openai-chat · glm-chat","GlmClient.chat_json → extract_toc；传 --toc-json 时不调用","HTTPS","book_pipeline.py:7539, 3223",["toc","W_toc","glm","T_http"]],
   ["页翻译","core.pages.translate","deepseek_flash，或 hy_mt2_local","openai-chat · glm-chat · llama-cpp-local","build_translation_client → DeepSeekClient｜GlmClient｜LocalLlamaChatClient → ChatTranslator.translate","HTTPS / 127.0.0.1","book_pipeline.py:6614, 2012 · local_llm_server.py:619",["ptr","W_tr","glm","ds","local","T_http","T_llama"]],
@@ -347,7 +355,7 @@ clients:{
 /* 本地模型时序：泳道与消息 [起点泳道, 终点泳道, 文本, 是否返回] */
 lanes:["Graph 节点","model_lease","ManagedLlamaServer","_llama_supervisor","llama-server"],
 seq:[[0,1,"首个未命中缓存的请求 → acquire_heavy_model_lease()",0],[1,1,"flock cpu.lock（OCR 占用时排队）",0],[1,2,"租约就绪",1],[2,3,"spawn：继承锁 fd + control-fd",0],[3,4,"启动 llama-server（127.0.0.1 空闲端口 · 会话密钥）",0],[3,2,"stdout 首行回传 PID",1],[0,4,"翻译请求：并发 1 · ctx 4096 · 输出 ≤2048",0],[4,0,"译文；溢出或截断直接报错",1],[0,2,"阶段结束 / SIGTERM → close()",0],[2,3,"关闭 control-fd",0],[3,4,"停止 server，等待退出",0],[2,1,"后端已退出 → release_heavy_model_lease()",0]],
-localCards:[["锁顺序","先取租约再加载权重，后端退出后才释放。OCR 引擎先释放再放租约，并清理异常回溯帧，避免异常对象把模型留在内存（e488251）。"],["故障恢复","supervisor 继承锁描述符，worker 退出或崩溃时停止 server。下一次任务能回收 owner 与 supervisor 都已消失的孤儿进程（recover_orphaned_server）。SIGTERM 能取消排队中或加载中的启动（c92bdbd）。"],["缓存与身份","二进制与模型 SHA-256 固定写入 pipeline.example.toml，并进入缓存身份。plan、status 和全部命中缓存的运行不加载模型。本地档位不用于目录和校勘。"]],
+localCards:[["锁顺序","先取租约再加载权重，后端退出后才释放。OCR 引擎先释放再放租约，并清理异常回溯帧，避免异常对象把模型留在内存（e488251）。"],["故障恢复","supervisor 继承锁描述符，worker 退出或崩溃时停止 server。下一次任务能回收 owner 与 supervisor 都已消失的孤儿进程（recover_orphaned_server）。SIGTERM 能取消排队中或加载中的启动（c92bdbd）。"],["缓存与身份","二进制与模型 SHA-256 固定写入 pipeline.example.toml，并进入缓存身份。plan、status 和全部命中缓存的运行不加载模型。原生 OCR 的 model_identity version=2，竖排排序或傍点算法变化会换身份，旧页检查点不复用。"]],
 
 /* 发布门：CHECK_IDS 原样 + 中文说明 */
 gates:{
@@ -358,6 +366,8 @@ profiles:[["full","publication.report","14 项门全部通过且 skipped=0，章
 
 /* 近期变更 */
 timeline:[
+ ["50b61c9","feat","新增 Magpie 视觉 OCR 驱动、固定种子 OCR 抽样和柄谷行人页框清理工具；拒答、纯拉丁文本和假空白在落盘前拦截"],
+ ["8cb3bd8","feat","原生竖排 OCR 按段阅读、删除版心页框并对傍点列重识别；model_identity 升到 2，旧竖排检查点失效"],
  ["c4733cc","fix","语义请求重试有上限：永久请求错误（SemanticRequestError）不再拆批重试，任一批失败即停止后续调度"],
  ["84be609","perf","同一节点判定内复用源 PDF 摘要（FileDigestCache），节点边界清空"],
  ["666b6bb","perf","全局知识库按工作区增量同步，只重建变化的书"],
@@ -370,7 +380,7 @@ timeline:[
  ["36c5331","merge","集成到 macos，保留生产 pipeline.toml，本地档位仅在 example 中提供"]],
 perf:[["永久翻译错误","24 次请求 → 1 次",96],["源 PDF 哈希","每节点 3 次 → 1 次",67],["知识库改一本","导入 5 本 → 1 本",80]],
 tests:[["test_book_pipeline",131],["test_book_graph",78],["test_publication_verifier",58],["test_document_pipeline",35],["test_frontend_runtime",31],["test_rag_knowledge_base",29],["test_kb_translation",26],["test_global_knowledge_base",26],["test_semantic_translation_runner",23],["test_local_llm_server",23],["test_epub_graph",22]],
-risks:[["失败测试：docx.render","<code>test_book_pipeline…test_cli_manual_toc_to_all_outputs</code> 的 verify 阶段 13 项通过、1 项失败。失败项是 <code>docx.render</code>（Word 渲染后发现版面异常）：本机 LibreOffice 渲染时 <code>fontconfig</code> 为 null，实际用的是 Liberation / FrankRuhl 回退字体，而不是请求的 SimSun、Microsoft YaHei。文本覆盖率 1.0，说明问题出在字体环境，不是内容缺失。"],["发布阻断：竖排 OCR 质量","20 页竖排扫描样书三页抽样 CER 为 67% / 87% / 70%，汇总 74%，远高于 2% 门限，正式发布被 <code>ocr.quality</code> 阻断。另有 15 页译文残留印刷页码，命中 <code>content.hygiene</code>。"]]
+risks:[["失败测试：docx.render","<code>test_book_pipeline…test_cli_manual_toc_to_all_outputs</code> 的 verify 阶段 13 项通过、1 项失败。失败项是 <code>docx.render</code>（Word 渲染后发现版面异常）：本机 LibreOffice 渲染时 <code>fontconfig</code> 为 null，实际用的是 Liberation / FrankRuhl 回退字体，而不是请求的 SimSun、Microsoft YaHei。文本覆盖率 1.0，说明问题出在字体环境，不是内容缺失。"],["发布阻断：竖排 OCR 质量","20 页竖排扫描样书三页抽样 CER 为 67% / 87% / 70%，汇总 74%，远高于 2% 门限；该测量早于 8cb3bd8 的按段排序、页框过滤和傍点重识别，更新后尚未重测，不能视为已通过。另有 15 页译文残留印刷页码，命中 <code>content.hygiene</code>；可用 <code>tools/books/clean_karatani_page_frames.py</code> 从页记录剥离并重新编译。"]]
 };
 
 /* ===== 渲染层 ===== */
@@ -460,6 +470,7 @@ function renderDag(){
  $("#dagDetail").innerHTML=`<b class="mono">${n[0]}</b> <span class="tag" style="--c:${DATA.dagColors[n[4]]}">${DATA.dagNames[n[4]]}</span>${n[3]===1?' <span class="kv">可选节点</span>':n[3]===2?' <span class="kv">默认节点，开启翻译后被替代</span>':""}${m?` <span class="tag" style="--c:${MODEL_COLOR[m[0]]}">${m[0]}</span>`:""}
  <div style="margin-top:8px"><span class="kv">requires：${n[2].length?n[2].join(" · "):"无（入口）"}</span><span class="kv">provides：${n[1].join(" · ")}</span></div>
  ${m?`<p style="margin:8px 0 0;font-size:13px"><b>模型客户端：</b>${m[1]}</p>`:""}
+ ${DATA.nodeNotes[n[0]]?`<p class="note" style="margin:6px 0 0"><b>节点行为：</b>${DATA.nodeNotes[n[0]]}</p>`:""}
  ${OPT[n[0]]?`<p class="note" style="margin:6px 0 0">${OPT[n[0]]}</p>`:""}<p class="note" style="margin:6px 0 0">上游：${up.join("、")||"无（入口）"}　下游：${down.join("、")||(isTarget?"无，这是 Recipe 的运行目标（target artifact）":"无")}</p>`;
 }
 $("#dagTabs").onclick=e=>{const b=e.target.closest("button");if(!b)return;if(b.dataset.k){dagKey=b.dataset.k;dagActive=-1}if(b.dataset.opt){dagOpt=b.dataset.opt==="1";dagActive=-1}renderDag()};
@@ -524,7 +535,7 @@ $("#perf").innerHTML=DATA.perf.map(p=>`<div class="row"><b>${p[0]}</b><div class
 /* 规模与测试 */
 const sizes=Object.entries(DATA.PKGS).filter(([,p])=>p.lines).sort((a,b)=>b[1].lines-a[1].lines);
 $("#sizeBars").innerHTML=sizes.map(([k,p])=>`<div class="row"><b>${k}</b><div class="bar" style="width:${p.lines/sizes[0][1].lines*100}%;--c:${pkgColor(k)}"></div><span class="note">${p.lines.toLocaleString()}</span></div>`).join("")+`<p class="note">legacy 含 maintenance；tools 含 tools/ 下全部 Python。pipeline/book_pipeline.py 单文件 8,042 行，是最大的模块。</p>`;
-$("#testBars").innerHTML=DATA.tests.map(([k,n])=>`<div class="row" style="grid-template-columns:190px 1fr 40px"><b class="mono" style="font-size:11px">${k}</b><div class="bar" style="width:${n/DATA.tests[0][1]*100}%;--c:var(--blue)"></div><span class="note">${n}</span></div>`).join("")+`<p class="note">共 60 个测试文件、882 个用例，本机全量运行约 22 秒。</p>`;
+$("#testBars").innerHTML=DATA.tests.map(([k,n])=>`<div class="row" style="grid-template-columns:190px 1fr 40px"><b class="mono" style="font-size:11px">${k}</b><div class="bar" style="width:${n/DATA.tests[0][1]*100}%;--c:var(--blue)"></div><span class="note">${n}</span></div>`).join("")+`<p class="note">共 60 个测试文件、886 个用例；新增 4 项竖排 OCR 用例已单独通过。</p>`;
 $("#risks").innerHTML=DATA.risks.map(r=>`<div class="card risk"><h3 class="bad">${r[0]}</h3><p class="sub" style="margin:6px 0 0;font-size:13px">${r[1]}</p></div>`).join("");
 
 /* 深浅主题切换 */
