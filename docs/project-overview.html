@@ -117,7 +117,8 @@ svg text{fill:var(--ink);font-family:system-ui,"PingFang SC",sans-serif}
 <!-- 模块 4b：模型客户端地图。类名、档位与 adapter 取自 book_pipeline.py、run_execution_service.py、pipeline.example.toml -->
 <section id="llm">
 <h2>LLM 与模型客户端</h2>
-<p class="sub">所有模型调用都从 <code>pipeline.toml</code> 的档位（Profile）出发：档位里的 <code>adapter</code> 决定构造哪个客户端类，客户端再决定传输方式。远端文本模型都走 OpenAI 兼容的 <code>{base_url}/chat/completions</code>。客户端返回的 <code>ModelIdentity</code>（provider、adapter、model、base_url、thinking、提示词版本）进入缓存身份，换模型就会让对应页检查点或批次缓存失效。</p>
+<p class="sub">下图按目标模型边界绘制：OCR 用 PaddleOCR，翻译用 DeepSeek / Hy-MT，GLM 只保留 <code>embedding-3</code> 作为 RAG 向量层。<code>pipeline.toml</code> 里仍保留 <code>glm_vision</code> / <code>glm_toc</code> / <code>glm-chat</code> 兼容档位，本图不画；默认档位切换不在本次文档改动内。客户端返回的 <code>ModelIdentity</code> 进入缓存身份，换模型会让对应页检查点或批次缓存失效。</p>
+<div class="grid g3" id="modelChoices" style="margin-bottom:12px"></div>
 <div class="canvas" id="clientCanvas"></div>
 <div class="legend"><span>点击一行，在图中高亮对应的客户端链路</span></div>
 <div class="card" style="margin-top:4px;overflow:auto"><table class="ctable" id="clientTable"></table></div>
@@ -162,7 +163,7 @@ svg text{fill:var(--ink);font-family:system-ui,"PingFang SC",sans-serif}
 /* ===== 数据层：页面上的所有数字和名称都集中在 DATA，渲染函数只负责把数据画出来 ===== */
 const C={entry:"#2d6cdf",runtime:"#5b6475",orch:"#c27c05",domain:"#0f8f78",model:"#7357c8",red:"#c4473a",violet:"#7357c8"};
 const DATA={
-stats:[["Python 模块","76","translation_agent/ 内 49,440 行"],["单元测试","886","60 个测试文件 · 新增 4 项竖排 OCR"],["DAG 节点","29","书籍 + EPUB 两个图"],["发布门","14 + 9","PDF 全量 / EPUB 原生"],["命令入口","8","pyproject [project.scripts]"],["模型档位","6","含本地 hy_mt2_local"]],
+stats:[["Python 模块","76","translation_agent/ 内 49,440 行"],["单元测试","886","60 个测试文件 · 新增 4 项竖排 OCR"],["DAG 节点","29","书籍 + EPUB 两个图"],["发布门","14 + 9","PDF 全量 / EPUB 原生"],["命令入口","8","pyproject [project.scripts]"],["模型档位","6","配置 6 个 · 模型图只画选型"]],
 
 /* 分层：每层若干包，pkg 对应 PKGS 中的键 */
 layers:[
@@ -237,7 +238,7 @@ publication:{lines:9900,sum:"把章节固化为 EPUB、DOCX、知识库、带书
  flows:["build_docx → markdown_footnotes_to_docx_markers → patch_docx_footnotes：[^id] 转稳定标记，再写成一引用一定义的真脚注","四类成品 → PublicationVerificationRequest → verify_publication：进入 14 项门，写 release-report.json","_check_docx_render → verify_docx_render：DOCX 渲染成临时 PDF，回传版面问题","graph/epub.py → verify_epub_publication：release_ready 决定 EPUB 节点能否放行"]},
 knowledge:{lines:4210,sum:"单书 RAG 检索（词法 + 向量混合、重排、附属文本降权）和跨书全局 SQLite FTS5 索引。",mods:[
  ["knowledge/global_knowledge_base.py","跨工作区全局索引，按工作区增量同步","outputs/*/ 的 chapters、knowledge_base.jsonl","全局 SQLite（FTS5 + 元数据）","sync_outputs,search,status,verify_sources"],
- ["knowledge/rag_knowledge_base.py","单书 RAG 运行时","knowledge_base.jsonl、.rag-manifest.json、查询","RagHit 列表、RagContext","RagKnowledgeBase,build_embedding_index"],
+ ["knowledge/rag_knowledge_base.py","单书 RAG 运行时（GLM embedding-3 可选向量索引）","knowledge_base.jsonl、.rag-manifest.json、查询","RagHit 列表、RagContext","RagKnowledgeBase,build_embedding_index"],
  ["knowledge/rag_reranking.py","OpenAI 兼容接口二次重排与别名扩展","候选 RagHit、查询","重新排序的 RagHit","OpenAICompatibleReranker,load_query_aliases"],
  ["knowledge/rag_apparatus.py","目录、索引等附属文本分类与降权","章节标题与正文","knowledge_base.apparatus.json","classify_apparatus,annotate_apparatus"],
  ["knowledge/rag_indexing.py","多书语料聚合切分","多个源知识库","派生 knowledge_base.jsonl、retrieval_sources.json","build_retrieval_corpus"],
@@ -314,19 +315,26 @@ dag:{
   ["core.publication.verify.epub",["publication.epub_report"],["source.epub","semantic.review","chapters.reader","publication.epub","semantic.translations?"],0,"verify"]]}},
 /* 调用模型的节点：kind 显示在节点右上角，chain 是节点内部实际的客户端调用链（类名与 book_pipeline.py / run_execution_service.py 一致） */
 nodeModel:{
- "core.pages.ocr":["OCR","resolve_ocr_backend_name 选出 OCRBackend，逐页调用 ocr_image：PaddleNativeOCR（paddleocr-native，本地 CPU）｜CodingPlanVisionOCR → McpStdioClient（coding-plan-mcp，glm-4.6v）｜GlmClient.ocr_image（glm-ocr）｜TesseractOCR｜paddleocr-local（Docker GPU 批量）"],
- "core.pages.proofread":["LLM","build_proofread_client → DeepSeekClient / GlmClient → ChatOCRProofreader.proofread。校勘只接受 openai-chat / glm-chat 档位，本地档位被拒绝"],
- "core.pages.translate":["LLM","build_translation_client → DeepSeekClient｜GlmClient｜LocalLlamaChatClient → ChatTranslator.translate（远端 prompt_style=book，本地 prompt_style=hy-mt）"],
- "core.toc.resolve":["LLM","GlmClient.chat_json → extract_toc，使用 toc_profile（示例 glm_toc / glm-5.2）。传入 --toc-json 人工目录时不调用模型；toc_source=outline 时换成 core.toc.from_outline，直接读 PDF 书签，不调用模型"],
+ "core.pages.ocr":["OCR","resolve_ocr_backend_name 选出 OCRBackend，逐页调用 ocr_image：PaddleNativeOCR（paddleocr-native，PP-OCRv5，本地 CPU）｜paddleocr-local（Docker GPU 批量）｜TesseractOCR（命令行兜底）"],
+ "core.pages.proofread":["LLM","build_proofread_client → DeepSeekClient → ChatOCRProofreader.proofread。选型为 deepseek_flash；GLM 兼容档位不画"],
+ "core.pages.translate":["LLM","build_translation_client → DeepSeekClient｜LocalLlamaChatClient → ChatTranslator.translate（远端 prompt_style=book，本地 prompt_style=hy-mt）。选型为 deepseek_flash / hy_mt2_local"],
  "core.semantic.translate":["LLM","RunExecutionService._prepare_epub_graph 构造请求函数：build_openai_chat_request｜LocalSemanticRequest → translate_units 分批调用"],
- "core.publish.knowledge_base":["嵌入","仅在 --rag-embed 时调用 maybe_build_zhipu_embedding_index → ZhipuEmbeddingProvider；失败只延后向量索引，不阻断出版"]},
+ "core.publish.knowledge_base":["嵌入","仅在 --rag-embed 时调用 maybe_build_zhipu_embedding_index → ZhipuEmbeddingProvider（GLM embedding-3，2048 维）；失败只延后向量索引，不阻断出版"]},
 /* 节点内的关键行为：缓存、排序和重试策略不塞进“模型客户端”链 */
 nodeNotes:{
- "core.pages.ocr":"native 竖排：列宽按文字高度加权估计；多段版面段间自上而下、段内从右到左；首段上方两列宽内、宽大于高的扁平框按印刷页码 / 跑眉删除，标题与图注保留。傍点加宽行只重识别左侧正文列。原生 OCR 的 model_identity version=2，旧竖排检查点不再命中。图外的 tools/magpie_ocr.py 也可预写 PageRecord；用 --ocr-cache-model magpie/group/cheap-first/vision-v1 绑定后，本节点直接续跑。",
- "core.pages.translate":"节点本身不缓存，但页级 translation overlay 按模型身份、提示词版本和目标语言判断是否新鲜；本地档位用 hy-mt 提示词，远端档位用 book 提示词，换模型只重译受影响页。",
+ "core.pages.ocr":"目标选型为 PaddleOCR PP-OCRv5（native CPU / Docker GPU），Tesseract 只作兜底；GLM-4.6V 视觉 OCR 是待移除的兼容后端（当前 pipeline.toml 仍以 glm_vision 为默认），不在目标模型图里。native 竖排：列宽按文字高度加权估计；多段版面段间自上而下、段内从右到左；首段上方两列宽内、宽大于高的扁平框按印刷页码 / 跑眉删除，标题与图注保留。傍点加宽行只重识别左侧正文列。原生 OCR 的 model_identity version=2，旧竖排检查点不再命中。图外的 tools/magpie_ocr.py 也可预写 PageRecord；用 --ocr-cache-model magpie/group/cheap-first/vision-v1 绑定后，本节点直接续跑。",
+ "core.pages.proofread":"选型为 deepseek_flash；GLM 校勘兼容档位保留在代码里，但不进入当前模型图。校勘只接受 openai-chat / glm-chat 档位，本地档位被拒绝。",
+ "core.pages.translate":"选型为 deepseek_flash（质量档 deepseek_pro）或本地 hy_mt2_local；GLM 翻译兼容档位不画。节点本身不缓存，但页级 translation overlay 按模型身份、提示词版本和目标语言判断是否新鲜；本地档位用 hy-mt 提示词，远端档位用 book 提示词，换模型只重译受影响页。",
+ "core.toc.resolve":"模型图不画目录模型：目标目录层用人工 --toc-json 或 PDF 书签（toc_source=outline）。pipeline.toml 仍默认 glm_toc，属于待移除的兼容默认。",
  "core.semantic.translate":"EPUB 语义翻译按批次缓存，缓存键含模型、提示词、思考档与温度；translation_mode=run 调模型，apply 只导入外部译文。本地档位经 LocalSemanticRequest 复用托管 llama-server。"},
 dagColors:{source:"#2d6cdf",page:"#0f8f78",translate:"#7357c8",struct:"#c27c05",semantic:"#5b6475",publish:"#0f8f78",verify:"#c4473a"},
 dagNames:{source:"来源绑定",page:"逐页处理",translate:"翻译（可选）",struct:"结构与复核",semantic:"语义重建",publish:"出版",verify:"验收"},
+
+/* 目标模型边界：只列选型路径，GLM 仅保留 RAG embedding */
+modelChoices:[
+ ["OCR 层","PaddleOCR PP-OCRv5","目标选型：native CPU 或 Docker GPU，Tesseract 只作兜底。当前 pipeline.toml 的 ocr_profile 仍指向 glm_vision，切换前以配置为准。"],
+ ["翻译层","DeepSeek V4 Flash / Hy-MT2-1.8B","当前默认 deepseek_flash，质量档 deepseek_pro；本地可选 hy_mt2_local。翻译路径不使用 GLM。"],
+ ["RAG 层","GLM embedding-3","唯一保留的 GLM 节点：ZhipuEmbeddingProvider，2048 维向量，供知识库向量索引。"]],
 
 /* 模型客户端：列 = 调用方（Graph 节点 / 图外工具）→ 调用封装（含所走协议）→ 客户端类 → 传输
    每个调用方对应唯一的封装节点，所以点击表格行时只会高亮这一条链路
@@ -334,23 +342,20 @@ dagNames:{source:"来源绑定",page:"逐页处理",translate:"翻译（可选�
 clients:{
  cols:["调用方（Graph 节点）","调用封装 · 协议","客户端类","传输"],
  nodes:[
-  [0,"ocr","pages.ocr"],[0,"proof","pages.proofread"],[0,"toc","toc.resolve"],[0,"ptr","pages.translate"],[0,"sem","semantic.translate"],[0,"kb","publish.knowledge_base"],[0,"out","图外：RAG 检索 / KB 翻译"],
-  [1,"W_ocr","ocr_pdf · OCRBackend.ocr_image"],[1,"W_proof","ChatOCRProofreader · TextChatBackend"],[1,"W_toc","extract_toc · chat_json"],[1,"W_tr","ChatTranslator · TextChatBackend"],[1,"W_units","translate_units · Callable[[str], str]"],[1,"W_emb","maybe_build_zhipu_embedding_index"],[1,"W_rr","Reranker / Translator 协议"],
-  [2,"paddle","PaddleNativeOCR"],[2,"vision","CodingPlanVisionOCR"],[2,"tess","TesseractOCR"],[2,"plocal","paddleocr-local 批量导入"],[2,"glm","GlmClient"],[2,"ds","DeepSeekClient(GlmClient)"],[2,"local","LocalLlamaChatClient"],[2,"oai","build_openai_chat_request"],[2,"lsr","LocalSemanticRequest"],[2,"zhipu","ZhipuEmbeddingProvider"],[2,"rr","OpenAICompatibleReranker / DeepSeekTranslator"],
-  [3,"T_cpu","本地 CPU 进程（PP-OCRv5）"],[3,"T_mcp","McpStdioClient → npx @z_ai/mcp-server"],[3,"T_bin","tesseract 命令行"],[3,"T_docker","Docker GPU 容器"],[3,"T_http","HTTPS {base_url}/chat/completions"],[3,"T_llama","ManagedLlamaServer → 127.0.0.1 llama-server"],[3,"T_sdk","openai SDK（embeddings / chat）"]],
+  [0,"ocr","pages.ocr"],[0,"proof","pages.proofread"],[0,"ptr","pages.translate"],[0,"sem","semantic.translate"],[0,"kb","publish.knowledge_base"],
+  [1,"W_ocr","ocr_pdf · OCRBackend.ocr_image"],[1,"W_proof","ChatOCRProofreader · TextChatBackend"],[1,"W_tr","ChatTranslator · TextChatBackend"],[1,"W_units","translate_units · Callable[[str], str]"],[1,"W_emb","maybe_build_zhipu_embedding_index"],
+  [2,"paddle","PaddleNativeOCR"],[2,"tess","TesseractOCR"],[2,"plocal","paddleocr-local 批量导入"],[2,"ds","DeepSeekClient"],[2,"local","LocalLlamaChatClient"],[2,"oai","build_openai_chat_request"],[2,"lsr","LocalSemanticRequest"],[2,"zhipu","ZhipuEmbeddingProvider"],
+  [3,"T_cpu","本地 CPU 进程（PP-OCRv5）"],[3,"T_bin","tesseract 命令行"],[3,"T_docker","Docker GPU 容器"],[3,"T_http","HTTPS {base_url}/chat/completions"],[3,"T_llama","ManagedLlamaServer → 127.0.0.1 llama-server"],[3,"T_sdk","openai SDK（embeddings）"]],
  rows:[
-  ["OCR","core.pages.ocr","paddle_native / glm_vision","paddleocr-native · coding-plan-mcp · glm-ocr · tesseract · paddleocr-local","resolve_ocr_backend_name 选后端 → OCRBackend.ocr_image 逐页识别","本地 CPU / MCP stdio / HTTPS / 命令行 / Docker","book_pipeline.py:6893 · ocr/paddle_native.py:154, 273, 369",["ocr","W_ocr","paddle","vision","tess","plocal","glm","T_cpu","T_mcp","T_bin","T_docker","T_http"]],
-  ["OCR 校勘","core.pages.proofread","deepseek_flash","openai-chat · glm-chat","build_proofread_client → DeepSeekClient / GlmClient → ChatOCRProofreader.proofread（拒绝本地档位）","HTTPS","book_pipeline.py:6683, 2141",["proof","W_proof","glm","ds","T_http"]],
-  ["目录解析","core.toc.resolve","glm_toc（glm-5.2）","openai-chat · glm-chat","GlmClient.chat_json → extract_toc；传 --toc-json 时不调用","HTTPS","book_pipeline.py:7539, 3223",["toc","W_toc","glm","T_http"]],
-  ["页翻译","core.pages.translate","deepseek_flash，或 hy_mt2_local","openai-chat · glm-chat · llama-cpp-local","build_translation_client → DeepSeekClient｜GlmClient｜LocalLlamaChatClient → ChatTranslator.translate","HTTPS / 127.0.0.1","book_pipeline.py:6614, 2012 · local_llm_server.py:619",["ptr","W_tr","glm","ds","local","T_http","T_llama"]],
+  ["OCR","core.pages.ocr","paddle_native / paddleocr_local","paddleocr-native · paddleocr-local · tesseract","resolve_ocr_backend_name 选后端 → OCRBackend.ocr_image 逐页识别","本地 CPU / Docker GPU / 命令行","book_pipeline.py:6893 · ocr/paddle_native.py:154, 273, 369",["ocr","W_ocr","paddle","tess","plocal","T_cpu","T_bin","T_docker"]],
+  ["OCR 校勘","core.pages.proofread","deepseek_flash","openai-chat","build_proofread_client → DeepSeekClient → ChatOCRProofreader.proofread","HTTPS","book_pipeline.py:6683, 2141",["proof","W_proof","ds","T_http"]],
+  ["页翻译","core.pages.translate","deepseek_flash，或 hy_mt2_local","openai-chat · llama-cpp-local","build_translation_client → DeepSeekClient｜LocalLlamaChatClient → ChatTranslator.translate","HTTPS / 127.0.0.1","book_pipeline.py:6614, 2012 · local_llm_server.py:619",["ptr","W_tr","ds","local","T_http","T_llama"]],
   ["EPUB 语义翻译","core.semantic.translate","translation_profile","openai-chat · llama-cpp-local","RunExecutionService._prepare_epub_graph → build_openai_chat_request｜LocalSemanticRequest → translate_units","HTTPS / 127.0.0.1","run_execution_service.py:591 · semantic_translation_runner.py:515 · local_llm_server.py:640",["sem","W_units","oai","lsr","T_http","T_llama"]],
-  ["知识库向量（可选）","core.publish.knowledge_base","—（--rag-embed）","—","maybe_build_zhipu_embedding_index → ZhipuEmbeddingProvider；失败只延后向量索引","openai SDK","rag_knowledge_base.py:109, 871",["kb","W_emb","zhipu","T_sdk"]],
-  ["检索重排 / KB 语料翻译","knowledge_base_cli · kb_translation","—","—","OpenAICompatibleReranker.rerank · DeepSeekTranslator","openai SDK / HTTPS","rag_reranking.py:33 · kb_translation.py:106",["out","W_rr","rr","T_sdk","T_http"]]],
- edges:[["ocr","W_ocr"],["proof","W_proof"],["toc","W_toc"],["ptr","W_tr"],["sem","W_units"],["kb","W_emb"],["out","W_rr"],
-  ["W_ocr","paddle"],["W_ocr","vision"],["W_ocr","tess"],["W_ocr","plocal"],["W_ocr","glm"],
-  ["W_proof","glm"],["W_proof","ds"],["W_toc","glm"],["W_tr","glm"],["W_tr","ds"],["W_tr","local"],
-  ["W_units","oai"],["W_units","lsr"],["W_emb","zhipu"],["W_rr","rr"],
-  ["paddle","T_cpu"],["vision","T_mcp"],["tess","T_bin"],["plocal","T_docker"],["glm","T_http"],["ds","T_http"],["local","T_llama"],["oai","T_http"],["lsr","T_llama"],["zhipu","T_sdk"],["rr","T_sdk"],["rr","T_http"]]},
+  ["知识库向量（RAG）","core.publish.knowledge_base","—（--rag-embed）","—","maybe_build_zhipu_embedding_index → ZhipuEmbeddingProvider（GLM embedding-3，2048 维）","openai SDK","rag_knowledge_base.py:109, 871",["kb","W_emb","zhipu","T_sdk"]]],
+ edges:[["ocr","W_ocr"],["proof","W_proof"],["ptr","W_tr"],["sem","W_units"],["kb","W_emb"],
+  ["W_ocr","paddle"],["W_ocr","tess"],["W_ocr","plocal"],["W_proof","ds"],["W_tr","ds"],["W_tr","local"],
+  ["W_units","oai"],["W_units","lsr"],["W_emb","zhipu"],
+  ["paddle","T_cpu"],["tess","T_bin"],["plocal","T_docker"],["ds","T_http"],["local","T_llama"],["oai","T_http"],["lsr","T_llama"],["zhipu","T_sdk"]]},
 
 /* 本地模型时序：泳道与消息 [起点泳道, 终点泳道, 文本, 是否返回] */
 lanes:["Graph 节点","model_lease","ManagedLlamaServer","_llama_supervisor","llama-server"],
@@ -478,8 +483,11 @@ $("#dagCanvas").onclick=e=>{const g=e.target.closest(".gnode");if(g){dagActive=+
 $("#dagLegend").innerHTML=Object.entries(DATA.dagNames).map(([k,v])=>`<span><i class="sw" style="background:${DATA.dagColors[k]}"></i>${v}</span>`).join("")+`<span>虚线框 = 可选节点</span>`+Object.entries(MODEL_COLOR).map(([k,c])=>`<span><span class="tag" style="--c:${c}">${k}</span> 节点内调用${k==="OCR"?"OCR 引擎":k==="LLM"?"大模型":"嵌入模型"}</span>`).join("");
 renderDag();
 
+/* 模型选型卡：直接标注 OCR / 翻译 / RAG 使用的模型 */
+$("#modelChoices").innerHTML=DATA.modelChoices.map(([layer,model,note])=>`<div class="card"><div class="label">${layer}</div><b>${model}</b><p class="sub" style="margin:6px 0 0;font-size:13px">${note}</p></div>`).join("");
+
 /* 模型客户端图：四列布局，点击表格行高亮该阶段经过的节点与边 */
-let clientHit=3;
+let clientHit=0;
 function renderClients(){
  const D=DATA.clients,colX=[20,232,532,884],CW=[190,276,328,330],RH=32,pos={};
  const byCol=[[],[],[],[]];D.nodes.forEach(n=>byCol[n[0]].push(n));
