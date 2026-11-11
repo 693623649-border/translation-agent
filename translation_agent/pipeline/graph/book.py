@@ -809,38 +809,21 @@ def _ocr_stage_semantics(args: Any) -> dict[str, Any]:
     profile = _selected_model_profiles(args)["ocr"]
     reading_direction = legacy.resolve_ocr_reading_direction(args, profile)
     backend, _reason = legacy.resolve_ocr_backend_name(args, profile)
-    if backend == "coding-plan-mcp":
-        identity: dict[str, Any] = {
+    identity: dict[str, Any]
+    if backend == "openai-vision":
+        identity = {
             "backend": backend,
+            "provider": profile.provider if profile is not None else "openai-compatible",
+            "base_url": _safe_endpoint(
+                profile.base_url if profile is not None else ""
+            ),
             "model": (
                 profile.model
                 if profile is not None
-                else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
+                else os.getenv("OPENAI_VISION_MODEL", "")
             ),
             "reading_direction": reading_direction,
-            "command_sha256": (
-                stable_fingerprint(list(profile.command))
-                if profile is not None and profile.command
-                else stable_fingerprint(args.ocr_command)
-            ),
-            "prompt_version": f"{reading_direction}-v2",
-            "mode": os.getenv("Z_AI_MODE", "ZHIPU").strip().upper(),
-            "max_output_tokens": max(
-                1,
-                int(os.getenv("Z_AI_VISION_MODEL_MAX_TOKENS", "4096")),
-            ),
-        }
-        segmentation: dict[str, Any] | None = _ocr_segmentation_semantics()
-    elif backend == "glm-ocr":
-        identity = {
-            "backend": backend,
-            "provider": profile.provider if profile is not None else "glm",
-            "base_url": _safe_endpoint(
-                profile.base_url
-                if profile is not None and profile.base_url
-                else args.ocr_api_base
-            ),
-            "model": profile.model if profile is not None else args.ocr_model,
+            "prompt_version": legacy.OpenAIVisionOCR.prompt_version,
         }
         segmentation = None
     elif backend == "paddleocr-native":
@@ -925,9 +908,10 @@ def _toc_stage_semantics(args: Any) -> dict[str, Any]:
             else None
         ),
         "profile": _profile_model_semantics(profile),
-        "api_mode": args.api_mode,
+        # No api_mode: GLM's coding-plan/standard split is gone, so the TOC
+        # node is identified by its profile and resolved base URL alone.
         "base_url": _safe_endpoint(toc_base),
-        "model": profile.model if profile is not None else args.text_model,
+        "model": profile.model if profile is not None else "",
         "thinking": profile.thinking if profile is not None else "disabled",
         "prompt_version": "book-toc-v1",
         "front_matter_pages": args.front_matter_pages,
@@ -974,7 +958,7 @@ def _phase_argv(
     argv.extend(["--phase", phase])
     # ``add`` is an argv fragment, not a set of independent tokens.  A value
     # may legitimately equal another option's existing value (for example
-    # ``--ocr-model glm-ocr --ocr-cache-model glm-ocr``).
+    # ``--translation-model glm-x --ocr-cache-model glm-x``).
     argv.extend(add)
     return argv
 

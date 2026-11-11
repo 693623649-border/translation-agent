@@ -443,7 +443,7 @@ def _add_spec_arguments(parser: argparse.ArgumentParser, *, source: bool = True)
     parser.add_argument("--start-page", type=int)
     parser.add_argument("--end-page", type=int)
     parser.add_argument("--ocr-profile")
-    parser.add_argument("--ocr-backend", choices=("auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"))
+    parser.add_argument("--ocr-backend", choices=("auto", "openai-vision", "tesseract", "paddleocr-local", "paddleocr-native"))
     parser.add_argument("--ocr-reading-direction", choices=("horizontal", "vertical"))
     from translation_agent.ocr.paddle_native import add_native_arguments
     add_native_arguments(parser)

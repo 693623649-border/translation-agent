@@ -34,8 +34,8 @@ from translation_agent.runtime.product_contracts import RunSpec
 from translation_agent.runtime.product_paths import default_profile_path
 
 
-OCR_ADAPTERS = frozenset({"coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"})
-TEXT_ADAPTERS = frozenset({"openai-chat", "glm-chat"})
+OCR_ADAPTERS = frozenset({"openai-vision", "tesseract", "paddleocr-local", "paddleocr-native"})
+TEXT_ADAPTERS = frozenset({"openai-chat"})
 # The managed local model is validated for translation only (not TOC/proofread).
 TRANSLATION_ADAPTERS = TEXT_ADAPTERS | {"llama-cpp-local"}
 

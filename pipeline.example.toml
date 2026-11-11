@@ -10,28 +10,22 @@ credential_env = ""
 concurrency = 1
 reading_direction = "horizontal"
 
-[profiles.glm_vision]
-adapter = "coding-plan-mcp"
-provider = "zhipu"
-base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-model = "glm-4.6v"
-credential_env = "GLM_CODING_API_KEY"
-command = ["npx", "-y", "@z_ai/mcp-server@0.1.4"]
+# OCR node: an OpenAI-compatible multimodal model through a local gateway
+# (Magpie as shipped).  The prompt and the ordered-band fallback live in
+# OpenAIVisionOCR, so this backend does not need the Zhipu vision MCP.  Point
+# base_url/model at whatever gateway you run; the routed model id is what it
+# advertises at GET {base_url}/models.
+[profiles.magpie_vision]
+adapter = "openai-vision"
+provider = "magpie"
+base_url = "http://127.0.0.1:3425/v1"
+model = "mistral/deepseek-v4-1-flash-1017"
+credential_env = "MAGPIE_API_KEY"
 timeout = 180
 concurrency = 4
 thinking = "omit"
 # Generic preset: choose "vertical" explicitly for Japanese/Chinese tategaki.
 reading_direction = "horizontal"
-
-[profiles.glm_toc]
-adapter = "openai-chat"
-provider = "zhipu"
-base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-model = "glm-5.2"
-credential_env = "GLM_TOC_API_KEY"
-timeout = 120
-concurrency = 1
-thinking = "disabled"
 
 [profiles.deepseek_pro]
 adapter = "openai-chat"
@@ -53,12 +47,25 @@ timeout = 120
 concurrency = 32
 thinking = "disabled"
 
+# Translation / proofread node on the same routed model as OCR.
+[profiles.magpie_flash]
+adapter = "openai-chat"
+provider = "magpie"
+base_url = "http://127.0.0.1:3425/v1"
+model = "mistral/deepseek-v4-1-flash-1017"
+credential_env = "MAGPIE_API_KEY"
+timeout = 180
+concurrency = 16
+# low/high/max are OpenAI-style levels and are sent as ``reasoning_effort``
+# (not ``thinking.type``, which the gateway accepts but ignores).
+thinking = "low"
+
 [pipeline]
-ocr_profile = "glm_vision"
-toc_profile = "glm_toc"
-translation_profile = "deepseek_flash"
+ocr_profile = "magpie_vision"
+toc_profile = "magpie_flash"
+translation_profile = "magpie_flash"
 # Optional. When omitted, proofreading safely reuses translation_profile.
-proofread_profile = "deepseek_flash"
+proofread_profile = "magpie_flash"
 
 # Optional local translation (Apple silicon, llama.cpp Metal). Select it
 # explicitly with --translation-profile hy_mt2_local; it is never a default

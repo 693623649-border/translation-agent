@@ -78,3 +78,5 @@ cleanup_wenxue_lilun.py
 scan_fragments.py
 summarize_verify.py
 tmp/
+.alma-snapshots
+.zcodeignore

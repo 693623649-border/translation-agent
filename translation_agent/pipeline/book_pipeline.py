@@ -67,6 +67,7 @@ from translation_agent.pipeline.compile_service import ChapterCompileRequest, ru
 import translation_agent.knowledge.rag_knowledge_base as rag_knowledge_base
 from translation_agent.runtime.pipeline_profiles import (
     LOCAL_LLAMA_ADAPTER,
+    REASONING_EFFORT_VALUES,
     THINKING_VALUES,
     ModelIdentity,
     ModelProfile,
@@ -109,8 +110,6 @@ except ImportError:  # pragma: no cover - POSIX compatibility path.
     msvcrt = None
 
 
-DEFAULT_CODING_API_BASE = "https://open.bigmodel.cn/api/coding/paas/v4"
-DEFAULT_STANDARD_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
 DEFAULT_DEEPSEEK_API_BASE = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEFAULT_OCR_CONCURRENCY = 4
@@ -723,26 +722,31 @@ class ProviderHTTPError(RuntimeError):
         self.status_code = status_code
 
 
-class GlmClient:
-    service_name = "GLM"
+class ChatCompletionsClient:
+    """OpenAI-compatible ``/chat/completions`` text client.
+
+    This client speaks only text chat.  It deliberately carries no OCR and no
+    provider-specific layout parser: image understanding belongs to
+    :class:`OpenAIVisionOCR`, and the only GLM capability left in the product
+    is the RAG embedding provider.
+    """
+
+    service_name = "ChatCompletions"
 
     def __init__(
         self,
         *,
         api_key: str,
-        api_base: str = DEFAULT_STANDARD_API_BASE,
-        ocr_model: str = "glm-ocr",
-        text_model: str = "glm-5.2",
+        api_base: str,
+        text_model: str,
         timeout: int = 240,
         retries: int = 6,
-        provider_name: str = "glm",
+        provider_name: str = "openai-compatible",
         adapter_name: str = "openai-chat",
         thinking: str = "disabled",
-        reading_direction: str = "horizontal",
     ) -> None:
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
-        self.ocr_model = ocr_model
         self.text_model = text_model
         self.timeout = timeout
         self.retries = retries
@@ -753,7 +757,21 @@ class GlmClient:
                 f"thinking must be one of {', '.join(THINKING_VALUES)}"
             )
         self.thinking = thinking
-        self.reading_direction = reading_direction if reading_direction in {"horizontal", "vertical"} else "horizontal"
+
+    def _apply_thinking(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Attach the reasoning dial in the dialect this profile selected.
+
+        ``low``/``high``/``max`` are OpenAI-style reasoning levels and must go
+        out as ``reasoning_effort``; wrapping them in ``thinking.type`` makes a
+        gateway accept the request but silently run without reasoning.  The
+        remaining values keep the original ``thinking.type`` payload.
+        """
+
+        if self.thinking in REASONING_EFFORT_VALUES:
+            payload["reasoning_effort"] = self.thinking
+        elif self.thinking != "omit":
+            payload["thinking"] = {"type": self.thinking}
+        return payload
 
     def model_identity(
         self,
@@ -828,82 +846,6 @@ class GlmClient:
         message = str(error).lower()
         return "timed out" in message or "timeout" in message
 
-    def _ocr_image_once(self, image_path: Path) -> tuple[str, str]:
-        mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
-        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        response = self._post(
-            "layout_parsing",
-            {
-                "model": self.ocr_model,
-                "file": f"data:{mime};base64,{encoded}",
-                "return_crop_images": False,
-                "need_layout_visualization": False,
-            },
-        )
-        text = response.get("md_results")
-        if not isinstance(text, str):
-            raise RuntimeError(f"Unexpected GLM-OCR response; request_id={response.get('request_id', 'unknown')}")
-        request_id = str(response.get("request_id") or response.get("id") or "")
-        return clean_ocr_text(text), request_id
-
-    def _ocr_segmented(self, image_path: Path, *, segments: int) -> tuple[str, str]:
-        part_paths: list[Path] = []
-        texts: list[str] = []
-        try:
-            with Image.open(image_path) as source:
-                image = source.convert("RGB")
-                width, height = image.size
-                if self.reading_direction == "vertical":
-                    boundaries = [0, *CodingPlanVisionOCR._blank_column_cuts(image, segments), width]
-                    regions = [
-                        (left, 0, right, height)
-                        for left, right in reversed(list(zip(boundaries, boundaries[1:])))
-                    ]
-                else:
-                    boundaries = [0, *CodingPlanVisionOCR._blank_row_cuts(image, segments), height]
-                    regions = [
-                        (0, top, width, bottom)
-                        for top, bottom in zip(boundaries, boundaries[1:])
-                    ]
-                for index, region in enumerate(regions, start=1):
-                    part_path = image_path.with_name(
-                        f"{image_path.stem}_segment_{index}_{uuid.uuid4().hex[:8]}.jpg"
-                    )
-                    image.crop(region).save(part_path, "JPEG", quality=95, optimize=True)
-                    part_paths.append(part_path)
-            for part_path in part_paths:
-                text, _request_id = self._ocr_image_once(part_path)
-                text = text.strip()
-                if text and not is_unreadable_ocr_text(text):
-                    texts.append(text)
-        finally:
-            for part_path in part_paths:
-                part_path.unlink(missing_ok=True)
-        if not texts:
-            raise RuntimeError("Segmented GLM-OCR returned an empty band.")
-        return CodingPlanVisionOCR._merge_band_texts(texts), f"glm-segmented-{uuid.uuid4().hex[:12]}"
-
-    def ocr_image(self, image_path: Path) -> tuple[str, str]:
-        try:
-            return self._ocr_image_once(image_path)
-        except Exception as exc:
-            if not (self._is_content_filter_error(exc) or self._is_timeout_error(exc)):
-                raise
-            segment_counts = (
-                (4, 8, 16, 32)
-                if self._is_content_filter_error(exc)
-                else (2,)
-            )
-            retry_error: Exception = exc
-            for segments in segment_counts:
-                try:
-                    return self._ocr_segmented(image_path, segments=segments)
-                except Exception as segmented_error:  # noqa: BLE001 - preserve original fallback behavior.
-                    retry_error = segmented_error
-                    if not self._is_content_filter_error(segmented_error):
-                        break
-            raise retry_error
-
     def chat_json(self, prompt: str, *, system: str, max_tokens: int = 16384) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": self.text_model,
@@ -914,13 +856,12 @@ class GlmClient:
             "max_tokens": max_tokens,
             "temperature": 0.1,
         }
-        if self.thinking != "omit":
-            payload["thinking"] = {"type": self.thinking}
+        self._apply_thinking(payload)
         response = self._post("chat/completions", payload)
         try:
             content = response["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("Unexpected GLM chat response.") from exc
+            raise RuntimeError("Unexpected chat response.") from exc
         return parse_json_response(str(content))
 
     def chat_text(self, prompt: str, *, system: str, max_tokens: int = 16384) -> str:
@@ -933,19 +874,18 @@ class GlmClient:
             "max_tokens": max_tokens,
             "temperature": 0.1,
         }
-        if self.thinking != "omit":
-            payload["thinking"] = {"type": self.thinking}
+        self._apply_thinking(payload)
         response = self._post("chat/completions", payload)
         try:
             return str(response["choices"][0]["message"]["content"]).strip()
         except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError("Unexpected GLM chat response.") from exc
+            raise RuntimeError("Unexpected chat response.") from exc
 
     def close(self) -> None:
         return
 
 
-class DeepSeekClient(GlmClient):
+class DeepSeekClient(ChatCompletionsClient):
     """OpenAI-compatible DeepSeek text client, isolated from GLM OCR/TOC credentials."""
 
     service_name = "DeepSeek"
@@ -982,8 +922,7 @@ class DeepSeekClient(GlmClient):
             "max_tokens": max_tokens,
             "temperature": 0.1,
         }
-        if self.thinking != "omit":
-            payload["thinking"] = {"type": self.thinking}
+        self._apply_thinking(payload)
         response = self._post("chat/completions", payload)
         try:
             return str(response["choices"][0]["message"]["content"]).strip()
@@ -997,846 +936,85 @@ class DeepSeekClient(GlmClient):
         return parse_json_response(self._chat(prompt, system=system, max_tokens=max_tokens))
 
 
-class McpStdioClient:
-    """Minimal newline-delimited JSON-RPC client for the official Coding Plan vision MCP."""
 
-    def __init__(
-        self,
-        command: list[str],
-        *,
-        api_key: str,
-        vision_model: str = "glm-4.6v",
-        request_timeout: int = 120,
-        reading_direction: str = "horizontal",
-    ) -> None:
-        if not command or shutil.which(command[0]) is None:
-            raise RuntimeError(
-                "Coding Plan vision OCR requires Node.js 18+ and npx. "
-                "Install Node.js, then verify: npx -y @z_ai/mcp-server@0.1.4"
+# --- page-band geometry shared by the vision OCR backends -------------------
+# A whole-page request can trip an input filter or exceed a gateway timeout on
+# a dense scan.  These helpers pick near-even cuts on the whitest rows/columns
+# so the resulting bands never slice through a line of text, and merge the
+# per-band transcriptions back into one page.
+def _blank_row_cuts(image: Image.Image, segments: int) -> list[int]:
+    """Choose near-even horizontal cuts on the whitest available rows."""
+    gray = image.convert("L")
+    width, height = gray.size
+    search_radius = max(12, height // (segments * 8))
+    cuts: list[int] = []
+    for index in range(1, segments):
+        target = height * index // segments
+        low = max((cuts[-1] + 20) if cuts else 20, target - search_radius)
+        high = min(height - 20, target + search_radius)
+        if high <= low:
+            cuts.append(target)
+            continue
+        # Printed text leaves fully or nearly white scan rows between lines.
+        # Darkness (rather than a single darkest pixel) tolerates speckles.
+        best = min(
+            range(low, high + 1),
+            key=lambda row: sum(
+                255 - pixel
+                for pixel in gray.crop((0, row, width, row + 1)).get_flattened_data()
+            ),
+        )
+        cuts.append(best)
+    return cuts
+
+
+def _blank_column_cuts(image: Image.Image, segments: int) -> list[int]:
+    """Choose near-even vertical cuts between right-to-left text columns."""
+    gray = image.convert("L")
+    width, height = gray.size
+    search_radius = max(12, width // (segments * 8))
+    cuts: list[int] = []
+    for index in range(1, segments):
+        target = width * index // segments
+        low = max((cuts[-1] + 20) if cuts else 20, target - search_radius)
+        high = min(width - 20, target + search_radius)
+        if high <= low:
+            cuts.append(target)
+            continue
+        best = min(
+            range(low, high + 1),
+            key=lambda column: sum(
+                255 - pixel
+                for pixel in gray.crop((column, 0, column + 1, height)).get_flattened_data()
+            ),
+        )
+        cuts.append(best)
+    return cuts
+
+
+def _merge_band_texts(texts: list[str]) -> str:
+    merged = texts[0].rstrip()
+    for following in texts[1:]:
+        following = following.lstrip()
+        if (
+            merged
+            and following
+            and merged[-1] not in "。！？!?；;：:…—.”’\"'）)]】》〉」』"
+            and not re.search(r"\d{1,4}\s*$", merged.splitlines()[-1])
+            and re.match(r"[\w\u3400-\u9fff]", following)
+        ):
+            separator = (
+                " "
+                if merged[-1].isascii()
+                and merged[-1].isalnum()
+                and following[0].isascii()
+                and following[0].isalnum()
+                else ""
             )
-        environment = os.environ.copy()
-        environment["Z_AI_API_KEY"] = api_key
-        environment.setdefault("Z_AI_MODE", "ZHIPU")
-        environment["Z_AI_VISION_MODEL"] = vision_model
-        self.request_timeout = max(30, int(request_timeout))
-        # The upstream MCP package retries a failed tool call internally. Keep
-        # its first HTTP deadline just below our JSON-RPC deadline so a dense
-        # page can be split locally instead of multiplying two retry loops.
-        environment["Z_AI_TIMEOUT"] = str(
-            max(30, self.request_timeout - 5) * 1000
-        )
-        self.stderr_lines: deque[str] = deque(maxlen=40)
-        self._api_key = api_key
-        self.reading_direction = reading_direction
-        self.process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            bufsize=1,
-            env=environment,
-            start_new_session=(os.name == "posix"),
-        )
-        self.stderr_thread = threading.Thread(
-            target=self._drain_stderr,
-            name=f"vision-mcp-stderr-{self.process.pid}",
-            daemon=True,
-        )
-        self.stderr_thread.start()
-        self.stdout_lines: queue.Queue[str | None] = queue.Queue()
-        self.stdout_thread = threading.Thread(
-            target=self._drain_stdout,
-            name=f"vision-mcp-stdout-{self.process.pid}",
-            daemon=True,
-        )
-        self.stdout_thread.start()
-        self.next_id = 1
-        self._request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "translation-agent", "version": "2.0.0"},
-            },
-        )
-        self._notify("notifications/initialized", {})
-        tools_result = self._request("tools/list", {})
-        tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
-        self.tool = next(
-            (tool for tool in tools if isinstance(tool, dict) and tool.get("name") == "extract_text_from_screenshot"),
-            None,
-        )
-        if self.tool is None:
-            self.close()
-            raise RuntimeError("Coding Plan vision MCP does not expose extract_text_from_screenshot.")
-
-    def _drain_stderr(self) -> None:
-        if self.process.stderr is None:
-            return
-        try:
-            for raw_line in self.process.stderr:
-                line = raw_line.strip().replace(self._api_key, "<redacted>")
-                if line:
-                    self.stderr_lines.append(line)
-        except (OSError, ValueError):
-            # close() may close the pipe while the daemon reader is blocked.
-            return
-
-    def _drain_stdout(self) -> None:
-        if self.process.stdout is None:
-            self.stdout_lines.put(None)
-            return
-        try:
-            for raw_line in self.process.stdout:
-                self.stdout_lines.put(raw_line)
-        except (OSError, ValueError):
-            pass
-        finally:
-            self.stdout_lines.put(None)
-
-    def _diagnostics(self) -> str:
-        if not self.stderr_lines:
-            return ""
-        return " MCP stderr: " + " | ".join(list(self.stderr_lines)[-8:])
-
-    def _write(self, message: dict[str, Any]) -> None:
-        if self.process.stdin is None:
-            raise RuntimeError("Vision MCP stdin is unavailable.")
-        self.process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
-        self.process.stdin.flush()
-
-    def _notify(self, method: str, params: dict[str, Any]) -> None:
-        self._write({"jsonrpc": "2.0", "method": method, "params": params})
-
-    def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        request_id = self.next_id
-        self.next_id += 1
-        self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-        if self.process.stdout is None:
-            raise RuntimeError("Vision MCP stdout is unavailable.")
-        while True:
-            try:
-                line = self.stdout_lines.get(timeout=self.request_timeout)
-            except queue.Empty:
-                raise RuntimeError(
-                    f"Vision MCP request timed out after {self.request_timeout} seconds."
-                    f"{self._diagnostics()}"
-                )
-            if line is None:
-                code = self.process.poll()
-                raise RuntimeError(
-                    f"Vision MCP stopped before responding (exit={code})."
-                    f"{self._diagnostics()}"
-                )
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if message.get("id") != request_id:
-                continue
-            if "error" in message:
-                raise RuntimeError(
-                    f"Vision MCP error: {message['error']}{self._diagnostics()}"
-                )
-            result = message.get("result", {})
-            return result if isinstance(result, dict) else {"value": result}
-
-    def _tool_arguments(self, image_path: Path) -> dict[str, Any]:
-        schema = self.tool.get("inputSchema", {}) if isinstance(self.tool, dict) else {}
-        properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        required = schema.get("required", []) if isinstance(schema, dict) else []
-        arguments: dict[str, Any] = {}
-        for name, definition in properties.items():
-            lowered = name.lower()
-            if any(token in lowered for token in ("image", "path", "file")):
-                arguments[name] = str(image_path.resolve())
-            elif any(token in lowered for token in ("prompt", "query", "instruction")):
-                direction = (
-                    "这是日文竖排书页。每个单页必须从最右侧文字列开始，列内自上而下读取，再逐列向左；"
-                    "把各列连接成正常日文段落，绝不能按左列到右列倒序输出。"
-                    "如果单页分成上下两个或多个独立版块，必须先完整读完上方版块，再依次读下方版块，"
-                    "不得在上下版块之间来回跳读。页眉和页码单独成行，不要插入正文句中。"
-                    if self.reading_direction == "vertical"
-                    else "按从左到右、从上到下的自然阅读顺序输出。"
-                )
-                arguments[name] = (
-                    "逐字提取书页中的全部可见文字，不翻译、不总结。"
-                    f"{direction}保持标题、段落、列表、表格和脚注结构，输出 Markdown；"
-                    "无法辨认处标记 [无法辨认]。只输出识别文本。"
-                )
-            elif name in required and isinstance(definition, dict) and "default" in definition:
-                arguments[name] = definition["default"]
-        missing = [name for name in required if name not in arguments]
-        if missing:
-            raise RuntimeError(f"Unsupported vision MCP tool schema; required arguments={missing}")
-        return arguments
-
-    def extract_text(self, image_path: Path) -> tuple[str, str]:
-        result = self._request(
-            "tools/call",
-            {
-                "name": "extract_text_from_screenshot",
-                "arguments": self._tool_arguments(image_path),
-            },
-        )
-        if result.get("isError"):
-            raise RuntimeError(f"Vision MCP tool failed: {result.get('content')}")
-        parts: list[str] = []
-        for block in result.get("content", []):
-            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
-                parts.append(block["text"])
-        text = "\n".join(parts).strip()
-        if not text:
-            raise RuntimeError("Vision MCP returned no OCR text.")
-        return clean_ocr_text(text), f"mcp-{uuid.uuid4().hex[:12]}"
-
-    def close(self) -> None:
-        if self.process.poll() is None:
-            if os.name == "posix":
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(self.process.pid, signal.SIGTERM)
-            else:  # pragma: no cover - Windows compatibility path.
-                self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                if os.name == "posix":
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                else:  # pragma: no cover - Windows compatibility path.
-                    self.process.kill()
-                self.process.wait(timeout=3)
-        if self.process.stdin is not None and not self.process.stdin.closed:
-            self.process.stdin.close()
-        if self.stdout_thread.is_alive():
-            self.stdout_thread.join(timeout=1)
-        if (
-            not self.stdout_thread.is_alive()
-            and self.process.stdout is not None
-            and not self.process.stdout.closed
-        ):
-            self.process.stdout.close()
-        if self.stderr_thread.is_alive():
-            self.stderr_thread.join(timeout=1)
-        # Do not close a TextIOWrapper while the drain thread owns its read
-        # lock. A terminated child closes the write end, so the daemon reader
-        # will observe EOF without cross-thread close().
-        if (
-            not self.stderr_thread.is_alive()
-            and self.process.stderr is not None
-            and not self.process.stderr.closed
-        ):
-            self.process.stderr.close()
-
-
-class CodingPlanVisionOCR:
-    """One persistent official vision-MCP process per OCR worker thread."""
-
-    ocr_model = "coding-plan/glm-4.6v-vision-mcp"
-
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        command: str,
-        reading_direction: str = "horizontal",
-        vision_model: str = "glm-4.6v",
-        request_timeout: int = 120,
-    ) -> None:
-        self.api_key = api_key
-        if os.name == "nt":
-            tokens = shlex.split(command, posix=False)
-            self.command = [
-                token[1:-1]
-                if len(token) >= 2
-                and token[0] == token[-1]
-                and token[0] in {'"', "'"}
-                else token
-                for token in tokens
-            ]
+            merged += separator + following
         else:
-            self.command = shlex.split(command)
-        self.vision_model = vision_model.strip() or "glm-4.6v"
-        self.request_timeout = max(30, int(request_timeout))
-        self.prompt_version = f"{reading_direction}-v2"
-        self.ocr_model = (
-            f"coding-plan/{self.vision_model}-vision-mcp/{self.prompt_version}"
-        )
-        if reading_direction not in {"horizontal", "vertical"}:
-            raise ValueError(f"Unsupported OCR reading direction: {reading_direction}")
-        self.reading_direction = reading_direction
-        self.local = threading.local()
-        self.clients: list[McpStdioClient] = []
-        self.clients_lock = threading.Lock()
-        self.closed = threading.Event()
-        request_delay = max(
-            0.0,
-            float(os.getenv("CODING_PLAN_VISION_REQUEST_DELAY", "0")),
-        )
-        credential_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
-        self.request_limiter = SharedAdaptiveRateLimiter(
-            request_delay,
-            identity=f"coding-plan-{credential_fingerprint}",
-            min_interval=float(
-                os.getenv(
-                    "CODING_PLAN_VISION_MIN_REQUEST_DELAY",
-                    "5" if request_delay > 0 else "0",
-                )
-            ),
-            max_interval=float(
-                os.getenv("CODING_PLAN_VISION_MAX_REQUEST_DELAY", "60")
-            ),
-            success_window=max(
-                1,
-                int(os.getenv("CODING_PLAN_VISION_SPEEDUP_WINDOW", "8")),
-            ),
-        )
-
-    def _wait_for_request_slot(self) -> None:
-        limiter = getattr(self, "request_limiter", None)
-        if limiter is not None:
-            limiter.wait()
-
-    def _report_request_success(self) -> None:
-        limiter = getattr(self, "request_limiter", None)
-        if limiter is None:
-            return
-        interval, changed = limiter.report_success()
-        if changed:
-            print(f"[ocr-rate] status=speed-up interval={interval:.1f}s", flush=True)
-
-    def _report_request_rate_limit(self) -> None:
-        limiter = getattr(self, "request_limiter", None)
-        if limiter is None:
-            return
-        interval, changed = limiter.report_rate_limit()
-        if changed:
-            print(f"[ocr-rate] status=throttled interval={interval:.1f}s", flush=True)
-
-    def _is_vertical_two_page_spread(self, image_path: Path) -> bool:
-        if getattr(self, "reading_direction", "horizontal") != "vertical":
-            return False
-        enabled = os.getenv("CODING_PLAN_SPLIT_SPREADS", "1").strip().lower()
-        if enabled in {"0", "false", "no", "off"}:
-            return False
-        with Image.open(image_path) as image:
-            return image.width >= image.height * 1.25
-
-    def _client(self) -> McpStdioClient:
-        closed = getattr(self, "closed", None)
-        if closed is not None and closed.is_set():
-            raise RuntimeError("Vision MCP OCR backend is closed.")
-        client = getattr(self.local, "client", None)
-        if client is None:
-            client = McpStdioClient(
-                self.command,
-                api_key=self.api_key,
-                vision_model=self.vision_model,
-                request_timeout=self.request_timeout,
-                reading_direction=self.reading_direction,
-            )
-            self.local.client = client
-            with self.clients_lock:
-                self.clients.append(client)
-        return client
-
-    @staticmethod
-    def _is_content_filter_error(error: Exception) -> bool:
-        message = str(error).lower()
-        return any(token in message for token in ("contentfilter", '"code":"1301"', "potentially unsafe"))
-
-    @staticmethod
-    def _is_timeout_error(error: Exception) -> bool:
-        message = str(error).lower()
-        return "timed out" in message or "timeout" in message
-
-    @staticmethod
-    def _is_short_ocr_error(error: Exception) -> bool:
-        return "below configured minimum" in str(error).lower()
-
-    @staticmethod
-    def _is_rate_limit_error(error: Exception) -> bool:
-        message = str(error).lower()
-        return "429" in message or "rate limit" in message or "rate-limit" in message
-
-    @staticmethod
-    def _blank_row_cuts(image: Image.Image, segments: int) -> list[int]:
-        """Choose near-even horizontal cuts on the whitest available rows."""
-        gray = image.convert("L")
-        width, height = gray.size
-        search_radius = max(12, height // (segments * 8))
-        cuts: list[int] = []
-        for index in range(1, segments):
-            target = height * index // segments
-            low = max((cuts[-1] + 20) if cuts else 20, target - search_radius)
-            high = min(height - 20, target + search_radius)
-            if high <= low:
-                cuts.append(target)
-                continue
-            # Printed text leaves fully or nearly white scan rows between lines.
-            # Darkness (rather than a single darkest pixel) tolerates speckles.
-            best = min(
-                range(low, high + 1),
-                key=lambda row: sum(
-                    255 - pixel
-                    for pixel in gray.crop((0, row, width, row + 1)).get_flattened_data()
-                ),
-            )
-            cuts.append(best)
-        return cuts
-
-    @staticmethod
-    def _blank_column_cuts(image: Image.Image, segments: int) -> list[int]:
-        """Choose near-even vertical cuts between right-to-left text columns."""
-        gray = image.convert("L")
-        width, height = gray.size
-        search_radius = max(12, width // (segments * 8))
-        cuts: list[int] = []
-        for index in range(1, segments):
-            target = width * index // segments
-            low = max((cuts[-1] + 20) if cuts else 20, target - search_radius)
-            high = min(width - 20, target + search_radius)
-            if high <= low:
-                cuts.append(target)
-                continue
-            best = min(
-                range(low, high + 1),
-                key=lambda column: sum(
-                    255 - pixel
-                    for pixel in gray.crop((column, 0, column + 1, height)).get_flattened_data()
-                ),
-            )
-            cuts.append(best)
-        return cuts
-
-    def _ocr_segmented(
-        self,
-        image_path: Path,
-        client: McpStdioClient,
-        *,
-        segments: int,
-        physical_spread: bool = False,
-    ) -> tuple[str, str]:
-        """OCR a filtered page as ordered horizontal bands using the same MCP."""
-        part_paths: list[tuple[Path, int | None]] = []
-        texts: list[str] = []
-        physical_page_texts: list[list[str]] = [[], []]
-        try:
-            with Image.open(image_path) as source:
-                image = source.convert("RGB")
-                width, height = image.size
-                if getattr(self, "reading_direction", "horizontal") == "vertical":
-                    boundaries = [0, *self._blank_column_cuts(image, segments), width]
-                    physical_page_regions = [
-                        (left, 0, right, height)
-                        for left, right in reversed(list(zip(boundaries, boundaries[1:])))
-                    ]
-                    page_rows = max(
-                        1,
-                        int(os.getenv("CODING_PLAN_VERTICAL_PAGE_ROWS", "1")),
-                    )
-                    page_columns = max(
-                        1,
-                        int(os.getenv("CODING_PLAN_VERTICAL_PAGE_COLUMNS", "1")),
-                    )
-                    # With the ordinary two-way spread split, each outer
-                    # region is one physical page (right page first).  Dense
-                    # vertical layouts can opt into a finer grid without
-                    # changing the ordering of the content-filter fallbacks,
-                    # which may deliberately request 4/8/16 outer bands.
-                    if segments == 2 and (page_rows > 1 or page_columns > 1):
-                        region_specs: list[
-                            tuple[tuple[int, int, int, int], int | None]
-                        ] = []
-                        for physical_page_index, (
-                            page_left,
-                            page_top,
-                            page_right,
-                            page_bottom,
-                        ) in enumerate(physical_page_regions):
-                            physical_page = image.crop(
-                                (page_left, page_top, page_right, page_bottom)
-                            )
-                            page_width, page_height = physical_page.size
-                            row_boundaries = [
-                                0,
-                                *self._blank_row_cuts(physical_page, page_rows),
-                                page_height,
-                            ]
-                            for row_top, row_bottom in zip(
-                                row_boundaries, row_boundaries[1:]
-                            ):
-                                row_image = physical_page.crop(
-                                    (0, row_top, page_width, row_bottom)
-                                )
-                                column_boundaries = [
-                                    0,
-                                    *self._blank_column_cuts(row_image, page_columns),
-                                    page_width,
-                                ]
-                                for column_left, column_right in reversed(
-                                    list(
-                                        zip(
-                                            column_boundaries,
-                                            column_boundaries[1:],
-                                        )
-                                    )
-                                ):
-                                    region_specs.append(
-                                        (
-                                            (
-                                                page_left + column_left,
-                                                page_top + row_top,
-                                                page_left + column_right,
-                                                page_top + row_bottom,
-                                            ),
-                                            (
-                                                physical_page_index
-                                                if physical_spread
-                                                else None
-                                            ),
-                                        )
-                                    )
-                    else:
-                        region_specs = []
-                        for region in physical_page_regions:
-                            left, _top, right, _bottom = region
-                            physical_page_index = (
-                                0 if (left + right) / 2 >= width / 2 else 1
-                            )
-                            region_specs.append(
-                                (
-                                    region,
-                                    physical_page_index if physical_spread else None,
-                                )
-                            )
-                else:
-                    boundaries = [0, *self._blank_row_cuts(image, segments), height]
-                    region_specs = [
-                        ((0, top, width, bottom), None)
-                        for top, bottom in zip(boundaries, boundaries[1:])
-                    ]
-                for index, (region, physical_page_index) in enumerate(
-                    region_specs,
-                    start=1,
-                ):
-                    part_path = image_path.with_name(
-                        f"{image_path.stem}_segment_{index}_{uuid.uuid4().hex[:8]}.jpg"
-                    )
-                    image.crop(region).save(part_path, "JPEG", quality=95, optimize=True)
-                    part_paths.append((part_path, physical_page_index))
-            for part_index, (part_path, physical_page_index) in enumerate(
-                part_paths,
-                start=1,
-            ):
-                segment_started_at = time.monotonic()
-                print(
-                    f"[ocr-segment-start] page_image={image_path.stem} "
-                    f"segment={part_index}/{len(part_paths)}",
-                    flush=True,
-                )
-                # Preserve previously completed segments when only the current
-                # request is rate-limited. Retrying at page level would repeat
-                # every successful segment from the beginning.
-                text, _ = retry_with_backoff(
-                    lambda: self._ocr_filtered_band(part_path, depth=0),
-                    policy=RetryPolicy(
-                        attempts=max(
-                            1,
-                            int(os.getenv("CODING_PLAN_SEGMENT_ATTEMPTS", "4")),
-                        ),
-                        base_delay=2.0,
-                        max_delay=12.0,
-                        rate_limit_base_delay=float(
-                            os.getenv("CODING_PLAN_SEGMENT_RATE_LIMIT_DELAY", "15")
-                        ),
-                        rate_limit_max_delay=float(
-                            os.getenv("CODING_PLAN_SEGMENT_RATE_LIMIT_MAX_DELAY", "60")
-                        ),
-                        rate_limit_jitter=float(
-                            os.getenv("CODING_PLAN_SEGMENT_RATE_LIMIT_JITTER", "3")
-                        ),
-                    ),
-                    should_retry=self._is_rate_limit_error,
-                    is_rate_limited=lambda _exc: True,
-                )
-                print(
-                    f"[ocr-segment-response] page_image={image_path.stem} "
-                    f"segment={part_index}/{len(part_paths)} "
-                    f"elapsed={time.monotonic() - segment_started_at:.1f}s "
-                    f"chars={len(text)}",
-                    flush=True,
-                )
-                text = text.strip()
-                if text and not self._is_empty_band_text(text):
-                    texts.append(text)
-                    if physical_page_index is not None:
-                        physical_page_texts[physical_page_index].append(text)
-        finally:
-            for part_path, _physical_page_index in part_paths:
-                part_path.unlink(missing_ok=True)
-        if not texts:
-            raise RuntimeError("Segmented vision MCP OCR returned an empty band.")
-        if physical_spread:
-            pages = [
-                self._merge_band_texts(page_texts) if page_texts else ""
-                for page_texts in physical_page_texts
-            ]
-            return (
-                PhysicalPageOCRText(pages),
-                f"mcp-segmented-{uuid.uuid4().hex[:12]}",
-            )
-        return self._merge_band_texts(texts), f"mcp-segmented-{uuid.uuid4().hex[:12]}"
-
-    @staticmethod
-    def _is_empty_band_text(text: str) -> bool:
-        return bool(
-            re.fullmatch(
-                r"(?:```\s*)?[（(\[]?(?:\[无法辨认\]|(?:无|没有)可见(?:文字|内容)|空白页|blank)"
-                r"(?:[，,：:].*)?[）)\]]?[。.]?(?:\s*```)?",
-                text.strip(),
-                flags=re.I,
-            )
-        )
-
-    @staticmethod
-    def _merge_band_texts(texts: list[str]) -> str:
-        merged = texts[0].rstrip()
-        for following in texts[1:]:
-            following = following.lstrip()
-            if (
-                merged
-                and following
-                and merged[-1] not in "。！？!?；;：:…—.”’\"'）)]】》〉」』"
-                and not re.search(r"\d{1,4}\s*$", merged.splitlines()[-1])
-                and re.match(r"[\w\u3400-\u9fff]", following)
-            ):
-                separator = (
-                    " "
-                    if merged[-1].isascii()
-                    and merged[-1].isalnum()
-                    and following[0].isascii()
-                    and following[0].isalnum()
-                    else ""
-                )
-                merged += separator + following
-            else:
-                merged += "\n\n" + following
-        return merged
-
-    def _ocr_filtered_band(self, image_path: Path, *, depth: int) -> tuple[str, str]:
-        """Recursively split a band that is filtered or too dense to finish."""
-        client = self._client()
-        try:
-            self._wait_for_request_slot()
-            result = client.extract_text(image_path)
-            minimum_chars = max(
-                0,
-                int(os.getenv("CODING_PLAN_MIN_OCR_CHARS", "0")),
-            )
-            compact_length = len(re.sub(r"\s+", "", result[0]))
-            # This opt-in guard is evaluated only for the complete physical
-            # page/band. Recursive children may legitimately contain a short
-            # heading or sparse lower block, so they must not inherit it.
-            if depth == 0 and minimum_chars and compact_length < minimum_chars:
-                raise RuntimeError(
-                    "Vision MCP OCR text is below configured minimum: "
-                    f"chars={compact_length} minimum={minimum_chars}."
-                )
-            self._report_request_success()
-            return result
-        except Exception as exc:
-            if self._is_rate_limit_error(exc):
-                self._report_request_rate_limit()
-            is_filter = self._is_content_filter_error(exc)
-            is_timeout = self._is_timeout_error(exc)
-            is_short = self._is_short_ocr_error(exc)
-            max_depth = 6 if is_filter else 3
-            if not (is_filter or is_timeout or is_short) or depth >= max_depth:
-                if is_filter or is_timeout or is_short:
-                    client.close()
-                    self.local.client = None
-                raise
-            fallback_reason = (
-                "content-filter" if is_filter else "short-output" if is_short else "timeout"
-            )
-            print(
-                f"[ocr-fallback] page_image={image_path.stem} "
-                f"reason={fallback_reason} "
-                f"depth={depth} next_depth={depth + 1}",
-                flush=True,
-            )
-            # A filtered MCP process can stop answering. Recreate it before
-            # sending the smaller child bands.
-            client.close()
-            self.local.client = None
-            child_paths: list[Path] = []
-            texts: list[str] = []
-            try:
-                with Image.open(image_path) as source:
-                    image = source.convert("RGB")
-                    width, height = image.size
-                    is_vertical = getattr(self, "reading_direction", "horizontal") == "vertical"
-                    is_vertical_grid_cell = (
-                        is_vertical
-                        and "_segment_" in image_path.stem
-                        and int(os.getenv("CODING_PLAN_VERTICAL_PAGE_ROWS", "1")) > 1
-                    )
-                    # A normal portrait physical page in this magazine is laid
-                    # out as an upper block followed by a lower block.  When a
-                    # whole page reaches the recursive fallback, splitting it
-                    # into right/left halves interleaves those blocks.  Narrow
-                    # column bands created by _ocr_segmented still need the
-                    # ordinary vertical right-to-left split.  Re-evaluating the
-                    # geometry at every recursion also lets a horizontal child
-                    # band fall back to its constituent vertical columns.
-                    is_portrait_page = (
-                        is_vertical
-                        and not is_vertical_grid_cell
-                        and width < height
-                        and width * 2 >= height
-                    )
-                    split_horizontally = not is_vertical or is_portrait_page
-                    split_dimension = height if split_horizontally else width
-                    if split_dimension < 40:
-                        raise RuntimeError(
-                            "Vision MCP fallback persisted at the minimum safe band size."
-                        ) from exc
-                    if split_horizontally:
-                        cut = self._blank_row_cuts(image, 2)[0]
-                        regions = ((0, 0, width, cut), (0, cut, width, height))
-                    else:
-                        cut = self._blank_column_cuts(image, 2)[0]
-                        regions = ((cut, 0, width, height), (0, 0, cut, height))
-                    if cut <= 0 or cut >= split_dimension:
-                        raise RuntimeError(
-                            "Vision MCP fallback could not be split into nonempty bands."
-                        ) from exc
-                    for index, region in enumerate(regions, start=1):
-                        child = image_path.with_name(
-                            f"{image_path.stem}_filtered_{depth}_{index}_{uuid.uuid4().hex[:8]}.jpg"
-                        )
-                        image.crop(region).save(
-                            child, "JPEG", quality=95, optimize=True
-                        )
-                        child_paths.append(child)
-                for child in child_paths:
-                    text, _ = self._ocr_filtered_band(child, depth=depth + 1)
-                    if text.strip() and not self._is_empty_band_text(text):
-                        texts.append(text.strip())
-            finally:
-                for child in child_paths:
-                    child.unlink(missing_ok=True)
-            if not texts:
-                raise RuntimeError("Filtered-band vision OCR returned no text.") from exc
-            return self._merge_band_texts(texts), f"mcp-filtered-{uuid.uuid4().hex[:12]}"
-
-    def ocr_image(self, image_path: Path) -> tuple[str, str]:
-        attempts = max(1, int(os.getenv("CODING_PLAN_OCR_ATTEMPTS", "2")))
-
-        def recognize_once() -> tuple[str, str]:
-            client = self._client()
-            used_segmented_path = False
-            try:
-                if self._is_vertical_two_page_spread(image_path):
-                    used_segmented_path = True
-                    spread_segments = max(
-                        2,
-                        int(os.getenv("CODING_PLAN_SPREAD_SEGMENTS", "2")),
-                    )
-                    return self._ocr_segmented(
-                        image_path,
-                        client,
-                        segments=spread_segments,
-                        physical_spread=True,
-                    )
-                self._wait_for_request_slot()
-                result = client.extract_text(image_path)
-                self._report_request_success()
-                return result
-            except Exception as exc:  # noqa: BLE001 - MCP/network failures are retried per page.
-                # Segmented requests report each 429 at the exact failing
-                # segment. Avoid penalising the shared interval twice when the
-                # final segment retry bubbles up to this page-level boundary.
-                if self._is_rate_limit_error(exc) and not used_segmented_path:
-                    self._report_request_rate_limit()
-                retry_error: Exception = exc
-                is_filter = self._is_content_filter_error(exc)
-                is_timeout = self._is_timeout_error(exc)
-                if is_filter or is_timeout:
-                    # A whole scholarly page can trip input filtering because
-                    # of an isolated historical phrase.  Retrying the identical
-                    # image cannot help, so use the same OCR service on ordered
-                    # page bands.  Eight bands are a final fallback when four
-                    # still contain the triggering context.
-                    # Recreate the stdio client first: some MCP server builds
-                    # stop answering subsequent tool calls after error 1301.
-                    # Recursive band handling may already have replaced the
-                    # client captured above. Close the currently active MCP
-                    # process, not a stale wrapper, before starting a retry.
-                    local_state = getattr(self, "local", None)
-                    active_client = (
-                        getattr(local_state, "client", None)
-                        if local_state is not None
-                        else None
-                    ) or client
-                    close_client = getattr(active_client, "close", None)
-                    if callable(close_client):
-                        close_client()
-                    if hasattr(self, "local"):
-                        self.local.client = None
-                    client = self._client()
-                    segment_counts = (4, 8, 16, 32) if is_filter else (2,)
-                    for segments in segment_counts:
-                        try:
-                            return self._ocr_segmented(image_path, client, segments=segments)
-                        except Exception as segmented_error:  # noqa: BLE001
-                            retry_error = segmented_error
-                            if not self._is_content_filter_error(segmented_error):
-                                break
-                process = getattr(client, "process", None)
-                if (
-                    (process is not None and process.poll() is not None)
-                    or self._is_timeout_error(exc)
-                ):
-                    client.close()
-                    self.local.client = None
-                raise retry_error
-
-        try:
-            return retry_with_backoff(
-                recognize_once,
-                policy=RetryPolicy(
-                    attempts=attempts,
-                    base_delay=2.0,
-                    max_delay=12.0,
-                    rate_limit_base_delay=5.0,
-                    rate_limit_max_delay=45.0,
-                    rate_limit_jitter=3.0,
-                ),
-                should_retry=lambda exc: not (
-                    (getattr(self, "closed", None) is not None and self.closed.is_set())
-                    or self._is_content_filter_error(exc)
-                    or self._is_timeout_error(exc)
-                    or self._is_rate_limit_error(exc)
-                ),
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Vision MCP OCR failed after {attempts} attempts: {exc}"
-            ) from exc
-
-    def close(self) -> None:
-        closed = getattr(self, "closed", None)
-        if closed is not None:
-            closed.set()
-        with self.clients_lock:
-            clients = list(self.clients)
-            self.clients.clear()
-        for client in clients:
-            client.close()
+            merged += "\n\n" + following
+    return merged
 
 
 class TesseractOCR:
@@ -1870,6 +1048,257 @@ class TesseractOCR:
         while re.search(fr"(?<=[{japanese}]) (?=[{japanese}])", text):
             text = re.sub(fr"(?<=[{japanese}]) (?=[{japanese}])", "", text)
         return text, "local-tesseract"
+
+    def close(self) -> None:
+        return
+
+
+# OpenAI-compatible vision OCR prompt.  A plain multimodal chat model has no
+# layout parser, so the reading-order contract has to be stated explicitly;
+# it is a superset of the Coding Plan MCP instruction.
+OPENAI_VISION_OCR_PROMPT_HORIZONTAL = (
+    "逐字提取这页书页中的全部可见文字，不翻译、不总结。"
+    "按从左到右、从上到下的自然阅读顺序输出。"
+    "保持标题、段落、列表、表格和脚注结构，输出 Markdown；"
+    "无法辨认处标记 [无法辨认]。只输出识别文本。"
+)
+OPENAI_VISION_OCR_PROMPT_VERTICAL = (
+    "逐字提取这页日文竖排书页中的全部可见文字，不翻译、不总结。"
+    "每个单页必须从最右侧文字列开始，列内自上而下读取，再逐列向左；"
+    "把各列连接成正常日文段落，绝不能按左列到右列倒序输出。"
+    "如果单页分成上下两个或多个独立版块，必须先完整读完上方版块，再依次读下方版块，"
+    "不得在上下版块之间来回跳读。页眉和页码单独成行，不要插入正文句中。"
+    "保持标题、段落、列表、表格和脚注结构，输出 Markdown；"
+    "无法辨认处标记 [无法辨认]。只输出识别文本。"
+)
+
+
+class OpenAIVisionOCR:
+    """OCR through an OpenAI-compatible ``/chat/completions`` vision model.
+
+    Unlike a dedicated layout parser, a routed chat model receives the page
+    image as a data URL, so this backend owns the reading-order prompt and the
+    ordered-band fallback itself.  It is the only vision backend left: GLM's
+    chat and vision endpoints are gone from the product.
+
+    Cache identity is ``openai-vision/<model>/<direction>-v1``: switching the
+    routed model or the reading direction invalidates page checkpoints, while
+    changing only the gateway URL or credential does not.
+    """
+
+    prompt_version = "openai-vision-v1"
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_base: str,
+        vision_model: str,
+        reading_direction: str = "horizontal",
+        request_timeout: int = 180,
+        retries: int = 3,
+        max_output_tokens: int = 8192,
+        temperature: float = 0.0,
+    ) -> None:
+        if reading_direction not in {"horizontal", "vertical"}:
+            raise ValueError(f"Unsupported OCR reading direction: {reading_direction}")
+        base = str(api_base or "").strip().rstrip("/")
+        if not base:
+            raise ValueError("OpenAI-compatible vision OCR requires a base URL.")
+        model = str(vision_model or "").strip()
+        if not model:
+            raise ValueError("OpenAI-compatible vision OCR requires a model name.")
+        self.api_key = api_key
+        self.api_base = base
+        self.vision_model = model
+        self.reading_direction = reading_direction
+        self.request_timeout = max(30, int(request_timeout))
+        self.retries = max(1, int(retries))
+        self.max_output_tokens = max(256, int(max_output_tokens))
+        self.temperature = float(temperature)
+        self.prompt = (
+            OPENAI_VISION_OCR_PROMPT_VERTICAL
+            if reading_direction == "vertical"
+            else OPENAI_VISION_OCR_PROMPT_HORIZONTAL
+        )
+        self.ocr_model = (
+            f"openai-vision/{model}/{reading_direction}/{self.prompt_version}"
+        )
+
+    @staticmethod
+    def _is_content_filter_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return any(
+            token in message
+            for token in ("contentfilter", '"code":"1301"', "potentially unsafe", "content_filter")
+        )
+
+    @staticmethod
+    def _is_timeout_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "timed out" in message or "timeout" in message
+
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        message = str(error).lower()
+        return "429" in message or "rate limit" in message or "rate-limit" in message
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.api_base}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        def request_once() -> dict[str, Any]:
+            try:
+                with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:1200]
+                raise ProviderHTTPError("VisionOCR", exc.code, detail) from exc
+
+        return retry_with_backoff(
+            request_once,
+            policy=RetryPolicy(
+                attempts=self.retries,
+                base_delay=1.5,
+                max_delay=8.0,
+                rate_limit_base_delay=5.0,
+                rate_limit_max_delay=45.0,
+                rate_limit_jitter=3.0,
+            ),
+            should_retry=lambda exc: not (
+                isinstance(exc, ProviderHTTPError)
+                and exc.status_code in {400, 401, 403, 404, 422}
+            ),
+        )
+
+    def _transcribe(self, image_path: Path) -> tuple[str, str]:
+        mime = "image/png" if image_path.suffix.lower() == ".png" else "image/jpeg"
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        payload: dict[str, Any] = {
+            "model": self.vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self.prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{encoded}"},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": self.max_output_tokens,
+            "temperature": self.temperature,
+        }
+        response = self._post(payload)
+        try:
+            content = response["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(
+                "Unexpected OpenAI-compatible vision response; request_id="
+                f"{response.get('id', 'unknown')}"
+            ) from exc
+        if isinstance(content, list):
+            # Some gateways return the content as typed blocks.
+            content = "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict)
+            )
+        text = clean_ocr_text(str(content or ""))
+        if not text:
+            raise RuntimeError("Vision OCR returned no text.")
+        request_id = str(response.get("id") or "")
+        return text, request_id
+
+    def _transcribe_bands(self, image_path: Path, *, segments: int) -> tuple[str, str]:
+        """Split a page into ordered bands and OCR each one separately.
+
+        A whole-page request can trip an input filter or exceed the gateway
+        timeout on a dense scan.  Horizontal layouts split on blank rows;
+        vertical (or two-page spread) layouts split on blank columns, keeping
+        right-to-left band order.
+        """
+
+        part_paths: list[Path] = []
+        texts: list[str] = []
+        try:
+            with Image.open(image_path) as source:
+                image = source.convert("RGB")
+                width, height = image.size
+                vertical = self.reading_direction == "vertical"
+                if vertical:
+                    boundaries = [
+                        0,
+                        *_blank_column_cuts(image, segments),
+                        width,
+                    ]
+                    regions = [
+                        (left, 0, right, height)
+                        for left, right in reversed(
+                            list(zip(boundaries, boundaries[1:]))
+                        )
+                    ]
+                else:
+                    boundaries = [
+                        0,
+                        *_blank_row_cuts(image, segments),
+                        height,
+                    ]
+                    regions = [
+                        (0, top, width, bottom)
+                        for top, bottom in zip(boundaries, boundaries[1:])
+                    ]
+                for index, region in enumerate(regions, start=1):
+                    part_path = image_path.with_name(
+                        f"{image_path.stem}_band_{index}_{uuid.uuid4().hex[:8]}.jpg"
+                    )
+                    image.crop(region).save(part_path, "JPEG", quality=95, optimize=True)
+                    part_paths.append(part_path)
+            for part_path in part_paths:
+                try:
+                    text, _request_id = self._transcribe(part_path)
+                except Exception as band_error:  # noqa: BLE001 - a blank band is not fatal.
+                    if self._is_content_filter_error(band_error):
+                        continue
+                    raise
+                text = text.strip()
+                if text and not is_unreadable_ocr_text(text):
+                    texts.append(text)
+        finally:
+            for part_path in part_paths:
+                part_path.unlink(missing_ok=True)
+        if not texts:
+            raise RuntimeError("Segmented vision OCR returned no text.")
+        return _merge_band_texts(texts), f"band-{uuid.uuid4().hex[:12]}"
+
+    def ocr_image(self, image_path: Path) -> tuple[str, str]:
+        try:
+            return self._transcribe(image_path)
+        except Exception as exc:  # noqa: BLE001 - fall back to ordered bands.
+            if not (self._is_content_filter_error(exc) or self._is_timeout_error(exc)):
+                raise
+            segment_counts = (
+                (2, 4, 8) if self._is_content_filter_error(exc) else (2,)
+            )
+            retry_error: Exception = exc
+            for segments in segment_counts:
+                try:
+                    return self._transcribe_bands(image_path, segments=segments)
+                except Exception as segmented_error:  # noqa: BLE001
+                    retry_error = segmented_error
+                    if not self._is_content_filter_error(segmented_error):
+                        break
+            raise retry_error
 
     def close(self) -> None:
         return
@@ -3222,7 +2651,7 @@ def normalize_toc_payload(payload: dict[str, Any], *, fallback_pages: list[int] 
 
 def extract_toc(
     records: list[PageRecord],
-    client: GlmClient,
+    client: ChatCompletionsClient,
     *,
     front_matter_pages: int,
     toc_pages: list[int] | None,
@@ -6171,7 +5600,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Text-model Profile for the optional OCR proofreading stage.",
     )
     parser.add_argument("--translation-profile", default=None)
-    parser.add_argument("--api-mode", choices=["coding-plan", "standard"], default=os.getenv("GLM_API_MODE", "coding-plan"))
     parser.add_argument(
         "--api-key",
         default=None,
@@ -6185,26 +5613,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--api-base",
         default=None,
-        help="Text model base URL; selected from --api-mode when omitted.",
+        help="Text model base URL for the stage that has no explicit profile.",
     )
-    parser.add_argument("--ocr-model", default=os.getenv("GLM_OCR_MODEL", "glm-ocr"))
-    parser.add_argument("--text-model", default=os.getenv("GLM_TEXT_MODEL", "glm-5.2"))
+    # The text model always comes from the selected profile (or --translation-model).
     parser.add_argument(
         "--api-timeout",
         type=int,
         default=int(os.getenv("GLM_API_TIMEOUT", "120")),
-        help="Timeout in seconds for each standard GLM HTTP request (default: GLM_API_TIMEOUT or 120).",
+        help="Timeout in seconds for each stage HTTP request (default: 120).",
     )
     parser.add_argument(
         "--ocr-backend",
-        choices=["auto", "coding-plan-mcp", "glm-ocr", "tesseract", "paddleocr-local", "paddleocr-native"],
+        choices=[
+            "auto",
+            "openai-vision",
+            "tesseract",
+            "paddleocr-local",
+            "paddleocr-native",
+        ],
         default=os.getenv("OCR_BACKEND", "auto"),
         help=(
-            "auto prefers local PaddleOCR GPU, then native CPU, and falls back to "
-            "the OCR profile/cloud backend when it is unavailable; coding-plan-mcp "
-            "is the cloud vision MCP, glm-ocr the separately billed standard API, "
-            "tesseract the offline engine, paddleocr-local the explicit local GPU "
-            "deployment (no content filtering, no API quota)."
+            "auto follows the selected OCR profile, then falls back to a detected "
+            "local PaddleOCR engine. openai-vision is an OpenAI-compatible "
+            "multimodal chat model (Magpie/OpenRouter/any gateway), tesseract the "
+            "offline engine, paddleocr-local the local GPU deployment, "
+            "paddleocr-native the local CPU engine."
         ),
     )
     parser.add_argument(
@@ -6250,12 +5683,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Environment variable containing the separately billed OCR credential.",
     )
-    parser.add_argument("--ocr-api-base", default=os.getenv("GLM_OCR_API_BASE", DEFAULT_STANDARD_API_BASE))
-    parser.add_argument(
-        "--ocr-command",
-        default=os.getenv("CODING_PLAN_VISION_MCP_COMMAND", "npx -y @z_ai/mcp-server@0.1.4"),
-        help="Official Coding Plan vision MCP stdio command.",
-    )
     parser.add_argument("--start-page", type=int, default=1)
     parser.add_argument("--end-page", type=int, default=None)
     parser.add_argument(
@@ -6285,7 +5712,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Reuse a cached OCR page only when its ocr_model starts with one of these "
-            "comma-separated prefixes; for example coding-plan/,manual/visually-confirmed-blank."
+            "comma-separated prefixes; for example openai-vision/,manual/visually-confirmed-blank."
         ),
     )
     parser.add_argument(
@@ -6515,15 +5942,8 @@ def resolve_api_key(
     )
     if profile is not None:
         return str(args.api_key or explicit_env or profile_key).strip()
-    if args.api_mode == "coding-plan":
-        return str(
-            args.api_key
-            or explicit_env
-            or profile_key
-            or os.getenv("GLM_CODING_API_KEY")
-            or os.getenv("Z_AI_API_KEY")
-            or ""
-        ).strip()
+    # No provider default: GLM credentials are not consulted anywhere except
+    # the RAG embedding provider, which resolves its own key.
     return str(
         args.api_key
         or explicit_env
@@ -6586,12 +6006,7 @@ def resolve_ocr_api_key(
     )
     if profile is not None:
         return str(args.ocr_api_key or explicit_env or profile_key).strip()
-    return str(
-        args.ocr_api_key
-        or explicit_env
-        or os.getenv("GLM_OCR_API_KEY")
-        or (resolve_api_key(args) if args.api_mode == "standard" else "")
-    ).strip()
+    return str(args.ocr_api_key or explicit_env).strip()
 
 
 def resolve_worker_counts(args: argparse.Namespace) -> tuple[int, int]:
@@ -6660,7 +6075,7 @@ def build_translation_client(
             thinking=(profile.thinking if profile is not None else "disabled"),
             adapter_name=(profile.adapter if profile is not None else "openai-chat"),
         )
-    client = GlmClient(
+    client = ChatCompletionsClient(
         api_key=key,
         api_base=(
             args.translation_api_base
@@ -6670,7 +6085,6 @@ def build_translation_client(
         text_model=(
             args.translation_model
             or (profile.model if profile is not None else "")
-            or args.text_model
         ),
         timeout=timeout,
         provider_name=provider or "glm",
@@ -6731,7 +6145,6 @@ def resolve_translation_identity(
         model = (
             args.translation_model
             or (profile.model if profile is not None else "")
-            or args.text_model
         )
     return ModelIdentity(
         provider=provider,
@@ -6749,20 +6162,13 @@ def resolve_toc_api_base(
     *,
     toc_profile: ModelProfile | None = None,
 ) -> str:
-    if args.api_mode == "coding-plan":
-        default_glm_base = (
-            args.api_base
-            or os.getenv("GLM_CODING_API_BASE")
-            or DEFAULT_CODING_API_BASE
-        )
-    else:
-        default_glm_base = (
-            args.api_base or os.getenv("GLM_API_BASE") or DEFAULT_STANDARD_API_BASE
-        )
+    # No provider default: the TOC stage must be told which gateway to use.
+    # GLM endpoints are deliberately absent -- GLM survives only as the RAG
+    # embedding provider.
     return (
         args.api_base
         or (toc_profile.base_url if toc_profile is not None else "")
-        or default_glm_base
+        or os.getenv("TOC_API_BASE", "")
     )
 
 
@@ -6818,6 +6224,19 @@ def resolve_ocr_reading_direction(
     )
 
 
+def _vision_model_name(
+    args: argparse.Namespace,
+    ocr_profile: ModelProfile | None,
+) -> str:
+    """The routed vision model id, from the profile first, then the environment."""
+
+    return (
+        (ocr_profile.model if ocr_profile is not None else "")
+        or os.getenv("OPENAI_VISION_MODEL", "")
+        or "unknown"
+    )
+
+
 def resolve_expected_ocr_model_prefix(
     args: argparse.Namespace,
     ocr_profile: ModelProfile | None = None,
@@ -6829,14 +6248,10 @@ def resolve_expected_ocr_model_prefix(
     if args.ocr_cache_model_prefix:
         return str(args.ocr_cache_model_prefix)
     backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
-    if backend == "coding-plan-mcp":
-        direction = resolve_ocr_reading_direction(args, ocr_profile)
-        model = (
-            ocr_profile.model
-            if ocr_profile is not None
-            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
-        )
-        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
+    if backend == "openai-vision":
+        # Vision OCR pages are keyed by model + reading direction, so status
+        # matches on that prefix and lets the exact resolver narrow the rest.
+        return f"openai-vision/{_vision_model_name(args, ocr_profile)}/"
     if backend in {"paddleocr-local", "paddleocr-native"}:
         return backend + "/"
     return None
@@ -6904,20 +6319,19 @@ def resolve_ocr_backend_name(
     requested = str(getattr(args, "ocr_backend", "") or "auto").strip()
     if requested not in {"auto", ""}:
         return requested, "explicit --ocr-backend"
-    if ocr_profile is not None and ocr_profile.adapter in {"paddleocr-native", "paddleocr-local"}:
-        return ocr_profile.adapter, "selected local OCR profile"
+    # A configured OCR profile names the backend the operator selected, so it
+    # is authoritative: an OCR node pinned to a cloud vision model must not be
+    # silently replaced by an opportunistically detected local engine.  Only a
+    # run without any OCR profile falls back to local-first auto detection.
+    if ocr_profile is not None and ocr_profile.adapter:
+        return ocr_profile.adapter, "selected OCR profile"
     if paddle_local_available():
         return "paddleocr-local", "auto: local PaddleOCR GPU deployment detected"
     if paddle_native_available(args, ocr_profile):
         return "paddleocr-native", "auto: native PaddleOCR CPU models detected"
-    fallback = (
-        ocr_profile.adapter
-        if ocr_profile is not None and ocr_profile.adapter
-        else "coding-plan-mcp"
-    )
-    return fallback, (
-        "auto: local PaddleOCR GPU deployment unavailable; using "
-        f"{fallback}"
+    raise ValueError(
+        "No OCR backend is available: configure an ocr_profile with adapter "
+        "openai-vision, or install a local PaddleOCR engine / tesseract."
     )
 
 
@@ -6992,16 +6406,12 @@ def resolve_expected_ocr_model_exact(
     if args.ocr_cache_model_prefix:
         return None
     backend, _reason = resolve_ocr_backend_name(args, ocr_profile)
-    if backend == "coding-plan-mcp":
+    if backend == "openai-vision":
         direction = resolve_ocr_reading_direction(args, ocr_profile)
-        model = (
-            ocr_profile.model
-            if ocr_profile is not None
-            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
+        return (
+            f"openai-vision/{_vision_model_name(args, ocr_profile)}/{direction}/"
+            f"{OpenAIVisionOCR.prompt_version}"
         )
-        return f"coding-plan/{model}-vision-mcp/{direction}-v2"
-    if backend == "glm-ocr":
-        return ocr_profile.model if ocr_profile is not None else args.ocr_model
     if backend == "tesseract":
         return f"tesseract/{args.tesseract_language}/psm-{args.tesseract_psm}"
     if backend == "paddleocr-native":
@@ -7306,14 +6716,14 @@ def _main_unlocked(
     )
     if (
         toc_profile is not None
-        and toc_profile.adapter not in {"openai-chat", "glm-chat"}
+        and toc_profile.adapter not in {"openai-chat"}
     ):
         parser.error(
             f"TOC profile {toc_profile.name!r} requires an OpenAI-compatible chat adapter."
         )
     if (
         proofread_profile is not None
-        and proofread_profile.adapter not in {"openai-chat", "glm-chat"}
+        and proofread_profile.adapter not in {"openai-chat"}
     ):
         parser.error(
             f"Proofread profile {proofread_profile.name!r} requires an "
@@ -7322,7 +6732,7 @@ def _main_unlocked(
     if (
         translation_profile is not None
         and translation_profile.adapter
-        not in {"openai-chat", "glm-chat", LOCAL_LLAMA_ADAPTER}
+        not in {"openai-chat", LOCAL_LLAMA_ADAPTER}
     ):
         parser.error(
             f"Translation profile {translation_profile.name!r} requires an OpenAI-compatible chat adapter."
@@ -7532,20 +6942,19 @@ def _main_unlocked(
         parser.error("API timeouts must be positive.")
     toc_key = resolve_api_key(args, toc_profile)
     ocr_key = resolve_api_key(args, effective_ocr_profile)
-    toc_text_model = (
-        toc_profile.model if toc_profile is not None else args.text_model
-    )
+    # The TOC model is profile-only: with no TOC profile there is no model to
+    # call, so automatic TOC parsing is unavailable (--toc-json still works).
+    toc_text_model = toc_profile.model if toc_profile is not None else ""
     toc_timeout = toc_profile.timeout if toc_profile is not None else args.api_timeout
-    glm_client = GlmClient(
+    toc_client = ChatCompletionsClient(
         api_key=toc_key,
         api_base=toc_api_base,
-        ocr_model=args.ocr_model,
         text_model=toc_text_model,
         timeout=toc_timeout,
-        provider_name=(toc_profile.provider if toc_profile is not None else "glm"),
+        provider_name=(toc_profile.provider if toc_profile is not None else "openai-compatible"),
         adapter_name=(toc_profile.adapter if toc_profile is not None else "openai-chat"),
         thinking=(toc_profile.thinking if toc_profile is not None else "disabled"),
-    ) if toc_key else None
+    ) if toc_key and toc_text_model else None
     ocr_backend: OCRBackend | None = None
 
     try:
@@ -7563,58 +6972,38 @@ def _main_unlocked(
                 )
                 if str(getattr(args, "ocr_backend", "") or "auto") in {"auto", ""}:
                     print(f"[ocr-backend] {backend_reason}", flush=True)
-                if ocr_backend_name == "coding-plan-mcp":
-                    if not ocr_key:
-                        raise ValueError("Coding Plan vision OCR requires GLM_CODING_API_KEY or Z_AI_API_KEY.")
-                    if effective_ocr_profile is not None and effective_ocr_profile.command:
-                        ocr_command = (
-                            effective_ocr_profile.command[0]
-                            if len(effective_ocr_profile.command) == 1
-                            else shlex.join(effective_ocr_profile.command)
+                if ocr_backend_name == "openai-vision":
+                    vision_key = resolve_ocr_api_key(args, effective_ocr_profile)
+                    vision_base = (
+                        effective_ocr_profile.base_url
+                        if effective_ocr_profile is not None
+                        and effective_ocr_profile.base_url
+                        else os.getenv("OPENAI_VISION_BASE_URL", "")
+                    )
+                    vision_model = (
+                        effective_ocr_profile.model
+                        if effective_ocr_profile is not None
+                        else os.getenv("OPENAI_VISION_MODEL", "")
+                    )
+                    if not vision_base or not vision_model:
+                        raise ValueError(
+                            "openai-vision OCR requires a base URL and model; set "
+                            "them on the ocr_profile (base_url / model) or "
+                            "OPENAI_VISION_BASE_URL / OPENAI_VISION_MODEL."
                         )
-                    else:
-                        ocr_command = args.ocr_command
-                    ocr_backend = CodingPlanVisionOCR(
-                        api_key=ocr_key,
-                        command=ocr_command,
+                    ocr_backend = OpenAIVisionOCR(
+                        api_key=vision_key,
+                        api_base=vision_base,
+                        vision_model=vision_model,
                         reading_direction=args.ocr_reading_direction,
-                        vision_model=(
-                            effective_ocr_profile.model
-                            if effective_ocr_profile is not None
-                            else os.getenv("Z_AI_VISION_MODEL", "glm-4.6v")
-                        ),
                         request_timeout=(
                             effective_ocr_profile.timeout
                             if effective_ocr_profile is not None
-                            else int(os.getenv("CODING_PLAN_VISION_TIMEOUT", "120"))
+                            else int(os.getenv("OPENAI_VISION_TIMEOUT", "180"))
                         ),
-                    )
-                elif ocr_backend_name == "glm-ocr":
-                    standard_ocr_key = resolve_ocr_api_key(args, effective_ocr_profile)
-                    if not standard_ocr_key:
-                        raise ValueError(
-                            "Standard GLM-OCR is not covered by Coding Plan. Set GLM_OCR_API_KEY separately, "
-                            "or use --ocr-backend coding-plan-mcp."
-                        )
-                    ocr_backend = GlmClient(
-                        api_key=standard_ocr_key,
-                        api_base=(
-                            effective_ocr_profile.base_url
-                            if effective_ocr_profile is not None and effective_ocr_profile.base_url
-                            else args.ocr_api_base
+                        max_output_tokens=int(
+                            os.getenv("OPENAI_VISION_MAX_TOKENS", "8192")
                         ),
-                        ocr_model=(
-                            effective_ocr_profile.model
-                            if effective_ocr_profile is not None
-                            else args.ocr_model
-                        ),
-                        text_model=toc_text_model,
-                        timeout=(
-                            effective_ocr_profile.timeout
-                            if effective_ocr_profile is not None
-                            else args.api_timeout
-                        ),
-                        reading_direction=args.ocr_reading_direction,
                     )
                 elif ocr_backend_name == "tesseract":
                     ocr_backend = TesseractOCR(
@@ -7871,12 +7260,12 @@ def _main_unlocked(
                     raise ValueError("Manual TOC JSON root must be an object.")
                 toc_payload = normalize_toc_payload(manual)
             else:
-                if glm_client is None:
+                if toc_client is None:
                     raise ValueError("Automatic TOC parsing requires the selected API key, or pass --toc-json.")
                 toc_pages = parse_page_spec(args.toc_pages) if args.toc_pages else None
                 toc_payload = extract_toc(
                     records,
-                    glm_client,
+                    toc_client,
                     front_matter_pages=args.front_matter_pages,
                     toc_pages=toc_pages,
                 )

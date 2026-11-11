@@ -15,6 +15,7 @@ from unittest.mock import patch
 import pymupdf as fitz
 
 from translation_agent.runtime.product_paths import dotenv_path
+from translation_agent.pipeline.book_pipeline import OpenAIVisionOCR
 import translation_agent.pipeline.book_pipeline as book_pipeline
 import translation_agent.cli.graph_pipeline as graph_pipeline
 from translation_agent.publication.publication_service import (
@@ -2332,33 +2333,15 @@ class BookGraphExecutionTests(unittest.TestCase):
                 ["--ocr-backend", "tesseract", "--dpi", "200"],
                 ["--ocr-backend", "tesseract", "--dpi", "240"],
             ),
+            # The gateway a vision endpoint points at is part of its identity.
             "base": (
-                [
-                    "--ocr-backend",
-                    "glm-ocr",
-                    "--ocr-api-base",
-                    "https://ocr-a.example.invalid",
-                ],
-                [
-                    "--ocr-backend",
-                    "glm-ocr",
-                    "--ocr-api-base",
-                    "https://ocr-b.example.invalid",
-                ],
+                ["--ocr-backend", "openai-vision"],
+                ["--ocr-backend", "openai-vision", "--ocr-reading-direction", "vertical"],
             ),
-            "command": (
-                [
-                    "--ocr-backend",
-                    "coding-plan-mcp",
-                    "--ocr-command",
-                    "vision-mcp --variant alpha",
-                ],
-                [
-                    "--ocr-backend",
-                    "coding-plan-mcp",
-                    "--ocr-command",
-                    "vision-mcp --variant beta",
-                ],
+            # Tesseract's language pack is part of its identity too.
+            "language": (
+                ["--ocr-backend", "tesseract", "--tesseract-language", "jpn_vert+eng"],
+                ["--ocr-backend", "tesseract", "--tesseract-language", "jpn+eng"],
             ),
         }
         for label, (first_options, changed_options) in semantic_changes.items():
@@ -2409,7 +2392,9 @@ class BookGraphExecutionTests(unittest.TestCase):
                 "--phase",
                 "ocr",
                 "--ocr-backend",
-                "glm-ocr",
+                "openai-vision",
+                "--ocr-reading-direction",
+                "vertical",
             ]
             calls: list[list[str]] = []
 
@@ -2790,7 +2775,13 @@ translation_profile = "translation"
             self.assertNotIn("--force", calls[1])
             self.assertIn("--force", calls[2])
 
-    def test_ocr_model_and_automatic_cache_model_remain_complete_pairs(self) -> None:
+    def test_ocr_backend_and_automatic_cache_model_remain_complete_pairs(self) -> None:
+        """The wrapper must hand the stage an explicit cache identity.
+
+        A backend without a cache model would let the stage guess its own
+        checkpoint identity, so every backend wrapper injects one.
+        """
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_pdf = root / "book.pdf"
@@ -2804,19 +2795,18 @@ translation_profile = "translation"
                     "--phase",
                     "ocr",
                     "--ocr-backend",
-                    "glm-ocr",
-                    "--ocr-model",
-                    "glm-ocr",
+                    "tesseract",
+                    "--tesseract-language",
+                    "jpn_vert+eng",
+                    "--tesseract-psm",
+                    "3",
                 ]
             )
 
             def fake_ocr(argv: list[str]) -> int:
-                self.assertEqual(argv[argv.index("--ocr-model") + 1], "glm-ocr")
-                self.assertEqual(
-                    argv[argv.index("--ocr-cache-model") + 1],
-                    "glm-ocr",
-                )
-                self._write_page_checkpoint(output, ocr_model="glm-ocr")
+                expected = "tesseract/jpn_vert+eng/psm-3"
+                self.assertEqual(argv[argv.index("--ocr-cache-model") + 1], expected)
+                self._write_page_checkpoint(output, ocr_model=expected)
                 return 0
 
             with patch(
@@ -2952,15 +2942,36 @@ translation_profile = "translation"
             source_pdf = root / "book.pdf"
             self._make_one_page_pdf(source_pdf)
             output = root / "output"
+            # Only a profile carries a base URL into the OCR identity, so the
+            # credential-stripping path has to be exercised through one.
+            config = root / "pipeline.toml"
+            config.write_text(
+                "schema_version = 1\n"
+                "[profiles.vision]\n"
+                'adapter = "openai-vision"\n'
+                'provider = "gateway"\n'
+                f'base_url = "{endpoint}"\n'
+                'model = "vision-model"\n'
+                'credential_env = "OCR_TEST_KEY"\n'
+                "timeout = 60\n"
+                "concurrency = 2\n"
+                "\n"
+                "[pipeline]\n"
+                'ocr_profile = "vision"\n',
+                encoding="utf-8",
+            )
 
             def fake_ocr(argv: list[str]) -> int:
                 model = argv[argv.index("--ocr-cache-model") + 1]
                 self._write_page_checkpoint(output, ocr_model=model)
                 return 0
 
-            with patch(
-                "translation_agent.pipeline.graph.book.legacy._main_unlocked",
-                side_effect=fake_ocr,
+            with (
+                patch.dict(os.environ, {"OCR_TEST_KEY": "ocr-key"}),
+                patch(
+                    "translation_agent.pipeline.graph.book.legacy._main_unlocked",
+                    side_effect=fake_ocr,
+                ),
             ):
                 result = prepare_book_graph(
                     [
@@ -2969,12 +2980,10 @@ translation_profile = "translation"
                         str(output),
                         "--phase",
                         "ocr",
+                        "--config",
+                        str(config),
                         "--ocr-backend",
-                        "glm-ocr",
-                        "--ocr-api-base",
-                        endpoint,
-                        "--api-base",
-                        endpoint,
+                        "openai-vision",
                     ]
                 ).execute()
 
@@ -3583,7 +3592,7 @@ translation_profile = "translation"
                 prepared.execute()
             self.assertFalse(output.exists())
 
-    def test_graph_status_uses_exact_tesseract_and_glm_ocr_identities(self) -> None:
+    def test_graph_status_uses_exact_ocr_backend_identities(self) -> None:
         cases = (
             (
                 "tesseract",
@@ -3599,20 +3608,22 @@ translation_profile = "translation"
                 "tesseract/chi_sim/psm-30",
             ),
             (
-                "glm",
+                "openai-vision",
                 [
                     "--ocr-backend",
-                    "coding-plan-mcp",
+                    "openai-vision",
                     "--ocr-reading-direction",
                     "horizontal",
                 ],
-                "coding-plan/glm-4.6v-vision-mcp/horizontal-v2",
-                "coding-plan/glm-4.6v-vision-mcp/horizontal-v20",
+                "openai-vision/mistral/deepseek-v4-1-flash-1017/horizontal/"
+                f"{OpenAIVisionOCR.prompt_version}",
+                "openai-vision/mistral/deepseek-v4-1-flash-1017/horizontal/"
+                f"{OpenAIVisionOCR.prompt_version}0",
             ),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch.dict(os.environ, {"Z_AI_VISION_MODEL": "glm-4.6v"}):
+            with patch.dict(os.environ, {"OPENAI_VISION_MODEL": "mistral/deepseek-v4-1-flash-1017"}):
                 for name, model_args, exact, similar_prefix in cases:
                     with self.subTest(backend=name):
                         output = root / name

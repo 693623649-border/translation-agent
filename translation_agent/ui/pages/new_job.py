@@ -258,7 +258,7 @@ with st.form("new_translation_job"):
     credential_names = {
         toc_profile.credential_env if toc_profile is not None else None,
         translation_profile.credential_env if translate else None,
-        ocr_profile.credential_env if ocr_profile is not None and effective_ocr_backend in {"coding-plan-mcp", "glm-ocr"} else None,
+        ocr_profile.credential_env if ocr_profile is not None and effective_ocr_backend in {"openai-vision"} else None,
         (
             proofread_profile.credential_env
             if include_proofread and not ocr_only and proofread_profile is not None

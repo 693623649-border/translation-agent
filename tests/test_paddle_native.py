@@ -64,17 +64,21 @@ class NativeOCRTests(unittest.TestCase):
         weight.write_text('updated weights')
         self.assertNotEqual(original, model_identity(self.options))
 
-    def test_auto_prefers_gpu_then_cpu_then_profile_and_explicit_cloud_wins(self):
+    def test_auto_prefers_gpu_then_cpu_and_an_explicit_backend_wins(self):
         args = book.build_parser().parse_args([])
         with patch('translation_agent.pipeline.book_pipeline.paddle_local_available', return_value=True):
             self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'paddleocr-local')
         with patch('translation_agent.pipeline.book_pipeline.paddle_local_available', return_value=False), patch('translation_agent.pipeline.book_pipeline.paddle_native_available', return_value=True):
             self.assertEqual(book.resolve_ocr_backend_name(args)[0], BACKEND)
-            args.ocr_backend = 'glm-ocr'
-            self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'glm-ocr')
+            args.ocr_backend = 'openai-vision'
+            self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'openai-vision')
+        # With neither a local engine nor an OCR profile there is nothing left
+        # to run: the removed cloud MCP fallback is gone, so a run fails loudly
+        # instead of silently routing to a backend this release cannot build.
         args.ocr_backend = 'auto'
         with patch('translation_agent.pipeline.book_pipeline.paddle_local_available', return_value=False), patch('translation_agent.pipeline.book_pipeline.paddle_native_available', return_value=False):
-            self.assertEqual(book.resolve_ocr_backend_name(args)[0], 'coding-plan-mcp')
+            with self.assertRaisesRegex(ValueError, 'No OCR backend is available'):
+                book.resolve_ocr_backend_name(args)
 
     def test_horizontal_and_vertical_ordering_and_malformed_results(self):
         result = {'rec_texts': ['left bottom', 'right top', 'left top'],

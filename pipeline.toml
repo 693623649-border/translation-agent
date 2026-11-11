@@ -1,27 +1,21 @@
 schema_version = 1
 
-[profiles.glm_vision]
-adapter = "coding-plan-mcp"
-provider = "zhipu"
-base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-model = "glm-4.6v"
-credential_env = "GLM_CODING_API_KEY"
-command = ["npx", "-y", "@z_ai/mcp-server@0.1.4"]
+# OCR node: OpenAI-compatible multimodal model through the local Magpie
+# gateway.  Magpie routes model ids, so the routed id is what the gateway
+# advertises (see: curl $MAGPIE_BASE/models).  The prompt and the ordered-band
+# fallback live in OpenAIVisionOCR, which makes this backend independent of
+# the Zhipu vision MCP.
+[profiles.magpie_vision]
+adapter = "openai-vision"
+provider = "magpie"
+base_url = "http://127.0.0.1:3425/v1"
+model = "mistral/deepseek-v4-1-flash-1017"
+credential_env = "MAGPIE_API_KEY"
 timeout = 180
 concurrency = 4
 thinking = "omit"
 # Generic preset: choose "vertical" explicitly for Japanese/Chinese tategaki.
 reading_direction = "horizontal"
-
-[profiles.glm_toc]
-adapter = "openai-chat"
-provider = "zhipu"
-base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-model = "glm-5.2"
-credential_env = "GLM_TOC_API_KEY"
-timeout = 120
-concurrency = 1
-thinking = "disabled"
 
 [profiles.deepseek_pro]
 adapter = "openai-chat"
@@ -43,12 +37,27 @@ timeout = 120
 concurrency = 32
 thinking = "disabled"
 
+# Translation / proofread node: same routed model as the OCR node, through
+# Magpie.  ``thinking = "disabled"`` is accepted by this gateway and produces
+# a non-reasoning completion, so page translation stays fast.
+[profiles.magpie_flash]
+adapter = "openai-chat"
+provider = "magpie"
+base_url = "http://127.0.0.1:3425/v1"
+model = "mistral/deepseek-v4-1-flash-1017"
+credential_env = "MAGPIE_API_KEY"
+timeout = 180
+concurrency = 16
+# low/high/max are OpenAI-style levels and are sent as ``reasoning_effort``
+# (not ``thinking.type``, which the gateway accepts but ignores).
+thinking = "low"
+
 [pipeline]
-ocr_profile = "glm_vision"
-toc_profile = "glm_toc"
-translation_profile = "deepseek_flash"
+ocr_profile = "magpie_vision"
+toc_profile = "magpie_flash"
+translation_profile = "magpie_flash"
 # Optional. When omitted, proofreading safely reuses translation_profile.
-proofread_profile = "deepseek_flash"
+proofread_profile = "magpie_flash"
 
 [profiles.paddleocr_local]
 adapter = "paddleocr-local"

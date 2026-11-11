@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from translation_agent.pipeline.book_pipeline import (  # noqa: E402
     PageRecord,
     build_parser as _book_parser,
+    OpenAIVisionOCR,
     resolve_ocr_backend_name,
     save_page_record,
     contiguous_page_segments,
@@ -117,12 +118,12 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
         self.assertTrue(exact.startswith("paddleocr-local/PP-OCRv5-server-det-"))
 
     @patch("translation_agent.pipeline.book_pipeline.paddle_native_available", return_value=False)
-    def test_auto_backend_prefers_local_then_falls_back(self, _native_probe) -> None:
+    def test_auto_backend_uses_profile_then_local_when_unconfigured(self, _native_probe) -> None:
         args = _book_parser().parse_args([])
         self.assertEqual(args.ocr_backend, "auto")
         remote_profile = ModelProfile(
             name="glm_vision",
-            adapter="coding-plan-mcp",
+            adapter="openai-vision",
             provider="zhipu",
             base_url="https://example.invalid",
             model="glm-4.6v",
@@ -131,19 +132,75 @@ class PaddleOcrLocalBackendTests(unittest.TestCase):
             concurrency=4,
             thinking="omit",
         )
+        # A configured OCR profile is authoritative: a detected local engine
+        # must not silently replace the node the operator pinned.
         with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=True):
             backend, reason = resolve_ocr_backend_name(args, remote_profile)
+            self.assertEqual(backend, "openai-vision")
+            self.assertEqual(reason, "selected OCR profile")
+        with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=False):
+            backend, reason = resolve_ocr_backend_name(args, remote_profile)
+            self.assertEqual(backend, "openai-vision")
+            self.assertEqual(reason, "selected OCR profile")
+        # With no OCR profile the run still prefers the local engine.
+        with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=True):
+            backend, reason = resolve_ocr_backend_name(args, None)
             self.assertEqual(backend, "paddleocr-local")
             self.assertIn("local", reason)
         with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=False):
-            backend, reason = resolve_ocr_backend_name(args, remote_profile)
-            self.assertEqual(backend, "coding-plan-mcp")
-            self.assertIn("unavailable", reason)
-        explicit = _book_parser().parse_args(["--ocr-backend", "coding-plan-mcp"])
+            # With no profile and no local engine there is no backend left.
+            with self.assertRaises(ValueError):
+                resolve_ocr_backend_name(args, None)
+        explicit = _book_parser().parse_args(["--ocr-backend", "openai-vision"])
         with patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=True):
             backend, reason = resolve_ocr_backend_name(explicit, remote_profile)
-            self.assertEqual(backend, "coding-plan-mcp")
+            self.assertEqual(backend, "openai-vision")
             self.assertEqual(reason, "explicit --ocr-backend")
+
+    def test_openai_vision_adapter_is_selectable_and_owns_its_identity(self) -> None:
+        args = _book_parser().parse_args(["--ocr-backend", "openai-vision"])
+        profile = ModelProfile(
+            name="magpie_vision",
+            adapter="openai-vision",
+            provider="magpie",
+            base_url="http://127.0.0.1:3425/v1",
+            model="mistral/deepseek-v4-1-flash-1017",
+            credential_env="MAGPIE_API_KEY",
+            timeout=180,
+            concurrency=4,
+            thinking="omit",
+            reading_direction="vertical",
+        )
+        self.assertEqual(
+            resolve_ocr_backend_name(args, profile),
+            ("openai-vision", "explicit --ocr-backend"),
+        )
+        auto = _book_parser().parse_args([])
+        self.assertEqual(
+            resolve_ocr_backend_name(auto, profile),
+            ("openai-vision", "selected OCR profile"),
+        )
+        self.assertEqual(
+            resolve_expected_ocr_model_exact(auto, profile),
+            "openai-vision/mistral/deepseek-v4-1-flash-1017/vertical/"
+            f"{OpenAIVisionOCR.prompt_version}",
+        )
+        # Switching the routed model or reading direction must invalidate pages.
+        horizontal = ModelProfile(
+            name="magpie_vision",
+            adapter="openai-vision",
+            provider="magpie",
+            base_url="http://127.0.0.1:3425/v1",
+            model="mistral/deepseek-v4-1-flash-1017",
+            credential_env="MAGPIE_API_KEY",
+            timeout=180,
+            concurrency=4,
+            thinking="omit",
+        )
+        self.assertNotEqual(
+            resolve_expected_ocr_model_exact(auto, profile),
+            resolve_expected_ocr_model_exact(auto, horizontal),
+        )
 
     def test_cloud_rerun_protects_local_paddle_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

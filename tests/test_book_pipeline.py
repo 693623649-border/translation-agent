@@ -20,10 +20,9 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from translation_agent.pipeline.book_pipeline import (
     ChatTranslator,
-    CodingPlanVisionOCR,
+    ChatCompletionsClient,
     DeepSeekClient,
-    GlmClient,
-    McpStdioClient,
+    OpenAIVisionOCR,
     PageRecord,
     TocEntry,
     _exclusive_stage_lock,
@@ -512,7 +511,7 @@ class UtilityTests(unittest.TestCase):
                 PageRecord(
                     pdf_page=1,
                     text="竖排",
-                    ocr_model="coding-plan/glm-4.6v-vision-mcp/vertical-v2",
+                    ocr_model="openai-vision/vision-model/vertical/openai-vision-v1",
                 ),
             )
             save_page_record(
@@ -520,15 +519,15 @@ class UtilityTests(unittest.TestCase):
                 PageRecord(
                     pdf_page=2,
                     text="横排",
-                    ocr_model="coding-plan/glm-4.6v-vision-mcp/horizontal-v2",
+                    ocr_model="openai-vision/vision-model/horizontal/openai-vision-v1",
                 ),
             )
 
             status = output_status(
                 output,
                 expected_ocr_model_prefix=(
-                    "coding-plan/glm-4.6v-vision-mcp/vertical-v2,"
-                    "coding-plan/glm-4.6v-vision-mcp/horizontal-v2"
+                    "openai-vision/vision-model/vertical/openai-vision-v1,"
+                    "openai-vision/vision-model/horizontal/openai-vision-v1"
                 ),
             )
 
@@ -538,8 +537,8 @@ class UtilityTests(unittest.TestCase):
         models = (
             "tesseract/chi_sim/psm-3",
             "tesseract/chi_sim/psm-30",
-            "coding-plan/glm-4.6v-vision-mcp/horizontal-v2",
-            "coding-plan/glm-4.6v-vision-mcp/horizontal-v20",
+            "openai-vision/vision-model/horizontal/openai-vision-v1",
+            "openai-vision/vision-model/horizontal/openai-vision-v10",
         )
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
@@ -561,23 +560,23 @@ class UtilityTests(unittest.TestCase):
                 output,
                 expected_ocr_model_prefix="tesseract/chi_sim/psm-3",
             )
-            glm_exact = output_status(
+            vision_exact = output_status(
                 output,
                 expected_ocr_model_exact=(
-                    "coding-plan/glm-4.6v-vision-mcp/horizontal-v2"
+                    "openai-vision/vision-model/horizontal/openai-vision-v1"
                 ),
             )
-            glm_prefix = output_status(
+            vision_prefix = output_status(
                 output,
                 expected_ocr_model_prefix=(
-                    "coding-plan/glm-4.6v-vision-mcp/horizontal-v2"
+                    "openai-vision/vision-model/horizontal/openai-vision-v1"
                 ),
             )
 
         self.assertEqual(tesseract_exact["ocr_pages_profile_fresh"], 1)
         self.assertEqual(tesseract_prefix["ocr_pages_profile_fresh"], 2)
-        self.assertEqual(glm_exact["ocr_pages_profile_fresh"], 1)
-        self.assertEqual(glm_prefix["ocr_pages_profile_fresh"], 2)
+        self.assertEqual(vision_exact["ocr_pages_profile_fresh"], 1)
+        self.assertEqual(vision_prefix["ocr_pages_profile_fresh"], 2)
 
     def test_status_only_accepts_fresh_full_publication_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -660,30 +659,6 @@ class UtilityTests(unittest.TestCase):
                     with _exclusive_stage_lock(output, "ocr"):
                         self.fail("duplicate stage lock should not be acquired")
 
-    def test_closed_vision_backend_cannot_recreate_mcp_process(self) -> None:
-        backend = object.__new__(CodingPlanVisionOCR)
-        backend.closed = threading.Event()
-        backend.closed.set()
-        with self.assertRaisesRegex(RuntimeError, "backend is closed"):
-            backend._client()
-
-    def test_vertical_mcp_prompt_requires_right_to_left_column_order(self) -> None:
-        client = object.__new__(McpStdioClient)
-        client.reading_direction = "vertical"
-        client.tool = {
-            "inputSchema": {
-                "properties": {
-                    "image_source": {"type": "string"},
-                    "prompt": {"type": "string"},
-                },
-                "required": ["image_source", "prompt"],
-            }
-        }
-        arguments = client._tool_arguments(Path("page.jpg"))
-        self.assertIn("最右侧文字列", arguments["prompt"])
-        self.assertIn("逐列向左", arguments["prompt"])
-        self.assertIn("先完整读完上方版块", arguments["prompt"])
-
     def test_shared_page_trim_removes_review_publication_header(self) -> None:
         text = (
             "本篇结尾。\n\n（参考文献）\n奈须蘑菇《DDD》\n"
@@ -719,10 +694,14 @@ class UtilityTests(unittest.TestCase):
             "作者望着天空，阅读其所著名著，成就显著。",
         )
 
-    def test_glm_chat_disables_thinking(self) -> None:
-        class RecordingClient(GlmClient):
+    def test_chat_completions_client_disables_thinking(self) -> None:
+        class RecordingClient(ChatCompletionsClient):
             def __init__(self) -> None:
-                super().__init__(api_key="test-key")
+                super().__init__(
+                    api_key="test-key",
+                    api_base="https://gateway.example.invalid/v1",
+                    text_model="test-model",
+                )
                 self.requests: list[tuple[str, dict]] = []
 
             def _post(self, endpoint: str, payload: dict) -> dict:
@@ -756,35 +735,13 @@ class UtilityTests(unittest.TestCase):
             self.assertEqual(payload["model"], "deepseek-v4-flash")
             self.assertEqual(payload["thinking"], {"type": "disabled"})
 
-    def test_standard_glm_ocr_content_filter_uses_segmented_fallback(self) -> None:
-        class FilterThenReadGlm(GlmClient):
-            def __init__(self) -> None:
-                super().__init__(
-                    api_key="test-key",
-                    reading_direction="horizontal",
-                )
-
-            def _ocr_image_once(self, image_path: Path) -> tuple[str, str]:
-                if "_segment_" not in image_path.stem:
-                    raise RuntimeError(
-                        'GLM request failed: GLM HTTP 400: {"contentFilter":[],'
-                        '"error":{"code":"1301","message":"potentially unsafe content"}}'
-                    )
-                match = re.search(r"_segment_(\d+)_", image_path.stem)
-                assert match is not None
-                values = {"1": "（无可见文字）", "2": "彼得", "3": "堡正文。", "4": "结尾。"}
-                return values[match.group(1)], "glm-test"
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "page.jpg"
-            Image.new("RGB", (240, 800), "white").save(image_path)
-            text, request_id = FilterThenReadGlm().ocr_image(image_path)
-
-            self.assertEqual(text, "彼得堡正文。\n\n结尾。")
-            self.assertTrue(request_id.startswith("glm-segmented-"))
-            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
-
     def test_provider_keys_are_isolated(self) -> None:
+        """Provider credentials never leak across stages.
+
+        GLM is out of the chat path entirely: its environment variables must
+        not satisfy any text stage, and only an explicit --api-key does.
+        """
+
         parser = build_parser()
         with patch.dict(
             "os.environ",
@@ -792,31 +749,37 @@ class UtilityTests(unittest.TestCase):
             clear=True,
         ):
             args = parser.parse_args(["sample.pdf"])
-            self.assertEqual(resolve_api_key(args), "glm-sentinel")
+            # No GLM chat fallback: the generic key is empty unless given.
+            self.assertEqual(resolve_api_key(args), "")
             self.assertEqual(resolve_translation_api_key(args), "deepseek-sentinel")
 
             args = parser.parse_args(
-                ["sample.pdf", "--api-key", "glm-cli", "--translation-api-key", "deepseek-cli"]
+                ["sample.pdf", "--api-key", "explicit-cli", "--translation-api-key", "deepseek-cli"]
             )
-            self.assertEqual(resolve_api_key(args), "glm-cli")
+            self.assertEqual(resolve_api_key(args), "explicit-cli")
             self.assertEqual(resolve_translation_api_key(args), "deepseek-cli")
 
         with patch.dict("os.environ", {"GLM_CODING_API_KEY": "glm-only"}, clear=True):
             args = parser.parse_args(["sample.pdf"])
-            self.assertEqual(resolve_api_key(args), "glm-only")
+            self.assertEqual(resolve_api_key(args), "")
             self.assertEqual(resolve_translation_api_key(args), "")
 
     def test_explicit_ocr_backend_overrides_profile_adapter(self) -> None:
-        class RecordingGlmOCR:
-            instances: list["RecordingGlmOCR"] = []
+        class RecordingVisionOCR:
+            """Stands in for OpenAIVisionOCR and records how it was built."""
+
+            instances: list["RecordingVisionOCR"] = []
 
             def __init__(self, **kwargs: object) -> None:
-                self.ocr_model = str(kwargs["ocr_model"])
-                self.kwargs = kwargs
+                self.api_key = str(kwargs["api_key"])
+                self.api_base = str(kwargs["api_base"])
+                self.vision_model = str(kwargs["vision_model"])
+                self.reading_direction = str(kwargs.get("reading_direction", "horizontal"))
+                self.ocr_model = f"openai-vision/{self.vision_model}/override-test"
                 self.instances.append(self)
 
             def ocr_image(self, image_path: Path) -> tuple[str, str]:
-                return "识别正文内容。", "glm-override-test"
+                return "识别正文内容。", "vision-override-test"
 
             def close(self) -> None:
                 return
@@ -835,10 +798,10 @@ class UtilityTests(unittest.TestCase):
                     (
                         "schema_version = 1",
                         "[profiles.vision]",
-                        'adapter = "coding-plan-mcp"',
-                        'provider = "glm"',
-                        'model = "glm-4.6v"',
-                        'credential_env = "PROFILE_CODING_KEY"',
+                        'adapter = "tesseract"',
+                        'provider = "local"',
+                        'model = "tesseract"',
+                        'credential_env = ""',
                         "[pipeline]",
                         'ocr_profile = "vision"',
                     )
@@ -849,8 +812,18 @@ class UtilityTests(unittest.TestCase):
             stderr = io.StringIO()
 
             with (
-                patch.dict("os.environ", {"GLM_OCR_API_KEY": "standard-key"}, clear=True),
-                patch("translation_agent.pipeline.book_pipeline.GlmClient", RecordingGlmOCR),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "PROFILE_VISION_KEY": "profile-key",
+                        # An explicit --ocr-backend drops the OCR profile, so the
+                        # vision endpoint has to come from the environment.
+                        "OPENAI_VISION_BASE_URL": "https://gateway.example.invalid/v1",
+                        "OPENAI_VISION_MODEL": "vision-model",
+                    },
+                    clear=True,
+                ),
+                patch("translation_agent.pipeline.book_pipeline.OpenAIVisionOCR", RecordingVisionOCR),
                 patch("translation_agent.pipeline.book_pipeline.load_env_file", lambda path: None),
                 patch("sys.stderr", stderr),
             ):
@@ -864,18 +837,21 @@ class UtilityTests(unittest.TestCase):
                         "--config",
                         str(config_path),
                         "--ocr-backend",
-                        "glm-ocr",
-                        "--ocr-model",
-                        "glm-ocr",
+                        "openai-vision",
                         "--ocr-concurrency",
                         "1",
                     ]
                 )
 
             self.assertEqual(result, 0)
-            self.assertEqual(len(RecordingGlmOCR.instances), 1)
-            self.assertEqual(RecordingGlmOCR.instances[0].ocr_model, "glm-ocr")
-            self.assertIn("--ocr-backend=glm-ocr overrides OCR profile", stderr.getvalue())
+            # The explicit backend wins over the profile's tesseract adapter.
+            self.assertEqual(len(RecordingVisionOCR.instances), 1)
+            built = RecordingVisionOCR.instances[0]
+            # The explicit backend wins over the profile's tesseract adapter,
+            # so the vision endpoint comes from the environment, not the profile.
+            self.assertEqual(built.api_base, "https://gateway.example.invalid/v1")
+            self.assertEqual(built.vision_model, "vision-model")
+            self.assertIn("--ocr-backend=openai-vision overrides OCR profile", stderr.getvalue())
 
     def test_worker_count_precedence_and_legacy_compatibility(self) -> None:
         parser = build_parser()
@@ -1654,461 +1630,51 @@ M.E.Sharpe, Inc., 1983.
         self.assertEqual(detect_language("これは日本語の文章です。日本語として判定されます。"), "ja")
         self.assertEqual(detect_language("This is a sufficiently long English sentence for language detection."), "en")
 
-    def test_coding_plan_vision_mcp_protocol(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            server = root / "fake_mcp.py"
-            server.write_text(
-                """
-import json
-import sys
-for line in sys.stdin:
-    message = json.loads(line)
-    if "id" not in message:
-        continue
-    method = message.get("method")
-    if method == "initialize":
-        result = {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}
-    elif method == "tools/list":
-        result = {"tools": [{"name": "extract_text_from_screenshot", "inputSchema": {"type": "object", "properties": {"image_path": {"type": "string"}}, "required": ["image_path"]}}]}
-    elif method == "tools/call":
-        result = {"content": [{"type": "text", "text": "# 识别标题\\n\\n识别正文"}]}
-    else:
-        result = {}
-    print(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}), flush=True)
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
-            image = root / "page.jpg"
-            Image.new("RGB", (100, 160), "white").save(image)
-            backend = CodingPlanVisionOCR(
-                api_key="test-key",
-                command=f"{sys.executable} -u {server}",
-                reading_direction="vertical",
-            )
-            try:
-                text, request_id = backend.ocr_image(image)
-            finally:
-                backend.close()
-            self.assertEqual(text, "# 识别标题\n\n识别正文")
-            self.assertTrue(request_id.startswith("mcp-"))
-            self.assertEqual(
-                backend.ocr_model,
-                "coding-plan/glm-4.6v-vision-mcp/vertical-v2",
-            )
+    def test_vision_band_fallback_keeps_right_to_left_column_order(self) -> None:
+        """A vertical page that trips the gateway is split into right-to-left bands."""
 
-    def test_coding_plan_content_filter_uses_segmented_fallback(self) -> None:
-        class FilterThenReadClient:
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_segment_" not in image_path.stem:
-                    raise RuntimeError(
-                        'HTTP 400: {"contentFilter":[],"error":{"code":"1301",'
-                        '"message":"potentially unsafe content"}}'
-                    )
-                match = re.search(r"_segment_(\d+)_", image_path.stem)
-                assert match is not None
-                values = {"1": "（无可见文字）", "2": "彼得", "3": "堡正文。", "4": "结尾。"}
-                return values[match.group(1)], "mcp-test"
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "page.jpg"
-            Image.new("RGB", (240, 800), "white").save(image_path)
-            backend = object.__new__(CodingPlanVisionOCR)
-            with patch.object(backend, "_client", return_value=FilterThenReadClient()):
-                text, request_id = backend.ocr_image(image_path)
-            self.assertEqual(text, "彼得堡正文。\n\n结尾。")
-            self.assertTrue(request_id.startswith("mcp-segmented-"))
-            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
-
-    def test_coding_plan_timeout_splits_dense_page_instead_of_retrying_whole_page(self) -> None:
-        class TimeoutThenReadClient:
-            def __init__(self) -> None:
-                self.whole_page_calls = 0
-
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_segment_" not in image_path.stem:
-                    self.whole_page_calls += 1
-                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
-                match = re.search(r"_segment_(\d+)_", image_path.stem)
-                assert match is not None
-                return {"1": "右页正文。", "2": "左页正文。"}[match.group(1)], "mcp-test"
-
-            def close(self) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "dense-spread.jpg"
-            Image.new("RGB", (400, 600), "white").save(image_path)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            client = TimeoutThenReadClient()
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "CODING_PLAN_SPREAD_SEGMENTS": "2",
-                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
-                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
-                    },
-                ),
-                patch.object(backend, "_client", return_value=client),
-            ):
-                text, request_id = backend.ocr_image(image_path)
-            self.assertEqual(client.whole_page_calls, 1)
-            self.assertEqual(text, "右页正文。\n\n左页正文。")
-            self.assertTrue(request_id.startswith("mcp-segmented-"))
-            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
-
-    def test_vertical_two_page_spread_is_split_before_first_model_call(self) -> None:
-        class ReadSegmentClient:
-            def __init__(self) -> None:
-                self.whole_page_calls = 0
-
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_segment_" not in image_path.stem:
-                    self.whole_page_calls += 1
-                    raise AssertionError("the whole spread must not be submitted")
-                match = re.search(r"_segment_(\d+)_", image_path.stem)
-                assert match is not None
-                return {"1": "右页。", "2": "左页。"}[match.group(1)], "mcp-test"
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "spread.jpg"
-            Image.new("RGB", (800, 400), "white").save(image_path)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            client = ReadSegmentClient()
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "CODING_PLAN_SPREAD_SEGMENTS": "2",
-                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
-                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
-                    },
-                ),
-                patch.object(backend, "_client", return_value=client),
-            ):
-                text, request_id = backend.ocr_image(image_path)
-            self.assertEqual(client.whole_page_calls, 0)
-            self.assertEqual(text, "右页。\n\n左页。")
-            self.assertEqual(text.physical_page_texts, ("右页。", "左页。"))
-            self.assertTrue(request_id.startswith("mcp-segmented-"))
-
-    def test_segment_rate_limit_does_not_restart_completed_segments(self) -> None:
-        class RateLimitedSegmentClient:
-            def __init__(self) -> None:
-                self.calls = {"1": 0, "2": 0}
-
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                match = re.search(r"_segment_(\d+)_", image_path.stem)
-                assert match is not None
-                segment = match.group(1)
-                self.calls[segment] += 1
-                if segment == "2" and self.calls[segment] == 1:
-                    raise RuntimeError("HTTP 429: Rate limit reached for requests")
-                return {"1": "右页。", "2": "左页。"}[segment], "mcp-test"
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "rate-limited-spread.jpg"
-            Image.new("RGB", (800, 400), "white").save(image_path)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            client = RateLimitedSegmentClient()
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "CODING_PLAN_SEGMENT_ATTEMPTS": "2",
-                        "CODING_PLAN_SEGMENT_RATE_LIMIT_DELAY": "0",
-                        "CODING_PLAN_SEGMENT_RATE_LIMIT_MAX_DELAY": "0",
-                        "CODING_PLAN_SEGMENT_RATE_LIMIT_JITTER": "0",
-                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
-                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
-                    },
-                ),
-                patch.object(backend, "_client", return_value=client),
-            ):
-                text, request_id = backend._ocr_segmented(
-                    image_path,
-                    client,
-                    segments=2,
-                )
-            self.assertEqual(text, "右页。\n\n左页。")
-            self.assertTrue(request_id.startswith("mcp-segmented-"))
-            self.assertEqual(client.calls, {"1": 1, "2": 2})
-
-    def test_vertical_segment_fallback_reads_right_to_left(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             image_path = Path(directory) / "vertical.jpg"
+            # Left half white, right half black, so each band is identifiable.
             image = Image.new("L", (240, 400), 0)
             image.paste(255, (116, 0, 240, 400))
             image.save(image_path)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-
-            def read_band(path: Path, *, depth: int) -> tuple[str, str]:
-                with Image.open(path).convert("L") as band:
-                    average = sum(band.get_flattened_data()) / (band.width * band.height)
-                    return ("右。" if average > 127 else "左。"), "test"
-
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "1",
-                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "1",
-                    },
-                ),
-                patch.object(backend, "_ocr_filtered_band", side_effect=read_band),
-            ):
-                text, request_id = backend._ocr_segmented(
-                    image_path,
-                    object(),
-                    segments=2,
-                )
-            self.assertEqual(text, "右。\n\n左。")
-            self.assertTrue(request_id.startswith("mcp-segmented-"))
-            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
-
-    def test_vertical_two_page_grid_reads_rows_then_columns_in_page_order(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "vertical-grid.jpg"
-            image = Image.new("RGB", (800, 400), "white")
-            colors = {
-                "左页上左。": (255, 0, 0),
-                "左页上右。": (0, 255, 0),
-                "左页下左。": (0, 0, 255),
-                "左页下右。": (255, 255, 0),
-                "右页上左。": (255, 0, 255),
-                "右页上右。": (0, 255, 255),
-                "右页下左。": (128, 0, 0),
-                "右页下右。": (0, 128, 0),
-            }
-            image.paste(colors["左页上左。"], (0, 0, 200, 200))
-            image.paste(colors["左页上右。"], (200, 0, 400, 200))
-            image.paste(colors["左页下左。"], (0, 200, 200, 400))
-            image.paste(colors["左页下右。"], (200, 200, 400, 400))
-            image.paste(colors["右页上左。"], (400, 0, 600, 200))
-            image.paste(colors["右页上右。"], (600, 0, 800, 200))
-            image.paste(colors["右页下左。"], (400, 200, 600, 400))
-            image.paste(colors["右页下右。"], (600, 200, 800, 400))
-            image.save(image_path, quality=100, subsampling=0)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-
-            def read_grid_cell(path: Path, *, depth: int) -> tuple[str, str]:
-                with Image.open(path).convert("RGB") as cell:
-                    self.assertEqual(cell.size, (200, 200))
-                    color = cell.getpixel((100, 100))
-                label = min(
-                    colors,
-                    key=lambda candidate: sum(
-                        abs(actual - expected)
-                        for actual, expected in zip(color, colors[candidate])
-                    ),
-                )
-                return label, "test"
-
-            with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "CODING_PLAN_VERTICAL_PAGE_ROWS": "2",
-                        "CODING_PLAN_VERTICAL_PAGE_COLUMNS": "2",
-                    },
-                ),
-                patch.object(
-                    backend,
-                    "_blank_row_cuts",
-                    side_effect=lambda page, count: [page.height // 2],
-                ),
-                patch.object(
-                    backend,
-                    "_blank_column_cuts",
-                    side_effect=lambda page, count: [page.width // 2],
-                ),
-                patch.object(backend, "_ocr_filtered_band", side_effect=read_grid_cell),
-            ):
-                text, request_id = backend._ocr_segmented(
-                    image_path,
-                    object(),
-                    segments=2,
-                )
-
-            self.assertEqual(
-                text,
-                "\n\n".join(
-                    (
-                        "右页上右。",
-                        "右页上左。",
-                        "右页下右。",
-                        "右页下左。",
-                        "左页上右。",
-                        "左页上左。",
-                        "左页下右。",
-                        "左页下左。",
-                    )
-                ),
+            backend = OpenAIVisionOCR(
+                api_key="test-key",
+                api_base="https://gateway.example.invalid/v1",
+                vision_model="vision-model",
+                reading_direction="vertical",
             )
-            self.assertTrue(request_id.startswith("mcp-segmented-"))
-            self.assertEqual(list(image_path.parent.glob("*_segment_*.jpg")), [])
 
-    def test_vertical_portrait_filtered_fallback_reads_top_then_bottom(self) -> None:
-        class TimeoutThenReadRegionClient:
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_filtered_" not in image_path.stem:
-                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
-                with Image.open(image_path).convert("RGB") as region:
-                    self.test_case.assertEqual(region.size, (120, 100))
-                    red, _green, blue = region.getpixel((60, 50))
-                    return ("上段。" if red > blue else "下段。"), "mcp-test"
-
-            def close(self) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "portrait-page.jpg"
-            image = Image.new("RGB", (120, 200), "red")
-            image.paste("blue", (0, 100, 120, 200))
-            image.save(image_path, quality=100, subsampling=0)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            backend.local = threading.local()
-            client = TimeoutThenReadRegionClient()
-            client.test_case = self
+            def transcribe(path: Path) -> tuple[str, str]:
+                if "_band_" in path.name:
+                    with Image.open(path).convert("L") as band:
+                        average = (
+                            sum(band.get_flattened_data())
+                            / (band.width * band.height)
+                        )
+                    return ("右列正文。", "id") if average > 127 else ("左列正文。", "id")
+                # The whole-page request is what trips the gateway filter.
+                raise RuntimeError("content_filter triggered")
 
             with (
-                patch.object(backend, "_client", return_value=client),
-                patch.object(backend, "_blank_row_cuts", return_value=[100]) as row_cuts,
+                patch.object(backend, "_transcribe", side_effect=transcribe),
                 patch.object(
                     backend,
-                    "_blank_column_cuts",
-                    side_effect=AssertionError("portrait page must not be split into columns"),
+                    "_is_content_filter_error",
+                    side_effect=lambda exc: "content_filter" in str(exc),
                 ),
             ):
-                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
+                text, request_id = backend.ocr_image(image_path)
 
-            self.assertEqual(text, "上段。\n\n下段。")
-            self.assertTrue(request_id.startswith("mcp-filtered-"))
-            row_cuts.assert_called_once()
-            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
-
-    def test_short_physical_page_output_uses_ordered_fallback(self) -> None:
-        class ShortThenReadRegionClient:
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_filtered_" not in image_path.stem:
-                    return "短。", "mcp-short"
-                with Image.open(image_path).convert("RGB") as region:
-                    red, _green, blue = region.getpixel((60, 50))
-                    return ("上段正文。" if red > blue else "下段正文。"), "mcp-test"
-
-            def close(self) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "short-portrait-page.jpg"
-            image = Image.new("RGB", (120, 200), "red")
-            image.paste("blue", (0, 100, 120, 200))
-            image.save(image_path, quality=100, subsampling=0)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            backend.local = threading.local()
-            client = ShortThenReadRegionClient()
-
-            with (
-                patch.dict(os.environ, {"CODING_PLAN_MIN_OCR_CHARS": "10"}),
-                patch.object(backend, "_client", return_value=client),
-                patch.object(backend, "_blank_row_cuts", return_value=[100]),
-            ):
-                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
-
-            self.assertEqual(text, "上段正文。\n\n下段正文。")
-            self.assertTrue(request_id.startswith("mcp-filtered-"))
-            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
-
-    def test_vertical_narrow_filtered_fallback_reads_right_then_left(self) -> None:
-        class TimeoutThenReadRegionClient:
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_filtered_" not in image_path.stem:
-                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
-                with Image.open(image_path).convert("RGB") as region:
-                    self.test_case.assertEqual(region.size, (30, 240))
-                    red, _green, blue = region.getpixel((15, 120))
-                    return ("右列。" if red > blue else "左列。"), "mcp-test"
-
-            def close(self) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "narrow-column.jpg"
-            image = Image.new("RGB", (60, 240), "blue")
-            image.paste("red", (30, 0, 60, 240))
-            image.save(image_path, quality=100, subsampling=0)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            backend.local = threading.local()
-            client = TimeoutThenReadRegionClient()
-            client.test_case = self
-
-            with (
-                patch.object(backend, "_client", return_value=client),
-                patch.object(backend, "_blank_column_cuts", return_value=[30]) as column_cuts,
-                patch.object(
-                    backend,
-                    "_blank_row_cuts",
-                    side_effect=AssertionError("narrow vertical band must not be split into rows"),
-                ),
-            ):
-                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
-
-            self.assertEqual(text, "右列。\n\n左列。")
-            self.assertTrue(request_id.startswith("mcp-filtered-"))
-            column_cuts.assert_called_once()
-            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
-
-    def test_vertical_grid_cell_fallback_keeps_right_to_left_columns(self) -> None:
-        class TimeoutThenReadRegionClient:
-            def extract_text(self, image_path: Path) -> tuple[str, str]:
-                if "_filtered_" not in image_path.stem:
-                    raise RuntimeError("Vision MCP request timed out after 120 seconds.")
-                with Image.open(image_path).convert("RGB") as region:
-                    red, _green, blue = region.getpixel((30, 100))
-                    return ("右列。" if red > blue else "左列。"), "mcp-test"
-
-            def close(self) -> None:
-                return
-
-        with tempfile.TemporaryDirectory() as directory:
-            image_path = Path(directory) / "page_segment_2_grid.jpg"
-            image = Image.new("RGB", (120, 200), "blue")
-            image.paste("red", (60, 0, 120, 200))
-            image.save(image_path, quality=100, subsampling=0)
-            backend = object.__new__(CodingPlanVisionOCR)
-            backend.reading_direction = "vertical"
-            backend.local = threading.local()
-            client = TimeoutThenReadRegionClient()
-
-            with (
-                patch.dict(os.environ, {"CODING_PLAN_VERTICAL_PAGE_ROWS": "2"}),
-                patch.object(backend, "_client", return_value=client),
-                patch.object(backend, "_blank_column_cuts", return_value=[60]),
-                patch.object(
-                    backend,
-                    "_blank_row_cuts",
-                    side_effect=AssertionError("grid row must retain vertical columns"),
-                ),
-            ):
-                text, request_id = backend._ocr_filtered_band(image_path, depth=0)
-
-            self.assertEqual(text, "右列。\n\n左列。")
-            self.assertTrue(request_id.startswith("mcp-filtered-"))
-            self.assertEqual(list(image_path.parent.glob("*_filtered_*.jpg")), [])
+            # Vertical reading order is right band first, then left.
+            self.assertEqual(text, "右列正文。\n\n左列正文。")
+            self.assertTrue(request_id.startswith("band-"))
+            self.assertEqual(list(image_path.parent.glob("*_band_*.jpg")), [])
 
     def test_ocr_pdf_marks_visually_blank_unreadable_page_as_blank_checkpoint(self) -> None:
         class UnreadableBlankBackend:
-            ocr_model = "glm-ocr"
+            ocr_model = "tesseract/jpn_vert/psm-3"
 
             def ocr_image(self, image_path: Path) -> tuple[str, str]:
                 return "The image is too blurry to read.", "blank-test"
@@ -2500,7 +2066,7 @@ class MappingAndCompilationTests(unittest.TestCase):
         records = ocr_pdf(
             self.pdf_path,
             output,
-            FakeOCR("coding-plan/test"),
+            FakeOCR("openai-vision/test"),
             start_page=1,
             end_page=1,
             concurrency=1,
@@ -2509,9 +2075,9 @@ class MappingAndCompilationTests(unittest.TestCase):
             jpeg_quality=80,
             keep_page_images=False,
             force=False,
-            cache_model_prefix="coding-plan/",
+            cache_model_prefix="openai-vision/",
         )
-        self.assertEqual(records[0].ocr_model, "coding-plan/test")
+        self.assertEqual(records[0].ocr_model, "openai-vision/test")
 
     def test_ocr_exact_cache_identity_rejects_similar_prefix(self) -> None:
         class FakeOCR:

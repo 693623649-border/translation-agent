@@ -349,10 +349,11 @@ class TranslationAgentApiTests(unittest.TestCase):
 
     def test_run_result_status_uses_selected_translation_profile(self) -> None:
         config = """
-[profiles.glm_vision]
-adapter = "coding-plan-mcp"
-provider = "zhipu"
-model = "glm-4.6v"
+[profiles.vision]
+adapter = "openai-vision"
+provider = "gateway"
+base_url = "https://gateway.example.invalid/v1"
+model = "vision-model"
 reading_direction = "vertical"
 
 [profiles.deepseek_pro]
@@ -363,7 +364,7 @@ model = "deepseek-v4-pro"
 credential_env = "DEEPSEEK_TEST_KEY"
 
 [pipeline]
-ocr_profile = "glm_vision"
+ocr_profile = "vision"
 translation_profile = "deepseek_pro"
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -376,9 +377,9 @@ translation_profile = "deepseek_pro"
                     "translation_agent.runtime.translation_agent_api.output_status",
                     return_value={"translations_profile_fresh": 0},
                 ) as mocked_status,
-                # The selected glm_vision profile is the remote fallback; the
-                # test asserts profile-based identity, so hold the local
-                # PaddleOCR probe off (its availability is host-dependent).
+                # The selected vision profile is the remote backend; the test
+                # asserts profile-based identity, so hold the local PaddleOCR
+                # probe off (its availability is host-dependent).
                 patch("translation_agent.pipeline.book_pipeline.paddle_local_available", return_value=False),
                 patch("translation_agent.pipeline.book_pipeline.paddle_native_available", return_value=False),
             ):
@@ -394,9 +395,15 @@ translation_profile = "deepseek_pro"
         identity = mocked_status.call_args.kwargs["expected_translation_identity"]
         self.assertEqual(identity.provider, "deepseek")
         self.assertEqual(identity.model, "deepseek-v4-pro")
+        # Status receives both the coarse prefix and the exact identity; the
+        # prefix scopes the model, the exact value pins direction + prompt.
         self.assertEqual(
             mocked_status.call_args.kwargs["expected_ocr_model_prefix"],
-            "coding-plan/glm-4.6v-vision-mcp/vertical-v2",
+            "openai-vision/vision-model/",
+        )
+        self.assertEqual(
+            mocked_status.call_args.kwargs["expected_ocr_model_exact"],
+            "openai-vision/vision-model/vertical/openai-vision-v1",
         )
 
 
